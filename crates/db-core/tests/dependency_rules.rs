@@ -1,11 +1,19 @@
 //! Architecture dependency-direction test (Phase 0 Workstream A).
 //!
 //! `docs/architecture/ARCHITECTURE.md` §2 requires that `reldex-db-core`
-//! depend only on `reldex-db-driver-api`, never on a concrete
-//! `reldex-driver-*` crate, and that no `reldex-driver-*` crate depend back
-//! on `reldex-db-core`. This test reads the workspace dependency graph from
-//! `cargo metadata` and asserts both directions of that rule so a violation
-//! fails CI instead of silently landing.
+//! depend only on `reldex-db-driver-api` *as a build dependency*, never on a
+//! concrete `reldex-driver-*` crate, and that no `reldex-driver-*` crate
+//! depend back on `reldex-db-core`. This test reads the workspace dependency
+//! graph from `cargo metadata` and asserts both directions of that rule so a
+//! violation fails CI instead of silently landing.
+//!
+//! One deliberate exception: `reldex-db-core`'s own `[dev-dependencies]` on
+//! `reldex-driver-mock` is allowed. `docs/architecture/ARCHITECTURE.md` §4
+//! is explicit that the mock driver exists so core logic is testable without
+//! a database, and `crates/db-core/tests/` is exactly where that happens; a
+//! `dev-dependency` never reaches the compiled product, so it does not
+//! violate the layering rule this test enforces. Only a normal dependency on
+//! a driver crate would.
 
 use std::process::Command;
 
@@ -43,19 +51,24 @@ fn db_core_and_driver_crates_do_not_cross_depend() {
         let name = package["name"]
             .as_str()
             .expect("package entry has no `name`");
-        let deps: Vec<&str> = package["dependencies"]
+        let deps: Vec<(&str, Option<&str>)> = package["dependencies"]
             .as_array()
             .expect("package entry has no `dependencies` array")
             .iter()
-            .filter_map(|dep| dep["name"].as_str())
+            .filter_map(|dep| Some((dep["name"].as_str()?, dep["kind"].as_str())))
             .collect();
 
         if name == "reldex-db-core" {
             checked_db_core = true;
-            for dep in &deps {
+            for (dep, kind) in &deps {
+                // See the module documentation: a `dev` dependency on the
+                // mock driver is the intended way to test this crate.
+                if *kind == Some("dev") {
+                    continue;
+                }
                 assert!(
                     !dep.starts_with("reldex-driver-"),
-                    "reldex-db-core must not depend on driver crate `{dep}` \
+                    "reldex-db-core must not have a non-dev dependency on driver crate `{dep}` \
                      (docs/architecture/ARCHITECTURE.md §2)"
                 );
             }
@@ -64,7 +77,7 @@ fn db_core_and_driver_crates_do_not_cross_depend() {
         if name.starts_with("reldex-driver-") {
             checked_a_driver = true;
             assert!(
-                !deps.contains(&"reldex-db-core"),
+                !deps.iter().any(|(dep, _)| *dep == "reldex-db-core"),
                 "driver crate `{name}` must not depend on reldex-db-core \
                  (docs/architecture/ARCHITECTURE.md §2)"
             );
