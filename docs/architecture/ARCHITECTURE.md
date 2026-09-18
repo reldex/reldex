@@ -264,7 +264,7 @@ Until then, no code should assume an answer.
    `Box<dyn DatabaseConnection>` for that session's lifetime.
 5. **Cancellation mechanism — contract RESOLVED by [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) D2;
    driver-level mechanism still open.** The contract is a separate `Arc<dyn CancelHandle>`,
-   `CancelKind::{Native, CallTimeout, Unsupported}`, and `SessionState::{Usable, NeedsValidation, Lost}`
+   `CancelKind::{Native, PreArmedDeadline, Unsupported}`, and `SessionState::{Usable, NeedsValidation, Lost}`
    reported on every `DbError`. Which mechanism the primary driver actually offers, and the
    cancellation latency achievable per platform, remain open (ADR-0001 C1, spike S4).
 6. **Result store representation.** What is the in-memory row/batch layout, bounded-memory policy,

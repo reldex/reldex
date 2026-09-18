@@ -8,9 +8,14 @@
 use std::fmt;
 
 use crate::error::DbResult;
+use crate::ids::ConnectionId;
 
 /// What a large object contains.
+///
+/// `#[non_exhaustive]`: `BFILE` and temporary-LOB distinctions are plausible
+/// additions that must not break the contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum LobKind {
     /// Binary data (`BLOB`). Chunks are raw bytes.
     Binary,
@@ -32,7 +37,42 @@ impl LobKind {
 ///
 /// Implementations live in driver crates and hold whatever native locator the
 /// vendor protocol needs; nothing about that leaks through this trait.
+///
+/// # Thread affinity
+///
+/// A `LobStream` is `Send`, so the type system will happily let it travel to
+/// another thread — and it must not. Like a [`crate::Cursor`], it is a *derived
+/// handle*: it reads over the connection that produced it, which lives on one
+/// `db-core` worker thread. Using it anywhere else would issue protocol traffic
+/// on a connection another thread believes it owns.
+///
+/// Only plain data ([`crate::RowBatch`]) crosses threads. Nothing in the type
+/// system enforces this, which is precisely why
+/// [`LobStream::connection_id`] exists: `db-core` asserts against it.
+///
+/// # Lifecycle
+///
+/// - **After any error** from [`LobStream::read_chunk`] the stream is finished.
+///   The only legal action is to drop it. A further `read_chunk` must return a
+///   [`crate::DbError`] — it must never panic, block, or resume reading as if
+///   nothing happened.
+/// - **After the owning connection is closed**, every remaining stream returns
+///   [`crate::DbError::connection_closed`] from `read_chunk`. It must never
+///   panic and never block on a connection that no longer exists.
+/// - **A commit or rollback may invalidate the locator.** Most servers scope a
+///   LOB locator to the transaction that produced it, so the driver must expect
+///   reads after a commit or rollback to fail and must report that as an
+///   ordinary [`crate::DbError`] (`ErrorKind::Transaction` when the server says
+///   so). `db-core` therefore treats an open locator as transaction-scoped and
+///   must not promise the user otherwise.
 pub trait LobStream: Send {
+    /// The connection this stream reads over.
+    ///
+    /// `db-core` asserts that a stream is only touched on the worker thread that
+    /// owns this connection. Must be cheap: it is an accessor on a field the
+    /// driver already holds, never a round trip.
+    fn connection_id(&self) -> ConnectionId;
+
     /// What the object contains.
     fn kind(&self) -> LobKind;
 
@@ -47,11 +87,14 @@ pub trait LobStream: Send {
     /// A return value of `0` means the object is exhausted. For character kinds
     /// the bytes are UTF-8 and an implementation must not split a multi-byte
     /// sequence across chunks when `buf.len() >= 4`, so a caller can decode each
-    /// chunk independently.
+    /// chunk independently. "Multi-byte sequence" includes a surrogate pair in
+    /// the driver's own encoding: a driver whose native read can cut a non-BMP
+    /// character in half must re-join the halves before returning UTF-8 here.
     ///
     /// # Errors
     ///
-    /// Any [`crate::DbError`] the underlying read produced.
+    /// Any [`crate::DbError`] the underlying read produced. After an error the
+    /// stream is finished; see the trait's lifecycle rules.
     fn read_chunk(&mut self, buf: &mut [u8]) -> DbResult<usize>;
 }
 
@@ -60,6 +103,9 @@ pub trait LobStream: Send {
 /// Held inside a [`crate::Value`] or a result [`crate::Column`], it costs one
 /// pointer and no data. Reading requires ownership, which is why a locator is
 /// taken out of a batch rather than borrowed from it.
+///
+/// It carries the thread-affinity and lifecycle rules of the [`LobStream`] it
+/// wraps; read those before implementing or consuming one.
 pub struct LobLocator {
     stream: Box<dyn LobStream>,
 }
@@ -69,6 +115,12 @@ impl LobLocator {
     #[must_use]
     pub fn new(stream: Box<dyn LobStream>) -> Self {
         Self { stream }
+    }
+
+    /// The connection this locator reads over. See [`LobStream::connection_id`].
+    #[must_use]
+    pub fn connection_id(&self) -> ConnectionId {
+        self.stream.connection_id()
     }
 
     /// What the object contains.
@@ -96,6 +148,7 @@ impl LobLocator {
 impl fmt::Debug for LobLocator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LobLocator")
+            .field("connection", &format_args!("{}", self.connection_id()))
             .field("kind", &self.kind())
             .field("size_hint", &self.size_hint())
             .finish()
@@ -106,13 +159,24 @@ impl fmt::Debug for LobLocator {
 mod tests {
     use super::*;
 
+    use crate::error::ErrorKind;
+
     struct SliceLob {
+        connection: ConnectionId,
         data: &'static [u8],
         position: usize,
         kind: LobKind,
+        /// Set once an error has been reported; a conforming stream must then
+        /// refuse further reads instead of resuming.
+        finished: bool,
+        closed: bool,
     }
 
     impl LobStream for SliceLob {
+        fn connection_id(&self) -> ConnectionId {
+            self.connection
+        }
+
         fn kind(&self) -> LobKind {
             self.kind
         }
@@ -122,6 +186,14 @@ mod tests {
         }
 
         fn read_chunk(&mut self, buf: &mut [u8]) -> DbResult<usize> {
+            if self.closed {
+                return Err(crate::error::DbError::connection_closed("LOB stream"));
+            }
+            if self.finished {
+                return Err(crate::error::DbError::internal(
+                    "LOB stream read after a failure; the only legal action was to drop it",
+                ));
+            }
             let remaining = &self.data[self.position..];
             let take = remaining.len().min(buf.len());
             buf[..take].copy_from_slice(&remaining[..take]);
@@ -130,12 +202,19 @@ mod tests {
         }
     }
 
-    fn locator(data: &'static [u8], kind: LobKind) -> LobLocator {
-        LobLocator::new(Box::new(SliceLob {
+    fn lob(data: &'static [u8], kind: LobKind) -> SliceLob {
+        SliceLob {
+            connection: ConnectionId::from_raw(11),
             data,
             position: 0,
             kind,
-        }))
+            finished: false,
+            closed: false,
+        }
+    }
+
+    fn locator(data: &'static [u8], kind: LobKind) -> LobLocator {
+        LobLocator::new(Box::new(lob(data, kind)))
     }
 
     #[test]
@@ -167,5 +246,32 @@ mod tests {
         let rendered = format!("{lob:?}");
         assert!(rendered.contains("NationalCharacter"), "{rendered}");
         assert!(!rendered.contains("ข้อมูล"), "{rendered}");
+    }
+
+    #[test]
+    fn a_locator_reports_the_connection_that_owns_it() {
+        // `db-core` asserts on this before touching a derived handle: nothing in
+        // the type system stops a `Send` stream from reaching the wrong thread.
+        let lob = locator(b"abc", LobKind::Binary);
+        assert_eq!(lob.connection_id(), ConnectionId::from_raw(11));
+        assert!(format!("{lob:?}").contains("ConnectionId#11"));
+    }
+
+    #[test]
+    fn a_stream_reports_rather_than_panics_after_failure_or_close() {
+        let mut stream = lob(b"abcdefgh", LobKind::Binary);
+        stream.finished = true;
+        let error = stream
+            .read_chunk(&mut [0_u8; 4])
+            .expect_err("a finished stream must refuse further reads");
+        assert_eq!(error.kind(), ErrorKind::DriverInternal);
+
+        let mut stream = lob(b"abcdefgh", LobKind::Binary);
+        stream.closed = true;
+        let error = stream
+            .read_chunk(&mut [0_u8; 4])
+            .expect_err("a stream whose connection closed must refuse reads");
+        assert_eq!(error.kind(), ErrorKind::DriverInternal);
+        assert_eq!(error.session_state(), crate::error::SessionState::Lost);
     }
 }

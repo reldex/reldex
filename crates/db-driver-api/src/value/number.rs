@@ -1,10 +1,21 @@
 //! Lossless decimal representation for database `NUMBER` values (ADR-0002 D5).
 //!
 //! A [`Number`] is sign + up to [`MAX_SIGNIFICANT_DIGITS`] significant decimal
-//! digits + a decimal exponent, which is exactly the domain of an Oracle
-//! Database `NUMBER`. It is `Copy` and allocation-free, so a numeric result cell
-//! costs no heap traffic, and nothing converts through `f64` implicitly:
+//! digits + a decimal exponent, which covers the domain of an Oracle Database
+//! `NUMBER`. It is `Copy` and allocation-free, so a numeric result cell costs no
+//! heap traffic, and nothing converts through `f64` implicitly:
 //! [`Number::to_f64_lossy`] is named for what it does.
+//!
+//! # Display is canonical, not pretty
+//!
+//! [`Number`]'s `Display` writes one form — plain positional decimal, with no
+//! exponent and no thousands separators — and [`Number::parse`] reads it back
+//! exactly. That makes `Display` a *serialization*, safe for round-tripping,
+//! diffing and tests. It is deliberately **not** a presentation format: choosing
+//! when a number becomes `1.23E+100`, how many decimals to show, or what the
+//! group separator is depends on locale and column width, and belongs to the UI
+//! (`SPEC.md` §13), not to a transport contract. `Display` therefore carries no
+//! tunable thresholds at all.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -12,22 +23,28 @@ use std::fmt::Write as _;
 use std::str::FromStr;
 
 /// Maximum number of significant decimal digits a [`Number`] can hold.
-pub const MAX_SIGNIFICANT_DIGITS: usize = 38;
+///
+/// Oracle Database documents `NUMBER` as 38 digits of *declarable* precision,
+/// but the stored form is 20 base-100 mantissa bytes, which can carry up to 40
+/// decimal digits — and computed values (notably division) reach that. The
+/// primary driver's own decimal buffer is 40 digits for the same reason
+/// (ADR-0001, `oracledb` review). The contract matches the storage, not the
+/// documentation, so a value the server sends can never fail to be represented.
+pub const MAX_SIGNIFICANT_DIGITS: usize = 40;
 
 /// Smallest decimal exponent a [`Number`] can hold.
 ///
 /// With the normalized form `±0.d₁…dₙ × 10^exponent`, this bounds the smallest
-/// representable magnitude at `1 × 10^-130`.
+/// representable magnitude at `1 × 10^-130`, which is `NUMBER`'s documented
+/// lower limit.
 pub const MIN_EXPONENT: i16 = -129;
 
 /// Largest decimal exponent a [`Number`] can hold.
 ///
-/// This bounds the largest representable magnitude just below `1 × 10^126`.
+/// This bounds the largest representable magnitude just below `1 × 10^126` —
+/// `NUMBER`'s documented upper limit is `9.99…9 × 10^125`, which normalizes to
+/// `0.999…9 × 10^126`.
 pub const MAX_EXPONENT: i16 = 126;
-
-/// How many zeros [`Number`]'s `Display` will write before switching to
-/// scientific notation.
-const PLAIN_ZERO_LIMIT: i32 = 20;
 
 /// Why a decimal value could not be represented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -45,8 +62,6 @@ pub enum NumberError {
     TooManyDigits,
     /// The magnitude is outside `[10^-130, 10^126)`.
     ExponentOutOfRange,
-    /// A floating-point input was `NaN` or infinite.
-    NotFinite,
 }
 
 impl fmt::Display for NumberError {
@@ -55,9 +70,8 @@ impl fmt::Display for NumberError {
             Self::Empty => "empty decimal value",
             Self::InvalidSyntax => "not a valid decimal literal",
             Self::InvalidDigit => "decimal digit outside 0..=9",
-            Self::TooManyDigits => "more than 38 significant decimal digits",
+            Self::TooManyDigits => "more than 40 significant decimal digits",
             Self::ExponentOutOfRange => "decimal exponent outside the supported range",
-            Self::NotFinite => "floating-point value is not finite",
         };
         f.write_str(text)
     }
@@ -68,7 +82,7 @@ impl std::error::Error for NumberError {}
 /// An exact decimal value.
 ///
 /// The value is `±0.d₁d₂…dₙ × 10^exponent` where `d₁ != 0`, `dₙ != 0` and
-/// `n <= 38`. Zero is the unique canonical value with `n == 0`, exponent `0` and
+/// `n <= 40`. Zero is the unique canonical value with `n == 0`, exponent `0` and
 /// a non-negative sign, so equality and hashing can be derived.
 ///
 /// ```
@@ -78,6 +92,11 @@ impl std::error::Error for NumberError {}
 /// assert_eq!(n.to_string(), "123.45");
 /// assert_eq!(n.digit_count(), 5);
 /// assert_eq!(Number::from(1_500_i64).to_string(), "1500");
+///
+/// // Scientific notation is accepted on input and normalized away on output;
+/// // `Display` is a canonical serialization, not a presentation format.
+/// assert_eq!("1.5E+3".parse::<Number>().expect("valid").to_string(), "1500");
+/// assert_eq!("-.5".parse::<Number>().expect("valid").to_string(), "-0.5");
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Number {
@@ -262,22 +281,6 @@ impl Number {
         })
     }
 
-    /// Converts a finite `f64`, going through its shortest round-trip decimal form.
-    ///
-    /// This is the only conversion *into* a `Number` that can lose information
-    /// relative to the real value the `f64` approximates, and it is explicit.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NumberError::NotFinite`] for `NaN` and infinities, and
-    /// [`NumberError::ExponentOutOfRange`] outside the representable range.
-    pub fn from_f64_lossy(value: f64) -> Result<Self, NumberError> {
-        if !value.is_finite() {
-            return Err(NumberError::NotFinite);
-        }
-        Self::parse(&value.to_string())
-    }
-
     /// Whether the value is zero.
     #[must_use]
     pub const fn is_zero(self) -> bool {
@@ -389,29 +392,12 @@ impl Number {
             negative,
         })
     }
-
-    fn fmt_scientific(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.negative {
-            f.write_char('-')?;
-        }
-        let digits = self.digits();
-        f.write_char(char::from(b'0' + digits[0]))?;
-        if digits.len() > 1 {
-            f.write_char('.')?;
-            for digit in &digits[1..] {
-                f.write_char(char::from(b'0' + *digit))?;
-            }
-        }
-        let exponent = i32::from(self.exponent) - 1;
-        if exponent < 0 {
-            write!(f, "E-{}", -exponent)
-        } else {
-            write!(f, "E+{exponent}")
-        }
-    }
 }
 
 impl fmt::Display for Number {
+    /// Writes the one canonical form: plain positional decimal, never
+    /// scientific, with no separators. See the module documentation for why this
+    /// carries no formatting policy.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.len == 0 {
             return f.write_str("0");
@@ -420,27 +406,23 @@ impl fmt::Display for Number {
         let digit_count = i32::try_from(digits.len()).unwrap_or(i32::MAX);
         let exponent = i32::from(self.exponent);
 
+        if self.negative {
+            f.write_char('-')?;
+        }
+
         if exponent >= digit_count {
-            let zeros = exponent - digit_count;
-            if zeros > PLAIN_ZERO_LIMIT {
-                return self.fmt_scientific(f);
-            }
-            if self.negative {
-                f.write_char('-')?;
-            }
+            // An integer, possibly with trailing zeros: 123 x 10^2 -> "12300".
             for digit in digits {
                 f.write_char(char::from(b'0' + *digit))?;
             }
-            for _ in 0..zeros {
+            for _ in 0..(exponent - digit_count) {
                 f.write_char('0')?;
             }
             return Ok(());
         }
 
         if exponent > 0 {
-            if self.negative {
-                f.write_char('-')?;
-            }
+            // The decimal point falls inside the digit run: "123.45".
             let split = usize::try_from(exponent).unwrap_or(0);
             for digit in &digits[..split] {
                 f.write_char(char::from(b'0' + *digit))?;
@@ -452,15 +434,9 @@ impl fmt::Display for Number {
             return Ok(());
         }
 
-        let zeros = -exponent;
-        if zeros > PLAIN_ZERO_LIMIT {
-            return self.fmt_scientific(f);
-        }
-        if self.negative {
-            f.write_char('-')?;
-        }
+        // Magnitude below one: "0." then the leading zeros the exponent implies.
         f.write_str("0.")?;
-        for _ in 0..zeros {
+        for _ in 0..(-exponent) {
             f.write_char('0')?;
         }
         for digit in digits {
@@ -577,9 +553,23 @@ mod tests {
         assert_eq!(round_trip("123.450"), "123.45");
         assert_eq!(round_trip("000123.45"), "123.45");
         assert_eq!(round_trip("0.00123"), "0.00123");
-        assert_eq!(round_trip(".5"), "0.5");
         assert_eq!(round_trip("1500"), "1500");
         assert_eq!(round_trip("  42  "), "42");
+    }
+
+    #[test]
+    fn parses_the_literal_shapes_drivers_actually_emit() {
+        // A driver that has to render its native decimal through `Display` and
+        // re-parse it here (ADR-0002, notes for driver implementers) produces
+        // exactly these shapes. None of them may be rejected.
+        assert_eq!(round_trip(".5"), "0.5");
+        assert_eq!(round_trip("-.5"), "-0.5");
+        assert_eq!(round_trip("+.5"), "0.5");
+        assert_eq!(round_trip("1E+2"), "100");
+        assert_eq!(round_trip("1e+2"), "100");
+        assert_eq!(round_trip("1.5E-130"), format!("0.{}15", "0".repeat(129)));
+        assert_eq!(round_trip(".0"), "0");
+        assert_eq!(round_trip("-0.0"), "0");
     }
 
     #[test]
@@ -587,9 +577,22 @@ mod tests {
         assert_eq!(round_trip("1.5e3"), "1500");
         assert_eq!(round_trip("1.5E+3"), "1500");
         assert_eq!(round_trip("15e-1"), "1.5");
-        assert_eq!(round_trip("1e-130"), "1E-130");
-        assert_eq!(round_trip("1.23e100"), "1.23E+100");
+        assert_eq!(round_trip("1e-130"), format!("0.{}1", "0".repeat(129)));
+        assert_eq!(round_trip("1.23e100"), format!("123{}", "0".repeat(98)));
         assert_eq!(round_trip("0e99"), "0");
+    }
+
+    #[test]
+    fn display_is_canonical_plain_decimal_with_no_policy() {
+        // One form, always. No threshold decides when a value "becomes"
+        // scientific, because that decision is the UI's (`SPEC.md` §13).
+        for text in ["1e-130", "1e60", "1.23e100", "9.99e125", "1e-40"] {
+            let rendered = Number::parse(text).expect("valid").to_string();
+            assert!(
+                !rendered.contains('E') && !rendered.contains('e'),
+                "{text} rendered as {rendered}, which is not the canonical form"
+            );
+        }
     }
 
     #[test]
@@ -602,9 +605,11 @@ mod tests {
             "-0.00123",
             "1500",
             "1E-130",
+            "1.5E-130",
             "1.23E+100",
-            "99999999999999999999999999999999999999",
-            "-0.99999999999999999999999999999999999999",
+            "9.99E+125",
+            "9999999999999999999999999999999999999999",
+            "-0.9999999999999999999999999999999999999999",
         ] {
             let parsed = Number::parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
             let rendered = parsed.to_string();
@@ -617,24 +622,36 @@ mod tests {
     }
 
     #[test]
-    fn keeps_all_thirty_eight_digits() {
-        let text = "12345678901234567890123456789012345678";
+    fn keeps_all_forty_digits_a_server_can_produce() {
+        // 38 is the declarable precision; 40 is what the 20-byte base-100
+        // mantissa can carry, and what division results actually reach. A value
+        // the server sends must never fail to be represented.
+        assert_eq!(MAX_SIGNIFICANT_DIGITS, 40);
+        // Ends in a non-zero digit: a trailing zero is not significant, so it
+        // would not exercise the limit.
+        let text = "1234567890123456789012345678901234567891";
         assert_eq!(text.len(), MAX_SIGNIFICANT_DIGITS);
-        let parsed = Number::parse(text).expect("38 digits must be accepted");
+        let parsed = Number::parse(text).expect("40 digits must be accepted");
         assert_eq!(parsed.digit_count(), MAX_SIGNIFICANT_DIGITS);
         assert_eq!(parsed.to_string(), text);
+
+        // The shape a division produces: 40 significant digits after the point.
+        let quotient = format!("0.{}", "3".repeat(40));
+        let parsed = Number::parse(&quotient).expect("40 fractional digits must be accepted");
+        assert_eq!(parsed.digit_count(), 40);
+        assert_eq!(parsed.to_string(), quotient);
     }
 
     #[test]
-    fn rejects_more_than_thirty_eight_significant_digits() {
-        let text = "123456789012345678901234567890123456789"; // 39 digits
-        assert_eq!(Number::parse(text), Err(NumberError::TooManyDigits));
+    fn rejects_more_than_forty_significant_digits() {
+        let text = "1".repeat(MAX_SIGNIFICANT_DIGITS + 1);
+        assert_eq!(Number::parse(&text), Err(NumberError::TooManyDigits));
         // Trailing zeros past the limit are not significant, so they are fine as
         // long as the exponent still fits.
         let padded = format!("1{}", "0".repeat(60));
         let parsed = Number::parse(&padded).expect("1e60 has one significant digit");
         assert_eq!(parsed.digit_count(), 1);
-        assert_eq!(parsed.to_string(), "1E+60");
+        assert_eq!(parsed.to_string(), padded);
         // Same shape, but now out of the NUMBER exponent range.
         assert_eq!(
             Number::parse(&format!("1{}", "0".repeat(130))),
@@ -711,8 +728,12 @@ mod tests {
             Err(NumberError::InvalidDigit)
         );
         assert_eq!(Number::from_digits(true, &[0, 0], 5), Ok(Number::ZERO));
+        assert!(
+            Number::from_digits(false, &[1; MAX_SIGNIFICANT_DIGITS], 0).is_ok(),
+            "a full 40-digit mantissa from a wire decoder must be accepted"
+        );
         assert_eq!(
-            Number::from_digits(false, &[1; 39], 0),
+            Number::from_digits(false, &[1; MAX_SIGNIFICANT_DIGITS + 1], 0),
             Err(NumberError::TooManyDigits)
         );
     }
@@ -746,26 +767,20 @@ mod tests {
     }
 
     #[test]
-    fn f64_conversions_are_explicitly_lossy() {
-        assert_eq!(
-            Number::from_f64_lossy(f64::NAN),
-            Err(NumberError::NotFinite)
-        );
-        assert_eq!(
-            Number::from_f64_lossy(f64::INFINITY),
-            Err(NumberError::NotFinite)
-        );
-        assert_eq!(
-            Number::from_f64_lossy(1.5).expect("finite").to_string(),
-            "1.5"
-        );
+    fn the_only_f64_conversion_is_the_explicitly_lossy_one_out() {
+        // There is no `from_f64`: nothing in the fetch path has an `f64` to
+        // start from, and offering one would invite silent precision loss into
+        // a contract whose whole point is not having any.
         let exact = Number::parse("123456789012345678901234567890").expect("valid");
         assert!((exact.to_f64_lossy() - 1.234_567_890_123_456_8e29).abs() < 1e14);
         assert_eq!(Number::ZERO.to_f64_lossy(), 0.0);
+        assert_eq!(Number::parse("1.5").expect("valid").to_f64_lossy(), 1.5);
     }
 
     #[test]
     fn stays_allocation_free_and_compact() {
+        // 40 digits + length + exponent + sign. Widening from 38 to 40 digits
+        // cost two bytes; `Value`'s size is asserted separately.
         assert!(
             size_of::<Number>() <= 48,
             "Number grew to {} bytes",

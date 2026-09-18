@@ -32,7 +32,7 @@ The primary database driver is Oracle's official [`oracle/rust-oracledb`](https:
 - [ ] Add Reldex-owned driver contract tests so an `oracledb` upgrade that changes behaviour is detected (ADR-0001).
 - [ ] Add test-support/mock driver. (skeleton crate created at `crates/drivers/mock`)
 - [x] Define normalized `DbError`. (implemented in `db-driver-api` per ADR-0002 D3: `DbError{kind, message, native, position, session_state, retryable, source}`)
-- [x] Define connection/session/query/result identifiers. (implemented in `db-driver-api` per ADR-0002 D7: `ConnectionId`/`SessionId`/`StatementId`/`ResultSetId` as `u64` newtypes)
+- [x] Define connection/session/query/result identifiers. (implemented in `db-driver-api` per ADR-0002 D7: `ConnectionId`/`ResultSetId` as `u64` newtypes; `SessionId` belongs to `db-core` and `StatementId` was cut after the API review)
 
 ## Workstream B — Session correctness
 
@@ -54,7 +54,7 @@ The primary database driver is Oracle's official [`oracle/rust-oracledb`](https:
 - [ ] REF CURSOR.
 - [ ] Multiple concurrent sessions.
 - [ ] Long-running query.
-- [ ] Cancellation from another control path. (ADR-0001 C1 / spike S4: `oracledb` has no public cancel API yet; Phase 0 may demonstrate cancellation via call-timeout semantics while an upstream request is pending — the limitation must be reported, not hidden.)
+- [ ] Cancellation from another control path. (ADR-0001 C1 / spike S4: `oracledb` has no public cancel API yet; the API review found that `set_call_timeout` takes the same lock `execute` holds, so a call timeout can only be a **pre-armed deadline**, not an on-demand cancel. A pre-armed deadline alone does NOT meet SPEC §10/§24.8; spike S4 evaluates four candidates in order and re-opens ADR-0001 with the owner if only the deadline works — the limitation must be reported, not hidden.)
 
 ## Workstream D — Data types
 

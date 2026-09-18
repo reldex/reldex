@@ -24,8 +24,14 @@
 //! The traits block. [`DatabaseDriver`] is `Send + Sync`;
 //! [`DatabaseConnection`] is `Send` but not `Sync` and is owned by one worker
 //! thread in `db-core`; [`CancelHandle`] is `Send + Sync` so a control path
-//! other than the blocked one can stop a running statement. See
-//! [`mod@session`] for the full contract.
+//! other than the blocked one can stop a running statement.
+//!
+//! Handles derived from a connection ([`Cursor`], [`LobLocator`]) are `Send` but
+//! must still be used only on the connection's owning worker thread — a runtime
+//! invariant the type system cannot express, which is why they report
+//! [`Cursor::connection_id`] for `db-core` to assert against. Only [`RowBatch`]
+//! crosses threads. See [`mod@session`] for the full contract, including the
+//! lifecycle of a handle after an error, a commit, or a close.
 //!
 //! # What lives elsewhere
 //!
@@ -47,7 +53,6 @@ pub mod value;
 pub use crate::error::{DbError, DbResult, ErrorKind, NativeError, SessionState, SqlPosition};
 pub use crate::ids::{
     ConnectionId, MAX_SAVEPOINT_NAME_LEN, ResultSetId, SavepointName, SavepointNameError,
-    SessionId, StatementId,
 };
 pub use crate::params::{
     ConnectionParams, Credentials, Endpoint, ExtensionValue, Extensions, Secret, SessionRole,
@@ -55,14 +60,15 @@ pub use crate::params::{
 };
 pub use crate::result::{
     BytesColumn, Column, ColumnData, ColumnKind, Cursor, DEFAULT_FETCH_ROWS, ExecutionOutcome,
-    NullMask, OutValues, RowBatch, TextColumn, Warning, WarningKind,
+    NullMask, OutValues, RowBatch, StatementKind, TextColumn, Warning, WarningKind,
 };
 pub use crate::session::{
-    CancelHandle, CancelKind, Capabilities, DatabaseConnection, DatabaseDriver, TransactionState,
+    CancelHandle, CancelKind, CancelOutcome, Capabilities, DatabaseConnection, DatabaseDriver,
+    TransactionState,
 };
 pub use crate::statement::{Bind, BindDirection, Binds, NamedBind, OutBindSpec, Statement};
 pub use crate::types::{ColumnMetadata, SqlType};
 pub use crate::value::{
-    LobKind, LobLocator, LobStream, MAX_EXPONENT, MAX_SIGNIFICANT_DIGITS, MIN_EXPONENT, Number,
-    NumberError, TemporalError, TimeZone, Timestamp, Value, ValueRef,
+    BindValue, LobKind, LobLocator, LobStream, MAX_EXPONENT, MAX_SIGNIFICANT_DIGITS, MIN_EXPONENT,
+    Number, NumberError, TemporalError, TimeZone, Timestamp, Value, ValueRef,
 };

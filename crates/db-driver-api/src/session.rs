@@ -7,12 +7,30 @@
 //!   open connections from anywhere.
 //! - [`DatabaseConnection`] is `Send` and deliberately **not** `Sync`. `db-core`
 //!   moves it onto the worker thread that owns the session for the session's
-//!   lifetime, and every statement-issuing method takes `&mut self`, so "one
-//!   session serializes its own calls" is enforced by the borrow checker rather
-//!   than by documentation.
+//!   lifetime, and every statement-issuing method takes `&mut self`.
 //! - [`CancelHandle`] is the one `Send + Sync` escape hatch. It is obtained
 //!   before a call blocks and is handed to whatever control path may need to
 //!   stop it (`SPEC.md` §24.8, `phase-0.md` Workstream C).
+//!
+//! ## What `&mut self` does and does not prove
+//!
+//! `&mut self` serializes calls **through the connection value itself**. It does
+//! *not* make "one session's database traffic is serialized" a compile-time
+//! property, and this crate must not claim that it does. A connection hands out
+//! independent `Send` handles — a [`crate::Cursor`], a [`crate::LobLocator`], a
+//! nested cursor inside a [`crate::Value`] — each of which issues its own
+//! protocol traffic without borrowing the connection at all. Two cursors on one
+//! connection can exist at once, and the borrow checker has nothing to say about
+//! where they are used.
+//!
+//! The real invariant is a runtime one, and `db-core` is what enforces it:
+//!
+//! > Every object derived from a connection is used **only on that connection's
+//! > owning worker thread**. Of everything a fetch produces, only
+//! > [`crate::RowBatch`] — plain data, no handles — crosses a thread boundary.
+//!
+//! [`crate::Cursor::connection_id`] and [`crate::LobStream::connection_id`]
+//! exist so that this can be asserted rather than assumed.
 //!
 //! There is no `DatabaseSession` trait here on purpose. A session
 //! (`SPEC.md` §6, `ARCHITECTURE.md` §3) is the `db-core` type that owns a
@@ -23,6 +41,7 @@
 //! and `db-core` decides how blocking work is scheduled.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::error::DbResult;
 use crate::ids::{ConnectionId, SavepointName};
@@ -32,56 +51,151 @@ use crate::statement::Statement;
 
 /// How a driver implements statement cancellation.
 ///
-/// Reported through [`Capabilities::cancel`] so the UI can disable Cancel rather
-/// than offer something that will not work.
+/// Reported through [`Capabilities::cancel`] so the UI can tell the user the
+/// truth *before* they press Cancel, rather than offering something that will
+/// not work (`SPEC.md` §24.8; "never hide limitations").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub enum CancelKind {
-    /// The driver cannot stop a running statement.
+    /// The driver cannot stop a running statement at all.
     ///
     /// [`CancelHandle::request_cancel`] returns
-    /// [`crate::ErrorKind::Unsupported`].
+    /// [`crate::ErrorKind::Unsupported`], and the UI disables Cancel.
     #[default]
     Unsupported,
-    /// The driver stops a statement by arming a short call timeout.
+    /// The driver can only enforce a deadline **armed before the call started**
+    /// ([`Statement::with_deadline`]).
     ///
-    /// Cancellation is coarse: it takes effect at the next protocol wait, and
-    /// the connection may be left mid-exchange, so the resulting error reports
-    /// [`crate::SessionState::NeedsValidation`]. The error is still
-    /// [`crate::ErrorKind::Cancelled`], never `Timeout`, because a cancel is
-    /// what the user asked for.
-    CallTimeout,
-    /// The driver sends a protocol-level interrupt on a separate control path.
+    /// This is not "cancel implemented with a timeout". A driver in this class
+    /// cannot interrupt a call that is already running — typically because
+    /// setting its timeout takes the same internal lock the running call holds
+    /// for the whole round trip, so an on-demand attempt would block until the
+    /// statement finished anyway, which is the opposite of cancelling. This is
+    /// the verified shape of the primary driver today (ADR-0001 C1).
+    ///
+    /// Consequences the rest of the system must respect:
+    ///
+    /// - [`CancelHandle::request_cancel`] returns
+    ///   [`CancelOutcome::NotInterruptible`] carrying the time left on the
+    ///   pre-armed deadline, if the driver knows it. It never blocks and never
+    ///   claims the statement will stop now.
+    /// - The UI must say what will actually happen ("this statement cannot be
+    ///   interrupted; it will stop by 14:32:07"), not show a spinner implying a
+    ///   cancel is in flight.
+    /// - When the deadline fires the call fails with
+    ///   [`crate::ErrorKind::Timeout`], because that is what happened. A driver
+    ///   must not relabel it `Cancelled` to make the UI look better.
+    ///
+    /// A driver in this class does **not** satisfy `SPEC.md` §10/§24.8 "cancel a
+    /// running statement". ADR-0001 spike S4 decides whether the primary driver
+    /// can leave this class.
+    PreArmedDeadline,
+    /// The driver interrupts a running statement over a separate control path.
+    ///
+    /// [`CancelHandle::request_cancel`] returns [`CancelOutcome::Requested`]
+    /// promptly, without waiting for the statement, and the blocked call fails
+    /// with [`crate::ErrorKind::Cancelled`]. This is the only class that meets
+    /// `SPEC.md` §24.8.
     Native,
+}
+
+impl CancelKind {
+    /// Whether this driver can stop a statement that is *already running*.
+    ///
+    /// The question the UI must ask before it offers a Cancel button, and the
+    /// one `SPEC.md` §24.8 is about. Only [`CancelKind::Native`] answers yes;
+    /// [`CancelKind::PreArmedDeadline`] can bound a call in advance but cannot
+    /// interrupt one.
+    #[must_use]
+    pub const fn interrupts_running_call(self) -> bool {
+        matches!(self, Self::Native)
+    }
+
+    /// Whether [`Statement::with_deadline`] is the only way to bound a call on
+    /// this driver, so `db-core` must arm one before every execute it may need
+    /// to stop.
+    #[must_use]
+    pub const fn needs_deadline_armed_up_front(self) -> bool {
+        matches!(self, Self::PreArmedDeadline)
+    }
+}
+
+/// What a cancellation request actually achieved.
+///
+/// [`CancelHandle::request_cancel`] returns this instead of a bare `()` so that
+/// "I asked, and nothing can come of it" is a value the UI can render, rather
+/// than an `Ok` that looks like success. `SPEC.md` §2 ranks correctness above
+/// convenience; an honest "not interruptible" is worth more than a spinner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum CancelOutcome {
+    /// An interrupt was delivered or armed on a separate control path.
+    ///
+    /// Best effort, as ever: the statement may still finish normally, and the
+    /// outcome arrives through the blocked call. Also the correct answer when
+    /// nothing was running, since cancellation is idempotent.
+    Requested,
+    /// This driver cannot interrupt a call that is already running
+    /// ([`CancelKind::PreArmedDeadline`]).
+    ///
+    /// Nothing was sent and nothing will stop early. The call ends when it ends,
+    /// or when the deadline armed before it started fires.
+    NotInterruptible {
+        /// How long is left on that pre-armed deadline, if the driver can work
+        /// it out.
+        ///
+        /// `None` means either that no deadline was armed — in which case the
+        /// statement will run to completion — or that the driver cannot measure
+        /// the remainder. Either way the caller must not invent a number: show
+        /// "cannot be interrupted" without a time.
+        deadline_remaining: Option<Duration>,
+    },
+}
+
+impl CancelOutcome {
+    /// Whether anything is actually going to try to stop the statement.
+    ///
+    /// False for [`CancelOutcome::NotInterruptible`], which is precisely the
+    /// case the UI must not present as a cancel in progress.
+    #[must_use]
+    pub const fn is_requested(self) -> bool {
+        matches!(self, Self::Requested)
+    }
 }
 
 /// What a driver can do.
 ///
 /// `Default` supports nothing: a driver opts in explicitly, so a capability can
 /// never be advertised by omission. The set will grow as Phase 0 finds out what
-/// is worth asking about.
+/// is worth asking about, which is why the fields are private and reached
+/// through a builder — adding one must not break every driver that constructs
+/// this struct.
+///
+/// ```
+/// use reldex_db_driver_api::{Capabilities, CancelKind};
+///
+/// let capabilities = Capabilities::none()
+///     .with_cancel(CancelKind::PreArmedDeadline)
+///     .with_savepoints(true)
+///     .with_named_binds(true)
+///     .with_lob_streaming(true);
+///
+/// assert!(capabilities.savepoints());
+/// // It can bound a call in advance, but it cannot interrupt one.
+/// assert!(!capabilities.can_interrupt_running_call());
+/// assert!(!capabilities.out_binds(), "not opted in, so not advertised");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Capabilities {
-    /// How statement cancellation is implemented.
-    pub cancel: CancelKind,
-    /// `SAVEPOINT` and `ROLLBACK TO SAVEPOINT` are supported.
-    pub savepoints: bool,
-    /// Binds may be addressed by name.
-    pub named_binds: bool,
-    /// OUT and IN OUT binds are supported.
-    pub out_binds: bool,
-    /// Nested cursors (`REF CURSOR`) are supported.
-    pub ref_cursor: bool,
-    /// Statements may return result sets implicitly.
-    pub implicit_results: bool,
-    /// Large objects are streamed rather than materialized.
-    pub lob_streaming: bool,
-    /// Encrypted transport is supported.
-    pub tls: bool,
-    /// [`DatabaseConnection::transaction_state`] is exact; it never returns
-    /// [`TransactionState::Unknown`].
-    pub exact_transaction_state: bool,
-    /// Errors carry a position in the statement text.
-    pub error_position: bool,
+    cancel: CancelKind,
+    savepoints: bool,
+    named_binds: bool,
+    out_binds: bool,
+    ref_cursor: bool,
+    lob_streaming: bool,
+    tls: bool,
+    exact_transaction_state: bool,
+    error_position: bool,
 }
 
 impl Capabilities {
@@ -94,7 +208,6 @@ impl Capabilities {
             named_binds: false,
             out_binds: false,
             ref_cursor: false,
-            implicit_results: false,
             lob_streaming: false,
             tls: false,
             exact_transaction_state: false,
@@ -102,10 +215,132 @@ impl Capabilities {
         }
     }
 
-    /// Whether [`CancelHandle::request_cancel`] can do anything at all.
+    /// Declares how statement cancellation is implemented.
     #[must_use]
-    pub const fn supports_cancel(self) -> bool {
-        !matches!(self.cancel, CancelKind::Unsupported)
+    pub const fn with_cancel(mut self, cancel: CancelKind) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// Declares support for `SAVEPOINT` and `ROLLBACK TO SAVEPOINT`.
+    #[must_use]
+    pub const fn with_savepoints(mut self, supported: bool) -> Self {
+        self.savepoints = supported;
+        self
+    }
+
+    /// Declares support for binds addressed by name.
+    #[must_use]
+    pub const fn with_named_binds(mut self, supported: bool) -> Self {
+        self.named_binds = supported;
+        self
+    }
+
+    /// Declares support for OUT and IN OUT binds.
+    #[must_use]
+    pub const fn with_out_binds(mut self, supported: bool) -> Self {
+        self.out_binds = supported;
+        self
+    }
+
+    /// Declares support for nested cursors (`REF CURSOR`).
+    #[must_use]
+    pub const fn with_ref_cursor(mut self, supported: bool) -> Self {
+        self.ref_cursor = supported;
+        self
+    }
+
+    /// Declares that large objects are streamed rather than materialized.
+    #[must_use]
+    pub const fn with_lob_streaming(mut self, supported: bool) -> Self {
+        self.lob_streaming = supported;
+        self
+    }
+
+    /// Declares support for encrypted transport.
+    #[must_use]
+    pub const fn with_tls(mut self, supported: bool) -> Self {
+        self.tls = supported;
+        self
+    }
+
+    /// Declares that [`DatabaseConnection::transaction_state`] is exact.
+    #[must_use]
+    pub const fn with_exact_transaction_state(mut self, exact: bool) -> Self {
+        self.exact_transaction_state = exact;
+        self
+    }
+
+    /// Declares that errors carry a position in the statement text.
+    #[must_use]
+    pub const fn with_error_position(mut self, supported: bool) -> Self {
+        self.error_position = supported;
+        self
+    }
+
+    /// How statement cancellation is implemented.
+    #[must_use]
+    pub const fn cancel(self) -> CancelKind {
+        self.cancel
+    }
+
+    /// Whether `SAVEPOINT` and `ROLLBACK TO SAVEPOINT` are supported.
+    #[must_use]
+    pub const fn savepoints(self) -> bool {
+        self.savepoints
+    }
+
+    /// Whether binds may be addressed by name.
+    #[must_use]
+    pub const fn named_binds(self) -> bool {
+        self.named_binds
+    }
+
+    /// Whether OUT and IN OUT binds are supported.
+    #[must_use]
+    pub const fn out_binds(self) -> bool {
+        self.out_binds
+    }
+
+    /// Whether nested cursors (`REF CURSOR`) are supported.
+    #[must_use]
+    pub const fn ref_cursor(self) -> bool {
+        self.ref_cursor
+    }
+
+    /// Whether large objects are streamed rather than materialized.
+    #[must_use]
+    pub const fn lob_streaming(self) -> bool {
+        self.lob_streaming
+    }
+
+    /// Whether encrypted transport is supported.
+    #[must_use]
+    pub const fn tls(self) -> bool {
+        self.tls
+    }
+
+    /// Whether [`DatabaseConnection::transaction_state`] is exact; it never
+    /// returns [`TransactionState::Unknown`].
+    #[must_use]
+    pub const fn exact_transaction_state(self) -> bool {
+        self.exact_transaction_state
+    }
+
+    /// Whether errors carry a position in the statement text.
+    #[must_use]
+    pub const fn error_position(self) -> bool {
+        self.error_position
+    }
+
+    /// Whether a statement that is **already running** can be stopped.
+    ///
+    /// This, not [`Capabilities::cancel`] being non-`Unsupported`, is what
+    /// `SPEC.md` §24.8 asks for and what decides whether the UI offers Cancel.
+    /// See [`CancelKind::PreArmedDeadline`].
+    #[must_use]
+    pub const fn can_interrupt_running_call(self) -> bool {
+        self.cancel.interrupts_running_call()
     }
 }
 
@@ -113,20 +348,26 @@ impl Capabilities {
 ///
 /// `SPEC.md` §10 requires a prompt when a worksheet closes with an active
 /// transaction, so the honest answer matters more than a confident one.
+///
+/// Deliberately **not** `#[non_exhaustive]`: three states is the whole truth
+/// table (open / not open / do not know), and `db-core` must handle each
+/// explicitly, so exhaustive matching is a feature (ADR-0002, amendment S1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TransactionState {
     /// The driver knows no transaction is open.
-    #[default]
     Inactive,
     /// The driver knows a transaction is open.
     Active,
     /// The driver cannot tell.
     ///
-    /// A driver that cannot observe server-side transaction state must report
-    /// this after any statement that could have opened one, and
+    /// The **default**, because it is the only safe thing to assume about a
+    /// connection nobody has said anything about: [`TransactionState::may_be_open`]
+    /// is true, so a default-constructed value makes the core prompt rather than
+    /// discard. A driver that cannot observe server-side transaction state must
+    /// report this after any statement that could have opened one, and
     /// [`TransactionState::Inactive`] only straight after a successful commit or
-    /// rollback. `db-core` treats `Unknown` as *may be open*: over-prompting is
-    /// acceptable, a silent commit is not.
+    /// rollback. Over-prompting is acceptable; a silent commit is not.
+    #[default]
     Unknown,
 }
 
@@ -146,31 +387,56 @@ impl TransactionState {
 ///
 /// The contract, stated so no layer has to guess:
 ///
-/// 1. **Best effort.** `Ok` means the request was delivered or armed, not that
-///    anything stopped.
-/// 2. **Idempotent.** Repeated calls, and calls while nothing is running, are a
+/// 1. **It must never block on the connection's own call lock, and must return
+///    promptly.** This is a hard requirement, not advice. A "cancel" that waits
+///    for the statement it is cancelling is worse than no cancel at all: it
+///    freezes the control path that was meant to stay responsive, and
+///    `SPEC.md` §24.17 requires the rest of the application to keep working.
+///    A driver that cannot signal without taking the lock the running call holds
+///    must report [`CancelKind::PreArmedDeadline`] or
+///    [`CancelKind::Unsupported`] and return immediately — never emulate a
+///    cancel by blocking.
+/// 2. **Best effort.** [`CancelOutcome::Requested`] means the request was
+///    delivered or armed, not that anything stopped.
+/// 3. **Honest about impotence.** A driver that cannot interrupt a running call
+///    returns [`CancelOutcome::NotInterruptible`] rather than a bare `Ok` that
+///    reads as success.
+/// 4. **Idempotent.** Repeated calls, and calls while nothing is running, are a
 ///    successful no-op.
-/// 3. **The outcome travels through the blocked call**, which returns
+/// 5. **The outcome travels through the blocked call**, which returns
 ///    [`crate::ErrorKind::Cancelled`] — never through this method's return value.
-/// 4. **Races are the caller's to handle.** If the statement finished first it
+/// 6. **Races are the caller's to handle.** If the statement finished first it
 ///    returns normally and the cancel is discarded.
-/// 5. **Session state afterwards is reported, not assumed.** The resulting error
+/// 7. **Session state afterwards is reported, not assumed.** The resulting error
 ///    carries [`crate::SessionState`]; the core revalidates or surfaces the loss
 ///    accordingly.
-/// 6. **No transaction is implicitly resolved.** A cancelled statement neither
+/// 8. **No transaction is implicitly resolved.** A cancelled statement neither
 ///    commits nor rolls back; [`DatabaseConnection::transaction_state`] is
 ///    authoritative afterwards.
 pub trait CancelHandle: Send + Sync {
     /// Requests that the connection stop its current operation.
     ///
+    /// **Must not block.** See rule 1 on the trait: this is called from a
+    /// control path while another thread is inside a blocking `execute` or
+    /// `fetch_batch`, and taking that call's lock would deadlock the very
+    /// responsiveness the method exists to provide.
+    ///
+    /// The returned [`CancelOutcome`] says what the request achieved, so the UI
+    /// can tell the user the truth instead of showing a cancel that is not
+    /// happening.
+    ///
     /// # Errors
     ///
     /// [`crate::ErrorKind::Unsupported`] when [`CancelHandle::kind`] is
     /// [`CancelKind::Unsupported`]; otherwise any error raised while delivering
-    /// the request.
-    fn request_cancel(&self) -> DbResult<()>;
+    /// the request. "I cannot interrupt this" is **not** an error — it is
+    /// [`CancelOutcome::NotInterruptible`].
+    fn request_cancel(&self) -> DbResult<CancelOutcome>;
 
     /// How this handle implements cancellation.
+    ///
+    /// Constant for the handle's lifetime, so the UI can decide what to offer
+    /// before anything is running.
     fn kind(&self) -> CancelKind;
 }
 
@@ -202,9 +468,34 @@ pub trait DatabaseDriver: Send + Sync {
 
 /// One physical/logical connection: the unit a `db-core` session owns.
 ///
-/// All statement-issuing methods take `&mut self`, so a connection's calls are
-/// serialized by construction. Cancellation is the one thing that reaches a busy
-/// connection from elsewhere, through [`CancelHandle`].
+/// All statement-issuing methods take `&mut self`, so calls *through the
+/// connection value* are serialized by construction. Objects derived from it —
+/// [`crate::Cursor`], [`crate::LobLocator`] — are independent handles that
+/// borrow nothing, so their thread affinity is a runtime rule `db-core`
+/// enforces; see the module documentation. Cancellation is the one thing that
+/// reaches a busy connection from elsewhere, through [`CancelHandle`].
+///
+/// # Lifetime of derived handles
+///
+/// One rule, stated once, so no driver has to invent it:
+///
+/// > A cursor or LOB stream never outlives the usefulness of its connection.
+/// > Once the connection is closed, every derived handle **reports** and does
+/// > not panic, does not block, and does not touch a socket that is gone.
+///
+/// In detail:
+///
+/// - After [`DatabaseConnection::close`], every outstanding [`crate::Cursor`]
+///   and [`crate::LobStream`] returns
+///   [`crate::DbError::connection_closed`] from every operation. `close`
+///   consumes the connection, so `db-core` is expected to have dropped them
+///   first; a driver must survive it not having done so.
+/// - After [`DatabaseConnection::commit`] or
+///   [`DatabaseConnection::rollback`], open cursors and LOB locators may be
+///   invalid — see those methods.
+/// - After any error from a cursor, the only legal call on it is
+///   [`crate::Cursor::close`]; after any error from a LOB stream, the only legal
+///   action is to drop it. Drivers enforce this by reporting, not by trusting.
 pub trait DatabaseConnection: Send {
     /// This connection's identifier.
     fn id(&self) -> ConnectionId;
@@ -215,26 +506,40 @@ pub trait DatabaseConnection: Send {
     /// A handle that can stop the current operation from another control path.
     ///
     /// Callable while the connection is busy on its worker thread, which is why
-    /// it is obtained before the blocking call starts.
+    /// it is obtained before the blocking call starts. Cheap and non-blocking:
+    /// it must not take any lock the running call holds.
     fn cancel_handle(&self) -> Arc<dyn CancelHandle>;
 
     /// Executes one statement and returns everything it produced.
     ///
     /// There is a single entry point because a worksheet cannot know in advance
     /// whether arbitrary user text returns rows, and the core must not parse SQL
-    /// to find out. A result set arrives as
-    /// [`ExecutionOutcome::take_cursor`].
+    /// to find out. A result set arrives as [`ExecutionOutcome::take_cursor`],
+    /// and what kind of statement it turned out to be as
+    /// [`ExecutionOutcome::statement_kind`] — which the driver must classify
+    /// itself, because the core will not.
     ///
-    /// A driver must reject [`crate::Value::Lob`] and [`crate::Value::Cursor`]
-    /// used as IN binds with [`crate::ErrorKind::Unsupported`].
+    /// The driver applies [`Statement::deadline`] before the call starts and
+    /// [`Statement::fetch_rows`] when it sizes its fetch; neither can be
+    /// supplied later.
     ///
     /// # Errors
     ///
     /// Any [`crate::DbError`]; [`crate::ErrorKind::Cancelled`] if the call was
-    /// cancelled.
+    /// cancelled, or [`crate::ErrorKind::Timeout`] if a deadline set through
+    /// [`Statement::with_deadline`] fired.
     fn execute(&mut self, statement: &Statement) -> DbResult<ExecutionOutcome>;
 
     /// Commits the open transaction.
+    ///
+    /// Committing may invalidate handles derived from this connection: most
+    /// servers scope a LOB locator to the transaction that produced it, and some
+    /// close open cursors. A driver must not paper over this. If a cursor or
+    /// locator is no longer usable afterwards, its next operation returns a
+    /// [`crate::DbError`] — [`crate::ErrorKind::Transaction`] when the server
+    /// says so — rather than blocking, panicking, or returning a short result
+    /// that looks complete. `db-core` therefore treats an open cursor or locator
+    /// as transaction-scoped and must not promise the user otherwise.
     ///
     /// # Errors
     ///
@@ -242,6 +547,9 @@ pub trait DatabaseConnection: Send {
     fn commit(&mut self) -> DbResult<()>;
 
     /// Rolls the open transaction back.
+    ///
+    /// The same handle-invalidation rule as [`DatabaseConnection::commit`]
+    /// applies, and more forcefully: rolling back commonly closes open cursors.
     ///
     /// # Errors
     ///
@@ -257,6 +565,9 @@ pub trait DatabaseConnection: Send {
     fn savepoint(&mut self, name: &SavepointName) -> DbResult<()>;
 
     /// Rolls back to a savepoint, leaving the transaction open.
+    ///
+    /// Like a full rollback, this may invalidate cursors and LOB locators opened
+    /// since the savepoint; see [`DatabaseConnection::commit`].
     ///
     /// # Errors
     ///
@@ -286,6 +597,11 @@ pub trait DatabaseConnection: Send {
     /// The driver must not commit as part of closing (`SPEC.md` §10): an open
     /// transaction is rolled back by the server, and the core is responsible for
     /// prompting before it gets here.
+    ///
+    /// Any cursor or LOB stream still alive afterwards must return
+    /// [`crate::DbError::connection_closed`] from every operation — never a
+    /// panic, never a block on a socket that is gone. See the trait's "Lifetime
+    /// of derived handles".
     ///
     /// # Errors
     ///
@@ -333,28 +649,93 @@ mod tests {
     fn default_capabilities_support_nothing() {
         let capabilities = Capabilities::default();
         assert_eq!(capabilities, Capabilities::none());
-        assert_eq!(capabilities.cancel, CancelKind::Unsupported);
-        assert!(!capabilities.supports_cancel());
-        assert!(!capabilities.savepoints);
-        assert!(!capabilities.exact_transaction_state);
+        assert_eq!(capabilities.cancel(), CancelKind::Unsupported);
+        assert!(!capabilities.can_interrupt_running_call());
+        assert!(!capabilities.savepoints());
+        assert!(!capabilities.named_binds());
+        assert!(!capabilities.out_binds());
+        assert!(!capabilities.ref_cursor());
+        assert!(!capabilities.lob_streaming());
+        assert!(!capabilities.tls());
+        assert!(!capabilities.exact_transaction_state());
+        assert!(!capabilities.error_position());
     }
 
     #[test]
-    fn cancel_kinds_that_do_something_are_flagged() {
-        for kind in [CancelKind::Native, CancelKind::CallTimeout] {
-            let capabilities = Capabilities {
-                cancel: kind,
-                ..Capabilities::none()
-            };
-            assert!(capabilities.supports_cancel());
-        }
+    fn capabilities_are_opted_into_one_at_a_time() {
+        // Private fields plus a builder: adding a capability must not break
+        // every driver that constructs this.
+        let capabilities = Capabilities::none()
+            .with_cancel(CancelKind::Native)
+            .with_savepoints(true)
+            .with_named_binds(true)
+            .with_out_binds(true)
+            .with_ref_cursor(true)
+            .with_lob_streaming(true)
+            .with_tls(true)
+            .with_exact_transaction_state(true)
+            .with_error_position(true);
+
+        assert_eq!(capabilities.cancel(), CancelKind::Native);
+        assert!(capabilities.savepoints());
+        assert!(capabilities.exact_transaction_state());
+        assert!(capabilities.error_position());
+        assert!(capabilities.can_interrupt_running_call());
     }
 
     #[test]
-    fn unknown_transaction_state_is_treated_as_open() {
+    fn only_a_native_cancel_can_stop_a_running_statement() {
+        // The distinction the UI needs: a pre-armed deadline bounds a call in
+        // advance but cannot interrupt one, so offering "Cancel" for it would be
+        // a lie (`SPEC.md` §24.8).
+        assert!(CancelKind::Native.interrupts_running_call());
+        assert!(!CancelKind::PreArmedDeadline.interrupts_running_call());
+        assert!(!CancelKind::Unsupported.interrupts_running_call());
+
+        assert!(CancelKind::PreArmedDeadline.needs_deadline_armed_up_front());
+        assert!(!CancelKind::Native.needs_deadline_armed_up_front());
+        assert!(!CancelKind::Unsupported.needs_deadline_armed_up_front());
+
+        assert!(
+            !Capabilities::none()
+                .with_cancel(CancelKind::PreArmedDeadline)
+                .can_interrupt_running_call()
+        );
+    }
+
+    #[test]
+    fn a_cancel_that_cannot_work_says_so_instead_of_returning_bare_ok() {
+        let requested = CancelOutcome::Requested;
+        assert!(requested.is_requested());
+
+        let impotent = CancelOutcome::NotInterruptible {
+            deadline_remaining: Some(Duration::from_secs(12)),
+        };
+        assert!(
+            !impotent.is_requested(),
+            "the UI must not present this as a cancel in progress"
+        );
+        let CancelOutcome::NotInterruptible { deadline_remaining } = impotent else {
+            panic!("expected NotInterruptible");
+        };
+        assert_eq!(deadline_remaining, Some(Duration::from_secs(12)));
+
+        // No deadline armed and no interrupt possible: the statement runs to
+        // completion, and the caller must not invent a time.
+        let unbounded = CancelOutcome::NotInterruptible {
+            deadline_remaining: None,
+        };
+        assert!(!unbounded.is_requested());
+    }
+
+    #[test]
+    fn unknown_transaction_state_is_the_default_and_is_treated_as_open() {
         assert!(TransactionState::Active.may_be_open());
         assert!(TransactionState::Unknown.may_be_open());
         assert!(!TransactionState::Inactive.may_be_open());
-        assert_eq!(TransactionState::default(), TransactionState::Inactive);
+        // The safe default: a connection nobody has classified must make the
+        // core prompt, not discard (`SPEC.md` §10).
+        assert_eq!(TransactionState::default(), TransactionState::Unknown);
+        assert!(TransactionState::default().may_be_open());
     }
 }

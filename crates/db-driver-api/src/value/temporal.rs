@@ -2,8 +2,25 @@
 //!
 //! One [`Timestamp`] type covers `DATE`, `TIMESTAMP` and
 //! `TIMESTAMP WITH TIME ZONE`; which of them a column actually is comes from the
-//! declared [`crate::types::SqlType`], not from the value. Constructors validate
-//! calendar ranges, so an impossible date cannot reach the core.
+//! declared [`crate::types::SqlType`], not from the value.
+//!
+//! # Which calendar
+//!
+//! Validation follows **the calendar rules of the source database**, which for
+//! the SQL servers this contract targets means the historical (mixed
+//! Julian/Gregorian) calendar, not the proleptic Gregorian calendar that most
+//! date libraries implement:
+//!
+//! - Dates before the Gregorian reform of 15 October 1582 use the **Julian**
+//!   leap rule — every fourth year, with no century exception. `1500-02-29` is a
+//!   real, storable date on such a server even though proleptic Gregorian says
+//!   1500 was not a leap year.
+//! - There is **no year zero**: year `-1` is 1 BC, `-2` is 2 BC. Leap years
+//!   before the common era therefore fall on `-1`, `-5`, `-9` …, which is offset
+//!   by one from naive "divisible by four" arithmetic on the negative number.
+//! - The ten days `1582-10-05` … `1582-10-14` were skipped by the reform and do
+//!   not exist. See [`Timestamp::new`] and [`Timestamp::from_source`] for the
+//!   deliberately different treatment on the two paths.
 //!
 //! Known gap (ADR-0002 D5): a named time-zone region is normalized to a fixed
 //! offset. Preserving region names would mean either a heap-allocated name on
@@ -20,6 +37,12 @@ pub enum TemporalError {
     MonthOutOfRange,
     /// The day was outside the valid range for that month and year.
     DayOutOfRange,
+    /// The date falls in the ten days the Gregorian reform skipped
+    /// (`1582-10-05` … `1582-10-14`), which never existed.
+    ///
+    /// Only strict construction reports this; the decode path accepts such a
+    /// date rather than failing a whole fetch (see [`Timestamp::from_source`]).
+    NonexistentCalendarDate,
     /// Hour, minute or second was outside its valid range.
     TimeOutOfRange,
     /// The nanosecond component was `1_000_000_000` or greater.
@@ -31,9 +54,12 @@ pub enum TemporalError {
 impl fmt::Display for TemporalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let text = match self {
-            Self::YearOutOfRange => "year outside -4712..=9999 (and non-zero)",
+            Self::YearOutOfRange => "year outside -4712..=9999 (and non-zero; there is no year 0)",
             Self::MonthOutOfRange => "month outside 1..=12",
             Self::DayOutOfRange => "day outside the valid range for that month",
+            Self::NonexistentCalendarDate => {
+                "date falls in the ten days skipped by the Gregorian reform (1582-10-05..1582-10-14)"
+            }
             Self::TimeOutOfRange => "hour, minute or second out of range",
             Self::NanosecondOutOfRange => "nanosecond outside 0..1_000_000_000",
             Self::OffsetOutOfRange => "UTC offset outside -1439..=1439 minutes",
@@ -45,7 +71,12 @@ impl fmt::Display for TemporalError {
 impl std::error::Error for TemporalError {}
 
 /// Time-zone information attached to a [`Timestamp`].
+///
+/// `#[non_exhaustive]`: a `Region` case for named IANA zones is a planned
+/// addition (ADR-0002 D5, lead decision 2), and adding it must not be a breaking
+/// change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub enum TimeZone {
     /// No zone information: a wall-clock value (`DATE`, `TIMESTAMP`).
     #[default]
@@ -122,21 +153,68 @@ pub struct Timestamp {
 }
 
 impl Timestamp {
-    /// Builds a date at midnight with no zone information.
+    /// Builds a date at midnight with no zone information, validating strictly.
     ///
     /// # Errors
     ///
-    /// See [`TemporalError`].
+    /// See [`Timestamp::new`].
     pub fn date(year: i16, month: u8, day: u8) -> Result<Self, TemporalError> {
         Self::new(year, month, day, 0, 0, 0)
     }
 
-    /// Builds a date and time with no sub-second part and no zone information.
+    /// Builds a date and time with no sub-second part and no zone information,
+    /// validating strictly.
+    ///
+    /// This is the constructor for values Reldex or a user *invents* — a bind
+    /// parameter, a literal typed into a filter. It rejects every date the
+    /// source calendar says never existed, including the ten days the Gregorian
+    /// reform skipped, because sending one to a server would only produce a
+    /// server-side error later, with worse diagnostics.
+    ///
+    /// Drivers decoding a value the *server produced* use
+    /// [`Timestamp::from_source`] instead.
+    ///
+    /// Leap years follow the calendar of the source database, so `1500-02-29`
+    /// (Julian) is accepted and `1900-02-29` (Gregorian) is not.
     ///
     /// # Errors
     ///
-    /// See [`TemporalError`].
+    /// See [`TemporalError`]; in particular
+    /// [`TemporalError::NonexistentCalendarDate`] for the reform gap.
     pub fn new(
+        year: i16,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    ) -> Result<Self, TemporalError> {
+        let timestamp = Self::from_source(year, month, day, hour, minute, second)?;
+        if is_in_reform_gap(year, month, day) {
+            return Err(TemporalError::NonexistentCalendarDate);
+        }
+        Ok(timestamp)
+    }
+
+    /// Builds a date and time from values a **server produced**, validating
+    /// leniently.
+    ///
+    /// Ranges are still checked — a month of 13 or a 30th of February is a
+    /// decoding bug and must not reach the core — but a date inside the ten days
+    /// the Gregorian reform skipped is *accepted*. A server that stores such a
+    /// value (or a wire decoder that reconstructs one) is reporting a fact, and
+    /// `SPEC.md` §2's correctness ranking is not served by failing an entire
+    /// fetch of a large table over one historical row. Reldex shows what the
+    /// database holds; it does not audit the database's own history.
+    ///
+    /// Use [`Timestamp::new`] for values Reldex constructs itself.
+    ///
+    /// # Errors
+    ///
+    /// [`TemporalError::YearOutOfRange`], [`TemporalError::MonthOutOfRange`],
+    /// [`TemporalError::DayOutOfRange`] or [`TemporalError::TimeOutOfRange`].
+    /// Never [`TemporalError::NonexistentCalendarDate`].
+    pub fn from_source(
         year: i16,
         month: u8,
         day: u8,
@@ -257,7 +335,10 @@ impl fmt::Display for Timestamp {
     }
 }
 
-/// Days in `month` of `year`, using proleptic Gregorian leap rules.
+/// The year the Gregorian reform took effect; dates before it are Julian.
+const GREGORIAN_REFORM_YEAR: i16 = 1582;
+
+/// Days in `month` of `year`, under the calendar rules of the source database.
 const fn days_in_month(year: i16, month: u8) -> u8 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -268,8 +349,38 @@ const fn days_in_month(year: i16, month: u8) -> u8 {
     }
 }
 
+/// Whether `year` is a leap year in the historical (mixed) calendar.
+///
+/// Two corrections over the usual proleptic-Gregorian one-liner:
+///
+/// - Years before the 1582 reform use the **Julian** rule (every fourth year,
+///   no century exception), so 1500 and 1300 are leap years.
+/// - The era numbering has **no year zero**, so a negative `year` is shifted by
+///   one before the divisibility test: `-1` is 1 BC, which was a leap year.
+///
+/// The reform year itself is treated as Gregorian, which is unambiguous:
+/// February 1582 predates the October cut-over, but 1582 is not a leap year
+/// under either rule, so the two readings agree.
 const fn is_leap_year(year: i16) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+    // Astronomical numbering: 1 BC becomes 0, 2 BC becomes -1, and so on, so
+    // that "divisible by four" means what it says on both sides of the era
+    // boundary.
+    let astronomical = if year < 0 { year + 1 } else { year };
+    if astronomical % 4 != 0 {
+        return false;
+    }
+    if year < GREGORIAN_REFORM_YEAR {
+        return true;
+    }
+    astronomical % 100 != 0 || astronomical % 400 == 0
+}
+
+/// Whether the date falls in the ten days the Gregorian reform skipped.
+///
+/// 4 October 1582 (Julian) was followed directly by 15 October 1582
+/// (Gregorian); the dates in between never occurred.
+const fn is_in_reform_gap(year: i16, month: u8, day: u8) -> bool {
+    year == GREGORIAN_REFORM_YEAR && month == 10 && day >= 5 && day <= 14
 }
 
 #[cfg(test)]
@@ -283,6 +394,93 @@ mod tests {
         assert!(Timestamp::date(2024, 2, 29).is_ok(), "2024 is a leap year");
         assert!(Timestamp::date(2000, 2, 29).is_ok(), "2000 is a leap year");
         assert!(Timestamp::date(-4712, 1, 1).is_ok());
+    }
+
+    #[test]
+    fn julian_leap_years_before_the_reform_are_accepted() {
+        // Proleptic Gregorian says 1500 and 1300 are not leap years, because
+        // they are divisible by 100 but not 400. The source calendar is Julian
+        // before 1582, so `DATE '1500-02-29'` is a real, storable value and
+        // rejecting it would make Reldex unable to display existing rows.
+        assert!(
+            Timestamp::date(1500, 2, 29).is_ok(),
+            "1500 is a Julian leap year"
+        );
+        assert!(
+            Timestamp::date(1300, 2, 29).is_ok(),
+            "1300 is a Julian leap year"
+        );
+        assert!(Timestamp::date(1200, 2, 29).is_ok());
+        // Still not a leap year under either rule.
+        assert_eq!(
+            Timestamp::date(1501, 2, 29),
+            Err(TemporalError::DayOutOfRange)
+        );
+        // After the reform the Gregorian century rule applies again.
+        assert_eq!(
+            Timestamp::date(1700, 2, 29),
+            Err(TemporalError::DayOutOfRange)
+        );
+        assert!(
+            Timestamp::date(1600, 2, 29).is_ok(),
+            "1600 is divisible by 400"
+        );
+    }
+
+    #[test]
+    fn bc_leap_years_account_for_the_missing_year_zero() {
+        // Year -1 is 1 BC, which was a leap year; naive `year % 4` would say no.
+        assert!(Timestamp::date(-1, 2, 29).is_ok(), "1 BC is a leap year");
+        assert!(Timestamp::date(-5, 2, 29).is_ok(), "5 BC is a leap year");
+        assert!(Timestamp::date(-4709, 2, 29).is_ok());
+        for year in [-2_i16, -3, -4] {
+            assert_eq!(
+                Timestamp::date(year, 2, 29),
+                Err(TemporalError::DayOutOfRange),
+                "{year} is not a leap year"
+            );
+        }
+        // There is no year zero at all.
+        assert_eq!(
+            Timestamp::date(0, 2, 28),
+            Err(TemporalError::YearOutOfRange)
+        );
+    }
+
+    #[test]
+    fn the_gregorian_reform_gap_is_strict_on_input_and_lenient_on_decode() {
+        // The ten days never happened, so a value Reldex invents is refused...
+        for day in 5..=14 {
+            assert_eq!(
+                Timestamp::date(1582, 10, day),
+                Err(TemporalError::NonexistentCalendarDate),
+                "1582-10-{day} never existed"
+            );
+        }
+        // ...but a value the server produced is accepted rather than failing the
+        // whole fetch.
+        for day in 5..=14 {
+            let decoded = Timestamp::from_source(1582, 10, day, 12, 0, 0)
+                .unwrap_or_else(|error| panic!("decode of 1582-10-{day} must succeed: {error}"));
+            assert_eq!(decoded.day(), day);
+        }
+        // The days on either side of the gap are ordinary.
+        assert!(Timestamp::date(1582, 10, 4).is_ok());
+        assert!(Timestamp::date(1582, 10, 15).is_ok());
+
+        // Leniency is limited to the gap: a decoder bug is still a bug.
+        assert_eq!(
+            Timestamp::from_source(1582, 13, 1, 0, 0, 0),
+            Err(TemporalError::MonthOutOfRange)
+        );
+        assert_eq!(
+            Timestamp::from_source(1900, 2, 29, 0, 0, 0),
+            Err(TemporalError::DayOutOfRange)
+        );
+        assert_eq!(
+            Timestamp::from_source(2026, 1, 1, 24, 0, 0),
+            Err(TemporalError::TimeOutOfRange)
+        );
     }
 
     #[test]

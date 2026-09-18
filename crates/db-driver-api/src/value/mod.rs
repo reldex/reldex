@@ -1,11 +1,21 @@
 //! The vendor-neutral value model (ADR-0002 D5).
 //!
-//! Two shapes, for two directions:
+//! Three shapes, because the three directions have genuinely different needs:
 //!
-//! - [`Value`] is owned and travels *into* the driver as a bind and *out of* it
-//!   as an OUT-bind result.
+//! - [`BindValue`] is owned, plain data, and travels *into* the driver as a bind
+//!   parameter. It is [`Clone`], so a prepared [`crate::Statement`] can be
+//!   executed more than once — re-running a query is the normal case, not an
+//!   exotic one.
+//! - [`Value`] is owned and comes *out* of a driver through an OUT bind. It can
+//!   additionally hold live driver resources (a LOB locator, a nested cursor),
+//!   which is exactly why it is not `Clone`: duplicating a live handle silently
+//!   would be a lie.
 //! - [`ValueRef`] borrows from a fetched [`crate::RowBatch`], so reading a cell
 //!   copies nothing.
+//!
+//! Splitting input from output also removes a rule the contract used to state in
+//! prose and could not enforce ("a driver must reject a LOB or cursor used as an
+//! IN bind"): there is now no way to write one.
 //!
 //! NULL is an explicit variant, never a sentinel. `NUMBER` is exact
 //! ([`Number`]); nothing converts through `f64` implicitly. Large objects stay
@@ -24,15 +34,97 @@ use std::fmt;
 use crate::error::{DbError, ErrorKind};
 use crate::result::Cursor;
 
-/// An owned database value.
+/// An owned, cloneable input value: what a bind parameter carries.
 ///
-/// Used for bind parameters and for values a driver returns through OUT binds.
-/// [`Value::Lob`] and [`Value::Cursor`] are produced by drivers only: a driver
-/// must reject them as IN binds with [`ErrorKind::Unsupported`].
+/// Plain data only. A statement holding these is [`Clone`], so `db-core` can
+/// re-execute the same statement — after a reconnect, for a "run again", or once
+/// per row of a form — without rebuilding every bind.
 ///
-/// `Value` is [`Send`] but deliberately not `Clone` — a LOB locator and a nested
-/// cursor are live driver resources, and duplicating them silently would be a
-/// lie.
+/// Driver-owned resources ([`LobLocator`], a nested cursor) are deliberately
+/// absent: they can only be produced by a driver, so they belong in [`Value`].
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum BindValue {
+    /// SQL NULL.
+    Null,
+    /// A boolean (PL/SQL `BOOLEAN`; not a column type on every server).
+    Boolean(bool),
+    /// An exact decimal (`NUMBER`).
+    Number(Number),
+    /// A 32-bit binary float (`BINARY_FLOAT`).
+    Float(f32),
+    /// A 64-bit binary float (`BINARY_DOUBLE`).
+    Double(f64),
+    /// Character data (`CHAR`, `VARCHAR2`, `NCHAR`, `NVARCHAR2`) as UTF-8.
+    Text(String),
+    /// Binary data (`RAW`, `LONG RAW`).
+    Bytes(Vec<u8>),
+    /// A date or timestamp; the declared [`crate::SqlType`] says which.
+    Timestamp(Timestamp),
+    /// JSON, carried as UTF-8 JSON text.
+    Json(String),
+}
+
+impl BindValue {
+    /// Whether this is SQL NULL.
+    #[must_use]
+    pub const fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+
+    /// A short, stable name for the variant, for diagnostics.
+    #[must_use]
+    pub const fn type_name(&self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Boolean(_) => "boolean",
+            Self::Number(_) => "number",
+            Self::Float(_) => "float",
+            Self::Double(_) => "double",
+            Self::Text(_) => "text",
+            Self::Bytes(_) => "bytes",
+            Self::Timestamp(_) => "timestamp",
+            Self::Json(_) => "json",
+        }
+    }
+}
+
+macro_rules! bind_value_from {
+    ($($source:ty => |$binding:ident| $body:expr),* $(,)?) => {$(
+        impl From<$source> for BindValue {
+            fn from($binding: $source) -> Self {
+                $body
+            }
+        }
+    )*};
+}
+
+bind_value_from! {
+    bool => |value| Self::Boolean(value),
+    Number => |value| Self::Number(value),
+    i64 => |value| Self::Number(Number::from(value)),
+    i32 => |value| Self::Number(Number::from(value)),
+    f64 => |value| Self::Double(value),
+    String => |value| Self::Text(value),
+    &str => |value| Self::Text(value.to_owned()),
+    Vec<u8> => |value| Self::Bytes(value),
+    Timestamp => |value| Self::Timestamp(value),
+}
+
+impl<T: Into<Self>> From<Option<T>> for BindValue {
+    fn from(value: Option<T>) -> Self {
+        value.map_or(Self::Null, Into::into)
+    }
+}
+
+/// An owned database value produced by a driver.
+///
+/// Returned through OUT and IN OUT binds. Unlike [`BindValue`] it can hold live
+/// driver resources — [`Value::Lob`] and [`Value::Cursor`] — which is why it is
+/// [`Send`] but deliberately not [`Clone`]: duplicating a live handle silently
+/// would be a lie. Those two variants carry the thread-affinity and lifecycle
+/// rules of [`LobStream`] and [`crate::Cursor`] respectively.
+#[non_exhaustive]
 pub enum Value {
     /// SQL NULL.
     Null,
@@ -109,63 +201,47 @@ impl fmt::Debug for Value {
     }
 }
 
-impl From<bool> for Value {
-    fn from(value: bool) -> Self {
-        Self::Boolean(value)
+impl From<BindValue> for Value {
+    fn from(value: BindValue) -> Self {
+        match value {
+            BindValue::Null => Self::Null,
+            BindValue::Boolean(inner) => Self::Boolean(inner),
+            BindValue::Number(inner) => Self::Number(inner),
+            BindValue::Float(inner) => Self::Float(inner),
+            BindValue::Double(inner) => Self::Double(inner),
+            BindValue::Text(inner) => Self::Text(inner),
+            BindValue::Bytes(inner) => Self::Bytes(inner),
+            BindValue::Timestamp(inner) => Self::Timestamp(inner),
+            BindValue::Json(inner) => Self::Json(inner),
+        }
     }
 }
 
-impl From<Number> for Value {
-    fn from(value: Number) -> Self {
-        Self::Number(value)
-    }
+macro_rules! value_from {
+    ($($source:ty),* $(,)?) => {$(
+        impl From<$source> for Value {
+            fn from(value: $source) -> Self {
+                Self::from(BindValue::from(value))
+            }
+        }
+    )*};
 }
 
-impl From<i64> for Value {
-    fn from(value: i64) -> Self {
-        Self::Number(Number::from(value))
-    }
-}
+value_from!(
+    bool,
+    Number,
+    i64,
+    i32,
+    f64,
+    String,
+    &str,
+    Vec<u8>,
+    Timestamp
+);
 
-impl From<i32> for Value {
-    fn from(value: i32) -> Self {
-        Self::Number(Number::from(value))
-    }
-}
-
-impl From<f64> for Value {
-    fn from(value: f64) -> Self {
-        Self::Double(value)
-    }
-}
-
-impl From<String> for Value {
-    fn from(value: String) -> Self {
-        Self::Text(value)
-    }
-}
-
-impl From<&str> for Value {
-    fn from(value: &str) -> Self {
-        Self::Text(value.to_owned())
-    }
-}
-
-impl From<Vec<u8>> for Value {
-    fn from(value: Vec<u8>) -> Self {
-        Self::Bytes(value)
-    }
-}
-
-impl From<Timestamp> for Value {
-    fn from(value: Timestamp) -> Self {
-        Self::Timestamp(value)
-    }
-}
-
-impl<T: Into<Self>> From<Option<T>> for Value {
+impl<T: Into<BindValue>> From<Option<T>> for Value {
     fn from(value: Option<T>) -> Self {
-        value.map_or(Self::Null, Into::into)
+        Self::from(BindValue::from(value))
     }
 }
 
@@ -173,7 +249,13 @@ impl<T: Into<Self>> From<Option<T>> for Value {
 ///
 /// Reading a cell copies nothing: text and bytes borrow the column's contiguous
 /// buffer, and a LOB is still just a handle.
+///
+/// Three variants describe *absence*, and they mean different things:
+/// [`ValueRef::Null`] is SQL NULL, [`ValueRef::Taken`] is a value that was moved
+/// out of the batch, and [`ValueRef::Unsupported`] is a value the contract has no
+/// type for. Collapsing any of them into NULL would make the UI show a lie.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ValueRef<'a> {
     /// SQL NULL.
     Null,
@@ -195,13 +277,49 @@ pub enum ValueRef<'a> {
     Json(&'a str),
     /// A large object that has not been read. Take it from the column to read it.
     Lob(&'a LobLocator),
+    /// A value of a type this contract cannot represent, rendered by the driver
+    /// as best-effort text.
+    ///
+    /// The column's [`crate::SqlType`] is [`crate::SqlType::Unsupported`] and
+    /// [`crate::ColumnMetadata::native_type_name`] holds the server's own type
+    /// name. The text is for display and export only: it must not be parsed back
+    /// into a typed value, and Reldex must not offer to edit such a cell.
+    Unsupported(&'a str),
+    /// The value used to be here and was moved out of the batch — today only via
+    /// [`crate::Column::take_lob`].
+    ///
+    /// Distinct from [`ValueRef::Null`] on purpose: the row was *not* NULL in the
+    /// database, and code that treats "taken" as "NULL" would export the wrong
+    /// data.
+    Taken,
 }
 
 impl<'a> ValueRef<'a> {
     /// Whether this is SQL NULL.
+    ///
+    /// False for [`ValueRef::Taken`] and [`ValueRef::Unsupported`]: neither is a
+    /// NULL in the database.
     #[must_use]
     pub const fn is_null(&self) -> bool {
         matches!(self, Self::Null)
+    }
+
+    /// Whether the value was moved out of the batch. See [`ValueRef::Taken`].
+    #[must_use]
+    pub const fn is_taken(&self) -> bool {
+        matches!(self, Self::Taken)
+    }
+
+    /// The driver's best-effort text for a value of an unrepresentable type.
+    ///
+    /// Deliberately separate from [`ValueRef::as_str`]: this text is not
+    /// character data, and must never be mistaken for it.
+    #[must_use]
+    pub const fn as_unsupported_text(&self) -> Option<&'a str> {
+        match self {
+            Self::Unsupported(value) => Some(*value),
+            _ => None,
+        }
     }
 
     /// The boolean, if this cell holds one.
@@ -298,6 +416,35 @@ mod tests {
     }
 
     #[test]
+    fn bind_values_are_cloneable_so_binds_can_be_reused() {
+        // `Value` cannot be `Clone` (it may own a live LOB or cursor), which used
+        // to make a bound statement single-use. Input values are a separate,
+        // plain-data type for exactly this reason.
+        let original = BindValue::from("ข้อมูล");
+        let copy = original.clone();
+        assert_eq!(original, copy);
+        assert_eq!(copy.type_name(), "text");
+
+        assert!(BindValue::Null.is_null());
+        assert!(BindValue::from(None::<i64>).is_null());
+        assert_eq!(BindValue::from(Some(7_i64)).type_name(), "number");
+        assert_eq!(BindValue::from(1.5_f64), BindValue::Double(1.5));
+        assert_eq!(BindValue::from(true), BindValue::Boolean(true));
+        assert_eq!(BindValue::from(vec![1_u8, 2]).type_name(), "bytes");
+        assert_eq!(
+            BindValue::from(Timestamp::date(2026, 9, 19).expect("valid")).type_name(),
+            "timestamp"
+        );
+    }
+
+    #[test]
+    fn a_bind_value_widens_into_an_output_value() {
+        let value = Value::from(BindValue::Json("{}".to_owned()));
+        assert_eq!(value.type_name(), "json");
+        assert!(!value.is_driver_owned());
+    }
+
+    #[test]
     fn debug_of_bytes_shows_length_not_content() {
         let rendered = format!("{:?}", Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
         assert_eq!(rendered, "Bytes(4 bytes)");
@@ -321,10 +468,34 @@ mod tests {
     }
 
     #[test]
+    fn absence_variants_do_not_impersonate_sql_null() {
+        let unsupported = ValueRef::Unsupported("+000000002 03:04:05.000000");
+        assert!(!unsupported.is_null(), "an INTERVAL value is not NULL");
+        assert!(!unsupported.is_taken());
+        assert_eq!(
+            unsupported.as_unsupported_text(),
+            Some("+000000002 03:04:05.000000")
+        );
+        // The rendering is not character data and must not be read as such.
+        assert!(unsupported.as_str().is_none());
+
+        let taken = ValueRef::Taken;
+        assert!(
+            !taken.is_null(),
+            "a consumed LOB was not a NULL in the database"
+        );
+        assert!(taken.is_taken());
+        assert!(taken.as_unsupported_text().is_none());
+
+        assert!(!ValueRef::Null.is_taken());
+        assert!(ValueRef::Text("x").as_unsupported_text().is_none());
+    }
+
+    #[test]
     fn conversion_errors_map_to_data_conversion() {
         let error = DbError::from(NumberError::TooManyDigits);
         assert_eq!(error.kind(), ErrorKind::DataConversion);
-        assert!(error.message().contains("38"));
+        assert!(error.message().contains("40"));
 
         let error = DbError::from(TemporalError::MonthOutOfRange);
         assert_eq!(error.kind(), ErrorKind::DataConversion);
@@ -334,5 +505,18 @@ mod tests {
     fn driver_owned_values_are_flagged() {
         assert!(!Value::Null.is_driver_owned());
         assert!(!Value::from(1_i64).is_driver_owned());
+    }
+
+    #[test]
+    fn value_sizes_stay_where_the_adr_says_they_are() {
+        // ADR-0002 D5 quotes these; a change here is a change to that claim and
+        // to the fetch-path memory argument, so it should be deliberate.
+        assert_eq!(size_of::<Number>(), 44, "Number");
+        assert_eq!(size_of::<Value>(), 48, "Value");
+        assert_eq!(size_of::<BindValue>(), 48, "BindValue");
+        assert_eq!(size_of::<ValueRef<'_>>(), 24, "ValueRef");
+        // Widening `Number` from 38 to 40 digits cost two bytes and did not
+        // change `Value` at all: it was already padded to 48.
+        assert_eq!(size_of::<Value>(), size_of::<BindValue>());
     }
 }

@@ -32,12 +32,12 @@ See `docs/exec-plans/active/phase-0.md`.
 - [~] Create `db-core`
 - [ ] Create initial database driver implementation — wrap Oracle's official `oracledb` crate (`oracle/rust-oracledb`, pinned exact version) in `crates/drivers/oracle-thin` (ADR-0001)
 - [ ] Add driver contract tests that detect behaviour changes on `oracledb` upgrades
-- [ ] Draft upstream request to `oracle/rust-oracledb` for a public statement-cancel API (owner to submit)
+- [ ] **(S4 critical path)** Draft upstream request to `oracle/rust-oracledb` for a public statement-cancel/break API — plus accessors for `OracleNumber` digits and the connection's transaction-in-progress flag (owner to submit)
 - [x] Add normalized `DbError`
 - [~] Add connection/profile model (driver-level connection params done; user-facing profile model pending)
 - [~] Add session abstraction (contract in db-driver-api; db-core implementation pending)
 - [~] Add transaction abstraction (contract in db-driver-api; db-core implementation pending)
-- [x] Add cancellation abstraction (contract; driver-level cancel pending spike S4)
+- [x] Add cancellation abstraction (contract; driver-level cancel pending spike S4 — call-timeout fallback disproved as on-demand cancel, it is a pre-armed deadline only)
 
 ### Functional POC
 - [ ] Connect/disconnect/ping

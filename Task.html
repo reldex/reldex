@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-19T21:40:00+07:00",
+  "updatedAt": "2026-09-19T23:30:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P0",
@@ -511,15 +511,18 @@
     "goal": "Prove the Rust core, thin database connectivity, cancellation, transaction behavior, and mobile feasibility before substantial UI investment.",
     "exitGate": "Desktop POC passes. Android/iOS feasibility is documented from physical-device tests."
   },
-  "summary": "Reldex is in Phase 0 — Architecture Validation. The Cargo workspace skeleton, CI, and a local Oracle 19c Docker test database (tools/oracle-test-db/) are in place and verified. ADR-0001 (primary driver = Oracle's oracledb crate) is accepted, conditional on spikes S1–S5. ADR-0002 (driver API and concurrency model) is now accepted provisionally: its db-driver-api contract is implemented — 5 traits, ~45 types, zero production dependencies, 68 unit + 6 doc tests, fmt/clippy/test green — with an independent API review in progress and owner review still pending. db-core's session/transaction implementation, the mock driver, the oracledb wrapper, and all Phase 0 spikes have not started yet.",
+  "summary": "Phase 0 — Architecture Validation. Workspace, CI, the local Oracle 19c Docker test DB and the vendor-neutral driver contract (db-driver-api, ADR-0002) are in place; the contract passed an independent review after a must-fix round (93 unit + 8 doc tests). Primary driver is Oracle's official oracledb crate (ADR-0001, conditional on spikes S1–S5). Biggest open risk: on-demand statement cancel is not available in the oracledb beta (spike S4).",
   "focus": [
-    "Independent API review of the db-driver-api contract (implemented per ADR-0002), then applying any resulting fixes",
-    "Building the mock driver and db-core's per-session worker-thread session/transaction layer against that contract",
-    "Wrapping the pinned oracledb crate in drivers/oracle-thin and preparing to run spikes S1–S5 against the verified local Oracle 19c test database",
-    "Code review, PR, and CI on Windows/Linux/macOS once the above lands"
+    "Mock driver + db-core session/transaction layer (worker thread per session)",
+    "oracledb wrapper in crates/drivers/oracle-thin + spikes S1–S5 against the Docker test DB"
   ],
   "blockers": [],
   "risks": [
+    {
+      "title": "Statement cancel may be impossible with the current oracledb beta",
+      "detail": "Independent API review verified from source that set_call_timeout blocks on the same lock as execute(); on-demand cancel cannot be built on it. Only a pre-armed per-call deadline is available today.",
+      "mitigation": "Spike S4 evaluates four candidates; the driver contract reports CancelKind honestly (PreArmedDeadline vs Native) so the UI can never pretend; upstream cancel-API request drafted for the owner to submit."
+    },
     {
       "title": "No public statement-cancel API in the primary driver",
       "detail": "oracledb (oracle/rust-oracledb) exposes no public cancel/break/interrupt function; execute() holds the connection's mutex for the call duration, so a second thread cannot interleave a break today (ADR-0001 Conflict C1).",
@@ -542,11 +545,11 @@
     }
   ],
   "nextSteps": [
-    "Complete independent API review of db-driver-api and apply any resulting fixes",
-    "Implement the mock driver and db-core's session/transaction layer (worker thread, cancel handle, conservative transaction tracking) against the db-driver-api contract",
-    "Wrap the pinned oracledb crate in drivers/oracle-thin and add Reldex-owned contract tests",
-    "Run Phase 0 spikes S1–S5 (connect, SELECT fidelity, session/transaction correctness, cancellation, REF CURSOR/binds/DBMS_OUTPUT) against the test database",
-    "Code review, PR, and CI on Windows/Linux/macOS"
+    "Finish mock driver + db-core session layer with tests",
+    "Wrap oracledb (pinned exact beta) and run spikes S1–S5; record results honestly in ADR-0001",
+    "Code review of both, open PR, CI on Windows/Linux/macOS, merge",
+    "Owner: review ADR-0002 lead decisions and submit the upstream cancel-API request",
+    "Follow-ups: TCPS listener for the test DB (S8), container memory cap, Android cross-compile check (S6, needs NDK)"
   ],
   "decisions": [
     {
@@ -565,15 +568,78 @@
     }
   ],
   "spikes": [
-    { "id": "S1", "title": "Connect + authenticate to 19c: Easy Connect, service name, full descriptor", "box": "0.5 d", "killCriterion": "Cannot authenticate against a stock 19c account after verifier workaround", "status": "todo", "result": "" },
-    { "id": "S2", "title": "SELECT fidelity: NUMBER precision at 38 digits, DATE, TIMESTAMP, TIMESTAMP TZ, NVARCHAR2/NCLOB with Thai text, RAW", "box": "1 d", "killCriterion": "Silent precision loss in NUMBER, or Thai/NCHAR corruption", "status": "todo", "result": "Not yet run against the driver. Pre-spike finding from raw sqlplus testing of the test-DB harness: Thai text was corrupted (U+FFFD) until the client set NLS_LANG=AMERICAN_AMERICA.AL32UTF8 — S2 must prove the Thai/NCHAR round-trip through the oracledb driver itself, not just sqlplus." },
-    { "id": "S3", "title": "Session/transaction correctness: auto-commit OFF, uncommitted state across statements, SAVEPOINT + ROLLBACK TO via SQL, second session cannot see uncommitted data", "box": "1 d", "killCriterion": "SAVEPOINT unusable, or session state leaks between connections", "status": "todo", "result": "" },
-    { "id": "S4", "title": "Cancel a long-running statement from another control path; measure latency", "box": "1.5 d", "killCriterion": "No mechanism achieves cancel within ~2 s and leaves the session usable — even via set_call_timeout", "status": "todo", "result": "" },
-    { "id": "S5", "title": "REF CURSOR + IN/OUT/IN OUT binds + DBMS_OUTPUT", "box": "1 d", "killCriterion": "REF CURSOR or OUT binds unusable", "status": "todo", "result": "" },
-    { "id": "S6", "title": "Cross-compile checks: cargo build --target aarch64-linux-android and aarch64-apple-ios", "box": "0.5 d", "killCriterion": "Either target fails to build and no provider swap fixes it", "status": "todo", "result": "" },
-    { "id": "S7", "title": "CLOB/BLOB streaming ≥100 MB with bounded RSS; confirm issue #18 impact", "box": "1 d", "killCriterion": "Memory grows with LOB size, or non-ASCII CLOBs unreadable", "status": "todo", "result": "" },
-    { "id": "S8", "title": "TCPS against a TLS-enabled listener", "box": "1 d", "killCriterion": "TCPS cannot be established without Instant Client", "status": "todo", "result": "" },
-    { "id": "S9", "title": "Network-loss detection and reconnect semantics; N concurrent sessions under load", "box": "1 d", "killCriterion": "Lost sessions are hidden rather than surfaced", "status": "todo", "result": "" }
+    {
+      "id": "S1",
+      "title": "Connect + authenticate to 19c: Easy Connect, service name, full descriptor",
+      "box": "0.5 d",
+      "killCriterion": "Cannot authenticate against a stock 19c account after verifier workaround",
+      "status": "todo",
+      "result": ""
+    },
+    {
+      "id": "S2",
+      "title": "SELECT fidelity: NUMBER precision at 38 digits, DATE, TIMESTAMP, TIMESTAMP TZ, NVARCHAR2/NCLOB with Thai text, RAW",
+      "box": "1 d",
+      "killCriterion": "Silent precision loss in NUMBER, or Thai/NCHAR corruption",
+      "status": "todo",
+      "result": "Not yet run against the driver. Pre-spike finding from raw sqlplus testing of the test-DB harness: Thai text was corrupted (U+FFFD) until the client set NLS_LANG=AMERICAN_AMERICA.AL32UTF8 — S2 must prove the Thai/NCHAR round-trip through the oracledb driver itself, not just sqlplus."
+    },
+    {
+      "id": "S3",
+      "title": "Session/transaction correctness: auto-commit OFF, uncommitted state across statements, SAVEPOINT + ROLLBACK TO via SQL, second session cannot see uncommitted data",
+      "box": "1 d",
+      "killCriterion": "SAVEPOINT unusable, or session state leaks between connections",
+      "status": "todo",
+      "result": ""
+    },
+    {
+      "id": "S4",
+      "title": "Cancel a long-running statement from another control path; measure latency (re-scoped after API review)",
+      "box": "2 d",
+      "killCriterion": "No mechanism achieves cancel within ~2 s and leaves the session usable — even via set_call_timeout",
+      "status": "todo",
+      "result": "Not run yet. Review finding: oracledb's set_call_timeout locks the same mutex execute() holds, so a call timeout is only a pre-armed deadline. Candidates in order: (1) pre-armed deadline, (2) privileged control session ALTER SYSTEM CANCEL SQL, (3) upstream public cancel API, (4) minimal fork/patch writing the break marker outside the mutex. If only (1) works, SPEC 10/24.8 Cancel is NOT met and ADR-0001 is re-opened with the owner."
+    },
+    {
+      "id": "S5",
+      "title": "REF CURSOR + IN/OUT/IN OUT binds + DBMS_OUTPUT",
+      "box": "1 d",
+      "killCriterion": "REF CURSOR or OUT binds unusable",
+      "status": "todo",
+      "result": ""
+    },
+    {
+      "id": "S6",
+      "title": "Cross-compile checks: cargo build --target aarch64-linux-android and aarch64-apple-ios",
+      "box": "0.5 d",
+      "killCriterion": "Either target fails to build and no provider swap fixes it",
+      "status": "todo",
+      "result": ""
+    },
+    {
+      "id": "S7",
+      "title": "CLOB/BLOB streaming ≥100 MB with bounded RSS; confirm issue #18 impact",
+      "box": "1 d",
+      "killCriterion": "Memory grows with LOB size, or non-ASCII CLOBs unreadable",
+      "status": "todo",
+      "result": ""
+    },
+    {
+      "id": "S8",
+      "title": "TCPS against a TLS-enabled listener",
+      "box": "1 d",
+      "killCriterion": "TCPS cannot be established without Instant Client",
+      "status": "todo",
+      "result": ""
+    },
+    {
+      "id": "S9",
+      "title": "Network-loss detection and reconnect semantics; N concurrent sessions under load",
+      "box": "1 d",
+      "killCriterion": "Lost sessions are hidden rather than surfaced",
+      "status": "todo",
+      "result": ""
+    }
   ],
   "phases": [
     {
@@ -584,64 +650,187 @@
         {
           "title": "Test infrastructure",
           "tasks": [
-            { "title": "Local Oracle 19c Docker test database (tools/oracle-test-db)", "status": "done", "note": "Verified: connection details, AL32UTF8/NLS_LANG requirement, and limitations documented in tools/oracle-test-db/README.md." }
+            {
+              "title": "Local Oracle 19c Docker test database (tools/oracle-test-db)",
+              "status": "done",
+              "note": "Verified: connection details, AL32UTF8/NLS_LANG requirement, and limitations documented in tools/oracle-test-db/README.md."
+            }
           ]
         },
         {
           "title": "Repository bootstrap",
           "tasks": [
-            { "title": "Create GitHub Organization and reldex/reldex repository", "status": "done" },
-            { "title": "Prepare initial project documentation", "status": "done" },
-            { "title": "Commit README.md, SPEC.md, ROADMAP.md, AGENTS.md", "status": "done" },
-            { "title": "Add .gitignore and .editorconfig", "status": "done" },
-            { "title": "Add repository-local skill under .agents/skills/reldex-development/", "status": "done" },
-            { "title": "Enable branch protection when repository becomes collaborative/public", "status": "todo" },
-            { "title": "Decide Community/Pro licensing before public release", "status": "todo" },
-            { "title": "Run trademark/domain clearance before commercial launch", "status": "todo" }
+            {
+              "title": "Create GitHub Organization and reldex/reldex repository",
+              "status": "done"
+            },
+            {
+              "title": "Prepare initial project documentation",
+              "status": "done"
+            },
+            {
+              "title": "Commit README.md, SPEC.md, ROADMAP.md, AGENTS.md",
+              "status": "done"
+            },
+            {
+              "title": "Add .gitignore and .editorconfig",
+              "status": "done"
+            },
+            {
+              "title": "Add repository-local skill under .agents/skills/reldex-development/",
+              "status": "done"
+            },
+            {
+              "title": "Enable branch protection when repository becomes collaborative/public",
+              "status": "todo"
+            },
+            {
+              "title": "Decide Community/Pro licensing before public release",
+              "status": "todo"
+            },
+            {
+              "title": "Run trademark/domain clearance before commercial launch",
+              "status": "todo"
+            }
           ]
         },
         {
           "title": "Driver/core",
           "tasks": [
-            { "title": "Create Rust workspace", "status": "done" },
-            { "title": "Create db-driver-api", "status": "done", "note": "Implemented per ADR-0002: 5 traits (DatabaseDriver, DatabaseConnection, CancelHandle, Cursor, LobStream), ~45 types, zero production dependencies, 68 unit + 6 doc tests, fmt/clippy/test green. Independent API review in progress; owner review pending." },
-            { "title": "Create db-core", "status": "in_progress", "note": "Skeleton crate at crates/db-core; depends only on db-driver-api. Session/worker-thread implementation against the now-implemented contract not started." },
-            { "title": "Create initial database driver implementation — wrap Oracle's official oracledb crate (oracle/rust-oracledb, pinned exact version) in crates/drivers/oracle-thin", "status": "todo", "note": "Per ADR-0001. Skeleton crate exists at crates/drivers/oracle-thin; wrapper not started." },
-            { "title": "Add driver contract tests that detect behaviour changes on oracledb upgrades", "status": "todo" },
-            { "title": "Draft upstream request to oracle/rust-oracledb for a public statement-cancel API (owner to submit)", "status": "todo" },
-            { "title": "Add normalized DbError", "status": "done", "note": "Implemented in db-driver-api per ADR-0002 D3: DbError{kind, message, native, position, session_state, retryable, source}; ErrorKind is a stable, #[non_exhaustive] vendor-neutral category set." },
-            { "title": "Add connection/profile model", "status": "in_progress", "note": "Driver-level connection params (ConnectionParams, Secret, Extensions) implemented in db-driver-api per ADR-0002 D7; user-facing profile model pending." },
-            { "title": "Add session abstraction", "status": "in_progress", "note": "Contract only: DatabaseConnection trait implemented in db-driver-api (ADR-0002); db-core's DatabaseSession (worker thread, cancel handle, transaction tracking) not yet implemented." },
-            { "title": "Add transaction abstraction", "status": "in_progress", "note": "Contract only: commit/rollback/savepoint/transaction_state on DatabaseConnection implemented in db-driver-api (ADR-0002 D4); db-core implementation pending." },
-            { "title": "Add cancellation abstraction", "status": "done", "note": "Contract implemented: Arc<dyn CancelHandle>, CancelKind::{Native,CallTimeout,Unsupported}, SessionState (ADR-0002 D2). Driver-level cancel mechanism pending spike S4 — oracledb has no public cancel API yet." }
+            {
+              "title": "Create Rust workspace",
+              "status": "done"
+            },
+            {
+              "title": "Create db-driver-api",
+              "status": "done",
+              "note": "Implemented per ADR-0002: 5 traits (DatabaseDriver, DatabaseConnection, CancelHandle, Cursor, LobStream), ~45 types, zero production dependencies, 68 unit + 6 doc tests, fmt/clippy/test green. Independent API review in progress; owner review pending."
+            },
+            {
+              "title": "Create db-core",
+              "status": "in_progress",
+              "note": "Skeleton crate at crates/db-core; depends only on db-driver-api. Session/worker-thread implementation against the now-implemented contract not started."
+            },
+            {
+              "title": "Create initial database driver implementation — wrap Oracle's official oracledb crate (oracle/rust-oracledb, pinned exact version) in crates/drivers/oracle-thin",
+              "status": "todo",
+              "note": "Per ADR-0001. Skeleton crate exists at crates/drivers/oracle-thin; wrapper not started."
+            },
+            {
+              "title": "Add driver contract tests that detect behaviour changes on oracledb upgrades",
+              "status": "todo"
+            },
+            {
+              "title": "(S4 critical path) Draft upstream request to oracle/rust-oracledb for a public statement-cancel/break API — plus accessors for OracleNumber digits and the transaction-in-progress flag (owner to submit)",
+              "status": "todo"
+            },
+            {
+              "title": "Add normalized DbError",
+              "status": "done",
+              "note": "Implemented in db-driver-api per ADR-0002 D3: DbError{kind, message, native, position, session_state, retryable, source}; ErrorKind is a stable, #[non_exhaustive] vendor-neutral category set."
+            },
+            {
+              "title": "Add connection/profile model",
+              "status": "in_progress",
+              "note": "Driver-level connection params (ConnectionParams, Secret, Extensions) implemented in db-driver-api per ADR-0002 D7; user-facing profile model pending."
+            },
+            {
+              "title": "Add session abstraction",
+              "status": "in_progress",
+              "note": "Contract only: DatabaseConnection trait implemented in db-driver-api (ADR-0002); db-core's DatabaseSession (worker thread, cancel handle, transaction tracking) not yet implemented."
+            },
+            {
+              "title": "Add transaction abstraction",
+              "status": "in_progress",
+              "note": "Contract only: commit/rollback/savepoint/transaction_state on DatabaseConnection implemented in db-driver-api (ADR-0002 D4); db-core implementation pending."
+            },
+            {
+              "title": "Add cancellation abstraction",
+              "status": "done",
+              "note": "Contract implemented and revised after API review: Arc<dyn CancelHandle>, CancelKind::{Native,PreArmedDeadline,Unsupported}, CancelOutcome, SessionState (ADR-0002 D2 + amendments). Driver-level cancel pending spike S4 — the call-timeout fallback was disproved as an on-demand cancel."
+            }
           ]
         },
         {
           "title": "Functional POC",
           "tasks": [
-            { "title": "Connect/disconnect/ping", "status": "todo" },
-            { "title": "SELECT", "status": "todo" },
-            { "title": "DML", "status": "todo" },
-            { "title": "PL/SQL anonymous block", "status": "todo" },
-            { "title": "IN/OUT/IN OUT binds", "status": "todo" },
-            { "title": "REF CURSOR", "status": "todo" },
-            { "title": "COMMIT/ROLLBACK/SAVEPOINT", "status": "todo" },
-            { "title": "CLOB/NCLOB/BLOB", "status": "todo" },
-            { "title": "DBMS_OUTPUT", "status": "todo" },
-            { "title": "Long-running query cancellation", "status": "todo" },
-            { "title": "TCPS", "status": "todo" },
-            { "title": "Network-loss behavior", "status": "todo" },
-            { "title": "Concurrent independent sessions", "status": "todo" }
+            {
+              "title": "Connect/disconnect/ping",
+              "status": "todo"
+            },
+            {
+              "title": "SELECT",
+              "status": "todo"
+            },
+            {
+              "title": "DML",
+              "status": "todo"
+            },
+            {
+              "title": "PL/SQL anonymous block",
+              "status": "todo"
+            },
+            {
+              "title": "IN/OUT/IN OUT binds",
+              "status": "todo"
+            },
+            {
+              "title": "REF CURSOR",
+              "status": "todo"
+            },
+            {
+              "title": "COMMIT/ROLLBACK/SAVEPOINT",
+              "status": "todo"
+            },
+            {
+              "title": "CLOB/NCLOB/BLOB",
+              "status": "todo"
+            },
+            {
+              "title": "DBMS_OUTPUT",
+              "status": "todo"
+            },
+            {
+              "title": "Long-running query cancellation",
+              "status": "todo"
+            },
+            {
+              "title": "TCPS",
+              "status": "todo"
+            },
+            {
+              "title": "Network-loss behavior",
+              "status": "todo"
+            },
+            {
+              "title": "Concurrent independent sessions",
+              "status": "todo"
+            }
           ]
         },
         {
           "title": "Platform validation",
           "tasks": [
-            { "title": "Windows x64", "status": "todo" },
-            { "title": "Linux x64", "status": "todo" },
-            { "title": "macOS ARM64", "status": "todo" },
-            { "title": "Android ARM64 physical device", "status": "todo" },
-            { "title": "iOS/iPadOS ARM64 physical device", "status": "todo" }
+            {
+              "title": "Windows x64",
+              "status": "todo"
+            },
+            {
+              "title": "Linux x64",
+              "status": "todo"
+            },
+            {
+              "title": "macOS ARM64",
+              "status": "todo"
+            },
+            {
+              "title": "Android ARM64 physical device",
+              "status": "todo"
+            },
+            {
+              "title": "iOS/iPadOS ARM64 physical device",
+              "status": "todo"
+            }
           ]
         }
       ]
@@ -654,26 +843,86 @@
         {
           "title": "Desktop MVP",
           "tasks": [
-            { "title": "Qt Quick application shell", "status": "todo" },
-            { "title": "Thin C++ ↔ Rust FFI adapter", "status": "todo" },
-            { "title": "Connection Manager", "status": "todo" },
-            { "title": "Workspace shell", "status": "todo" },
-            { "title": "SQL Worksheet", "status": "todo" },
-            { "title": "Multiple independent sessions", "status": "todo" },
-            { "title": "Run current statement", "status": "todo" },
-            { "title": "Run selection", "status": "todo" },
-            { "title": "Run script", "status": "todo" },
-            { "title": "PL/SQL execution", "status": "todo" },
-            { "title": "Bind-variable dialog", "status": "todo" },
-            { "title": "Cancel", "status": "todo" },
-            { "title": "Commit/Rollback", "status": "todo" },
-            { "title": "Result Store", "status": "todo" },
-            { "title": "Virtualized Result Grid", "status": "todo" },
-            { "title": "Query History", "status": "todo" },
-            { "title": "DBMS_OUTPUT panel", "status": "todo" },
-            { "title": "Basic Object Browser", "status": "todo" },
-            { "title": "Production connection indicator", "status": "todo" },
-            { "title": "Secure credential integration on Windows", "status": "todo" }
+            {
+              "title": "Qt Quick application shell",
+              "status": "todo"
+            },
+            {
+              "title": "Thin C++ ↔ Rust FFI adapter",
+              "status": "todo"
+            },
+            {
+              "title": "Connection Manager",
+              "status": "todo"
+            },
+            {
+              "title": "Workspace shell",
+              "status": "todo"
+            },
+            {
+              "title": "SQL Worksheet",
+              "status": "todo"
+            },
+            {
+              "title": "Multiple independent sessions",
+              "status": "todo"
+            },
+            {
+              "title": "Run current statement",
+              "status": "todo"
+            },
+            {
+              "title": "Run selection",
+              "status": "todo"
+            },
+            {
+              "title": "Run script",
+              "status": "todo"
+            },
+            {
+              "title": "PL/SQL execution",
+              "status": "todo"
+            },
+            {
+              "title": "Bind-variable dialog",
+              "status": "todo"
+            },
+            {
+              "title": "Cancel",
+              "status": "todo"
+            },
+            {
+              "title": "Commit/Rollback",
+              "status": "todo"
+            },
+            {
+              "title": "Result Store",
+              "status": "todo"
+            },
+            {
+              "title": "Virtualized Result Grid",
+              "status": "todo"
+            },
+            {
+              "title": "Query History",
+              "status": "todo"
+            },
+            {
+              "title": "DBMS_OUTPUT panel",
+              "status": "todo"
+            },
+            {
+              "title": "Basic Object Browser",
+              "status": "todo"
+            },
+            {
+              "title": "Production connection indicator",
+              "status": "todo"
+            },
+            {
+              "title": "Secure credential integration on Windows",
+              "status": "todo"
+            }
           ]
         }
       ]
@@ -686,17 +935,50 @@
         {
           "title": "IDE capabilities",
           "tasks": [
-            { "title": "PL/SQL object editor", "status": "todo" },
-            { "title": "Compile source", "status": "todo" },
-            { "title": "Map compile errors to editor positions", "status": "todo" },
-            { "title": "Table Inspector", "status": "todo" },
-            { "title": "DDL viewer", "status": "todo" },
-            { "title": "Explain Plan tree/text", "status": "todo" },
-            { "title": "Metadata cache", "status": "todo" },
-            { "title": "Basic autocomplete", "status": "todo" },
-            { "title": "Streaming CSV/TSV/JSON export", "status": "todo" },
-            { "title": "macOS packaging", "status": "todo" },
-            { "title": "Linux packaging", "status": "todo" }
+            {
+              "title": "PL/SQL object editor",
+              "status": "todo"
+            },
+            {
+              "title": "Compile source",
+              "status": "todo"
+            },
+            {
+              "title": "Map compile errors to editor positions",
+              "status": "todo"
+            },
+            {
+              "title": "Table Inspector",
+              "status": "todo"
+            },
+            {
+              "title": "DDL viewer",
+              "status": "todo"
+            },
+            {
+              "title": "Explain Plan tree/text",
+              "status": "todo"
+            },
+            {
+              "title": "Metadata cache",
+              "status": "todo"
+            },
+            {
+              "title": "Basic autocomplete",
+              "status": "todo"
+            },
+            {
+              "title": "Streaming CSV/TSV/JSON export",
+              "status": "todo"
+            },
+            {
+              "title": "macOS packaging",
+              "status": "todo"
+            },
+            {
+              "title": "Linux packaging",
+              "status": "todo"
+            }
           ]
         }
       ]
@@ -709,16 +991,46 @@
         {
           "title": "Performance / DBA",
           "tasks": [
-            { "title": "Session Monitor", "status": "todo" },
-            { "title": "Locks / blockers", "status": "todo" },
-            { "title": "Long operations", "status": "todo" },
-            { "title": "Wait events", "status": "todo" },
-            { "title": "SQL statistics", "status": "todo" },
-            { "title": "DBMS_XPLAN display cursor", "status": "todo" },
-            { "title": "Plan comparison", "status": "todo" },
-            { "title": "Evaluate Arrow-backed Result Store", "status": "todo" },
-            { "title": "Add benchmark suite", "status": "todo" },
-            { "title": "Establish memory budgets from measurements", "status": "todo" }
+            {
+              "title": "Session Monitor",
+              "status": "todo"
+            },
+            {
+              "title": "Locks / blockers",
+              "status": "todo"
+            },
+            {
+              "title": "Long operations",
+              "status": "todo"
+            },
+            {
+              "title": "Wait events",
+              "status": "todo"
+            },
+            {
+              "title": "SQL statistics",
+              "status": "todo"
+            },
+            {
+              "title": "DBMS_XPLAN display cursor",
+              "status": "todo"
+            },
+            {
+              "title": "Plan comparison",
+              "status": "todo"
+            },
+            {
+              "title": "Evaluate Arrow-backed Result Store",
+              "status": "todo"
+            },
+            {
+              "title": "Add benchmark suite",
+              "status": "todo"
+            },
+            {
+              "title": "Establish memory budgets from measurements",
+              "status": "todo"
+            }
           ]
         }
       ]
@@ -731,13 +1043,34 @@
         {
           "title": "Tablet",
           "tasks": [
-            { "title": "Android tablet UI", "status": "todo" },
-            { "title": "iPad UI", "status": "todo" },
-            { "title": "Adaptive workspace layout", "status": "todo" },
-            { "title": "External keyboard shortcuts", "status": "todo" },
-            { "title": "Trackpad/mouse support", "status": "todo" },
-            { "title": "Touch-specific grid behavior", "status": "todo" },
-            { "title": "Validate background/resume session handling", "status": "todo" }
+            {
+              "title": "Android tablet UI",
+              "status": "todo"
+            },
+            {
+              "title": "iPad UI",
+              "status": "todo"
+            },
+            {
+              "title": "Adaptive workspace layout",
+              "status": "todo"
+            },
+            {
+              "title": "External keyboard shortcuts",
+              "status": "todo"
+            },
+            {
+              "title": "Trackpad/mouse support",
+              "status": "todo"
+            },
+            {
+              "title": "Touch-specific grid behavior",
+              "status": "todo"
+            },
+            {
+              "title": "Validate background/resume session handling",
+              "status": "todo"
+            }
           ]
         }
       ]
@@ -750,11 +1083,26 @@
         {
           "title": "Phone",
           "tasks": [
-            { "title": "Phone navigation model", "status": "todo" },
-            { "title": "Editor/result/output adaptive pages", "status": "todo" },
-            { "title": "Result card mode", "status": "todo" },
-            { "title": "Direct connection on supported platforms", "status": "todo" },
-            { "title": "Mobile secure credential storage", "status": "todo" }
+            {
+              "title": "Phone navigation model",
+              "status": "todo"
+            },
+            {
+              "title": "Editor/result/output adaptive pages",
+              "status": "todo"
+            },
+            {
+              "title": "Result card mode",
+              "status": "todo"
+            },
+            {
+              "title": "Direct connection on supported platforms",
+              "status": "todo"
+            },
+            {
+              "title": "Mobile secure credential storage",
+              "status": "todo"
+            }
           ]
         }
       ]
@@ -767,32 +1115,91 @@
         {
           "title": "Pro candidates",
           "tasks": [
-            { "title": "Schema Compare", "status": "todo" },
-            { "title": "Data Compare", "status": "todo" },
-            { "title": "Advanced Monitoring", "status": "todo" },
-            { "title": "Performance Analyzer", "status": "todo" },
-            { "title": "Automation", "status": "todo" },
-            { "title": "Advanced Export", "status": "todo" },
-            { "title": "AI Assistant", "status": "todo" },
-            { "title": "Optional Gateway", "status": "todo" },
-            { "title": "Team features", "status": "todo" }
+            {
+              "title": "Schema Compare",
+              "status": "todo"
+            },
+            {
+              "title": "Data Compare",
+              "status": "todo"
+            },
+            {
+              "title": "Advanced Monitoring",
+              "status": "todo"
+            },
+            {
+              "title": "Performance Analyzer",
+              "status": "todo"
+            },
+            {
+              "title": "Automation",
+              "status": "todo"
+            },
+            {
+              "title": "Advanced Export",
+              "status": "todo"
+            },
+            {
+              "title": "AI Assistant",
+              "status": "todo"
+            },
+            {
+              "title": "Optional Gateway",
+              "status": "todo"
+            },
+            {
+              "title": "Team features",
+              "status": "todo"
+            }
           ]
         }
       ]
     }
   ],
   "activity": [
-    { "date": "2026-09-19", "text": "Local Oracle 19c Docker test DB up and verified" },
-    { "date": "2026-09-19", "text": "ADR-0002 accepted provisionally; db-driver-api contract implemented (68 unit + 6 doc tests)" },
-    { "date": "2026-09-19", "text": "README refreshed; Task.html dashboard introduced" },
-    { "date": "2026-09-19", "text": "Task.html progress dashboard introduced at the repository root." },
-    { "date": "2026-09-19", "text": "ADR-0002 proposed: blocking, object-safe db-driver-api contract with a per-session worker thread in db-core." },
-    { "date": "2026-09-19", "text": "Local Oracle 19c Docker test database verified end-to-end (tools/oracle-test-db/): connection details, AL32UTF8/NLS_LANG requirement, and known limitations documented." },
-    { "date": "2026-09-19", "text": "ADR-0001 accepted (conditional on spikes S1–S5): Oracle's oracledb crate adopted as the primary database driver." },
-    { "date": "2026-09-19", "text": "Cargo workspace skeleton (db-driver-api, db-core, drivers/mock, drivers/oracle-thin, reldex-core-poc) and GitHub Actions CI added." },
-    { "date": "2026-09-19", "text": "Repository bootstrap commit: initial README, SPEC, ROADMAP, AGENTS.md, and repository-local skill." }
+    {
+      "date": "2026-09-19",
+      "text": "Independent API review of db-driver-api: 7 must-fix + should-fix items applied; cancel contract re-scoped to PreArmedDeadline/Native; NUMBER widened to 40 digits; S4 re-scoped."
+    },
+    {
+      "date": "2026-09-19",
+      "text": "Local Oracle 19c Docker test DB up and verified"
+    },
+    {
+      "date": "2026-09-19",
+      "text": "ADR-0002 accepted provisionally; db-driver-api contract implemented (68 unit + 6 doc tests)"
+    },
+    {
+      "date": "2026-09-19",
+      "text": "README refreshed; Task.html dashboard introduced"
+    },
+    {
+      "date": "2026-09-19",
+      "text": "Task.html progress dashboard introduced at the repository root."
+    },
+    {
+      "date": "2026-09-19",
+      "text": "ADR-0002 proposed: blocking, object-safe db-driver-api contract with a per-session worker thread in db-core."
+    },
+    {
+      "date": "2026-09-19",
+      "text": "Local Oracle 19c Docker test database verified end-to-end (tools/oracle-test-db/): connection details, AL32UTF8/NLS_LANG requirement, and known limitations documented."
+    },
+    {
+      "date": "2026-09-19",
+      "text": "ADR-0001 accepted (conditional on spikes S1–S5): Oracle's oracledb crate adopted as the primary database driver."
+    },
+    {
+      "date": "2026-09-19",
+      "text": "Cargo workspace skeleton (db-driver-api, db-core, drivers/mock, drivers/oracle-thin, reldex-core-poc) and GitHub Actions CI added."
+    },
+    {
+      "date": "2026-09-19",
+      "text": "Repository bootstrap commit: initial README, SPEC, ROADMAP, AGENTS.md, and repository-local skill."
+    }
   ]
 }
+
 </script>
 
 <div id="error-banner" role="alert" hidden></div>

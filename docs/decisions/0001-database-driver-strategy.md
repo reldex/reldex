@@ -2,6 +2,10 @@
 
 **Status:** Accepted (conditional on Phase 0 spikes S1–S5)
 **Date:** 2026-09-19
+**Amended:** 2026-09-19 — **C1 revised and spike S4 widened.** The ADR-0002 API review re-read
+`oracledb`'s source and established that `set_call_timeout` locks the same `Arc<Mutex<Client>>` that
+`execute` holds for the whole round trip. The "cancel = short call timeout on demand" fallback this
+ADR originally recommended therefore does not exist. See C1 and the S4 row.
 **Decided by:** project owner, 2026-09-19 — the primary driver is Oracle's official
 [`oracle/rust-oracledb`](https://github.com/oracle/rust-oracledb) (crate `oracledb`). If a kill
 criterion in the spike plan fires, this ADR is re-opened rather than silently worked around.
@@ -58,22 +62,56 @@ the status only becomes unconditional `Accepted` once spikes S1–S5 pass.
 The owner's "Oracle-maintained" constraint and `SPEC.md` §7 no longer conflict. Three real
 conflicts remain.
 
-**C1 — Cancellation is not in the public API.** `SPEC.md` §10 requires every worksheet to expose
-Cancel; §24.8 makes it a Definition-of-Done item; `ARCHITECTURE.md` §6 and `phase-0.md` Workstream C
-require cancelling from a *different control path*. Searching the crate for any public
-cancel/break/interrupt function returns nothing; the public `Connection` surface is
-close/commit/rollback/execute/query/ping/statement/set_call_timeout and metadata accessors
+**C1 — Cancellation is not in the public API, and the obvious stand-in does not work.** *(Revised
+2026-09-19 after the ADR-0002 API review re-read the source; the original text is superseded because
+it was too optimistic.)*
+
+`SPEC.md` §10 requires every worksheet to expose Cancel; §24.8 makes it a Definition-of-Done item;
+`ARCHITECTURE.md` §6 and `phase-0.md` Workstream C require cancelling from a *different control
+path*. Searching the crate for any public cancel/break/interrupt function returns nothing; the public
+`Connection` surface is close/commit/rollback/execute/query/ping/statement/set_call_timeout and
+metadata accessors
 ([`src/connection/mod.rs`](https://github.com/oracle/rust-oracledb/blob/main/src/connection/mod.rs)).
 The protocol machinery exists but is private and reachable only via read-timeout recovery:
 `recover_from_error()` sends `MARKER_TYPE_INTERRUPT` then resets
 ([`src/client/mod.rs`](https://github.com/oracle/rust-oracledb/blob/main/src/client/mod.rs)); the
 break marker constant is `_MARKER_TYPE_BREAK`, i.e. unused
-([`src/constants.rs`](https://github.com/oracle/rust-oracledb/blob/main/src/constants.rs)). The
-client is held as `Arc<Mutex<Client>>` and `execute()` locks it for the duration of the call, so a
-second thread could not interleave a break even if one were exposed. **Options:** (a) use
-`set_call_timeout` as a coarse stand-in and accept "cancel = short timeout" semantics for Phase 0;
-(b) file an upstream enhancement request and gate Phase 1 on it; (c) carry a small fork/patch. This
-ADR recommends (a)+(b) for Phase 0 and treats (c) as the contingency.
+([`src/constants.rs`](https://github.com/oracle/rust-oracledb/blob/main/src/constants.rs)).
+
+**What the re-read established.** The client is held as `Arc<Mutex<Client>>`, and `execute()` locks
+it for the duration of the round trip. `Connection::set_call_timeout` locks **the same mutex**.
+Therefore the option this ADR originally recommended — "use `set_call_timeout` as a coarse stand-in,
+arming a short timeout when the user presses Cancel" — **cannot work**: the call that arms the
+timeout would block until the statement it is meant to stop has finished. It is not a degraded
+cancel; it is a hang on the control path that was supposed to stay responsive (`SPEC.md` §24.17).
+
+**What remains true.** `set_call_timeout` *can* bound a call if it is armed **before** the call
+starts. That is a per-call deadline, not cancellation: the user cannot change their mind once a
+statement is running, and the latency of "stopping" is whatever deadline was set in advance.
+ADR-0002 therefore models this honestly as `CancelKind::PreArmedDeadline` with an explicit
+`CancelOutcome::NotInterruptible` result, and the contract requires `request_cancel` never to block
+on the connection's own call lock. A driver in that class **does not satisfy `SPEC.md` §10/§24.8**,
+and the UI must say so rather than show a Cancel button that does nothing.
+
+**Options, in the order spike S4 must evaluate them** (see the revised S4 row):
+
+(a) **Pre-armed call timeout.** Works today, costs nothing, and gives a bounded worst case. Latency
+    equals the deadline, so it is a *limit*, not a cancel. Phase 0 baseline, not a solution.
+(b) **Privileged control session issuing `ALTER SYSTEM CANCEL SQL 'sid, serial#'`** (18c+) over a
+    second connection. This is a genuine cancel from a different control path, but it requires the
+    `ALTER SYSTEM` privilege, which most application accounts do not and should not have. It can only
+    ever be an **opt-in extra** for sites that choose to grant it, never the default path.
+(c) **Upstream enhancement request** for a public cancel/break API. The right long-term answer, and
+    cheap to file; the upstream maintainer has been responsive (see C2). Not something Phase 0 can
+    depend on.
+(d) **Minimal fork/patch** exposing a break handle that writes the TTC break/interrupt marker on a
+    **cloned socket, outside the mutex**. This is how a real break works at the protocol level and is
+    why it can be delivered while `execute` holds the lock. Contingency: carrying a patch against a
+    pre-GA crate in the most correctness-critical layer is a real maintenance cost (C2).
+
+This ADR now recommends running S4 through (a)→(d) in that order and treats (c)+(d) as the only
+paths to meeting `SPEC.md` §24.8 for an unprivileged account. If only (a) works, the kill criterion
+fires: this ADR is re-opened with the owner.
 
 **C2 — Beta maturity vs. correctness-first priorities.** `SPEC.md` §2 ranks database and
 transaction correctness above everything. The driver is a ~2-month-old pre-release ("APIs and
@@ -173,8 +211,8 @@ Sources: `A` = [Appendix A feature table](https://github.com/oracle/rust-oracled
 | SQL/PL-SQL object types and collections | Missing | A |
 | COMMIT / ROLLBACK; auto-commit OFF by default | Supported — matches `SPEC.md` §10 | D `txn_management.md` |
 | SAVEPOINT / ROLLBACK TO SAVEPOINT | **Unknown** — no API; presumably plain SQL, untested | D (absent) |
-| **Cancel a running statement from another control path** | **Missing** — no public API | S (see C1) |
-| Call timeouts | Supported | A; `Connection::set_call_timeout` |
+| **Cancel a running statement from another control path** | **Missing** — no public API, and `set_call_timeout` cannot substitute (it takes the same mutex `execute` holds) | S (see C1) |
+| Call timeouts | Supported, but only **armed before the call** | A; `Connection::set_call_timeout` (see C1) |
 | Network-loss detection / reconnect semantics | Unknown | D `ha.md` defers to Oracle Net config |
 | Concurrent independent sessions | Supported in principle (separate `Connection`s); unmeasured | S |
 | Large results / fetch batching (`fetch_array_size`, `prefetch_rows`) | Supported | D `tuning.md` |
@@ -228,7 +266,10 @@ usual reason mobile database drivers fail. Native ORA- codes are preserved, sati
 `ARCHITECTURE.md` §4 and invariant 9. Optional Arrow support may later serve `SPEC.md` §12.
 
 **Harder.** Reldex depends on pre-GA software for its most correctness-critical layer. Cancellation
-— a Definition-of-Done item — has no upstream API today. Enterprise sites using NNE or 11G
+— a Definition-of-Done item — has no upstream API today, and (revised 2026-09-19) no workable
+substitute either: the pre-armed call timeout bounds a statement but cannot stop one on request, so
+until spike S4 finds a mechanism, Reldex ships without the Cancel `SPEC.md` §24.8 requires and must
+say so in the UI rather than pretend. Enterprise sites using NNE or 11G
 verifiers cannot connect at all, and both are common in the 19c estate the product targets; that is
 a *market* limitation, not only a technical one, and should reach the README before launch. The
 blocking API constrains the concurrency ADR. UTF-8-only client charset must be checked against Thai
@@ -270,8 +311,13 @@ Only these updates are needed:
 - `ARCHITECTURE.md` §11 — name the concrete crate hosted by `crates/drivers/oracle-thin`.
 - `TASKS.md` — "Create initial database driver implementation" becomes adopting and wrapping
   `oracledb`; add tasks for contract tests and the upstream cancel request.
-- `phase-0.md` Workstream C — record that cancellation may be timeout-based in Phase 0, and make
-  Workstream F note NNE and 11G verifiers as known unsupported configurations.
+- `phase-0.md` Workstream C — **revised 2026-09-19:** record that Phase 0 may have no cancellation at
+  all, only a *pre-armed per-call deadline* (ADR-0002 `CancelKind::PreArmedDeadline`), and that this
+  does not satisfy `SPEC.md` §24.8; make Workstream F note NNE and 11G verifiers as known unsupported
+  configurations.
+- `TASKS.md` / `Task.html` — S4's scope and budget changed (1.5 d → 2 d) and it now has four ordered
+  candidates; the "upstream cancel/break enhancement request" should become a task in its own right,
+  because its lead time is weeks.
 
 **If a kill criterion fires and the ODPI-C fallback is chosen instead**, these would need amending:
 `SPEC.md` §7 (default path is thin), §8 (mobile platform validation), §18 and §25 (mobile
@@ -289,7 +335,7 @@ mobile as a separate decision (gateway mode per `SPEC.md` §18).
 | S1 | Connect + authenticate to 19c: Easy Connect, service name, full descriptor | 0.5 d | Cannot authenticate against a stock 19c account after verifier workaround |
 | S2 | SELECT fidelity: NUMBER precision at 38 digits, DATE, TIMESTAMP, TIMESTAMP TZ, NVARCHAR2/NCLOB with Thai text, RAW | 1 d | Silent precision loss in NUMBER, or Thai/NCHAR corruption |
 | S3 | Session/transaction correctness: auto-commit OFF, uncommitted state across statements, SAVEPOINT + ROLLBACK TO via SQL, second session cannot see uncommitted data | 1 d | SAVEPOINT unusable, or session state leaks between connections |
-| S4 | **Cancel a long-running statement from another control path**; measure latency | 1.5 d | No mechanism achieves cancel within ~2 s and leaves the session usable — even via `set_call_timeout` |
+| S4 | **Cancel a long-running statement from another control path**; measure latency. Evaluate, in order: (1) **pre-armed call timeout** — `set_call_timeout` before `execute`; latency *is* the deadline, and it cannot be changed once the statement is running; (2) **privileged control session** issuing `ALTER SYSTEM CANCEL SQL 'sid, serial#'` (18c+) on a second connection — a real cancel, but needs `ALTER SYSTEM`, so only ever an opt-in extra, never the default path; (3) **upstream public cancel/break API** — file the enhancement request and record the response; (4) **minimal fork/patch** exposing a break handle that writes the TTC break/interrupt marker on a cloned socket **outside** the `Arc<Mutex<Client>>` | 2 d | Only (1) works. A pre-armed deadline is a *limit*, not a cancel: the user cannot stop a statement already running, so `SPEC.md` §10/§24.8 "Cancel" is **not met** and this ADR must be re-opened with the owner. Also killed if any mechanism leaves the session unusable, or if (2)/(4) cannot cancel within ~2 s |
 | S5 | REF CURSOR + IN/OUT/IN OUT binds + DBMS_OUTPUT | 1 d | REF CURSOR or OUT binds unusable |
 | S6 | Cross-compile checks: `cargo build --target aarch64-linux-android` and `aarch64-apple-ios` | 0.5 d | Either target fails to build and no provider swap fixes it |
 | S7 | CLOB/BLOB streaming ≥100 MB with bounded RSS; confirm issue #18 impact | 1 d | Memory grows with LOB size, or non-ASCII CLOBs unreadable |
@@ -299,6 +345,14 @@ mobile as a separate decision (gateway mode per `SPEC.md` §18).
 S4 is the **first kill-criterion spike that matters** — S1–S3 are expected to pass, and S4 is where
 the known gap is. Run S1–S4 before committing to Phase 1 scope. S6 is cheap and should be run early
 opportunistically because it can be done without a database.
+
+S4's scope widened on 2026-09-19: the ADR-0002 API review verified from source that
+`set_call_timeout` contends with `execute` for the same `Arc<Mutex<Client>>`, so the "cancel = short
+timeout on demand" fallback this ADR originally assumed does not exist (revised C1). S4 must now
+work through four candidates rather than confirm one, and its kill criterion is stated in terms of
+`SPEC.md` §24.8 rather than a latency number alone. Budget raised from 1.5 d to 2 d accordingly.
+Options (3) and (4) are the only ones that deliver a real cancel for an unprivileged account, so S4
+should file the upstream request early — its lead time is measured in weeks, not hours.
 
 ### Test database
 

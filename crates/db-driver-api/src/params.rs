@@ -4,9 +4,11 @@
 //! particular driver understands goes into [`Extensions`], which the core passes
 //! through without interpreting it.
 //!
-//! Secrets live in [`Secret`], which redacts itself in `Debug`, implements no
-//! `Display`, and zeroes its buffer on drop — so a `Debug` of a whole
-//! [`ConnectionParams`] is safe to log (`AGENTS.md`, "Code quality").
+//! Secrets live in [`Secret`], which redacts itself in `Debug` and implements no
+//! `Display`, so a `Debug` of a whole [`ConnectionParams`] is safe to log
+//! (`AGENTS.md`, "Code quality"). [`Secret`] also overwrites its buffer on drop,
+//! but that is a best-effort hygiene measure, not a guarantee — see its
+//! documentation.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -14,10 +16,24 @@ use std::time::Duration;
 
 /// A credential value that never renders itself.
 ///
-/// The buffer is overwritten on drop. That is best effort and not a security
-/// guarantee: a `String` passed in by the caller may already have been copied,
-/// and the allocator may have reused pages. Platform secure storage
-/// (`SPEC.md` §17) remains the place secrets are kept at rest.
+/// What this type actually promises:
+///
+/// - It has no `Display`, and its `Debug` prints `Secret(<redacted>)`, so a
+///   password cannot reach a log through an ordinary `{:?}` of any struct that
+///   contains one. That is the property `AGENTS.md` requires, and it is tested.
+/// - [`Secret::expose`] is the single, greppable place the plaintext is read.
+///
+/// What it does **not** promise: that the plaintext is gone from memory.
+/// [`Drop`] overwrites the buffer with zeros, which is useful hygiene but is not
+/// a guarantee. The compiler is free to elide a write to memory that is about to
+/// be freed; the `String` the caller passed to [`Secret::new`] was already a
+/// separate copy; [`Clone`] makes more; and the allocator, the OS page cache and
+/// any swap file are outside this crate's reach. Treating the wipe as a security
+/// control would be exactly the kind of overclaim `SPEC.md` §2 rules out.
+///
+/// A dependency that does this properly (`zeroize`) is deliberately deferred to
+/// the credential-storage ADR (`ARCHITECTURE.md` §13 item 9), where secure
+/// storage at rest (`SPEC.md` §17) is decided as a whole.
 pub struct Secret {
     bytes: Vec<u8>,
 }
@@ -46,6 +62,8 @@ impl Secret {
 }
 
 impl Drop for Secret {
+    /// Best-effort wipe. See the type documentation: this is hygiene, not a
+    /// guarantee, and nothing in Reldex may rely on it.
     fn drop(&mut self) {
         self.bytes.fill(0);
     }
@@ -69,6 +87,7 @@ impl fmt::Debug for Secret {
 ///
 /// The core stores and forwards these; it never interprets them.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ExtensionValue {
     /// Free text (a wallet path, a cipher list, a vendor option name).
     Text(String),
@@ -122,6 +141,7 @@ impl Extensions {
 
 /// Where the database is and how it is named.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Endpoint {
     /// A host, a port, and a service or database name the driver resolves.
     HostPort {
@@ -137,7 +157,12 @@ pub enum Endpoint {
 }
 
 /// How the session authenticates.
+///
+/// `#[non_exhaustive]`: `SPEC.md` §8 lists external authentication mechanisms
+/// (Kerberos, token, wallet/SEPS) that no driver supports yet, and adding one
+/// must not be a breaking change.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Credentials {
     /// A user name and password.
     UserPassword {
@@ -167,8 +192,10 @@ pub enum SessionRole {
 /// Whether the transport is encrypted.
 ///
 /// Certificate, wallet and cipher detail stays in [`Extensions`] until an ADR
-/// settles a vendor-neutral shape for it.
+/// settles a vendor-neutral shape for it. `#[non_exhaustive]` because native
+/// network encryption and mutual TLS are plausible additional modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum TlsMode {
     /// Plain TCP.
     Disabled,

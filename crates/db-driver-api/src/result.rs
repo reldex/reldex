@@ -15,7 +15,7 @@ use std::fmt;
 use std::num::NonZeroUsize;
 
 use crate::error::{DbError, DbResult, NativeError, SqlPosition};
-use crate::ids::ResultSetId;
+use crate::ids::{ConnectionId, ResultSetId};
 use crate::types::ColumnMetadata;
 use crate::value::{LobLocator, Number, Timestamp, Value, ValueRef};
 
@@ -46,11 +46,30 @@ impl NullMask {
         }
     }
 
-    /// Marks a row as SQL NULL. Out-of-range indices are ignored.
-    pub fn set_null(&mut self, row: usize) {
-        if row < self.len {
-            self.bits[row / 64] |= 1_u64 << (row % 64);
+    /// Marks a row as SQL NULL.
+    ///
+    /// An out-of-range `row` is refused rather than ignored. Silently dropping
+    /// it would produce a batch in which a NULL cell reads back as data — a
+    /// correctness failure (`SPEC.md` §2) that would surface as wrong values in
+    /// a grid, far from its cause.
+    ///
+    /// Returning a `Result` rather than panicking keeps a driver bug reportable
+    /// through the normal error path, and this is not the hot path: it is called
+    /// once per NULL cell, not once per cell.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::ErrorKind::DriverInternal`] if `row` is not below
+    /// [`NullMask::len`].
+    pub fn set_null(&mut self, row: usize) -> DbResult<()> {
+        if row >= self.len {
+            return Err(DbError::internal(format!(
+                "row {row} marked NULL in a mask of {} rows",
+                self.len
+            )));
         }
+        self.bits[row / 64] |= 1_u64 << (row % 64);
+        Ok(())
     }
 
     /// Whether the row is SQL NULL. Out-of-range indices report `false`.
@@ -69,12 +88,6 @@ impl NullMask {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
-    }
-
-    /// How many rows are NULL.
-    #[must_use]
-    pub fn null_count(&self) -> usize {
-        (0..self.len).filter(|row| self.is_null(*row)).count()
     }
 }
 
@@ -139,12 +152,6 @@ impl TextColumn {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
-    /// Total bytes of character data held.
-    #[must_use]
-    pub fn total_bytes(&self) -> usize {
-        self.buffer.len()
-    }
 }
 
 /// Variable-length byte values stored as one buffer plus offsets.
@@ -205,16 +212,11 @@ impl BytesColumn {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
-    /// Total bytes of data held.
-    #[must_use]
-    pub fn total_bytes(&self) -> usize {
-        self.buffer.len()
-    }
 }
 
 /// The storage family of a column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ColumnKind {
     /// Booleans.
     Boolean,
@@ -234,6 +236,8 @@ pub enum ColumnKind {
     Json,
     /// Unread large objects.
     Lob,
+    /// Values of a type the contract cannot represent, as best-effort text.
+    Unsupported,
 }
 
 /// One column's values, laid out contiguously.
@@ -241,6 +245,7 @@ pub enum ColumnKind {
 /// Values at NULL rows are unspecified placeholders; read cells through
 /// [`Column::value`], which consults the mask first.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ColumnData {
     /// Booleans.
     Boolean(Vec<bool>),
@@ -259,8 +264,23 @@ pub enum ColumnData {
     /// JSON text.
     Json(TextColumn),
     /// Large objects that have not been read. `None` means the locator has
-    /// already been taken out of the batch.
+    /// already been taken out of the batch — which is *not* the same as SQL
+    /// NULL; see [`Column::take_lob`].
     Lob(Vec<Option<LobLocator>>),
+    /// Values of a type the contract has no variant for, rendered by the driver
+    /// as best-effort text.
+    ///
+    /// This is what keeps `SELECT *` working over a table with an `INTERVAL`,
+    /// `ROWID`, `TIMESTAMP WITH LOCAL TIME ZONE`, `XMLType` or `VECTOR` column.
+    /// The alternative — failing the fetch, as the contract used to require —
+    /// makes a single unsupported column hide an entire table from the user,
+    /// which is a worse answer than showing the server's own rendering of it.
+    ///
+    /// The column's [`crate::SqlType`] is [`crate::SqlType::Unsupported`] and
+    /// its [`ColumnMetadata::native_type_name`] names the real type. Cells read
+    /// back as [`ValueRef::Unsupported`], never as [`ValueRef::Text`], so
+    /// nothing downstream can mistake the rendering for character data.
+    Unsupported(TextColumn),
 }
 
 impl ColumnData {
@@ -272,7 +292,7 @@ impl ColumnData {
             Self::Number(values) => values.len(),
             Self::Float(values) => values.len(),
             Self::Double(values) => values.len(),
-            Self::Text(values) | Self::Json(values) => values.len(),
+            Self::Text(values) | Self::Json(values) | Self::Unsupported(values) => values.len(),
             Self::Bytes(values) => values.len(),
             Self::Timestamp(values) => values.len(),
             Self::Lob(values) => values.len(),
@@ -298,6 +318,7 @@ impl ColumnData {
             Self::Timestamp(_) => ColumnKind::Timestamp,
             Self::Json(_) => ColumnKind::Json,
             Self::Lob(_) => ColumnKind::Lob,
+            Self::Unsupported(_) => ColumnKind::Unsupported,
         }
     }
 }
@@ -358,10 +379,18 @@ impl Column {
         self.nulls.is_null(row)
     }
 
-    /// How many rows are NULL.
+    /// Whether the value at `row` was moved out of the batch by
+    /// [`Column::take_lob`].
+    ///
+    /// A taken cell is not NULL and must never be reported as one.
     #[must_use]
-    pub fn null_count(&self) -> usize {
-        self.nulls.null_count()
+    pub fn is_taken(&self, row: usize) -> bool {
+        match &self.data {
+            ColumnData::Lob(values) => {
+                row < self.len() && !self.nulls.is_null(row) && values[row].is_none()
+            }
+            _ => false,
+        }
     }
 
     /// Borrows one cell, or `None` if `row` is out of range.
@@ -382,9 +411,11 @@ impl Column {
             ColumnData::Json(values) => ValueRef::Json(values.get(row)?),
             ColumnData::Bytes(values) => ValueRef::Bytes(values.get(row)?),
             ColumnData::Timestamp(values) => ValueRef::Timestamp(*values.get(row)?),
+            ColumnData::Unsupported(values) => ValueRef::Unsupported(values.get(row)?),
             ColumnData::Lob(values) => match values.get(row)? {
                 Some(locator) => ValueRef::Lob(locator),
-                None => ValueRef::Null,
+                // Not NULL: the row held a LOB and something took it.
+                None => ValueRef::Taken,
             },
         };
         Some(value)
@@ -392,18 +423,22 @@ impl Column {
 
     /// Takes the large-object locator at `row` so it can be read.
     ///
-    /// Reading a LOB needs ownership, so the locator leaves the batch and the
-    /// row becomes NULL. Returns `None` for any other column kind, an
-    /// out-of-range row, or a locator that was already taken.
+    /// Reading a LOB needs ownership, so the locator leaves the batch. The NULL
+    /// mask is **not** touched: the cell becomes [`ValueRef::Taken`], which is a
+    /// distinct state from SQL NULL. Marking it NULL — as this method used to —
+    /// would make an exporter that re-reads the batch write an empty cell where
+    /// the database holds a value.
+    ///
+    /// Returns `None` for any other column kind, an out-of-range row, a row that
+    /// is SQL NULL, or a locator that was already taken.
     pub fn take_lob(&mut self, row: usize) -> Option<LobLocator> {
+        if self.nulls.is_null(row) {
+            return None;
+        }
         let ColumnData::Lob(values) = &mut self.data else {
             return None;
         };
-        let taken = values.get_mut(row)?.take();
-        if taken.is_some() {
-            self.nulls.set_null(row);
-        }
-        taken
+        values.get_mut(row)?.take()
     }
 }
 
@@ -490,11 +525,52 @@ impl RowBatch {
 
 /// A forward-only, batched result set.
 ///
-/// A cursor is owned by the session's worker thread; `&mut self` makes that a
-/// compile-time fact rather than a convention.
+/// # Thread affinity
+///
+/// A cursor is `Send`, and `&mut self` on [`Cursor::fetch_batch`] serializes
+/// calls *to that cursor*. Neither fact ties it to a connection: a cursor is an
+/// independent handle that a driver may hand to any thread, and two cursors on
+/// one connection can exist at once. The rule the type system cannot express is
+/// therefore stated here, and `db-core` enforces it:
+///
+/// > **A cursor is used only on the worker thread that owns its connection.**
+/// > Of everything a fetch produces, only [`RowBatch`] — plain data, no handles
+/// > — may cross a thread boundary.
+///
+/// [`Cursor::connection_id`] exists so `db-core` can assert this rather than
+/// hope. The same rule applies to [`crate::LobStream`] and to a nested cursor
+/// returned as a [`crate::Value`].
+///
+/// # Lifecycle
+///
+/// - **After any error** from [`Cursor::fetch_batch`], the only legal call is
+///   [`Cursor::close`]. A driver must not assume the caller obeys this: a
+///   further `fetch_batch` has to return a [`DbError`], never panic, never block
+///   and never silently resume a half-consumed result set.
+/// - **After [`Cursor::close`]**, the cursor is gone — `close` consumes it, so
+///   this is enforced.
+/// - **After the owning connection is closed**
+///   ([`DatabaseConnection::close`](crate::DatabaseConnection::close)), every
+///   cursor derived from it returns
+///   [`DbError::connection_closed`] from `fetch_batch` and from `close`. It must
+///   never panic and never block on a connection that no longer exists.
+/// - **A commit or rollback may invalidate an open cursor.** Servers differ, and
+///   `ROLLBACK` in particular commonly closes cursors. A driver must not pretend
+///   otherwise: the next `fetch_batch` reports an ordinary [`DbError`]
+///   (`ErrorKind::Transaction` when the server says so) and `db-core` surfaces
+///   it rather than returning a truncated result as if it were complete
+///   (`SPEC.md` §2). See
+///   [`DatabaseConnection::commit`](crate::DatabaseConnection::commit).
 pub trait Cursor: Send {
     /// This result set's identifier.
     fn id(&self) -> ResultSetId;
+
+    /// The connection this cursor fetches over.
+    ///
+    /// `db-core` asserts that a cursor is only touched on the worker thread that
+    /// owns this connection. Must be cheap: an accessor on a field the driver
+    /// already holds, never a round trip.
+    fn connection_id(&self) -> ConnectionId;
 
     /// Column descriptions, in select-list order.
     fn columns(&self) -> &[ColumnMetadata];
@@ -504,15 +580,24 @@ pub trait Cursor: Send {
     /// A batch with no rows means the result is exhausted; a driver must not
     /// return an empty batch while more rows remain.
     ///
+    /// `max_rows` bounds this call. The statement-level
+    /// [`Statement::fetch_rows`](crate::Statement::fetch_rows) hint, which a
+    /// driver needs *before* execute to size its own array fetch, is a separate
+    /// knob; see that method.
+    ///
     /// # Errors
     ///
-    /// Any [`DbError`]. A cancelled fetch returns [`crate::ErrorKind::Cancelled`].
+    /// Any [`DbError`]. A cancelled fetch returns
+    /// [`crate::ErrorKind::Cancelled`]. After any error the cursor is finished;
+    /// see the trait's lifecycle rules.
     fn fetch_batch(&mut self, max_rows: NonZeroUsize) -> DbResult<RowBatch>;
 
     /// Whether the driver already knows the result is exhausted.
     fn is_exhausted(&self) -> bool;
 
     /// Releases the cursor's server-side and client-side resources.
+    ///
+    /// This is the one call that stays legal after a failed fetch.
     ///
     /// # Errors
     ///
@@ -523,6 +608,14 @@ pub trait Cursor: Send {
 }
 
 /// Why a statement produced a warning.
+///
+/// The set is deliberately tiny, and it must stay that way: a driver may have
+/// nothing better than a free-text warning string to classify — the primary
+/// driver's `last_warning()` returns exactly that (ADR-0001, `oracledb` review)
+/// — so kind detection can be **text-based** inside a driver. A large taxonomy
+/// would therefore be a taxonomy of substring matches pretending to be types.
+/// [`Warning::message`] and [`Warning::native`] carry the detail; the kind only
+/// says whether the UI must act on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum WarningKind {
@@ -530,7 +623,77 @@ pub enum WarningKind {
     /// requires these to reach the user.
     CompiledWithErrors,
     /// The server reported something worth showing that is not an error.
+    ///
+    /// This is the honest destination for a warning a driver cannot classify —
+    /// which, for a driver whose upstream gives it only a `String`, is most of
+    /// them. Without it such a warning would have to be dropped or mislabelled.
     Informational,
+}
+
+/// What kind of statement the server just ran.
+///
+/// Reported by the driver because `db-core` must not parse SQL (ADR-0002 D6) and
+/// the server is the only authority. Two things need it:
+///
+/// - **DDL commits.** Most SQL servers commit the open transaction before *and*
+///   after a DDL statement, whatever the client's auto-commit setting. The
+///   contract cannot forbid this and must not hide it: `SPEC.md` §10's "never
+///   silently commit" is a rule about *Reldex's* behaviour, and the honest way
+///   to keep it here is to tell the user it happened. A driver reporting
+///   [`StatementKind::Ddl`] lets `db-core` reset its transaction tracking and
+///   lets the UI say so.
+/// - **Conservative transaction tracking.** A driver that cannot observe
+///   server-side transaction state ([`Capabilities::exact_transaction_state`] is
+///   false) still knows that a `SELECT` did not open a write transaction and a
+///   `COMMIT` closed one.
+///
+/// A driver that genuinely cannot tell reports [`StatementKind::Other`], which
+/// is the default, and `db-core` stays conservative.
+///
+/// [`Capabilities::exact_transaction_state`]: crate::Capabilities::exact_transaction_state
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum StatementKind {
+    /// A query that returns rows (`SELECT`, `WITH … SELECT`).
+    Query,
+    /// Data manipulation (`INSERT`, `UPDATE`, `DELETE`, `MERGE`).
+    Dml,
+    /// Data definition (`CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `GRANT`).
+    ///
+    /// See [`StatementKind::commits_implicitly`].
+    Ddl,
+    /// An anonymous PL/SQL block or a call to stored code, which may have done
+    /// anything, including committing.
+    PlSqlBlock,
+    /// `COMMIT`, `ROLLBACK`, `SAVEPOINT` or `SET TRANSACTION` submitted as text
+    /// rather than through [`crate::DatabaseConnection::commit`] and friends.
+    TransactionControl,
+    /// `ALTER SESSION`, `SET ROLE` and similar statements that change session
+    /// state a worksheet owns (`SPEC.md` §9).
+    SessionControl,
+    /// Something else, or the driver could not classify it.
+    #[default]
+    Other,
+}
+
+impl StatementKind {
+    /// Whether running this kind of statement commits the open transaction on
+    /// the server regardless of any client setting.
+    ///
+    /// True for [`StatementKind::Ddl`]. `db-core` must treat the transaction as
+    /// resolved and tell the user, because it could neither prevent nor undo it.
+    #[must_use]
+    pub const fn commits_implicitly(self) -> bool {
+        matches!(self, Self::Ddl)
+    }
+
+    /// Whether this kind may have changed the transaction state in a way the
+    /// core cannot predict, so tracking must fall back to
+    /// [`crate::TransactionState::Unknown`].
+    #[must_use]
+    pub const fn transaction_state_is_unpredictable(self) -> bool {
+        matches!(self, Self::PlSqlBlock | Self::Other)
+    }
 }
 
 /// A non-fatal message produced by a statement.
@@ -597,6 +760,7 @@ impl Warning {
 ///
 /// The shape mirrors the statement's [`crate::Binds`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum OutValues {
     /// The statement had no output binds.
     None,
@@ -648,8 +812,8 @@ impl OutValues {
 pub struct ExecutionOutcome {
     cursor: Option<Box<dyn Cursor>>,
     rows_affected: Option<u64>,
+    statement_kind: StatementKind,
     out_values: OutValues,
-    implicit_results: Vec<Box<dyn Cursor>>,
     warnings: Vec<Warning>,
 }
 
@@ -660,8 +824,8 @@ impl ExecutionOutcome {
         Self {
             cursor: None,
             rows_affected: None,
+            statement_kind: StatementKind::Other,
             out_values: OutValues::None,
-            implicit_results: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -680,17 +844,17 @@ impl ExecutionOutcome {
         self
     }
 
+    /// Records what kind of statement the server ran. See [`StatementKind`].
+    #[must_use]
+    pub fn with_statement_kind(mut self, statement_kind: StatementKind) -> Self {
+        self.statement_kind = statement_kind;
+        self
+    }
+
     /// Attaches the values written back through output binds.
     #[must_use]
     pub fn with_out_values(mut self, out_values: OutValues) -> Self {
         self.out_values = out_values;
-        self
-    }
-
-    /// Attaches result sets the statement returned implicitly.
-    #[must_use]
-    pub fn with_implicit_results(mut self, implicit_results: Vec<Box<dyn Cursor>>) -> Self {
-        self.implicit_results = implicit_results;
         self
     }
 
@@ -712,15 +876,26 @@ impl ExecutionOutcome {
         self.cursor.take()
     }
 
-    /// Takes the implicitly returned result sets out of the outcome.
-    pub fn take_implicit_results(&mut self) -> Vec<Box<dyn Cursor>> {
-        std::mem::take(&mut self.implicit_results)
-    }
-
     /// How many rows the statement changed, if the driver reported it.
     #[must_use]
     pub const fn rows_affected(&self) -> Option<u64> {
         self.rows_affected
+    }
+
+    /// What kind of statement the server ran, as far as the driver can tell.
+    #[must_use]
+    pub const fn statement_kind(&self) -> StatementKind {
+        self.statement_kind
+    }
+
+    /// Whether the server committed the open transaction as a side effect of
+    /// running this statement, whatever auto-commit said.
+    ///
+    /// `db-core` must reset its transaction tracking and tell the user; there
+    /// was nothing it could have done to prevent it. See [`StatementKind::Ddl`].
+    #[must_use]
+    pub const fn committed_implicitly(&self) -> bool {
+        self.statement_kind.commits_implicitly()
     }
 
     /// The values written back through output binds.
@@ -755,8 +930,8 @@ impl fmt::Debug for ExecutionOutcome {
         f.debug_struct("ExecutionOutcome")
             .field("has_cursor", &self.cursor.is_some())
             .field("rows_affected", &self.rows_affected)
+            .field("statement_kind", &self.statement_kind)
             .field("out_values", &self.out_values)
-            .field("implicit_results", &self.implicit_results.len())
             .field("warnings", &self.warnings)
             .finish()
     }
@@ -776,7 +951,7 @@ mod tests {
                 Some(text) => data.push(text),
                 None => {
                     data.push_null_placeholder();
-                    nulls.set_null(row);
+                    nulls.set_null(row).expect("row is in range");
                 }
             }
         }
@@ -786,6 +961,10 @@ mod tests {
     struct EmptyLob;
 
     impl LobStream for EmptyLob {
+        fn connection_id(&self) -> ConnectionId {
+            ConnectionId::from_raw(3)
+        }
+
         fn kind(&self) -> LobKind {
             LobKind::Binary
         }
@@ -799,24 +978,50 @@ mod tests {
         }
     }
 
+    fn lob_column(rows: &[bool]) -> Column {
+        let mut values = Vec::with_capacity(rows.len());
+        let mut nulls = NullMask::new(rows.len());
+        for (row, present) in rows.iter().enumerate() {
+            if *present {
+                values.push(Some(LobLocator::new(Box::new(EmptyLob))));
+            } else {
+                values.push(None);
+                nulls.set_null(row).expect("row is in range");
+            }
+        }
+        Column::new(ColumnData::Lob(values), nulls).expect("lengths match")
+    }
+
     #[test]
     fn null_mask_tracks_individual_rows() {
         let mut mask = NullMask::new(130);
         assert!(!mask.is_empty());
-        assert_eq!(mask.null_count(), 0);
-        mask.set_null(0);
-        mask.set_null(63);
-        mask.set_null(64);
-        mask.set_null(129);
-        mask.set_null(500); // out of range, ignored
+        for row in [0, 63, 64, 129] {
+            mask.set_null(row).expect("row is in range");
+        }
         assert!(mask.is_null(0));
         assert!(mask.is_null(63));
         assert!(mask.is_null(64));
         assert!(mask.is_null(129));
         assert!(!mask.is_null(1));
         assert!(!mask.is_null(130));
-        assert_eq!(mask.null_count(), 4);
         assert!(NullMask::new(0).is_empty());
+    }
+
+    #[test]
+    fn marking_a_row_outside_the_mask_is_reported_not_ignored() {
+        // Swallowing this used to turn a decoder bug into a batch whose NULLs
+        // silently read back as data.
+        let mut mask = NullMask::new(2);
+        let error = mask.set_null(2).expect_err("row 2 is out of range");
+        assert_eq!(error.kind(), ErrorKind::DriverInternal);
+        assert!(error.message().contains('2'), "{error}");
+        assert!(!mask.is_null(0), "a rejected call must not touch the mask");
+
+        let error = NullMask::new(0)
+            .set_null(0)
+            .expect_err("an empty mask has no rows at all");
+        assert_eq!(error.kind(), ErrorKind::DriverInternal);
     }
 
     #[test]
@@ -830,7 +1035,6 @@ mod tests {
         assert_eq!(column.get(1), Some(""));
         assert_eq!(column.get(2), Some("ข้อมูล"));
         assert_eq!(column.get(3), None);
-        assert_eq!(column.total_bytes(), "alpha".len() + "ข้อมูล".len());
         assert!(TextColumn::new().is_empty());
     }
 
@@ -842,7 +1046,6 @@ mod tests {
         assert_eq!(column.len(), 2);
         assert_eq!(column.get(0), Some(&[1_u8, 2, 3][..]));
         assert_eq!(column.get(1), Some(&[][..]));
-        assert_eq!(column.total_bytes(), 3);
     }
 
     #[test]
@@ -867,8 +1070,43 @@ mod tests {
         assert!(batch.value(1, 1).expect("cell exists").is_null());
         assert!(batch.value(2, 0).is_none(), "row out of range");
         assert!(batch.value(0, 2).is_none(), "column out of range");
-        assert_eq!(batch.column(1).map(Column::null_count), Some(1));
         assert_eq!(batch.column(1).map(Column::kind), Some(ColumnKind::Text));
+        assert_eq!(batch.column(1).map(|column| column.is_null(1)), Some(true));
+    }
+
+    #[test]
+    fn an_unsupported_column_keeps_the_rest_of_the_row_readable() {
+        // `SELECT *` over a table with an INTERVAL column must still return the
+        // other columns. It used to be a hard error for the whole fetch.
+        let mut rendering = TextColumn::with_capacity(2, 64);
+        rendering.push("+000000002 03:04:05.000000");
+        rendering.push_null_placeholder();
+        let mut nulls = NullMask::new(2);
+        nulls.set_null(1).expect("row is in range");
+
+        let unsupported =
+            Column::new(ColumnData::Unsupported(rendering), nulls).expect("lengths match");
+        let names = text_column(&[Some("a"), Some("b")]);
+        let batch = RowBatch::new(vec![names, unsupported]).expect("equal lengths");
+
+        assert_eq!(
+            batch.column(1).map(Column::kind),
+            Some(ColumnKind::Unsupported)
+        );
+        assert_eq!(
+            batch
+                .value(0, 1)
+                .and_then(|cell| cell.as_unsupported_text()),
+            Some("+000000002 03:04:05.000000")
+        );
+        // It is not text, and it is not NULL.
+        assert!(batch.value(0, 1).and_then(|cell| cell.as_str()).is_none());
+        assert!(!batch.value(0, 1).expect("cell exists").is_null());
+        // A genuine NULL in an unsupported column is still a NULL.
+        assert!(batch.value(1, 1).expect("cell exists").is_null());
+        // The supported columns are unaffected, which is the whole point.
+        assert_eq!(batch.value(0, 0).and_then(|cell| cell.as_str()), Some("a"));
+        assert_eq!(batch.value(1, 0).and_then(|cell| cell.as_str()), Some("b"));
     }
 
     #[test]
@@ -893,11 +1131,9 @@ mod tests {
     }
 
     #[test]
-    fn taking_a_lob_removes_it_from_the_batch() {
-        let column = Column::not_null(ColumnData::Lob(vec![Some(LobLocator::new(Box::new(
-            EmptyLob,
-        )))]));
-        let mut batch = RowBatch::new(vec![column]).expect("single column");
+    fn a_consumed_lob_is_distinguishable_from_sql_null() {
+        // Row 0 holds a LOB, row 1 is SQL NULL.
+        let mut batch = RowBatch::new(vec![lob_column(&[true, false])]).expect("single column");
 
         assert!(
             batch
@@ -905,6 +1141,7 @@ mod tests {
                 .and_then(|cell| cell.as_lob().map(LobLocator::kind))
                 .is_some()
         );
+        assert!(batch.value(1, 0).expect("cell exists").is_null());
 
         let taken = batch
             .column_mut(0)
@@ -912,7 +1149,21 @@ mod tests {
             .expect("locator present");
         assert_eq!(taken.kind(), LobKind::Binary);
 
-        assert!(batch.value(0, 0).expect("cell exists").is_null());
+        // The row is now "taken", NOT null: the database did hold a value, and
+        // an exporter re-reading the batch must not write an empty cell.
+        let cell = batch.value(0, 0).expect("cell exists");
+        assert!(!cell.is_null(), "a consumed LOB must not impersonate NULL");
+        assert!(cell.is_taken());
+        assert_eq!(batch.column(0).map(|column| column.is_taken(0)), Some(true));
+        assert_eq!(batch.column(0).map(|column| column.is_null(0)), Some(false));
+
+        // The genuinely NULL row is untouched and is still NULL, not "taken".
+        assert!(batch.value(1, 0).expect("cell exists").is_null());
+        assert_eq!(
+            batch.column(0).map(|column| column.is_taken(1)),
+            Some(false)
+        );
+
         assert!(
             batch
                 .column_mut(0)
@@ -920,12 +1171,21 @@ mod tests {
                 .is_none(),
             "a locator can only be taken once"
         );
+        assert!(
+            batch
+                .column_mut(0)
+                .and_then(|column| column.take_lob(1))
+                .is_none(),
+            "there is nothing to take from a SQL NULL row"
+        );
     }
 
     #[test]
     fn take_lob_only_applies_to_lob_columns() {
         let mut column = Column::not_null(ColumnData::Boolean(vec![true]));
         assert!(column.take_lob(0).is_none());
+        assert!(!column.is_taken(0));
+        assert!(!column.is_taken(99));
     }
 
     #[test]
@@ -949,6 +1209,7 @@ mod tests {
     fn execution_outcome_reports_compilation_warnings() {
         let outcome = ExecutionOutcome::new()
             .with_rows_affected(0)
+            .with_statement_kind(StatementKind::PlSqlBlock)
             .with_warnings(vec![
                 Warning::new(WarningKind::CompiledWithErrors, "package body has errors")
                     .with_native(NativeError::new(
@@ -969,6 +1230,53 @@ mod tests {
         );
         assert!(outcome.out_values().is_empty());
         assert!(format!("{outcome:?}").contains("has_cursor: false"));
+    }
+
+    #[test]
+    fn a_driver_that_cannot_classify_a_warning_still_reports_it() {
+        // The primary driver's upstream exposes warnings as a bare `String`, so
+        // classification may be text-based. `Informational` is where an
+        // unclassifiable warning goes; without it a driver would have to drop
+        // the warning or mislabel it as a compilation failure.
+        let outcome = ExecutionOutcome::new().with_warnings(vec![Warning::new(
+            WarningKind::Informational,
+            "ORA-24344: success with compilation error",
+        )]);
+        assert_eq!(outcome.warnings().len(), 1);
+        assert_eq!(outcome.warnings()[0].kind(), WarningKind::Informational);
+        assert!(
+            !outcome.compiled_with_errors(),
+            "an unclassified warning must not be promoted to a compilation failure"
+        );
+    }
+
+    #[test]
+    fn ddl_reports_the_commit_the_contract_cannot_forbid() {
+        // `SPEC.md` §10 forbids Reldex committing silently. A server that
+        // commits around DDL whatever the client asked for is not something the
+        // contract can prevent — so it reports it and the user gets told.
+        let ddl = ExecutionOutcome::new().with_statement_kind(StatementKind::Ddl);
+        assert_eq!(ddl.statement_kind(), StatementKind::Ddl);
+        assert!(ddl.committed_implicitly());
+
+        for kind in [
+            StatementKind::Query,
+            StatementKind::Dml,
+            StatementKind::PlSqlBlock,
+            StatementKind::TransactionControl,
+            StatementKind::SessionControl,
+            StatementKind::Other,
+        ] {
+            let outcome = ExecutionOutcome::new().with_statement_kind(kind);
+            assert!(!outcome.committed_implicitly(), "{kind:?}");
+        }
+
+        // A driver that cannot classify says so, and the core stays cautious.
+        assert_eq!(StatementKind::default(), StatementKind::Other);
+        assert!(ExecutionOutcome::new().statement_kind() == StatementKind::Other);
+        assert!(StatementKind::Other.transaction_state_is_unpredictable());
+        assert!(StatementKind::PlSqlBlock.transaction_state_is_unpredictable());
+        assert!(!StatementKind::Query.transaction_state_is_unpredictable());
     }
 
     #[test]

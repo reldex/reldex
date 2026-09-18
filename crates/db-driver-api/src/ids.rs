@@ -1,8 +1,13 @@
 //! Typed identifiers used across the driver boundary (ADR-0002 D7).
 //!
 //! Nothing crosses a layer as a bare integer or a bare string: a connection id
-//! cannot be passed where a statement id is expected, and a savepoint name is
+//! cannot be passed where a result-set id is expected, and a savepoint name is
 //! validated before a driver can interpolate it into SQL.
+//!
+//! Only the two identifiers the *contract itself* uses live here. A session id
+//! belongs to `db-core`, which owns sessions, and a statement id would be a
+//! `db-core` concept too — neither appears in any signature below the driver
+//! boundary, so neither is defined here (ADR-0002, amendment C1).
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,20 +56,12 @@ macro_rules! sequential_id {
 
 sequential_id! {
     /// Identifies one physical/logical connection produced by a driver.
-    ConnectionId
-}
-
-sequential_id! {
-    /// Identifies one worksheet-owned session in `db-core`.
     ///
-    /// Defined here so the driver contract and the core agree on the type, even
-    /// though the driver contract itself stops at [`ConnectionId`].
-    SessionId
-}
-
-sequential_id! {
-    /// Identifies one submitted statement execution.
-    StatementId
+    /// Every object derived from a connection — a [`crate::Cursor`], a
+    /// [`crate::LobLocator`] — reports the id of the connection that owns it, so
+    /// `db-core` can assert that a handle is only ever used on that connection's
+    /// worker thread (ADR-0002 D2).
+    ConnectionId
 }
 
 sequential_id! {
@@ -174,16 +171,16 @@ mod tests {
         assert_ne!(a, b);
         assert!(b.get() > a.get());
 
-        // Distinct sequences: a StatementId is not comparable with a ConnectionId,
-        // which is the point of the newtypes.
-        let s = StatementId::allocate();
-        assert_eq!(StatementId::from_raw(s.get()), s);
+        // Distinct sequences: a ResultSetId is not comparable with a
+        // ConnectionId, which is the point of the newtypes.
+        let r = ResultSetId::allocate();
+        assert_eq!(ResultSetId::from_raw(r.get()), r);
     }
 
     #[test]
     fn ids_display_with_their_type_name() {
         assert_eq!(ResultSetId::from_raw(7).to_string(), "ResultSetId#7");
-        assert_eq!(SessionId::from_raw(1).to_string(), "SessionId#1");
+        assert_eq!(ConnectionId::from_raw(1).to_string(), "ConnectionId#1");
     }
 
     #[test]

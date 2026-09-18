@@ -99,6 +99,11 @@ impl fmt::Display for ErrorKind {
 /// The driver reports this; the core never infers it. `SPEC.md` §18 forbids
 /// silently replacing a lost transactional session, so this value drives whether
 /// the core revalidates, or surfaces the loss to the user.
+///
+/// Deliberately **not** `#[non_exhaustive]`: it is a closed three-state ladder
+/// (fine / check it / gone) and `db-core` must handle every rung explicitly.
+/// Exhaustive matching is the point — a new state would be a semantic change
+/// that every call site has to revisit anyway (ADR-0002, amendment S1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SessionState {
     /// The session is known to be usable; the failure was confined to the call.
@@ -110,6 +115,36 @@ pub enum SessionState {
     /// The session is gone. Any transaction it held is lost and must be
     /// surfaced, never silently re-established.
     Lost,
+}
+
+impl SessionState {
+    /// The state a failure of `kind` implies before the driver says otherwise.
+    ///
+    /// [`DbError::new`] applies this, so an error built by a driver that forgets
+    /// to call [`DbError::with_session_state`] still errs on the safe side:
+    ///
+    /// - [`ErrorKind::NetworkLost`] — the session is [`SessionState::Lost`].
+    /// - [`ErrorKind::Connection`], [`ErrorKind::Timeout`],
+    ///   [`ErrorKind::Cancelled`] and [`ErrorKind::DriverInternal`] — the
+    ///   connection may be mid-protocol, so [`SessionState::NeedsValidation`].
+    /// - everything else — [`SessionState::Usable`]: the failure was a
+    ///   server-side rejection of one statement, which does not disturb the
+    ///   session.
+    ///
+    /// A driver that knows better overrides it with
+    /// [`DbError::with_session_state`]; that is the only way to *narrow* the
+    /// default, and doing so is a deliberate claim.
+    #[must_use]
+    pub const fn initial_for(kind: ErrorKind) -> Self {
+        match kind {
+            ErrorKind::NetworkLost => Self::Lost,
+            ErrorKind::Connection
+            | ErrorKind::Timeout
+            | ErrorKind::Cancelled
+            | ErrorKind::DriverInternal => Self::NeedsValidation,
+            _ => Self::Usable,
+        }
+    }
 }
 
 /// A native database error, preserved verbatim for diagnostics.
@@ -156,45 +191,81 @@ impl fmt::Display for NativeError {
 /// Every field is optional because drivers report different things: a SQL parse
 /// error usually yields an offset, a PL/SQL compilation error a line and column.
 /// This is what later maps compile errors to editor positions (`TASKS.md` P2).
+///
+/// # The offset is counted in characters, not bytes
+///
+/// Servers report parse-error offsets in **characters** of the statement text,
+/// so this type stores a character offset and says so in the name. Getting this
+/// wrong is not theoretical: `SPEC.md` §14 requires Thai data and Thai
+/// identifiers to work, and every non-ASCII character makes the byte offset and
+/// the character offset diverge.
+///
+/// A driver reports what the server gave it. The editor, which indexes bytes,
+/// converts once with [`SqlPosition::byte_offset_in`] against the exact text
+/// that was submitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct SqlPosition {
-    byte_offset: Option<u32>,
+    char_offset: Option<u32>,
     line: Option<u32>,
     column: Option<u32>,
 }
 
 impl SqlPosition {
-    /// A position given as a zero-based byte offset into the statement text.
+    /// A position given as a zero-based **character** offset into the statement
+    /// text: the number of Unicode scalar values (Rust `char`s) that precede it.
     #[must_use]
-    pub const fn at_offset(byte_offset: u32) -> Self {
+    pub const fn at_char_offset(char_offset: u32) -> Self {
         Self {
-            byte_offset: Some(byte_offset),
+            char_offset: Some(char_offset),
             line: None,
             column: None,
         }
     }
 
     /// A position given as a one-based line and column.
+    ///
+    /// The column is counted in characters, for the same reason as
+    /// [`SqlPosition::at_char_offset`].
     #[must_use]
     pub const fn at_line_column(line: u32, column: u32) -> Self {
         Self {
-            byte_offset: None,
+            char_offset: None,
             line: Some(line),
             column: Some(column),
         }
     }
 
-    /// Adds a zero-based byte offset to an existing position.
+    /// Zero-based character offset into the submitted statement text, if known.
     #[must_use]
-    pub const fn with_offset(mut self, byte_offset: u32) -> Self {
-        self.byte_offset = Some(byte_offset);
-        self
+    pub const fn char_offset(self) -> Option<u32> {
+        self.char_offset
     }
 
-    /// Zero-based byte offset into the submitted statement text, if known.
+    /// Resolves the character offset to a byte offset within `sql`.
+    ///
+    /// `sql` must be the exact text that was submitted. Returns `None` when no
+    /// character offset was reported, or when the offset is past the end of
+    /// `sql` — which means the driver and the text disagree, and the caller must
+    /// not guess.
+    ///
+    /// ```
+    /// use reldex_db_driver_api::SqlPosition;
+    ///
+    /// let sql = "SELECT 'ข้อมูล' FROM nosuchtable";
+    /// let byte = SqlPosition::at_char_offset(16)
+    ///     .byte_offset_in(sql)
+    ///     .expect("offset is inside the statement");
+    ///
+    /// assert_eq!(&sql[byte..byte + 4], "FROM");
+    /// assert_ne!(byte, 16, "the two units diverge as soon as the text is not ASCII");
+    /// ```
     #[must_use]
-    pub const fn byte_offset(self) -> Option<u32> {
-        self.byte_offset
+    pub fn byte_offset_in(self, sql: &str) -> Option<usize> {
+        let target = self.char_offset? as usize;
+        sql.char_indices()
+            .nth(target)
+            .map(|(byte_offset, _)| byte_offset)
+            .or_else(|| (sql.chars().count() == target).then_some(sql.len()))
     }
 
     /// One-based line number, if known.
@@ -212,16 +283,16 @@ impl SqlPosition {
     /// Whether the position carries any information at all.
     #[must_use]
     pub const fn is_empty(self) -> bool {
-        self.byte_offset.is_none() && self.line.is_none() && self.column.is_none()
+        self.char_offset.is_none() && self.line.is_none() && self.column.is_none()
     }
 }
 
 impl fmt::Display for SqlPosition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (self.line, self.column, self.byte_offset) {
+        match (self.line, self.column, self.char_offset) {
             (Some(line), Some(column), _) => write!(f, "line {line}, column {column}"),
             (Some(line), None, _) => write!(f, "line {line}"),
-            (None, _, Some(offset)) => write!(f, "offset {offset}"),
+            (None, _, Some(offset)) => write!(f, "character offset {offset}"),
             (None, _, None) => f.write_str("unknown position"),
         }
     }
@@ -236,11 +307,16 @@ impl fmt::Display for SqlPosition {
 ///
 /// let err = DbError::new(ErrorKind::Syntax, "table or view does not exist")
 ///     .with_native(NativeError::new(942, "ORA-00942: table or view does not exist"))
-///     .with_position(SqlPosition::at_offset(14))
-///     .with_session_state(SessionState::Usable);
+///     .with_position(SqlPosition::at_char_offset(14));
 ///
 /// assert_eq!(err.kind(), ErrorKind::Syntax);
 /// assert_eq!(err.native().map(NativeError::code), Some(942));
+/// // A syntax error does not disturb the session, so the derived default says so.
+/// assert_eq!(err.session_state(), SessionState::Usable);
+///
+/// // A lost network does, without the driver having to remember to say it.
+/// let lost = DbError::new(ErrorKind::NetworkLost, "connection reset");
+/// assert_eq!(lost.session_state(), SessionState::Lost);
 /// ```
 #[derive(Debug)]
 pub struct DbError {
@@ -258,11 +334,17 @@ pub struct DbError {
 
 impl DbError {
     /// Creates an error with a vendor-neutral, credential-free message.
+    ///
+    /// `session_state` starts at [`SessionState::initial_for`] the kind, not at
+    /// [`SessionState::Usable`]: a driver that forgets to classify the session
+    /// then under-reports nothing, and `SPEC.md` §18's "never silently replace a
+    /// lost transactional session" does not depend on every driver remembering
+    /// one builder call. Override with [`DbError::with_session_state`].
     #[must_use]
     pub fn new(kind: ErrorKind, message: impl Into<Box<str>>) -> Self {
         Self {
             kind,
-            session_state: SessionState::Usable,
+            session_state: SessionState::initial_for(kind),
             retryable: false,
             message: message.into(),
             native: None,
@@ -274,9 +356,10 @@ impl DbError {
     /// Shorthand for an [`ErrorKind::Cancelled`] error.
     ///
     /// This is what a blocked call returns after a successful cancellation
-    /// request (ADR-0002 D2). `session_state` defaults to
-    /// [`SessionState::Usable`]; a driver using the call-timeout fallback must
-    /// override it with [`SessionState::NeedsValidation`].
+    /// request (ADR-0002 D2). `session_state` therefore starts at
+    /// [`SessionState::NeedsValidation`], because a cancelled call may have left
+    /// the connection mid-exchange. A driver that can prove the session is clean
+    /// narrows it with [`DbError::with_session_state`].
     #[must_use]
     pub fn cancelled() -> Self {
         Self::new(ErrorKind::Cancelled, "operation cancelled")
@@ -295,6 +378,25 @@ impl DbError {
     #[must_use]
     pub fn internal(message: impl Into<Box<str>>) -> Self {
         Self::new(ErrorKind::DriverInternal, message)
+    }
+
+    /// The error every connection-derived handle returns once its connection has
+    /// been closed.
+    ///
+    /// `handle` names the kind of object for diagnostics ("cursor", "LOB
+    /// stream"). Using a [`crate::Cursor`] or [`crate::LobStream`] after
+    /// [`DatabaseConnection::close`](crate::DatabaseConnection::close) is a
+    /// `db-core` bug, but the driver must report it rather than panic or block
+    /// on a connection that no longer exists (ADR-0002 D2, handle lifecycle).
+    /// The session is [`SessionState::Lost`] because it is, by construction,
+    /// gone.
+    #[must_use]
+    pub fn connection_closed(handle: &str) -> Self {
+        Self::new(
+            ErrorKind::DriverInternal,
+            format!("{handle} was used after its connection was closed"),
+        )
+        .with_session_state(SessionState::Lost)
     }
 
     /// Attaches the preserved native database error.
@@ -438,13 +540,68 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_helper_reports_cancellation() {
+    fn session_state_is_derived_from_the_kind_not_assumed_usable() {
+        // Every kind, so a new variant cannot quietly inherit "Usable".
+        let expected = [
+            (ErrorKind::Configuration, SessionState::Usable),
+            (ErrorKind::Connection, SessionState::NeedsValidation),
+            (ErrorKind::Authentication, SessionState::Usable),
+            (ErrorKind::NetworkLost, SessionState::Lost),
+            (ErrorKind::Timeout, SessionState::NeedsValidation),
+            (ErrorKind::Cancelled, SessionState::NeedsValidation),
+            (ErrorKind::Syntax, SessionState::Usable),
+            (ErrorKind::Constraint, SessionState::Usable),
+            (ErrorKind::Permission, SessionState::Usable),
+            (ErrorKind::Transaction, SessionState::Usable),
+            (ErrorKind::Resource, SessionState::Usable),
+            (ErrorKind::DataConversion, SessionState::Usable),
+            (ErrorKind::Unsupported, SessionState::Usable),
+            (ErrorKind::DriverInternal, SessionState::NeedsValidation),
+            (ErrorKind::Other, SessionState::Usable),
+        ];
+
+        for (kind, state) in expected {
+            assert_eq!(SessionState::initial_for(kind), state, "{kind}");
+            assert_eq!(
+                DbError::new(kind, "message").session_state(),
+                state,
+                "DbError::new did not apply the derived state for {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_driver_may_still_override_the_derived_session_state() {
+        let narrowed = DbError::new(
+            ErrorKind::Timeout,
+            "call timed out before any bytes were sent",
+        )
+        .with_session_state(SessionState::Usable);
+        assert_eq!(narrowed.session_state(), SessionState::Usable);
+        assert!(!narrowed.session_may_be_unusable());
+
+        let widened = DbError::new(ErrorKind::Syntax, "socket died mid-parse")
+            .with_session_state(SessionState::Lost);
+        assert_eq!(widened.session_state(), SessionState::Lost);
+    }
+
+    #[test]
+    fn cancelled_helper_reports_cancellation_and_a_suspect_session() {
         let err = DbError::cancelled();
         assert!(err.is_cancelled());
         assert_eq!(err.kind(), ErrorKind::Cancelled);
+        // A cancel may leave the connection mid-exchange, so this is the default
+        // rather than something each driver has to remember.
+        assert_eq!(err.session_state(), SessionState::NeedsValidation);
+        assert!(err.session_may_be_unusable());
+    }
 
-        let timed_out = DbError::cancelled().with_session_state(SessionState::NeedsValidation);
-        assert!(timed_out.session_may_be_unusable());
+    #[test]
+    fn a_handle_used_after_its_connection_closed_reports_a_lost_session() {
+        let err = DbError::connection_closed("cursor");
+        assert_eq!(err.kind(), ErrorKind::DriverInternal);
+        assert_eq!(err.session_state(), SessionState::Lost);
+        assert!(err.to_string().contains("cursor"), "{err}");
     }
 
     #[test]
@@ -493,16 +650,49 @@ mod tests {
 
     #[test]
     fn sql_position_renders_the_most_useful_form() {
-        assert_eq!(SqlPosition::at_offset(12).to_string(), "offset 12");
+        assert_eq!(
+            SqlPosition::at_char_offset(12).to_string(),
+            "character offset 12"
+        );
         assert_eq!(
             SqlPosition::at_line_column(2, 7).to_string(),
             "line 2, column 7"
         );
-        assert_eq!(
-            SqlPosition::at_line_column(2, 7).with_offset(30).line(),
-            Some(2)
-        );
+        assert_eq!(SqlPosition::at_char_offset(12).char_offset(), Some(12));
+        assert_eq!(SqlPosition::at_line_column(2, 7).char_offset(), None);
         assert!(SqlPosition::default().is_empty());
+        assert_eq!(SqlPosition::default().to_string(), "unknown position");
+    }
+
+    #[test]
+    fn character_offsets_resolve_correctly_through_non_ascii_sql() {
+        // `SPEC.md` §14: Thai text is a supported, ordinary case. A server
+        // reports the offset in characters; the editor indexes bytes.
+        let sql = "SELECT 'ข้อมูลพนักงาน' FROM nosuchtable";
+        let byte_of_from = sql.find("FROM").expect("FROM is present");
+        let chars_before_from = sql[..byte_of_from].chars().count();
+        assert_ne!(
+            chars_before_from, byte_of_from,
+            "the test text must actually distinguish the two units"
+        );
+
+        let position =
+            SqlPosition::at_char_offset(u32::try_from(chars_before_from).expect("fits in u32"));
+        assert_eq!(position.byte_offset_in(sql), Some(byte_of_from));
+
+        // Offset zero and offset "one past the end" both resolve; anything
+        // beyond that means the driver and the text disagree.
+        assert_eq!(SqlPosition::at_char_offset(0).byte_offset_in(sql), Some(0));
+        let char_count = u32::try_from(sql.chars().count()).expect("fits in u32");
+        assert_eq!(
+            SqlPosition::at_char_offset(char_count).byte_offset_in(sql),
+            Some(sql.len())
+        );
+        assert_eq!(
+            SqlPosition::at_char_offset(char_count + 1).byte_offset_in(sql),
+            None
+        );
+        assert_eq!(SqlPosition::at_line_column(1, 1).byte_offset_in(sql), None);
     }
 
     #[test]

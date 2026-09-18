@@ -47,9 +47,16 @@ pub enum SqlType {
     Cursor,
     /// A native type this contract cannot represent.
     ///
-    /// A driver must not silently coerce such a column into another family; it
-    /// reports `Unsupported` and fails the fetch with
-    /// [`crate::ErrorKind::Unsupported`] if the value is actually requested.
+    /// A driver must not silently coerce such a column into another family, and
+    /// it must not fail the fetch either: `SELECT *` over a table with one
+    /// `INTERVAL`, `ROWID`, `XMLType` or `VECTOR` column must still return the
+    /// other columns (`SPEC.md` §2 ranks correctness above convenience, and
+    /// refusing the whole result is neither).
+    ///
+    /// The driver reports `Unsupported` here, keeps the server's own type name
+    /// in [`ColumnMetadata::native_type_name`], and delivers the cells as
+    /// [`crate::ColumnData::Unsupported`] — a best-effort text rendering the UI
+    /// can show read-only.
     Unsupported,
 }
 
@@ -149,6 +156,12 @@ impl ColumnMetadata {
     }
 
     /// Records declared decimal precision and scale.
+    ///
+    /// For [`SqlType::Timestamp`] and [`SqlType::TimestampWithTimeZone`], the
+    /// `scale` slot carries the declared **fractional-seconds precision**
+    /// (`TIMESTAMP(6)` is `scale == 6`) — that is how servers report it, and a
+    /// separate field would be a second name for the same number. `precision`
+    /// is not meaningful for those types. See [`ColumnMetadata::scale`].
     #[must_use]
     pub fn with_precision_scale(mut self, precision: u8, scale: i8) -> Self {
         self.precision = Some(precision);
@@ -196,6 +209,11 @@ impl ColumnMetadata {
     }
 
     /// Declared decimal scale, if any.
+    ///
+    /// For [`SqlType::Timestamp`] and [`SqlType::TimestampWithTimeZone`] this is
+    /// the declared fractional-seconds precision (`0..=9`) rather than a decimal
+    /// scale. The declared [`ColumnMetadata::sql_type`] says which reading
+    /// applies; no other field changes meaning by type.
     #[must_use]
     pub const fn scale(&self) -> Option<i8> {
         self.scale
@@ -232,6 +250,29 @@ mod tests {
         assert_eq!(column.scale(), Some(2));
         assert_eq!(column.native_type_name(), Some("NUMBER(38,2)"));
         assert_eq!(column.max_size_bytes(), None);
+    }
+
+    #[test]
+    fn timestamp_scale_carries_fractional_seconds_precision() {
+        let column = ColumnMetadata::new("CREATED_AT", SqlType::TimestampWithTimeZone)
+            .with_precision_scale(0, 6)
+            .with_native_type_name("TIMESTAMP(6) WITH TIME ZONE");
+        assert_eq!(column.scale(), Some(6));
+        assert_eq!(
+            column.native_type_name(),
+            Some("TIMESTAMP(6) WITH TIME ZONE")
+        );
+    }
+
+    #[test]
+    fn unsupported_columns_keep_the_servers_own_type_name() {
+        let column = ColumnMetadata::new("SPAN", SqlType::Unsupported)
+            .with_native_type_name("INTERVAL DAY(2) TO SECOND(6)");
+        assert_eq!(column.sql_type(), SqlType::Unsupported);
+        assert_eq!(
+            column.native_type_name(),
+            Some("INTERVAL DAY(2) TO SECOND(6)")
+        );
     }
 
     #[test]
