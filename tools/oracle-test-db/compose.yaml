@@ -1,0 +1,43 @@
+# ---------------------------------------------------------------------------
+# tools/oracle-test-db/compose.yaml
+#
+# Local, disposable Oracle Database 19c (Single-Instance, Non-CDB) test
+# instance for Phase 0 driver integration tests. See README.md for full
+# usage, verified connection details, and limitations.
+#
+# Image: doctorkirk/oracle-19c:19.3 - a community image (not published or
+# maintained by Oracle) built from Oracle's official docker-images
+# SingleInstance 19.3 scripts. Pinned to the 19.3 tag deliberately; do not
+# move this to `latest`.
+# ---------------------------------------------------------------------------
+services:
+  oracle19c:
+    image: doctorkirk/oracle-19c:19.3
+    container_name: reldex-oracle19c
+    restart: "no"
+    stop_grace_period: 2m
+    shm_size: 1g
+    env_file:
+      - .env
+    environment:
+      ORACLE_SID: ${ORACLE_SID:-RELDEX}
+      ORACLE_PWD: ${ORACLE_PWD}
+      ORACLE_CHARACTERSET: ${ORACLE_CHARACTERSET:-AL32UTF8}
+    ports:
+      # Bind to loopback only - never expose the listener beyond this host.
+      - "127.0.0.1:1521:1521"
+    volumes:
+      - reldex-oracle19c-data:/opt/oracle/oradata
+      - ./init:/opt/oracle/scripts/setup:ro
+    healthcheck:
+      test: ["CMD", "/opt/oracle/checkDBStatus.sh"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      # First start runs DBCA (10-25 min on this hardware); give it generous
+      # headroom before the healthcheck is allowed to report unhealthy.
+      start_period: 30m
+
+volumes:
+  reldex-oracle19c-data:
+    name: reldex-oracle19c-data
