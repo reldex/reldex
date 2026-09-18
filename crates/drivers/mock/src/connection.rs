@@ -7,8 +7,8 @@ use std::time::Instant;
 
 use reldex_db_driver_api::{
     CancelHandle, CancelKind, CancelOutcome, Capabilities, ConnectionId, DatabaseConnection,
-    DatabaseDriver, DbError, DbResult, ErrorKind, ExecutionOutcome, SavepointName, SessionState,
-    Statement, StatementKind, TransactionState,
+    DatabaseDriver, DbError, DbResult, ErrorKind, ExecutionOutcome, OutValues, SavepointName,
+    SessionState, Statement, StatementKind, TransactionState, Value,
 };
 
 use crate::cursor::MockCursor;
@@ -335,6 +335,22 @@ impl MockConnection {
                     outcome = outcome.with_rows_affected(*rows_affected);
                 }
                 Ok(outcome)
+            }
+            Action::RefCursorOut { name, source } => {
+                let plan = self.resolve_query_source(source);
+                self.note_statement_kind(StatementKind::PlSqlBlock);
+                let cursor = MockCursor::new(
+                    self.id,
+                    plan,
+                    Arc::clone(&self.scenario),
+                    self.closed_flag(),
+                );
+                Ok(ExecutionOutcome::new()
+                    .with_statement_kind(StatementKind::PlSqlBlock)
+                    .with_out_values(OutValues::Named(vec![(
+                        name.as_str().into(),
+                        Value::Cursor(Box::new(cursor)),
+                    )])))
             }
             Action::Fail(error) => Err(error.build()),
             Action::Block(spec) => self.run_block(spec, statement),

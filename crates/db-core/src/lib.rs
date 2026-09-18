@@ -66,7 +66,8 @@ mod worker;
 
 pub use ids::SessionId;
 pub use session::{
-    CloseDisposition, CloseError, Completion, DatabaseSession, ExecuteOutcome, SessionManager,
+    CloseDisposition, CloseError, Completion, DatabaseSession, ExecuteOutcome, OutValue, OutValues,
+    SessionManager,
 };
 
 // Re-exported so most callers need only this crate for session-level work,

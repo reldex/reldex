@@ -15,8 +15,8 @@ use std::num::NonZeroUsize;
 
 use common::{connect, exec, exec_quietly, observation, query, render, scalar, unique};
 use reldex_db_driver_api::{
-    Bind, ErrorKind, NamedBind, OutBindSpec, OutValues, SqlType, Statement, StatementKind,
-    Timestamp, Value, ValueRef, WarningKind,
+    Bind, ErrorKind, NamedBind, OutBindSpec, OutValues, SessionState, SqlType, Statement,
+    StatementKind, Timestamp, Value, ValueRef, WarningKind,
 };
 
 #[test]
@@ -149,32 +149,65 @@ fn an_out_bind_can_be_executed_repeatedly_without_losing_its_value() {
     connection.close().expect("close");
 }
 
-#[test]
-fn a_ref_cursor_out_bind_is_fetched_while_the_parent_connection_stays_usable() {
-    let mut connection = connect();
+/// Creates the five-row table both REF CURSOR tests read.
+fn ref_cursor_table(connection: &mut dyn reldex_db_driver_api::DatabaseConnection) -> String {
     let table = unique("s5_rc");
     exec(
-        connection.as_mut(),
+        connection,
         &format!("CREATE TABLE {table} (id NUMBER(5), label VARCHAR2(20))"),
     );
     for id in 1..=5 {
         exec(
-            connection.as_mut(),
+            connection,
             &format!("INSERT INTO {table} VALUES ({id}, 'row {id}')"),
         );
     }
     connection.commit().expect("commit");
+    table
+}
 
-    let statement = Statement::new(format!(
+/// The statement that opens a REF CURSOR over `table` through an OUT bind.
+fn open_ref_cursor(table: &str) -> Statement {
+    Statement::new(format!(
         "BEGIN OPEN :rc FOR SELECT id, label FROM {table} ORDER BY id; END;"
     ))
-    .with_named_binds(vec![NamedBind::new("rc", Bind::output(SqlType::Cursor))]);
+    .with_named_binds(vec![NamedBind::new("rc", Bind::output(SqlType::Cursor))])
+}
 
-    let outcome = connection.execute(&statement).expect("open the ref cursor");
-    let value = outcome.out_values().named("rc").expect("the ref cursor");
-    let Value::Cursor(cursor) = value else {
+fn two() -> NonZeroUsize {
+    NonZeroUsize::new(2).expect("non-zero")
+}
+
+#[test]
+fn a_ref_cursor_out_bind_is_fetched_while_the_parent_connection_stays_usable() {
+    let mut connection = connect();
+    let table = ref_cursor_table(connection.as_mut());
+
+    let mut outcome = connection
+        .execute(&open_ref_cursor(&table))
+        .expect("open the ref cursor");
+
+    // Owning the cursor is what contract gap C-1 used to make impossible:
+    // `OutValues` exposed only `&Value`, and every useful `Cursor` method needs
+    // ownership. `take_named` moves it out and leaves `Value::Taken` behind.
+    let value = outcome
+        .out_values_mut()
+        .take_named("rc")
+        .expect("the ref cursor");
+    let Value::Cursor(mut cursor) = value else {
         panic!("expected a cursor out value, got {value:?}");
     };
+    assert!(
+        outcome
+            .out_values()
+            .named("rc")
+            .is_some_and(Value::is_taken),
+        "a consumed OUT value must read back as taken, never as NULL"
+    );
+    assert!(
+        outcome.out_values_mut().take_named("rc").is_none(),
+        "a live cursor must not be ownable twice"
+    );
 
     // The driver opened it and described it correctly.
     assert_eq!(cursor.columns().len(), 2);
@@ -190,26 +223,88 @@ fn a_ref_cursor_out_bind_is_fetched_while_the_parent_connection_stays_usable() {
             .collect::<Vec<_>>()
     ));
 
-    // **CONTRACT GAP.** Its rows cannot be read. `Cursor::fetch_batch` takes
-    // `&mut self` and `Cursor::close` takes `Box<Self>`, but the only route to
-    // an OUT value is `ExecutionOutcome::out_values() -> &OutValues` and
-    // `OutValues::named() -> Option<&Value>`. There is no
-    // `take_out_values`/`take_named`, so the `Box<dyn Cursor>` inside
-    // `Value::Cursor` can never be owned by the caller and the REF CURSOR is
-    // unusable end to end. `crates/db-driver-api` is frozen for this
-    // workstream, so this is recorded rather than patched; see
-    // `docs/exec-plans/active/phase-0-spike-results.md`.
-    //
-    // Everything below the missing accessor is already implemented and
-    // exercised by the equivalent select-list path, so the change needed is
-    // one method on `OutValues`, not a redesign.
-    let _unreadable_without_a_contract_change: Option<NonZeroUsize> = None;
-    let _ = render(ValueRef::Null);
+    // Fetch it in batches, and prove between every batch that the parent
+    // connection is still usable — the nested cursor and its connection share
+    // one session, so a driver that serialised them wrongly would deadlock or
+    // corrupt the protocol here rather than later.
+    let mut rows = Vec::new();
+    let mut batches = 0_usize;
+    loop {
+        let batch = cursor.fetch_batch(two()).expect("fetch a batch");
+        if batch.is_empty() {
+            break;
+        }
+        batches += 1;
+        assert!(batch.row_count() <= 2, "max_rows must bound the batch");
+        for row in 0..batch.row_count() {
+            rows.push((
+                render(batch.value(row, 0).unwrap_or(ValueRef::Null)),
+                render(batch.value(row, 1).unwrap_or(ValueRef::Null)),
+            ));
+        }
+        assert_eq!(
+            scalar(connection.as_mut(), "SELECT 42 FROM dual"),
+            "42",
+            "the parent connection must stay usable between nested fetches"
+        );
+        assert!(batches < 10, "fetch never reported exhaustion");
+    }
 
-    // The parent connection must still work afterwards.
+    assert_eq!(
+        rows,
+        (1..=5)
+            .map(|id| (id.to_string(), format!("row {id}")))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(batches, 3, "5 rows at 2 per batch is 2 + 2 + 1");
+    observation(format!(
+        "REF CURSOR delivered {} rows in {batches} batches of at most 2, with the \
+         parent connection answering a query between every batch",
+        rows.len()
+    ));
+
+    cursor.close().expect("closing a nested cursor");
     assert_eq!(scalar(connection.as_mut(), "SELECT 1 FROM dual"), "1");
     exec_quietly(connection.as_mut(), &format!("DROP TABLE {table} PURGE"));
     connection.close().expect("close");
+}
+
+#[test]
+fn a_ref_cursor_outliving_its_connection_reports_rather_than_panics() {
+    // ADR-0002 D2 "Lifecycle of derived handles": after the connection closes,
+    // every outstanding cursor reports `DbError` from every operation. A nested
+    // cursor is a derived handle like any other.
+    let mut connection = connect();
+    let table = ref_cursor_table(connection.as_mut());
+
+    let mut outcome = connection
+        .execute(&open_ref_cursor(&table))
+        .expect("open the ref cursor");
+    let Some(Value::Cursor(mut cursor)) = outcome.out_values_mut().take_named("rc") else {
+        panic!("expected a cursor out value");
+    };
+    assert_eq!(
+        cursor.fetch_batch(two()).expect("first batch").row_count(),
+        2
+    );
+
+    exec_quietly(connection.as_mut(), &format!("DROP TABLE {table} PURGE"));
+    connection.close().expect("close");
+
+    let error = cursor
+        .fetch_batch(two())
+        .expect_err("a cursor whose connection is gone must report, not fetch");
+    assert_eq!(error.kind(), ErrorKind::DriverInternal, "{error}");
+    assert_eq!(error.session_state(), SessionState::Lost, "{error}");
+    observation(format!("nested cursor after connection close: {error}"));
+    // `close` is the one call that stays legal after a failed fetch. This
+    // driver releases the server-side cursor by dropping the upstream handle,
+    // so there is nothing left to do and nothing that can fail — the same
+    // answer `a_cursor_outliving_its_connection_reports_rather_than_panics`
+    // records for a top-level cursor. What matters is that it does not panic.
+    cursor
+        .close()
+        .expect("closing a dead nested cursor is still fine");
 }
 
 #[test]

@@ -97,9 +97,16 @@ impl DatabaseDriver for OracleThinDriver {
         params: &reldex_db_driver_api::ConnectionParams,
     ) -> DbResult<Box<dyn DatabaseConnection>> {
         let config = build_config(params)?;
+        let allow_timestamp_with_time_zone = matches!(
+            params.extensions().get(EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE),
+            Some(ExtensionValue::Flag(true))
+        );
         let connection =
             oracledb::connect(config).map_err(|error| crate::error::map_connect(&error))?;
-        Ok(Box::new(OracleConnection::new(connection)))
+        Ok(Box::new(OracleConnection::new(
+            connection,
+            allow_timestamp_with_time_zone,
+        )))
     }
 }
 
@@ -161,6 +168,27 @@ fn build_config(params: &reldex_db_driver_api::ConnectionParams) -> DbResult<Con
 /// Extension key: the size of the driver's statement cache.
 pub const EXT_STATEMENT_CACHE_SIZE: &str = "oracle.statement_cache_size";
 
+/// Extension key: allow `TIMESTAMP WITH TIME ZONE` values to be decoded,
+/// accepting that one carrying a **named region** will abort the process.
+///
+/// Off by default, and the default is the whole point. `oracledb`
+/// 26.0.0-beta.3 decodes the region-encoded form of that type through a bare
+/// `todo!()` (`src/ora_type/timestamp.rs:238`, upstream defect U-3), and
+/// because that panic unwinds while the client mutex is held it becomes a
+/// process abort rather than a statement failure (U-4) — so no wrapper can
+/// contain it, `catch_unwind` included.
+///
+/// The two encodings cannot be told apart before the value is decoded: the
+/// region flag is a bit in the value's own wire bytes, which `oracledb` reads
+/// inside the round trip, and the column's describe metadata says only
+/// `TIMESTAMP WITH TIME ZONE`. So the choice is per **column**, not per value,
+/// and the safe side of it is to refuse the column. A plain-offset value would
+/// decode correctly (spike S2 proves it does), which is what this switch is for
+/// — but turning it on means any query that happens to touch a region-encoded
+/// value kills the application, which is not a trade a database tool should
+/// make for the user by default.
+pub const EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE: &str = "oracle.allow_timestamp_with_time_zone";
+
 /// The cancel handle for a connection.
 ///
 /// This driver is [`CancelKind::PreArmedDeadline`], so `request_cancel` sends
@@ -221,10 +249,12 @@ pub(crate) struct OracleConnection {
     cancel: Arc<OracleCancelHandle>,
     closed: Closed,
     transaction: TransactionState,
+    /// See [`EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE`].
+    allow_timestamp_with_time_zone: bool,
 }
 
 impl OracleConnection {
-    fn new(inner: Connection) -> Self {
+    fn new(inner: Connection, allow_timestamp_with_time_zone: bool) -> Self {
         Self {
             id: ConnectionId::allocate(),
             inner,
@@ -234,7 +264,45 @@ impl OracleConnection {
             // place besides a successful commit or rollback where the driver
             // claims to know.
             transaction: TransactionState::Inactive,
+            allow_timestamp_with_time_zone,
         }
+    }
+
+    /// Refuses an output bind this upstream version cannot decode without
+    /// risking the process.
+    ///
+    /// The OUT-bind path has no describe to inspect — the values come back
+    /// decoded in the execute response — so the only moment a
+    /// `TIMESTAMP WITH TIME ZONE` output can be refused is before the statement
+    /// runs, from the type the caller declared. See
+    /// [`EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE`].
+    fn check_out_bind_types(&self, statement: &Statement) -> DbResult<()> {
+        if self.allow_timestamp_with_time_zone {
+            return Ok(());
+        }
+        let refused = |spec: Option<OutBindSpec>| {
+            spec.is_some_and(|spec| spec.sql_type() == SqlType::TimestampWithTimeZone)
+        };
+        let found = match statement.binds() {
+            Binds::Positional(binds) => binds.iter().any(|bind| refused(bind.out_spec())),
+            Binds::Named(binds) => binds.iter().any(|bind| refused(bind.bind().out_spec())),
+            _ => false,
+        };
+        if found {
+            return Err(DbError::new(
+                ErrorKind::Unsupported,
+                format!(
+                    "an output bind of type TIMESTAMP WITH TIME ZONE is refused on \
+                     oracledb 26.0.0-beta.3: a value whose zone is a named region \
+                     reaches an unimplemented branch in the upstream decoder and takes \
+                     the whole process down with it, and the two forms cannot be told \
+                     apart before the value is decoded. Declare the bind as VARCHAR2 \
+                     and format it in PL/SQL, or set the connection extension \
+                     \"{EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE}\" to accept the risk"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn guard(&self) -> DbResult<()> {
@@ -313,10 +381,35 @@ impl OracleConnection {
         // Without this, `oracledb` materializes CLOB and BLOB values into the
         // row, which breaks `SPEC.md` §12's bounded-memory rule silently.
         prepared.fetch_lobs();
+        // **Describe before fetching.** With prefetch on, `oracledb` asks the
+        // server for rows in the same round trip as the execute and decodes
+        // them there — so by the time this driver can look at a single column
+        // type, every prefetched value has already been through the decoder.
+        // That is fatal rather than merely awkward: a `TIMESTAMP WITH TIME
+        // ZONE` carrying a named region hits a `todo!()` inside that decode and
+        // the panic becomes a process abort (U-3 with U-4), which no wrapper
+        // can contain. Asking for zero prefetched rows turns the execute into a
+        // describe, and `OracleCursor::new` then refuses the column before
+        // anything is decoded.
+        //
+        // The cost is one extra round trip on a *small* result — measured on
+        // the Phase 0 container as a 1.3 ms median for a one-row query against
+        // a 634 µs median `ping`, i.e. exactly one bare round trip
+        // (`describing_before_fetching_costs_about_one_extra_round_trip`). A
+        // large result pays nothing: `fetch_array_size` still sizes every
+        // fetch, so the same number of batches crosses the wire either way.
+        //
+        // It does move *where* a query blocks. A `SELECT`'s row source only
+        // runs when rows are asked for, so `execute` now returns as soon as the
+        // server has described the select list and the work — and any armed
+        // deadline — lands on the first `fetch_batch`. For a UI that is an
+        // improvement (the grid's columns are known immediately); for spike S4
+        // it means a long-running query has to be driven to its first batch to
+        // be observed running at all.
+        prepared.prefetch_rows(0);
         if let Some(rows) = statement.fetch_rows() {
             let rows = u32::try_from(rows.get()).unwrap_or(u32::MAX);
             prepared.fetch_array_size(rows);
-            prepared.prefetch_rows(rows);
         }
         let cursor = match names {
             Some(names) => {
@@ -327,7 +420,12 @@ impl OracleConnection {
         }
         .map_err(|error| crate::error::map(&error))?;
 
-        let cursor = OracleCursor::new(cursor, self.id, self.closed.clone())?;
+        let cursor = OracleCursor::new(
+            cursor,
+            self.id,
+            self.closed.clone(),
+            self.allow_timestamp_with_time_zone,
+        )?;
         Ok(ExecutionOutcome::new()
             .with_statement_kind(StatementKind::Query)
             .with_cursor(Box::new(cursor))
@@ -474,8 +572,16 @@ impl OracleConnection {
             }),
             SqlType::Cursor => take_out::<oracledb::Cursor>(row, slot)?
                 .map(|cursor| {
-                    OracleCursor::new(cursor, self.id, self.closed.clone())
-                        .map(|cursor| Value::Cursor(Box::new(cursor)))
+                    // A nested cursor never prefetches, so this describe-time
+                    // check runs before any of its values are decoded, exactly
+                    // as it does for a top-level cursor.
+                    OracleCursor::new(
+                        cursor,
+                        self.id,
+                        self.closed.clone(),
+                        self.allow_timestamp_with_time_zone,
+                    )
+                    .map(|cursor| Value::Cursor(Box::new(cursor)))
                 })
                 .transpose()?,
             other => {
@@ -526,6 +632,7 @@ impl DatabaseConnection for OracleConnection {
 
     fn execute(&mut self, statement: &Statement) -> DbResult<ExecutionOutcome> {
         self.guard()?;
+        self.check_out_bind_types(statement)?;
         let Classification {
             kind, returns_rows, ..
         } = classify(statement.sql());

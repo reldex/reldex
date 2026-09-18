@@ -10,6 +10,26 @@ use reldex_db_driver_api::{
 use crate::conn::Closed;
 use crate::value::{ColumnBuilder, ColumnPlan, column_metadata, plan_for};
 
+/// The refusal a `TIMESTAMP WITH TIME ZONE` column earns by default.
+///
+/// See [`OracleCursor::new`] and the crate documentation ("Known limitations").
+fn timestamp_with_time_zone_is_refused(column: &str) -> DbError {
+    DbError::new(
+        ErrorKind::Unsupported,
+        format!(
+            "column \"{column}\" is a TIMESTAMP WITH TIME ZONE, which this driver \
+             refuses to fetch on oracledb 26.0.0-beta.3: a value whose zone is a \
+             named region (for example TIMESTAMP '2026-01-01 00:00:00 Asia/Bangkok') \
+             reaches an unimplemented branch in the upstream decoder and takes the \
+             whole process down with it, and a region cannot be told from a plain \
+             offset before the value is decoded. Cast the column in the statement \
+             (TO_CHAR(c, 'YYYY-MM-DD HH24:MI:SS TZR')) to read it, or set the \
+             connection extension \"{allow}\" to accept the risk",
+            allow = crate::conn::EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE,
+        ),
+    )
+}
+
 /// A forward-only, batched result set over an `oracledb` cursor.
 pub(crate) struct OracleCursor {
     id: ResultSetId,
@@ -26,17 +46,30 @@ pub(crate) struct OracleCursor {
 }
 
 impl OracleCursor {
-    /// Wraps a cursor, rejecting select lists this contract cannot express.
+    /// Wraps a cursor, rejecting select lists this contract cannot express or
+    /// this upstream version cannot decode safely.
     ///
-    /// A cursor-typed *result column* (`SELECT CURSOR(SELECT …) FROM …`) is out
-    /// of scope for V1 and must be reported as
-    /// [`ErrorKind::Unsupported`] rather than silently dropped
-    /// (ADR-0002 lead decision 3). Every other unrepresentable type becomes a
-    /// text rendering instead, so one odd column never hides a whole table.
+    /// This runs on the **describe**, before a single value has been decoded:
+    /// `conn::execute_query` asks `oracledb` for zero prefetched rows so the
+    /// execute round trip returns column metadata only, and a nested cursor
+    /// never prefetches at all. That is what makes the two refusals below
+    /// possible rather than theoretical.
+    ///
+    /// - A cursor-typed *result column* (`SELECT CURSOR(SELECT …) FROM …`) is
+    ///   out of scope for V1 and must be reported as [`ErrorKind::Unsupported`]
+    ///   rather than silently dropped (ADR-0002 lead decision 3).
+    /// - A `TIMESTAMP WITH TIME ZONE` column is refused unless the caller opted
+    ///   in, because decoding one whose zone is a named region aborts the
+    ///   process (upstream U-3 compounded by U-4) and the two forms cannot be
+    ///   told apart before the decode happens.
+    ///
+    /// Every other unrepresentable type becomes a text rendering instead, so one
+    /// odd column never hides a whole table.
     pub(crate) fn new(
         inner: oracledb::Cursor,
         connection: ConnectionId,
         closed: Closed,
+        allow_timestamp_with_time_zone: bool,
     ) -> DbResult<Self> {
         let mut columns = Vec::with_capacity(inner.columns().len());
         let mut plans = Vec::with_capacity(inner.columns().len());
@@ -51,6 +84,11 @@ impl OracleCursor {
                         metadata.name()
                     ),
                 ));
+            }
+            if metadata.sql_type() == SqlType::TimestampWithTimeZone
+                && !allow_timestamp_with_time_zone
+            {
+                return Err(timestamp_with_time_zone_is_refused(metadata.name()));
             }
             plans.push(plan_for(meta.db_type()).1);
             columns.push(metadata);

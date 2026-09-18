@@ -7,6 +7,16 @@ that produced it, and every measurement says how it was taken.
 
 Where something failed, it is written down as a failure.
 
+> **Updated 2026-09-19, after the first run.** Two of the problems this
+> document recorded have been fixed and the fixes re-verified against the same
+> database: contract gap **C-1** (a REF CURSOR could not be consumed) is closed
+> by an additive change to `db-driver-api`, so **S5 now passes in full**; and
+> **U-3** (a named time-zone region aborts the process) has a mitigation after
+> all — the driver refuses `TIMESTAMP WITH TIME ZONE` on the describe, before
+> any value is decoded, so the crash becomes an ordinary error. The sections
+> below say what changed and what it cost. Contract gap **C-2** is fixed in
+> ADR-0002.
+
 ---
 
 ## 1. Environment
@@ -58,19 +68,32 @@ spike S8 has not run. The driver reports `tls = false` and refuses
 | Spike | Verdict | One-line summary |
 |---|---|---|
 | S1 connect / auth | **Pass** | Easy Connect and full descriptor both work; failures classify correctly |
-| S2 type fidelity | **Partial — two critical upstream defects** | Reads are exact, including Thai and non-BMP text; *binding* a NUMBER is unsafe and is now refused for the affected values |
+| S2 type fidelity | **Partial — three critical upstream defects** | Reads are exact, including Thai and non-BMP text; *binding* a NUMBER is unsafe and is now refused for the affected values, and `TIMESTAMP WITH TIME ZONE` is refused on the describe because one form of it aborts the process (U-3) |
 | S3 session / transaction | **Pass** | Auto-commit off, savepoints, DDL commit reporting and session isolation all behave |
 | S4 cancellation | **Fail for Reldex's requirement** | No mechanism stops a statement *and* keeps the session, in the general case |
-| S5 PL/SQL | **Partial** | Everything works except reading a REF CURSOR, which a contract gap blocks |
+| S5 PL/SQL | **Pass** | Everything works, REF CURSOR included, after the additive contract change C-1 |
 | S7 LOB streaming | **Pass** | 100 MB CLOB and BLOB streamed with +4.7 MB working set |
 | S9 concurrency | **Pass** | 8 concurrent sessions, 400 inserts, 283 ms |
 | S6, S8 | **Not run** | Out of scope for this workstream (S6 metadata) / no TLS listener (S8) |
 
-Test counts: **52 unit tests** and **1 documentation test** that need no
-database, and **40 integration tests** behind the `oracle-it` feature — 39 run
-and pass, 1 is `#[ignore]`d because it aborts the process (U-3). Full opt-in
-run: `s1_connect` 7, `s2_fidelity` 7 + 1 ignored, `s3_session` 6, `s4_cancel` 7,
-`s5_plsql` 9, `s7_lob_and_s9_concurrency` 3.
+Test counts (after the C-1 and U-3 changes): **52 unit tests** and **1
+documentation test** in this crate that need no database, and **44 integration
+tests** behind the `oracle-it` feature — 43 run and pass, 1 is `#[ignore]`d
+because it aborts the process on purpose, to record U-3 (it is the case the
+default refusal now prevents). Full opt-in run: `s1_connect` 7, `s2_fidelity`
+11 (10 + 1 ignored), `s3_session` 6, `s4_cancel` 7, `s5_plsql` 10,
+`s7_lob_and_s9_concurrency` 3.
+
+Across the workspace, DB-free: **199 tests and 10 documentation tests, all
+green** (`cargo test --workspace`).
+
+> **Run S4 with `--test-threads=1`.** Its seven tests include three long
+> cartesian joins, a `KILL SESSION` and a 20-second PL/SQL sleep; run in
+> parallel against this single-instance container they load the server enough
+> that the deadline-recovery outcome flips (see U-6, which is load-dependent by
+> construction). Serial runs are stable. This is pre-existing and not caused by
+> any change recorded here: it reproduces with the driver's pre-change fetch
+> path as well (three parallel runs, one failure).
 
 ---
 
@@ -134,8 +157,9 @@ affected values rather than storing them wrongly.
 | DATE, BC (`-0044-03-15`) | Pass | returned, not rejected |
 | DATE, `1500-02-29` (Julian) | Pass | returned, not rejected |
 | TIMESTAMP(9) | Pass | `2026-09-19T13:45:30.123456789` |
-| TIMESTAMP WITH TIME ZONE, numeric offset | Pass **after a driver fix** | `2026-09-19T13:45:30.123456789+07:00` |
-| TIMESTAMP WITH TIME ZONE, **named region** | **Fail (upstream)** | aborts the process; see U-3 |
+| TIMESTAMP WITH TIME ZONE, numeric offset | Pass **after a driver fix**, behind an opt-in | `2026-09-19T13:45:30.123456789+07:00` — read with the `oracle.allow_timestamp_with_time_zone` extension set, because the column is refused by default (U-3) |
+| TIMESTAMP WITH TIME ZONE, **named region** | **Refused, cleanly** | the column is refused on the describe with `ErrorKind::Unsupported`, before any value is decoded; decoding one still aborts the process upstream, which is what the refusal prevents. See U-3 |
+| TIMESTAMP WITH TIME ZONE, any form, by default | **Refused** | `a_timestamp_with_time_zone_column_is_refused_before_anything_is_fetched`; the session stays `Usable` and `TO_CHAR(c, '… TZR')` reads the value as text |
 | RAW | Pass | `00FF107F80DEADBEEF` byte-exact |
 | NULLs of 10 types | Pass | every nullable column reads back `ValueRef::Null` |
 | `INTERVAL DAY TO SECOND`, `INTERVAL YEAR TO MONTH`, `ROWID`, `TIMESTAMP WITH LOCAL TIME ZONE` | Pass | rendered as `ColumnData::Unsupported` text (`P3DT0H0M0.000000000S`, `P2Y6M`, `AAAACPAABAAAAWRAAA`, `2026-…Z`) with the server's own type name; the columns either side of them still arrive |
@@ -152,6 +176,9 @@ of this. Correctness was established by comparing against the server's own
 > (2) Precision and scale are no longer reported for character and binary
 > columns, where Oracle sends `0, 0` and passing it through stated a decimal
 > precision of zero rather than "none".
+> (3) **The driver now describes before it fetches** and refuses a
+> `TIMESTAMP WITH TIME ZONE` column, which is the U-3 mitigation; see U-3 for
+> what it costs and why it is per-column.
 
 ### S3 — session and transaction semantics — **Pass**
 
@@ -176,7 +203,7 @@ of this. Correctness was established by comparing against the server's own
 
 This is the spike the decision rests on. It is written up in full in §4.
 
-### S5 — PL/SQL — **Partial**
+### S5 — PL/SQL — **Pass**
 
 | Check | Verdict | Evidence |
 |---|---|---|
@@ -191,7 +218,10 @@ This is the spike the decision rests on. It is written up in full in §4.
 | PL/SQL compile error detected | Pass | `CREATE PROCEDURE` with a bad body → `compiled_with_errors() == true`, `WarningKind::CompiledWithErrors` |
 | `USER_ERRORS` lookup | Pass | `PLS-00201: identifier 'THIS_DOES_NOT_EXIST' must be declared` at line 1, column 34 |
 | Error position for a failing block | Pass | ORA-06550 → `SqlPosition` line 2, column 3 |
-| **REF CURSOR OUT bind** | **Partial — blocked by a contract gap** | the cursor is opened and described correctly (columns `ID`, `LABEL`, types right), but its rows cannot be read: see C-1 |
+| **REF CURSOR OUT bind** | **Pass**, after contract change C-1 | `a_ref_cursor_out_bind_is_fetched_while_the_parent_connection_stays_usable`: opened and described correctly (columns `ID`, `LABEL`, types right), then **fetched to exhaustion** — 5 rows in 3 batches of at most 2 — with the parent connection answering `SELECT 42 FROM dual` between every batch, then closed |
+| REF CURSOR, taken twice | Pass | the second `take_named("rc")` returns `None` and the slot reads back as `Value::Taken`, never as SQL NULL: one live cursor cannot be owned twice |
+| REF CURSOR after its connection closes | Pass | `a_ref_cursor_outliving_its_connection_reports_rather_than_panics`: `fetch_batch` returns `driver-internal: cursor was used after its connection was closed` with `SessionState::Lost`, and does not panic or touch the socket. `close` is a successful no-op, the same answer S1 records for a top-level cursor |
+| REF CURSOR through `DatabaseSession` | Pass | `crates/db-core/tests/out_values.rs` (mock driver): the nested cursor stays on the session's worker thread and surfaces as an ordinary `ResultSetId` |
 
 ### S7 — large-object streaming — **Pass**
 
@@ -252,6 +282,13 @@ Four candidates, evaluated in the order ADR-0001 sets out.
 
 *Tests:* `a_deadline_stops_a_long_sql_statement_and_the_session_survives`,
 `a_deadline_on_a_plsql_sleep_destroys_the_session`.
+
+> *Note added 2026-09-19.* Since the U-3 mitigation the driver describes before
+> it fetches, so a query's work — and therefore the moment its deadline fires —
+> is on the first `fetch_batch` rather than on `execute`; the SQL case above is
+> now driven through `run_to_first_batch`. The mechanism, the outcomes and the
+> numbers are unchanged. Note also that which outcome the SQL case produces is
+> **load-dependent** (see U-6): these measurements are from a serial run.
 
 The difference is explained by upstream's recovery path, and it is a defect
 (U-6). On a read timeout, `Client::receive_data_packet` calls
@@ -482,12 +519,79 @@ panicked at src/ora_type/timestamp.rs:238:17: not yet implemented
 
 and then, via U-4, the process aborts.
 
-*Mitigation:* **none is possible.** The driver cannot know in advance whether a
-`TIMESTAMP WITH TIME ZONE` column holds an offset or a region, and cannot
-contain the panic. Any Reldex user who selects such a column kills the
-application. The test that demonstrates it is `#[ignore]`d for exactly that
-reason (`a_named_time_zone_region_is_read_or_reported` in `s2_fidelity.rs`);
-run it alone with `--ignored`.
+#### Mitigation (revised 2026-09-19): refuse the column on the describe
+
+The first version of this section said "none is possible". That was wrong about
+the *timing*, and the correction matters: the panic can be avoided even though
+it cannot be contained.
+
+**What was checked, and ruled out.** Reading `oracledb` 26.0.0-beta.3's source:
+
+| Escape considered | Available? |
+|---|---|
+| A per-column fetch-type override / define-as-string | **No.** `Metadata::requires_define()` is hard-coded to the LOB family (`BLOB`, `CLOB`, `JSON`, `VECTOR`) and `define_metadata()` only rewrites those to `LONG`/`LONG RAW`. `Metadata`'s fields are private and there is no public setter, so a caller cannot ask for a column to arrive as anything else |
+| An output type handler | **No.** There is no such hook. The whole public statement surface is `exclude_from_cache`, `fetch_array_size`, `fetch_lobs`, `prefetch_rows` |
+| A parse-only describe | **No.** `ExecuteMessage`'s `parse_only` flag (which would set `TTC_EXEC_OPTION_DESCRIBE`) is always `false` and has no public setter |
+| A session setting that makes the server send offsets | **No.** The region-or-offset choice is a property of the **stored value** — the high bit of `buf[11]` — decided when the row was written. `ALTER SESSION SET TIME_ZONE` governs `TIMESTAMP WITH LOCAL TIME ZONE`, not what a stored `TIMESTAMP WITH TIME ZONE` sends |
+| Telling region from offset before decoding | **No.** The flag is in the value's own wire bytes, which `oracledb` reads inside the round trip; the column's describe metadata says only `TIMESTAMP WITH TIME ZONE`. The two forms can occur in the same column, in adjacent rows |
+| **Detecting the column from the describe, before fetching** | **Yes** — this is what is implemented |
+
+**What is implemented.** The driver asks `oracledb` for **zero prefetched rows**
+(`Statement::prefetch_rows(0)`) on every query. Without that, the execute round
+trip carries rows (default 2) and `oracledb` decodes them before the wrapper
+sees anything — so the abort happens before any check could run. With it, the
+execute is a describe: the column metadata arrives, no value has been decoded,
+and `OracleCursor::new` refuses a `TIMESTAMP WITH TIME ZONE` column with
+`ErrorKind::Unsupported`, naming the column and the documented `TO_CHAR(c,
+'… TZR')` escape. The session is untouched — `SessionState::Usable` — because
+nothing failed; a column was declined. A nested cursor from an OUT bind never
+prefetches at all, so it is covered by the same check. The OUT-bind path has no
+describe to inspect, so a bind *declared* `TIMESTAMP WITH TIME ZONE` is refused
+before the statement runs.
+
+**Why the refusal is per column, not per value.** It has to be. The decode
+happens inside `oracledb`'s response deserialization for the whole row, before
+the wrapper is given anything, so there is no point at which one cell could be
+reported as `Unsupported` while its neighbours arrive — the way an `INTERVAL`
+column is handled (ADR-0002 M1). By the time a per-value decision were possible
+the process is already gone.
+
+**The trade-off, stated plainly.** The offset-only form of the type decodes
+correctly and is proven to (the S2 row above). Refusing the column therefore
+gives up a capability that works, for values that are indistinguishable from
+ones that do not. That is the right side to be on for a database IDE — a clean
+error is recoverable, a process abort loses the user's uncommitted work in
+every other open worksheet as well — but it is a real loss and it is not
+pretended otherwise. A caller that knows its data holds only offsets can set
+the connection extension `oracle.allow_timestamp_with_time_zone`
+(`EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE`) and get the old behaviour, including the
+abort. Reldex itself must not set it by default.
+
+**What it costs.** One extra round trip on a *small* result: a one-row query
+takes a **1.3 ms** median against a **634 µs** median `ping` — that is, exactly
+one bare round trip more than before (`describing_before_fetching_costs_about_one_extra_round_trip`;
+20 iterations, median of the sorted samples). A large result pays **nothing**:
+`fetch_array_size` still sizes every fetch, so the same number of batches
+crosses the wire either way.
+
+It also moves *where* a query blocks. A `SELECT`'s row source only runs when
+rows are asked for, so `execute` now returns as soon as the server has
+described the select list, and the work — and any deadline armed through
+`Statement::with_deadline` — lands on the first `fetch_batch`. For the UI that
+is an improvement (the grid's columns are known immediately). For spike S4 it
+means a long-running query has to be driven to its first batch to be observed
+running at all, which is what `run_to_first_batch` in `s4_cancel.rs` now does;
+§4's findings and measurements are unchanged.
+
+*Evidence:* `a_timestamp_with_time_zone_column_is_refused_before_anything_is_fetched`
+and `a_timestamp_with_time_zone_output_bind_is_refused_before_the_statement_runs`
+in `s2_fidelity.rs`, both passing. The test that demonstrates the abort,
+`a_named_time_zone_region_is_read_or_reported`, is still in the suite and still
+`#[ignore]`d — it now turns the guard off deliberately, so it records both the
+upstream defect and what the default prevents. Run it alone with `--ignored`.
+
+*Still an upstream bug.* This is containment, not a fix: the type remains
+unreadable on `26.0.0-beta.3`, and issue C in §6 should still be submitted.
 
 ### U-4 — **Any panic inside a round trip becomes a process abort** (critical)
 
@@ -536,6 +640,16 @@ connection gone.
 duration of the recovery exchange.
 *Mitigation:* none available in the wrapper; the resulting error is mapped
 honestly as `NetworkLost` / `SessionState::Lost`.
+
+*Added 2026-09-19: which way it goes is **load-dependent**, by construction.*
+The outcome turns on whether the server answers the interrupt marker inside the
+remaining timeout window, so the same statement can end as `Timeout` with the
+session intact or as `NetworkLost` with the session gone depending on how busy
+the server is. Under the parallel S4 run against this single-instance
+container — three cartesian joins, a `KILL SESSION` and a 20-second sleep at
+once — both S4 deadline tests have been observed flipping. Serial runs
+(`--test-threads=1`) are stable and are what §4's measurements were taken from.
+Reldex cannot rely on a fired deadline leaving the session usable.
 
 ### U-7 — **A server-side cancel is not observed by the client**
 
@@ -782,33 +896,66 @@ See §4 candidate 3 and the drafted issue in §6.
 
 ## 7. Contract problems found in `reldex-db-driver-api`
 
-`crates/db-driver-api` is frozen for this workstream, so these are described
-rather than changed.
+The first run of these spikes found two; both are now **fixed**, with the lead's
+approval for the one that changed the contract. C-3 remains a note.
 
-### C-1 — a REF CURSOR cannot be consumed (blocking)
+### C-1 — a REF CURSOR could not be consumed (blocking) — **fixed**
 
-`ExecutionOutcome::out_values()` returns `&OutValues`, and `OutValues::named` /
-`OutValues::positional` return `Option<&Value>`. A `Value::Cursor` holds a
+`ExecutionOutcome::out_values()` returned `&OutValues`, and `OutValues::named` /
+`OutValues::positional` returned `Option<&Value>`. A `Value::Cursor` holds a
 `Box<dyn Cursor>`, and every useful method on `Cursor` needs ownership:
-`fetch_batch(&mut self)` and `close(self: Box<Self>)`. There is no
+`fetch_batch(&mut self)` and `close(self: Box<Self>)`. There was no
 `take_out_values`, no `out_values_mut`, and no `OutValues::take`. So a REF
-CURSOR OUT bind can be opened and *described* but never read — which makes
-`Capabilities::ref_cursor` unmeetable and `SPEC.md` §11 unimplementable.
+CURSOR OUT bind could be opened and *described* but never read — which made
+`Capabilities::ref_cursor` unmeetable and `SPEC.md` §11 unimplementable. The
+driver side was already implemented and working; only the accessor was missing.
 
-*Smallest fix:* add `ExecutionOutcome::take_out_values(&mut self) -> OutValues`
-(mirroring the existing `take_cursor`), or `OutValues::take_named(&mut self,
-name: &str) -> Option<Value>`. The driver side is already implemented and works;
-only the accessor is missing.
+*Fixed* by a small additive change to `db-driver-api`, recorded as ADR-0002
+amendment **P1**:
+
+```rust
+impl OutValues {
+    pub fn take_named(&mut self, name: &str) -> Option<Value>;
+    pub fn take_positional(&mut self, index: usize) -> Option<Value>;
+}
+impl ExecutionOutcome {
+    pub fn take_out_values(&mut self) -> OutValues;      // mirrors take_cursor
+    pub fn out_values_mut(&mut self) -> &mut OutValues;  // mirrors RowBatch::column_mut
+}
+enum Value { /* … */ Taken }                             // + Value::is_taken()
+```
+
+A consumed slot becomes `Value::Taken`, never `Value::Null` — the rule
+ADR-0002 M6 established for `Column::take_lob`, applied to output binds — and
+`take_out_values` leaves a same-shaped container of `Taken` slots rather than
+`OutValues::None`, so the outcome still reports which binds it had. Taking twice
+returns `None`, so one live cursor cannot be owned twice. Zero production
+dependencies, as before.
+
 *Evidence:* `a_ref_cursor_out_bind_is_fetched_while_the_parent_connection_stays_usable`
-in `s5_plsql.rs`, which documents the gap where the fetch would be.
+and `a_ref_cursor_outliving_its_connection_reports_rather_than_panics` in
+`s5_plsql.rs`, both passing against the live database; four new unit tests in
+`db-driver-api`; `crates/db-core/tests/out_values.rs` for the path through
+`DatabaseSession`.
 
-### C-2 — ADR-0002's driver notes describe a different upstream version
+### C-2 — ADR-0002's driver notes described a different upstream version — **fixed**
 
-The "notes for driver implementers" describe a structured upstream
+The "notes for driver implementers" described a structured upstream
 `DbError { code, offset }`. In `26.0.0-beta.3` the public type is
-`ErrorKind::DbError(String)` and the wire offset is discarded (U-8). The ADR
-should name the version it describes, and `SPEC.md` §24.14's "highlight the
-offending token" should be scoped to PL/SQL until U-8 is fixed upstream.
+`ErrorKind::DbError(String)` and the wire offset is discarded (U-8).
+
+*Fixed* in ADR-0002: the section now names the pinned version, every note is
+marked *confirmed* or *corrected* against it, the "re-verify on upgrade" marker
+is kept, and three further notes are added that a driver implementer needs
+(prefetch decodes rows during `execute`; a panic inside a round trip aborts the
+process; the `OracleNumber` encoder is unsafe for two families of value). Two
+notes besides the `DbError` one were wrong and are corrected: `Connection::execute`
+does **not** reject a query, it silently discards its rows; and a split surrogate
+pair in `Lob::read` cannot be repaired by "re-joining halves", because the whole
+read fails and returns nothing.
+
+`SPEC.md` §24.14's "highlight the offending token" still needs scoping to PL/SQL
+until U-8 is fixed upstream — that file is not owned by this task; see §9.
 
 ### C-3 — not a defect, but worth recording
 
@@ -851,9 +998,10 @@ asserts the same for connection parameters.
 | **S1** No pure-Rust path can authenticate against 19c | **GO** | Both connect forms authenticate; 119 ms median |
 | **S2** Silent NUMBER precision loss | **CONDITIONAL GO** | Reads are exact to 40 digits. Writes are **not** safe upstream (U-1): the driver refuses the affected values rather than corrupting them, so nothing is silent — but binding a decimal below 0.1 with an odd leading-zero count is impossible until upstream fixes it |
 | **S2** Thai / NCHAR corruption | **GO** | Byte-exact for Thai, non-BMP and mixed text, in `VARCHAR2`, `NVARCHAR2`, `CHAR`, `NCHAR` and `DBMS_OUTPUT`, with no NLS environment set |
+| **S2** `TIMESTAMP WITH TIME ZONE` (U-3) | **CONDITIONAL GO** (was: shipping blocker) | The type is no longer readable at all by default — the column is refused before anything is decoded, so the process cannot be killed by it. `TO_CHAR(c, '… TZR')` reads the value as text meanwhile. This is containment, not support: the type stays unusable until upstream fixes the `todo!()` |
 | **S3** Auto-commit cannot be turned off | **GO** | Off by default, proven against a second session; DDL's implicit commit is reported, not hidden |
 | **S4** No way to stop a running statement and keep the session | **NO-GO as specified** | See §4. A pre-armed deadline is the only mechanism, and it costs the session whenever the server cannot answer the interrupt promptly. `SPEC.md` §24.8 needs upstream work |
-| **S5** PL/SQL / OUT binds unusable | **GO, with one gap** | PL/SQL, OUT, IN OUT, DBMS_OUTPUT, compile-error reporting and error positions all work. REF CURSOR is blocked by C-1, a change inside Reldex's own contract, not upstream |
+| **S5** PL/SQL / OUT binds unusable | **GO** | PL/SQL, OUT, IN OUT, DBMS_OUTPUT, compile-error reporting and error positions all work, and REF CURSOR is fetched to exhaustion with the parent connection usable throughout, after contract change C-1 (ADR-0002 P1) |
 | **S7** LOBs cannot be streamed in bounded memory | **GO** | 200 MB streamed for 4.7 MB of working set |
 | **S9** Concurrency | **GO** | 8 sessions, 400 inserts, 283 ms |
 
@@ -864,10 +1012,20 @@ asserts the same for connection parameters.
    (issues A and D in §6); or reopen ADR-0001's rejected alternatives. This
    report recommends the first, plus submitting the issues, and explicitly
    recommends **against** a fork (§4 candidate 4).
-2. **U-3 has no mitigation.** Until upstream fixes the `todo!()`, selecting a
-   `TIMESTAMP WITH TIME ZONE` column that holds a named region crashes the
-   application. That is a shipping blocker on its own, independent of S4.
-3. **C-1** needs a small, additive change to the frozen `db-driver-api` before
-   REF CURSOR support can be finished.
+2. ~~**U-3 has no mitigation.**~~ **Resolved as far as it can be.** Selecting a
+   `TIMESTAMP WITH TIME ZONE` column no longer crashes the application: it is
+   refused on the describe, before any value is decoded. What remains for the
+   owner is to accept the price — the type is unreadable as a typed value until
+   upstream fixes the `todo!()`, including the offset-only form that works —
+   and to decide whether Reldex's UI should offer the
+   `oracle.allow_timestamp_with_time_zone` escape hatch at all. The
+   recommendation is **no**: the opt-in exists for tests and for a caller that
+   controls its own data, not for an IDE that opens arbitrary databases.
+3. ~~**C-1** needs a small, additive change to the frozen `db-driver-api`.~~
+   **Done** (lead-approved); see §7 and ADR-0002 amendment P1. REF CURSOR works
+   end to end, including through `DatabaseSession`.
 4. **Whether to relax the NUMBER bind refusal** (U-1) if the owner would rather
    have the values with a documented risk. The recommendation is no.
+5. **`SPEC.md` §24.14 should scope "highlight the offending token" to PL/SQL**
+   until U-8 is fixed upstream (C-2). Not changed here: `SPEC.md` is not owned
+   by this task.

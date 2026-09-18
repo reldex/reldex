@@ -1,9 +1,10 @@
 # 0002 — Driver API and Concurrency Model
 
 **Status:** Accepted (provisional — implemented; independent API review completed 2026-09-19 and its
-must-fix findings applied, see "Amendments after API review"; owner review pending)
+must-fix findings applied, see "Amendments after API review"; amended again after the ADR-0001
+Phase 0 spikes, see "Amendments after the Phase 0 spikes"; owner review pending)
 **Date:** 2026-09-19
-**Amended:** 2026-09-19 (API review)
+**Amended:** 2026-09-19 (API review), 2026-09-19 (Phase 0 spikes)
 
 ## Context
 
@@ -272,8 +273,9 @@ statement parser is private, so the wrapper has to classify statements to route 
 - **LOBs are never materialised.** `Value::Lob(LobLocator)` wraps a driver-owned
   `Box<dyn LobStream>` read in caller-sized chunks, so memory is bounded by the caller's buffer
   (`SPEC.md` §12, §21).
-- **REF CURSOR is a nested cursor** (`Value::Cursor(Box<dyn Cursor>)`) delivered through OUT binds.
-  Cursor-typed *result columns* are out of scope for now; implicit result sets are cut (see D8).
+- **REF CURSOR is a nested cursor** (`Value::Cursor(Box<dyn Cursor>)`) delivered through OUT binds,
+  and it is **owned out** of the outcome rather than borrowed — see amendment P1. Cursor-typed
+  *result columns* are out of scope for now; implicit result sets are cut (see D8).
 - JSON is carried as UTF-8 JSON text (`Value::Json`), leaving room for a binary form later without
   a parser in this crate.
 - **An unrepresentable column does not kill the fetch** (amendment M1). `SqlType::Unsupported` used
@@ -295,7 +297,9 @@ cannot know whether arbitrary user text produces rows, and `db-core` must not pa
 `ExecutionOutcome { cursor, rows_affected, statement_kind, out_values, warnings }`; `Warning`
 carries PL/SQL "compiled with errors" with its own `SqlPosition`. Binds are positional or named,
 each `Bind::In(BindValue) | Out(OutBindSpec) | InOut`, with a declared `SqlType` and size for OUT.
-`Statement` is `Clone`, so a bound call can be executed again.
+`Statement` is `Clone`, so a bound call can be executed again. The cursor and any driver-owned
+output value are **taken** out of the outcome (`take_cursor`, `take_out_values`,
+`OutValues::take_named`/`take_positional`), never borrowed; see amendment P1.
 
 **`Statement` carries the two options a driver needs before it executes** (amendments M5, S4):
 
@@ -538,42 +542,135 @@ asymmetric pair in a contract is worse than neither).
 **C2 — Recorded as known, deliberately deferred gaps:** DML `RETURNING INTO` arrays and array binds.
 See D8.
 
+## Amendments after the Phase 0 spikes (2026-09-19)
+
+The ADR-0001 spikes S1–S5, S7 and S9 ran against a live Oracle Database 19.3 with the
+`oracle-thin` driver and found one **blocking** gap in this contract and one factual error in its
+driver notes. Both are recorded in `docs/exec-plans/active/phase-0-spike-results.md` §7 as C-1 and
+C-2. Numbering: `P` = Phase 0 spike.
+
+**P1 — Output values can be owned, so a REF CURSOR is readable (spike contract gap C-1).**
+`ExecutionOutcome::out_values()` returned `&OutValues`, and `OutValues::named`/`positional` returned
+`Option<&Value>`. A `Value::Cursor` holds a `Box<dyn Cursor>`, and every useful method on `Cursor`
+needs ownership — `fetch_batch(&mut self)`, `close(self: Box<Self>)`. So a REF CURSOR delivered
+through an OUT bind could be opened and *described* but never read: `Capabilities::ref_cursor` was
+unmeetable and `SPEC.md` §11's "REF CURSOR" unimplementable. The same argument applies to a
+`Value::Lob`. This was a defect in the contract, not in the driver, which had the whole path
+implemented behind the missing accessor.
+
+The fix is additive and follows the shape `Column::take_lob` already established:
+
+- `OutValues::take_named(&mut self, name) -> Option<Value>` and
+  `OutValues::take_positional(&mut self, index) -> Option<Value>` move the value out of its slot.
+- `ExecutionOutcome::take_out_values(&mut self) -> OutValues` is the wholesale form — the one
+  `db-core` uses — and `ExecutionOutcome::out_values_mut()` the borrowing one, mirroring
+  `RowBatch::column_mut`.
+- **A consumed slot is `Value::Taken`, never `Value::Null`.** This is M6's rule applied to output
+  binds: a bind that carried a value must not read back as SQL NULL once something took it, or an
+  exporter writes an empty cell where the database held data. `take_out_values` therefore leaves a
+  *same-shaped* container of `Taken` slots rather than `OutValues::None`, so the outcome still
+  reports that the statement had output binds. Taking twice returns `None`, which is what makes
+  owning one live cursor twice impossible.
+
+`Value` gains the `Taken` variant (it is `#[non_exhaustive]`, so this is not a breaking change) and
+`Value::is_taken()`; `Value::is_null()` stays false for it. Sizes are unchanged (unit variant).
+
+`db-core` mirrors this in `ExecuteOutcome::out_values`: a nested cursor is a handle derived from the
+connection, so it never leaves the worker thread — the core registers it in the same result map an
+ordinary query's cursor goes into and reports a `ResultSetId`, so fetching a REF CURSOR is the same
+API call as fetching anything else and closing the session releases it the same way (D1/D2).
+
+*Evidence:* `a_ref_cursor_out_value_can_be_owned_and_fetched` and
+`a_taken_out_value_is_distinguishable_from_null_and_cannot_be_taken_twice` in `db-driver-api`;
+`a_ref_cursor_out_bind_is_fetched_while_the_parent_connection_stays_usable` and
+`a_ref_cursor_outliving_its_connection_reports_rather_than_panics` in the oracle-thin spike S5;
+`crates/db-core/tests/out_values.rs` against the mock driver.
+
+**P2 — The driver notes are corrected against `=26.0.0-beta.3` (spike contract gap C-2).** The
+"Notes for driver implementers" below described a structured upstream `DbError { code, offset }`
+that does not exist in the pinned version; see that section, which now names the version it
+describes and marks each note with what the spikes found.
+
 ## Notes for driver implementers
 
-Findings from the review's reading of `oracle/rust-oracledb`. **Verified from source by review on
-2026-09-19; re-verify on upgrade** — the crate is pre-GA and its API is explicitly subject to change.
-These are recorded so the next worker does not rediscover them, not as contract requirements.
+Findings from reading `oracle/rust-oracledb` **`=26.0.0-beta.3`** — the version this repository pins
+(`crates/drivers/oracle-thin/Cargo.toml`) and the only version any of this was checked against.
+First written from the API review's reading on 2026-09-19 and **corrected on 2026-09-19 against the
+same version** after the Phase 0 spikes ran against a live database (spike contract gap C-2: three
+of these notes described upstream `main`, not `beta.3`). **Re-verify on upgrade** — the crate is
+pre-GA and its API is explicitly subject to change. These are recorded so the next worker does not
+rediscover them, not as contract requirements.
 
-- **Cursors and LOBs own a cloned `Arc<Mutex<Client>>`.** There is no lifetime tie to the
-  `Connection`, `Connection`'s methods take `&self`, and two cursors can coexist on one connection.
-  This is the concrete reason D1's old `&mut self` claim was wrong, and the reason
+- **Cursors and LOBs own a cloned `Arc<Mutex<Client>>`.** *Confirmed.* There is no lifetime tie to
+  the `Connection`, `Connection`'s methods take `&self`, and two cursors can coexist on one
+  connection. This is the concrete reason D1's old `&mut self` claim was wrong, and the reason
   `Cursor::connection_id()` exists.
 - **`Connection::set_call_timeout` takes the same mutex `execute` holds for the whole round trip.**
-  An on-demand cancel built on it would block until the statement finished. This is the evidence
-  behind `CancelKind::PreArmedDeadline` (M5) and behind ADR-0001's revised C1.
-- **`OracleNumber`'s fields are private.** Conversion goes through its `Display` into one reusable
-  `String` per column, then `Number::parse`. That is why `Number::parse` must accept every shape
-  `Display` can emit (`.5`, `-.5`, `1E+2`, `1.5E-130`) — see S6. An upstream request for digit/exponent
-  accessors is worthwhile: it would remove a string allocation per numeric column.
-- **`transaction_in_progress` is tracked internally but not exposed.** The wrapper must therefore
-  report `Capabilities::exact_transaction_state == false`. An upstream request to expose it is
-  worthwhile; it would materially improve `SPEC.md` §10 prompting.
-- **Fetch is row-at-a-time**, `Vec<Option<DbValue>>`, with a per-cell `String` allocation. Building
-  D6's column batches therefore costs one extra copy on top. Measure before optimising: the copy may
-  be cheaper than the allocations it removes downstream, and `phase-0.md` "Measurements" requires a
-  number before any claim.
-- **LOBs are materialised by default.** The wrapper must call `Statement::fetch_lobs()` to get
-  locators instead of buffers, or `SPEC.md` §12's bounded-memory rule is violated silently.
-- **`Lob::read` can split a surrogate pair** on a non-BMP CLOB chunk (upstream issue #18 territory).
-  The wrapper must re-join halves before returning UTF-8, as `LobStream::read_chunk` requires.
-- **`Connection::execute` rejects queries** and the crate's own statement parser is private, so the
-  wrapper has to classify statements itself to route them. That classification is what
-  `ExecutionOutcome::statement_kind` (S9) asks for — it is not extra work.
-- **No `rows_affected` on `Cursor`**; it is available only on the non-query path.
-- **`DbError` exposes `code: usize` and `offset: usize`.** The offset is a character offset, which
-  maps to `SqlPosition::at_char_offset` (S3). Note the `usize` → `i32`/`u32` narrowing when
-  populating `NativeError`/`SqlPosition`.
-- **Warnings are a plain `String`** (`last_warning()`), with no code and no structure. See S11.
+  *Confirmed, and now measured:* called 500 ms into a 5-second statement it blocked for 4.8 s, the
+  whole remainder of the call (spike S4). An on-demand cancel built on it would block until the
+  statement finished. This is the evidence behind `CancelKind::PreArmedDeadline` (M5) and behind
+  ADR-0001's revised C1.
+- **`OracleNumber`'s fields are private.** *Confirmed.* Conversion goes through its `Display` into
+  one reusable `String` per column, then `Number::parse`. That is why `Number::parse` must accept
+  every shape `Display` can emit (`.5`, `-.5`, `1E+2`, `1.5E-130`) — see S6. An upstream request for
+  digit/exponent accessors is worthwhile: it would remove a string allocation per numeric column.
+- **`OracleNumber`'s *encoder* is unsafe for two families of value.** *New; found by spike S2 and
+  not visible from the API.* A value with an odd number of leading zeros after the decimal point is
+  written one base-100 place out and the server stores it **ten times too large, silently**; a value
+  of magnitude ≥ 1E40 indexes past the encoder's 40-byte digit array and **aborts the process**. A
+  wrapper must refuse both rather than bind them (`oracledb` U-1, U-2). Reading is exact in both
+  cases, verified to 126 digits.
+- **`transaction_in_progress` is tracked internally but not exposed.** *Confirmed* — a private field
+  on `Client` with no accessor. The wrapper must therefore report
+  `Capabilities::exact_transaction_state == false`. An upstream request to expose it is worthwhile;
+  it would materially improve `SPEC.md` §10 prompting.
+- **Fetch is row-at-a-time**, `DbRow { column_values: Vec<Option<DbValue>> }`, with a per-cell
+  `String` for character data (`DbValue::String`). *Confirmed.* Building D6's column batches
+  therefore costs one extra copy on top. Measure before optimising: the copy may be cheaper than the
+  allocations it removes downstream, and `phase-0.md` "Measurements" requires a number before any
+  claim.
+- **Prefetching decodes rows during `execute`.** *New; the property the U-3 mitigation turns on.*
+  A query's execute round trip carries `Statement::prefetch_rows` rows (default 2) and `oracledb`
+  decodes them before the caller sees anything, so a wrapper cannot inspect the described column
+  types before the first values have been through the decoder. `prefetch_rows(0)` makes the execute
+  a describe: the columns arrive, no value is decoded, and the row source only runs on the first
+  `fetch` — which also moves where a long query blocks, and where an armed deadline fires, from
+  `execute` to `fetch_batch`. A nested cursor from an OUT bind never prefetches at all.
+- **LOBs are materialised by default.** *Confirmed.* The wrapper must call `Statement::fetch_lobs()`
+  to get locators instead of buffers, or `SPEC.md` §12's bounded-memory rule is violated silently.
+- **`Lob` implements `io::Read`, and its request boundary can split a surrogate pair** on a non-BMP
+  CLOB (upstream issue #18 territory). *Confirmed, with a correction to the earlier note:* the read
+  sizes its request as `buf.len() / 3` **UCS-2 units**, and when the boundary lands inside a pair the
+  UTF-16 decode fails and the **whole read** fails — there are no halves to re-join, because nothing
+  is returned. The wrapper absorbs it by retrying with one fewer unit, out of a fixed staging buffer
+  that also fixes the `InvalidInput`-instead-of-short-read behaviour when the decoded UTF-8 exceeds
+  the caller's buffer. That is what makes `LobStream::read_chunk`'s contract meetable.
+- **`Connection::execute` does not reject a query — it discards its rows.** *Corrected:* the earlier
+  note said "rejects". `Statement::execute`'s documentation says the statement "may not be a query",
+  but nothing enforces it: a `SELECT` executes and `ExecResult` keeps rows only for PL/SQL out binds
+  and DML `RETURNING`, so the rows are simply unreachable. Since the crate's own statement parser is
+  private, the wrapper must classify statements itself to route them — which is what
+  `ExecutionOutcome::statement_kind` (S9) asks for, so it is not extra work, but getting it wrong is
+  silent rather than loud.
+- **No `rows_affected` on `Cursor`**; *confirmed* — it exists only on `ExecResult` and
+  `ExecBatchResult`, the non-query path.
+- **`DbError` does *not* expose `code` and `offset`.** *Corrected; this note described upstream
+  `main`, not `beta.3`.* The public shape is `ErrorKind::DbError(String)`: `response/error_info.rs`
+  parses the error number only to build the message text and reads the wire's error position with
+  `resp.read_ub2()?; // error position` and throws it away (`oracledb` U-8). So a wrapper must
+  recover the ORA code by parsing `ORA-nnnnn` out of the message, and a character offset for a plain
+  SQL error is **unavailable at any price** — only the `line n, column m` that ORA-06550 puts in its
+  own text can be recovered, which happens to be the PL/SQL case `SPEC.md` §24.14 needs.
+  `SqlPosition::at_char_offset` therefore has no upstream source on this version, and `SPEC.md`
+  §24.14's "highlight the offending token" is achievable for PL/SQL only. `Capabilities::error_position`
+  has no finer grain than one boolean; see spike contract note C-3.
+- **A panic inside a round trip becomes a process abort.** *New; found by spike S2 (`oracledb` U-4).*
+  `impl Drop for StatementHolder` does `self.client_ref.lock().unwrap()`, so a panic that poisoned
+  the client mutex panics again during unwinding. **No wrapper can contain an upstream panic**, and
+  `catch_unwind` does not help. Everything a driver knows to be a panicking input must therefore be
+  refused *before* it reaches the crate.
+- **Warnings are a plain `String`** — `last_warning() -> Result<Option<String>, Error>`, with no code
+  and no structure. *Confirmed.* See S11.
 
 ## Consequences
 

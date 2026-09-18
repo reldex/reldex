@@ -13,9 +13,13 @@
 
 mod common;
 
-use common::{connect, exec, exec_quietly, observation, query, render, scalar, unique};
+use common::{
+    connect, connect_decoding_timestamp_with_time_zone, exec, exec_quietly, measurement,
+    observation, query, render, scalar, unique,
+};
 use reldex_db_driver_api::{
-    Bind, ColumnData, DatabaseConnection, Number, SqlType, Statement, Timestamp, ValueRef,
+    Bind, ColumnData, DatabaseConnection, ErrorKind, Number, SessionState, SqlType, Statement,
+    Timestamp, ValueRef,
 };
 
 /// Thai text, chosen because it exercises combining marks above and below the
@@ -390,7 +394,12 @@ fn character_data_round_trips_byte_exact_including_thai_and_a_non_bmp_character(
 
 #[test]
 fn temporal_values_round_trip_including_dates_the_gregorian_calendar_rejects() {
-    let mut connection = connect();
+    // The offset-only form of `TIMESTAMP WITH TIME ZONE` decodes correctly, and
+    // this is the test that proves it — so it opts in explicitly. The driver
+    // refuses the type by default because a *named region* aborts the process
+    // and the two forms are indistinguishable before the decode; see
+    // `a_timestamp_with_time_zone_column_is_refused_before_anything_is_fetched`.
+    let mut connection = connect_decoding_timestamp_with_time_zone();
     let table = unique("s2_tim");
     exec(
         connection.as_mut(),
@@ -511,15 +520,11 @@ fn temporal_values_round_trip_including_dates_the_gregorian_calendar_rejects() {
     connection.close().expect("close");
 }
 
-/// **This test aborts the process on `oracledb` 26.0.0-beta.3.** It is left in
-/// the suite, ignored by default, as an executable record of the defect and as
-/// the check that will pass once upstream fixes it. Run it on its own:
+/// U-3's mitigation: a `TIMESTAMP WITH TIME ZONE` column is refused on the
+/// **describe**, before a single value has been decoded.
 ///
-/// ```text
-/// cargo test -p reldex-driver-oracle-thin --features oracle-it ///     --test s2_fidelity -- --ignored --exact a_named_time_zone_region_is_read_or_reported
-/// ```
-///
-/// Two upstream defects compound here, and the second one is the serious one:
+/// The defect it contains is two upstream defects compounding, and the second
+/// is the serious one:
 ///
 /// 1. `src/ora_type/timestamp.rs:238` is a bare `todo!()` for the
 ///    region-encoded form of `TIMESTAMP WITH TIME ZONE` (`buf[11] & 0x80`).
@@ -528,11 +533,90 @@ fn temporal_values_round_trip_including_dates_the_gregorian_calendar_rejects() {
 ///    `self.client_ref.lock().unwrap()` — a panic during unwinding, which
 ///    aborts the process. So `catch_unwind` cannot contain it, and **no**
 ///    upstream panic can ever be contained by a wrapper.
+///
+/// Region and offset cannot be told apart before the decode — the flag is a bit
+/// in the value's own wire bytes, which `oracledb` reads inside the round trip,
+/// and the describe says only `TIMESTAMP WITH TIME ZONE`. So the refusal is per
+/// column, and this test uses the named-region value that used to kill the
+/// process: it now produces an ordinary error and leaves the session usable.
 #[test]
-#[ignore = "aborts the process on oracledb 26.0.0-beta.3; see the doc comment"]
+fn a_timestamp_with_time_zone_column_is_refused_before_anything_is_fetched() {
+    let mut connection = connect();
+    let sql = "SELECT TO_TIMESTAMP_TZ('2026-01-01 00:00:00 Asia/Bangkok',
+                                      'YYYY-MM-DD HH24:MI:SS TZR') AS tstz FROM dual";
+    let error = match connection.execute(&Statement::new(sql)) {
+        Ok(_) => panic!("a TIMESTAMP WITH TIME ZONE column must be refused, not fetched"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
+    assert_eq!(
+        error.session_state(),
+        SessionState::Usable,
+        "refusing a column must not cost the session"
+    );
+    assert!(
+        error.message().contains("TSTZ") && error.message().contains("TIMESTAMP WITH TIME ZONE"),
+        "the refusal must name the column and the type: {error}"
+    );
+    observation(format!("named-region TSTZ column -> {error}"));
+
+    // The same column inside a wider select list is refused too: the decode
+    // happens for the whole row inside the upstream round trip, so there is no
+    // per-column escape — reporting one cell as `Unsupported` would not help.
+    let error = match connection.execute(&Statement::new(
+        "SELECT 1 AS ordinary, SYSTIMESTAMP AS tstz, 2 AS after FROM dual",
+    )) {
+        Ok(_) => panic!("a TIMESTAMP WITH TIME ZONE anywhere in the select list must be refused"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
+
+    // The session is untouched: it is a refusal, not a failure.
+    assert_eq!(scalar(connection.as_mut(), "SELECT 1 FROM dual"), "1");
+    // And the documented escape works without the driver rewriting anything.
+    let text = scalar(
+        connection.as_mut(),
+        "SELECT TO_CHAR(TO_TIMESTAMP_TZ('2026-01-01 00:00:00 Asia/Bangkok',
+                                        'YYYY-MM-DD HH24:MI:SS TZR'),
+                        'YYYY-MM-DD HH24:MI:SS TZR') FROM dual",
+    );
+    assert_eq!(text, "2026-01-01 00:00:00 ASIA/BANGKOK");
+    observation(format!(
+        "the documented TO_CHAR escape reads it as text: {text}"
+    ));
+    connection.close().expect("close");
+}
+
+/// The same refusal on the OUT-bind path, which has no describe to inspect.
+#[test]
+fn a_timestamp_with_time_zone_output_bind_is_refused_before_the_statement_runs() {
+    let mut connection = connect();
+    let statement = Statement::new("BEGIN :1 := SYSTIMESTAMP; END;")
+        .with_positional_binds(vec![Bind::output(SqlType::TimestampWithTimeZone)]);
+    let error = match connection.execute(&statement) {
+        Ok(_) => panic!("a TIMESTAMP WITH TIME ZONE output bind must be refused"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
+    observation(format!("TSTZ output bind -> {error}"));
+    assert_eq!(scalar(connection.as_mut(), "SELECT 1 FROM dual"), "1");
+    connection.close().expect("close");
+}
+
+/// **This test aborts the process on `oracledb` 26.0.0-beta.3.** It is what the
+/// refusal above exists to prevent: it turns the guard off through the
+/// documented extension and reads a named region anyway. It stays in the suite,
+/// ignored by default, as an executable record of the defect and as the check
+/// that will pass once upstream fixes it. Run it on its own:
+///
+/// ```text
+/// cargo test -p reldex-driver-oracle-thin --features oracle-it ///     --test s2_fidelity -- --ignored --exact a_named_time_zone_region_is_read_or_reported
+/// ```
+#[test]
+#[ignore = "aborts the process on oracledb 26.0.0-beta.3; this is what the default refusal prevents"]
 fn a_named_time_zone_region_is_read_or_reported() {
     let outcome = std::panic::catch_unwind(|| {
-        let mut connection = connect();
+        let mut connection = connect_decoding_timestamp_with_time_zone();
         let text = scalar(
             connection.as_mut(),
             "SELECT TO_TIMESTAMP_TZ('2026-09-19 13:45:30 Asia/Bangkok',
@@ -559,7 +643,9 @@ fn a_named_time_zone_region_is_read_or_reported() {
 
 #[test]
 fn raw_bytes_and_nulls_of_every_type_survive() {
-    let mut connection = connect();
+    // Opted in for the `tz` column: this test is about NULLs of every type,
+    // including a NULL `TIMESTAMP WITH TIME ZONE`.
+    let mut connection = connect_decoding_timestamp_with_time_zone();
     let table = unique("s2_raw");
     exec(
         connection.as_mut(),
@@ -708,7 +794,62 @@ fn a_batch_is_column_oriented_and_honours_the_requested_size() {
     connection.close().expect("close");
 }
 
+/// What the U-3 mitigation costs on the fetch path.
+///
+/// The driver asks `oracledb` for **zero** prefetched rows so the execute round
+/// trip returns column metadata only and an undecodable select list can be
+/// refused before any value is decoded. A query therefore pays one round trip
+/// for the describe and another for the first batch, where it used to get the
+/// first couple of rows with the execute. This measures what that is worth
+/// against the Phase 0 container, next to a `ping` — one bare round trip — so
+/// the two can be compared rather than asserted.
+#[test]
+fn describing_before_fetching_costs_about_one_extra_round_trip() {
+    let mut connection = connect();
+    let rounds = 20;
+    let mut pings = Vec::with_capacity(rounds);
+    let mut queries = Vec::with_capacity(rounds);
+    let batch_size = std::num::NonZeroUsize::new(100).expect("non-zero");
+
+    for _ in 0..rounds {
+        let started = Instant::now();
+        connection.ping().expect("ping");
+        pings.push(started.elapsed());
+
+        let started = Instant::now();
+        let mut outcome = connection
+            .execute(&Statement::new("SELECT 1 FROM dual"))
+            .expect("select");
+        let mut cursor = outcome.take_cursor().expect("cursor");
+        assert_eq!(
+            cursor.fetch_batch(batch_size).expect("fetch").row_count(),
+            1
+        );
+        cursor.close().expect("close");
+        queries.push(started.elapsed());
+    }
+
+    pings.sort_unstable();
+    queries.sort_unstable();
+    let ping = pings[pings.len() / 2];
+    let query = queries[queries.len() / 2];
+    measurement("s2.ping_median", format!("{ping:.1?}"));
+    measurement("s2.one_row_query_median", format!("{query:.1?}"));
+    observation(format!(
+        "a one-row query (describe round trip + fetch round trip + close) took a \
+         median {query:.1?} against a median {ping:.1?} for one bare round trip"
+    ));
+    // Not a performance assertion, a sanity bound: if the describe-first change
+    // ever cost an order of magnitude rather than a round trip, this fails.
+    assert!(
+        query < ping * 20,
+        "a one-row query took {query:.1?} against a {ping:.1?} round trip"
+    );
+    connection.close().expect("close");
+}
+
 use reldex_db_driver_api::Column;
+use std::time::Instant;
 
 /// Keeps the import list honest about the enum used in the assertions above.
 const _: fn(&ColumnData) -> usize = ColumnData::len;

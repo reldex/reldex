@@ -27,6 +27,7 @@
 
 mod common;
 
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -51,6 +52,29 @@ const LONG_SQL: &str =
 /// A PL/SQL sleep. The server will not look at an interrupt until it wakes up,
 /// which is what makes this the harder case.
 const LONG_PLSQL: &str = "BEGIN DBMS_SESSION.SLEEP(20); END;";
+
+/// Runs a statement and, for a query, drives its first batch.
+///
+/// **A query's work happens on the fetch.** This driver describes before it
+/// fetches — it asks `oracledb` for zero prefetched rows so a select list it
+/// cannot decode safely can be refused before any value is decoded (the U-3
+/// mitigation) — so `execute` returns as soon as the server has described the
+/// result, and the row source only starts producing when rows are asked for. A
+/// cancellation test that stopped at `execute` would be timing the describe
+/// rather than the statement, which is why every long-SQL case here goes
+/// through this helper. For PL/SQL, which produces no cursor, it is exactly
+/// `execute`.
+fn run_to_first_batch(
+    connection: &mut dyn DatabaseConnection,
+    statement: &Statement,
+) -> Result<(), DbError> {
+    let mut outcome = connection.execute(statement)?;
+    let Some(mut cursor) = outcome.take_cursor() else {
+        return Ok(());
+    };
+    cursor.fetch_batch(NonZeroUsize::MIN)?;
+    cursor.close()
+}
 
 /// Reports whether a connection still works after something was done to it.
 fn still_usable(connection: &mut dyn DatabaseConnection) -> Result<(), DbError> {
@@ -80,8 +104,11 @@ fn a_deadline_stops_a_long_sql_statement_and_the_session_survives() {
     let deadline = Duration::from_secs(2);
 
     let started = Instant::now();
-    let error = match connection.execute(&Statement::new(LONG_SQL).with_deadline(deadline)) {
-        Ok(_) => panic!("the deadline did not stop the statement"),
+    let error = match run_to_first_batch(
+        connection.as_mut(),
+        &Statement::new(LONG_SQL).with_deadline(deadline),
+    ) {
+        Ok(()) => panic!("the deadline did not stop the statement"),
         Err(error) => error,
     };
     let elapsed = started.elapsed();
@@ -329,7 +356,10 @@ fn cancel_from_a_control_session(
         let started = Instant::now();
         // A generous deadline is armed purely so a failed test cannot hang the
         // suite; it is far longer than the cancel should take.
-        let result = connection.execute(&Statement::new(sql).with_deadline(SAFETY_DEADLINE));
+        let result = run_to_first_batch(
+            connection.as_mut(),
+            &Statement::new(sql).with_deadline(SAFETY_DEADLINE),
+        );
         let elapsed = started.elapsed();
         let after = still_usable(connection.as_mut());
         let _ = connection.close();

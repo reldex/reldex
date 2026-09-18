@@ -124,6 +124,12 @@ impl<T: Into<Self>> From<Option<T>> for BindValue {
 /// [`Send`] but deliberately not [`Clone`]: duplicating a live handle silently
 /// would be a lie. Those two variants carry the thread-affinity and lifecycle
 /// rules of [`LobStream`] and [`crate::Cursor`] respectively.
+///
+/// Because those handles need ownership to be useful, they are moved out of an
+/// [`crate::OutValues`] with [`crate::OutValues::take_named`] /
+/// [`crate::OutValues::take_positional`], which leave [`Value::Taken`] behind —
+/// the same distinction [`crate::Column::take_lob`] draws between a consumed
+/// cell and SQL NULL.
 #[non_exhaustive]
 pub enum Value {
     /// SQL NULL.
@@ -149,13 +155,31 @@ pub enum Value {
     /// A nested cursor (`REF CURSOR`), returned through an OUT bind or an
     /// implicit result.
     Cursor(Box<dyn Cursor>),
+    /// The value used to be here and was moved out with
+    /// [`crate::OutValues::take_named`] or
+    /// [`crate::OutValues::take_positional`].
+    ///
+    /// Distinct from [`Value::Null`] on purpose, and for the same reason
+    /// [`crate::ValueRef::Taken`] is: the bind *did* carry a value, so code that
+    /// read "taken" as "NULL" would report the wrong thing to the user. It also
+    /// makes taking idempotent — a live cursor or LOB locator can be owned only
+    /// once.
+    Taken,
 }
 
 impl Value {
     /// Whether this is SQL NULL.
+    ///
+    /// False for [`Value::Taken`]: a consumed value was not a NULL.
     #[must_use]
     pub const fn is_null(&self) -> bool {
         matches!(self, Self::Null)
+    }
+
+    /// Whether the value has already been moved out. See [`Value::Taken`].
+    #[must_use]
+    pub const fn is_taken(&self) -> bool {
+        matches!(self, Self::Taken)
     }
 
     /// Whether this value may only be produced by a driver, never bound as input.
@@ -179,6 +203,7 @@ impl Value {
             Self::Json(_) => "json",
             Self::Lob(_) => "lob",
             Self::Cursor(_) => "cursor",
+            Self::Taken => "taken",
         }
     }
 }
@@ -197,6 +222,7 @@ impl fmt::Debug for Value {
             Self::Json(value) => write!(f, "Json({value:?})"),
             Self::Lob(value) => write!(f, "Lob({value:?})"),
             Self::Cursor(_) => f.write_str("Cursor(..)"),
+            Self::Taken => f.write_str("Taken"),
         }
     }
 }

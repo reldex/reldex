@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use reldex_db_driver_api::{
     ConnectionParams, Credentials, DatabaseConnection, DatabaseDriver, DbResult, Endpoint,
-    ExecutionOutcome, RowBatch, Secret, Statement, ValueRef,
+    ExecutionOutcome, ExtensionValue, Extensions, RowBatch, Secret, Statement, ValueRef,
 };
 use reldex_driver_oracle_thin::OracleThinDriver;
 
@@ -79,6 +79,24 @@ pub fn system_params() -> Option<ConnectionParams> {
 pub fn connect() -> Box<dyn DatabaseConnection> {
     OracleThinDriver::new()
         .connect(&params())
+        .expect("the test database should accept the configured credentials")
+}
+
+/// Opens a connection that will decode `TIMESTAMP WITH TIME ZONE` columns.
+///
+/// The driver refuses them by default because a value carrying a **named
+/// region** aborts the process inside `oracledb` (U-3 with U-4) and the two
+/// encodings cannot be told apart before the decode. Tests that deliberately
+/// exercise the offset-only form — which does work — opt in here, and so
+/// document exactly what the switch buys and what it costs.
+pub fn connect_decoding_timestamp_with_time_zone() -> Box<dyn DatabaseConnection> {
+    let mut extensions = Extensions::new();
+    extensions.set(
+        reldex_driver_oracle_thin::EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE,
+        ExtensionValue::Flag(true),
+    );
+    OracleThinDriver::new()
+        .connect(&params().with_extensions(extensions))
         .expect("the test database should accept the configured credentials")
 }
 

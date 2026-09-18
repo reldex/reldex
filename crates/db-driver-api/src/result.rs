@@ -759,6 +759,19 @@ impl Warning {
 /// Values the server wrote back through OUT and IN OUT binds.
 ///
 /// The shape mirrors the statement's [`crate::Binds`].
+///
+/// # Borrowing and owning
+///
+/// [`OutValues::positional`] and [`OutValues::named`] borrow, which is enough
+/// for plain data. A [`Value::Lob`] or a [`Value::Cursor`] is not plain data:
+/// every useful method on [`Cursor`] needs ownership
+/// ([`Cursor::fetch_batch`] takes `&mut self`, [`Cursor::close`] takes
+/// `Box<Self>`), so a `REF CURSOR` delivered through an OUT bind is unreadable
+/// through a shared reference. [`OutValues::take_named`] and
+/// [`OutValues::take_positional`] move the value out instead, leaving
+/// [`Value::Taken`] in the slot — a state distinct from SQL NULL, for the same
+/// reason [`Column::take_lob`] leaves [`ValueRef::Taken`] rather than marking
+/// the row NULL.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum OutValues {
@@ -793,7 +806,40 @@ impl OutValues {
         }
     }
 
+    /// Takes the value written back for a positional bind, so a driver-owned
+    /// handle inside it can be used.
+    ///
+    /// The slot is left holding [`Value::Taken`], which is *not* SQL NULL: the
+    /// bind did carry a value and something took it. Returns `None` when there
+    /// is nothing to take — no such slot, an input-only bind, or a slot that was
+    /// already taken — which makes repeated calls safe rather than a way to own
+    /// the same live cursor twice.
+    pub fn take_positional(&mut self, index: usize) -> Option<Value> {
+        match self {
+            Self::Positional(values) => take_slot(values.get_mut(index)?.as_mut()?),
+            Self::None | Self::Named(_) => None,
+        }
+    }
+
+    /// Takes the value written back for a named bind. See
+    /// [`OutValues::take_positional`] for what is left behind.
+    pub fn take_named(&mut self, name: &str) -> Option<Value> {
+        match self {
+            Self::Named(values) => {
+                let slot = values
+                    .iter_mut()
+                    .find(|(key, _)| &**key == name)
+                    .map(|(_, value)| value)?;
+                take_slot(slot)
+            }
+            Self::None | Self::Positional(_) => None,
+        }
+    }
+
     /// Whether anything was written back.
+    ///
+    /// Still true of a slot whose value has been taken: the statement did have
+    /// an output bind, and reporting otherwise would hide it.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         match self {
@@ -802,6 +848,40 @@ impl OutValues {
             Self::Named(values) => values.is_empty(),
         }
     }
+}
+
+impl OutValues {
+    /// The same container with every value replaced by [`Value::Taken`].
+    ///
+    /// This is what [`ExecutionOutcome::take_out_values`] leaves behind, so an
+    /// outcome whose values have been moved out still reports the binds it had
+    /// rather than claiming it had none.
+    fn same_shape_all_taken(&self) -> Self {
+        match self {
+            Self::None => Self::None,
+            Self::Positional(values) => Self::Positional(
+                values
+                    .iter()
+                    .map(|slot| slot.as_ref().map(|_| Value::Taken))
+                    .collect(),
+            ),
+            Self::Named(values) => Self::Named(
+                values
+                    .iter()
+                    .map(|(name, _)| (name.clone(), Value::Taken))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// Moves a value out of a slot, leaving [`Value::Taken`]; `None` if it was
+/// already taken.
+fn take_slot(slot: &mut Value) -> Option<Value> {
+    if slot.is_taken() {
+        return None;
+    }
+    Some(std::mem::replace(slot, Value::Taken))
 }
 
 /// Everything one `execute` produced.
@@ -902,6 +982,28 @@ impl ExecutionOutcome {
     #[must_use]
     pub const fn out_values(&self) -> &OutValues {
         &self.out_values
+    }
+
+    /// Takes the output-bind values out of the outcome, so the caller owns any
+    /// driver handle inside them.
+    ///
+    /// Mirrors [`ExecutionOutcome::take_cursor`]. The outcome keeps a
+    /// same-shaped [`OutValues`] whose slots read back as [`Value::Taken`], so
+    /// it still reports that the statement had output binds and never
+    /// misreports a consumed slot as SQL NULL.
+    ///
+    /// A caller that only needs one value can leave the container in place and
+    /// use [`OutValues::take_named`] through
+    /// [`ExecutionOutcome::out_values_mut`] instead.
+    pub fn take_out_values(&mut self) -> OutValues {
+        let emptied = self.out_values.same_shape_all_taken();
+        std::mem::replace(&mut self.out_values, emptied)
+    }
+
+    /// The values written back through output binds, mutably, for taking a
+    /// driver-owned handle out of one. Mirrors [`RowBatch::column_mut`].
+    pub fn out_values_mut(&mut self) -> &mut OutValues {
+        &mut self.out_values
     }
 
     /// Non-fatal messages the statement produced.
@@ -1203,6 +1305,165 @@ mod tests {
 
         assert!(OutValues::None.is_empty());
         assert!(OutValues::Positional(vec![None]).is_empty());
+    }
+
+    /// A stand-in for a driver's nested `REF CURSOR`: nothing about it works
+    /// through a shared reference, which is the whole of contract gap C-1.
+    struct StubCursor {
+        columns: Vec<ColumnMetadata>,
+    }
+
+    impl StubCursor {
+        fn boxed() -> Box<dyn Cursor> {
+            Box::new(Self {
+                columns: vec![ColumnMetadata::new("ID", crate::SqlType::Number)],
+            })
+        }
+    }
+
+    impl Cursor for StubCursor {
+        fn id(&self) -> ResultSetId {
+            ResultSetId::from_raw(11)
+        }
+
+        fn connection_id(&self) -> ConnectionId {
+            ConnectionId::from_raw(3)
+        }
+
+        fn columns(&self) -> &[ColumnMetadata] {
+            &self.columns
+        }
+
+        fn fetch_batch(&mut self, _max_rows: NonZeroUsize) -> DbResult<RowBatch> {
+            Ok(RowBatch::empty())
+        }
+
+        fn is_exhausted(&self) -> bool {
+            true
+        }
+
+        fn close(self: Box<Self>) -> DbResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_ref_cursor_out_value_can_be_owned_and_fetched() {
+        // Contract gap C-1: `OutValues` used to expose only `&Value`, and every
+        // useful method on `Cursor` needs ownership — so a REF CURSOR could be
+        // described but never read, which made `Capabilities::ref_cursor`
+        // unmeetable.
+        let mut outcome = ExecutionOutcome::new()
+            .with_statement_kind(StatementKind::PlSqlBlock)
+            .with_out_values(OutValues::Named(vec![(
+                "rc".into(),
+                Value::Cursor(StubCursor::boxed()),
+            )]));
+
+        let taken = outcome
+            .out_values_mut()
+            .take_named("rc")
+            .expect("the cursor is there");
+        let Value::Cursor(mut cursor) = taken else {
+            panic!("expected a cursor, got {taken:?}");
+        };
+        assert_eq!(cursor.columns().len(), 1);
+        assert!(
+            cursor
+                .fetch_batch(NonZeroUsize::new(10).expect("non-zero"))
+                .expect("fetch")
+                .is_empty()
+        );
+        cursor.close().expect("close");
+    }
+
+    #[test]
+    fn a_taken_out_value_is_distinguishable_from_null_and_cannot_be_taken_twice() {
+        let mut values = OutValues::Named(vec![
+            ("rc".into(), Value::Cursor(StubCursor::boxed())),
+            ("nothing".into(), Value::Null),
+        ]);
+
+        assert!(values.take_named("rc").is_some());
+        // The slot is now "taken", NOT null: the bind did carry a value, and a
+        // caller that read this as NULL would report the wrong thing.
+        let slot = values.named("rc").expect("the slot is still there");
+        assert!(slot.is_taken());
+        assert!(
+            !slot.is_null(),
+            "a consumed value must not impersonate NULL"
+        );
+        assert_eq!(slot.type_name(), "taken");
+        // Owning the same live cursor twice is exactly what must not happen.
+        assert!(values.take_named("rc").is_none());
+        assert!(values.take_named("absent").is_none());
+        // `is_empty` still reports that the statement had output binds.
+        assert!(!values.is_empty());
+
+        // A genuine NULL is taken as a NULL, and is not confused with the above.
+        let null = values
+            .take_named("nothing")
+            .expect("a NULL is still a value");
+        assert!(null.is_null());
+        assert!(!null.is_taken());
+    }
+
+    #[test]
+    fn positional_out_values_are_taken_by_index_and_input_slots_stay_empty() {
+        let mut values = OutValues::Positional(vec![None, Some(Value::from(7_i64))]);
+        assert!(
+            values.take_positional(0).is_none(),
+            "an input-only bind has nothing to take"
+        );
+        assert!(values.take_positional(9).is_none(), "index out of range");
+        let taken = values.take_positional(1).expect("an output bind");
+        assert!(matches!(taken, Value::Number(_)), "{taken:?}");
+        assert!(values.take_positional(1).is_none());
+        assert!(values.positional(1).is_some_and(Value::is_taken));
+        // Taking from the wrong shape is a no-op, not a panic.
+        assert!(OutValues::None.take_positional(0).is_none());
+        assert!(OutValues::None.take_named("x").is_none());
+        assert!(
+            OutValues::Positional(vec![Some(Value::Null)])
+                .take_named("x")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn taking_every_out_value_leaves_the_shape_behind() {
+        // `take_out_values` is the wholesale form `db-core` uses: it must not
+        // turn "this statement had output binds" into "it had none".
+        let mut outcome = ExecutionOutcome::new().with_out_values(OutValues::Named(vec![
+            ("rc".into(), Value::Cursor(StubCursor::boxed())),
+            ("n".into(), Value::from(1_i64)),
+        ]));
+        let mut owned = outcome.take_out_values();
+        assert!(matches!(owned.take_named("rc"), Some(Value::Cursor(_))));
+        assert!(matches!(owned.take_named("n"), Some(Value::Number(_))));
+
+        let left = outcome.out_values();
+        assert!(!left.is_empty(), "the binds existed and must still show");
+        assert!(left.named("rc").is_some_and(Value::is_taken));
+        assert!(left.named("n").is_some_and(Value::is_taken));
+        assert!(outcome.out_values_mut().take_named("rc").is_none());
+
+        // The positional shape survives the same way, input slots included.
+        let mut outcome = ExecutionOutcome::new()
+            .with_out_values(OutValues::Positional(vec![None, Some(Value::from(2_i64))]));
+        assert!(outcome.take_out_values().take_positional(1).is_some());
+        assert!(outcome.out_values().positional(0).is_none());
+        assert!(
+            outcome
+                .out_values()
+                .positional(1)
+                .is_some_and(Value::is_taken)
+        );
+
+        // Nothing to take is still nothing.
+        let mut empty = ExecutionOutcome::new();
+        assert!(empty.take_out_values().is_empty());
+        assert!(empty.out_values().is_empty());
     }
 
     #[test]

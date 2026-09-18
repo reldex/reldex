@@ -450,6 +450,20 @@ pub enum Action {
         /// Rows changed, if any.
         rows_affected: Option<u64>,
     },
+    /// Returns a nested `REF CURSOR` through a **named** output bind, the way
+    /// a PL/SQL `OPEN :rc FOR …` does.
+    ///
+    /// Reported as [`StatementKind::PlSqlBlock`] with
+    /// `OutValues::Named([(name, Value::Cursor(..))])`. It exists so `db-core`
+    /// can be exercised against the REF CURSOR path without a database; the
+    /// shape is deliberately the narrow one that path needs and can grow when
+    /// another output shape has to be scripted.
+    RefCursorOut {
+        /// The output bind's name, without its placeholder prefix.
+        name: String,
+        /// Where the nested cursor's rows come from.
+        source: QuerySource,
+    },
     /// Fails immediately with a scripted error.
     Fail(ScriptedError),
     /// Blocks the worker thread until released or cancelled. See

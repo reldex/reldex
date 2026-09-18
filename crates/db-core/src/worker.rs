@@ -23,8 +23,49 @@ use reldex_db_driver_api::{
 };
 
 use crate::ids::SessionId;
-use crate::session::{CloseDisposition, ExecuteOutcome};
+use crate::session::{CloseDisposition, ExecuteOutcome, OutValue, OutValues};
 use crate::shared::SessionShared;
+
+/// Moves the driver's output values onto the core side, registering any nested
+/// `REF CURSOR` as a result of this session.
+///
+/// A `Value::Cursor` is a handle derived from the connection, so it must stay
+/// on this thread (ADR-0002 D1/D2). It is put in the same `cursors` map an
+/// ordinary query's cursor goes into, and the caller gets its
+/// [`ResultSetId`] — so fetching a REF CURSOR is the same API call as fetching
+/// anything else, and closing the session releases it the same way.
+fn take_out_values(
+    outcome: &mut reldex_db_driver_api::ExecutionOutcome,
+    cursors: &mut HashMap<ResultSetId, Box<dyn Cursor>>,
+) -> OutValues {
+    let mut register = |value: reldex_db_driver_api::Value| match value {
+        reldex_db_driver_api::Value::Cursor(cursor) => {
+            let id = cursor.id();
+            cursors.insert(id, cursor);
+            OutValue::Result(id)
+        }
+        other => OutValue::Value(other),
+    };
+    match outcome.take_out_values() {
+        reldex_db_driver_api::OutValues::None => OutValues::None,
+        reldex_db_driver_api::OutValues::Positional(values) => OutValues::Positional(
+            values
+                .into_iter()
+                .map(|slot| slot.map(&mut register))
+                .collect(),
+        ),
+        reldex_db_driver_api::OutValues::Named(values) => OutValues::Named(
+            values
+                .into_iter()
+                .map(|(name, value)| (name, register(value)))
+                .collect(),
+        ),
+        // `OutValues` is `#[non_exhaustive]`: a shape this core does not know
+        // about must not be silently reported as "no output binds", but there
+        // is nothing useful it can say about one either.
+        _ => OutValues::None,
+    }
+}
 
 /// One outstanding request's reply channel. A plain [`mpsc::channel`] used
 /// once as a oneshot: see [`crate::Completion`].
@@ -282,6 +323,7 @@ fn run(
                     } else {
                         shared.note_statement_kind(statement_kind);
                     }
+                    let out_values = take_out_values(&mut outcome, cursors);
                     shared.note_driver_transaction_state(connection.transaction_state());
                     let _ = reply.send(Ok(ExecuteOutcome {
                         result,
@@ -289,6 +331,7 @@ fn run(
                         statement_kind,
                         committed_implicitly,
                         warnings: outcome.warnings().to_vec(),
+                        out_values,
                     }));
                 }
                 Err(err) => {

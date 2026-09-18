@@ -107,6 +107,40 @@
 //! [`Unsupported`](reldex_db_driver_api::ColumnData::Unsupported) text, so one
 //! odd column never hides a whole table.
 //!
+//! # Known limitations
+//!
+//! Each of these is a defect in `oracledb` 26.0.0-beta.3 that this driver
+//! contains by **refusing** rather than by risking wrong data or a dead process.
+//! All are recorded with a reproduction in
+//! `docs/exec-plans/active/phase-0-spike-results.md` §5, and all should be
+//! re-checked on the next upstream version.
+//!
+//! - **`TIMESTAMP WITH TIME ZONE` is refused** (U-3, U-4). A value whose zone is
+//!   a named region — `TIMESTAMP '2026-01-01 00:00:00 Asia/Bangkok'` — is
+//!   decoded through a bare `todo!()`, and because the panic unwinds while the
+//!   client mutex is held it aborts the **process**, so no wrapper can contain
+//!   it. Region and offset encodings cannot be told apart before the value is
+//!   decoded, and the decode happens inside the upstream round trip, so the
+//!   refusal has to be per *column*: a query whose select list contains such a
+//!   column, and an output bind declared with that type, both fail with
+//!   [`Unsupported`](reldex_db_driver_api::ErrorKind::Unsupported) before
+//!   anything is fetched. `TO_CHAR(c, '… TZR')` in the statement reads the value
+//!   as text. The offset-only form does decode correctly, and
+//!   [`EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE`] turns the refusal off for a caller
+//!   that knows its data — at the price of the abort.
+//! - **A `NUMBER` with an odd number of leading zeros after the decimal point
+//!   cannot be bound** (U-1): the upstream encoder stores it ten times too
+//!   large, silently. `0.05`, `0.0005`, `1E-4` and friends are refused; write
+//!   them as literals.
+//! - **A `NUMBER` of magnitude 1E40 or larger cannot be bound** (U-2): the
+//!   upstream encoder indexes past its digit buffer and the process aborts.
+//!   Reading such values is exact and unaffected.
+//! - **A running statement cannot be interrupted** (U-10); see the capability
+//!   note above.
+//! - **A cursor-typed result column** (`SELECT CURSOR(…) …`) is refused rather
+//!   than silently dropped (ADR-0002 lead decision 3). A `REF CURSOR` through an
+//!   *output bind* is fully supported.
+//!
 //! # Threading
 //!
 //! Everything here is blocking and single-threaded per connection, as ADR-0002
@@ -123,4 +157,4 @@ mod error;
 mod lob;
 mod value;
 
-pub use conn::{EXT_STATEMENT_CACHE_SIZE, OracleThinDriver};
+pub use conn::{EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE, EXT_STATEMENT_CACHE_SIZE, OracleThinDriver};

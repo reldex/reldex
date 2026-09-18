@@ -18,12 +18,82 @@ use crate::ids::SessionId;
 use crate::shared::SessionShared;
 use crate::worker::{self, Command};
 
+/// One value a statement wrote back through an output bind.
+///
+/// Mirrors [`reldex_db_driver_api::Value`] with one substitution: a nested
+/// `REF CURSOR` is a handle derived from the connection, so it never leaves the
+/// worker thread. `db-core` registers it as a result and reports its
+/// [`ResultSetId`], exactly like the cursor an ordinary query produces
+/// (ADR-0002 D1/D2).
+#[derive(Debug)]
+pub enum OutValue {
+    /// Plain data, or a [`reldex_db_driver_api::LobLocator`] to read through
+    /// [`DatabaseSession::read_lob_chunk`]. Never
+    /// `reldex_db_driver_api::Value::Cursor`.
+    Value(reldex_db_driver_api::Value),
+    /// A nested result set, open on this session's worker thread. Fetch it with
+    /// [`DatabaseSession::fetch_batch`] and release it with
+    /// [`DatabaseSession::close_result`], like any other result.
+    Result(ResultSetId),
+}
+
+/// The values a statement wrote back through output binds, in the shape its
+/// binds had.
+///
+/// The core-side mirror of [`reldex_db_driver_api::OutValues`]; see
+/// [`OutValue`] for what changes on the way through.
+#[derive(Debug)]
+pub enum OutValues {
+    /// The statement had no output binds.
+    None,
+    /// Index-aligned with the statement's positional binds; `None` marks a bind
+    /// that was input-only.
+    Positional(Vec<Option<OutValue>>),
+    /// Named output binds, without their placeholder prefix.
+    Named(Vec<(Box<str>, OutValue)>),
+}
+
+impl OutValues {
+    /// The value written back for a positional bind.
+    #[must_use]
+    pub fn positional(&self, index: usize) -> Option<&OutValue> {
+        match self {
+            Self::Positional(values) => values.get(index)?.as_ref(),
+            Self::None | Self::Named(_) => None,
+        }
+    }
+
+    /// The value written back for a named bind.
+    #[must_use]
+    pub fn named(&self, name: &str) -> Option<&OutValue> {
+        match self {
+            Self::Named(values) => values
+                .iter()
+                .find(|(key, _)| &**key == name)
+                .map(|(_, value)| value),
+            Self::None | Self::Positional(_) => None,
+        }
+    }
+
+    /// Whether anything was written back.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::None => true,
+            Self::Positional(values) => values.iter().all(Option::is_none),
+            Self::Named(values) => values.is_empty(),
+        }
+    }
+}
+
 /// Everything one [`DatabaseSession::execute`] produced.
 ///
 /// Mirrors [`reldex_db_driver_api::ExecutionOutcome`], with the driver's
 /// cursor replaced by the [`ResultSetId`] `db-core` now owns on the worker
-/// thread — the cursor itself never leaves it (ADR-0002 D1/D2).
-#[derive(Debug, Clone)]
+/// thread — the cursor itself never leaves it (ADR-0002 D1/D2). A nested
+/// `REF CURSOR` returned through an output bind is handled the same way; see
+/// [`OutValue`].
+#[derive(Debug)]
 pub struct ExecuteOutcome {
     /// The result set's id, if the statement produced one. Pass this to
     /// [`DatabaseSession::fetch_batch`] and, once done,
@@ -41,6 +111,10 @@ pub struct ExecuteOutcome {
     /// Non-fatal messages the statement produced (for example, PL/SQL
     /// "compiled with errors").
     pub warnings: Vec<Warning>,
+    /// The values the statement wrote back through output binds. A nested
+    /// `REF CURSOR` among them is already registered as a result of this
+    /// session; see [`OutValue`].
+    pub out_values: OutValues,
 }
 
 /// What to do with a possibly-open transaction when closing a session.
