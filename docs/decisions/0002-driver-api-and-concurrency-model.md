@@ -1,6 +1,6 @@
 # 0002 — Driver API and Concurrency Model
 
-**Status:** Proposed
+**Status:** Accepted (provisional — implemented; independent API review in progress; owner review pending)
 **Date:** 2026-09-19
 
 ## Context
@@ -202,6 +202,23 @@ another ADR's subject (`ARCHITECTURE.md` §13 items 2, 6, 8, 12) or unproven in 
 APIs small until the architecture stabilizes" (`AGENTS.md`) applies literally here: every trait
 method is a compatibility promise to `db-core`, the mock driver, the oracle-thin driver and later
 the FFI, and Phase 0 exists to find out which promises we can keep.
+
+## Lead decisions (2026-09-19)
+
+During implementation the implementer raised five open questions. The lead decided each below under
+the owner's delegation; all five are open to owner review.
+
+1. **No auto-commit toggle in the V1 contract (D4).** Accepted.
+2. **`TIMESTAMP WITH TIME ZONE` named regions (D5).** Accepted as a documented limitation — normalized
+   to a UTC offset for now — on condition the type stays extensible so a named region can be added
+   later without a breaking change.
+3. **Cursor-typed result columns, i.e. nested `CURSOR(...)` in a select list (D5, D8).** Accepted as
+   out of scope for V1, provided a driver reports `ErrorKind::Unsupported` rather than silently
+   dropping the column.
+4. **`Secret` zeroing stays best-effort, no `zeroize` dependency for now (D7).** Accepted; revisit in
+   the credential-storage ADR (`ARCHITECTURE.md` §13 item 9).
+5. **`SavepointName` restricted to a portable simple identifier of at most 30 ASCII characters (D4).**
+   Accepted.
 
 ## Consequences
 

@@ -65,6 +65,12 @@ Vendor-neutral names (`SPEC.md` §6). Vendor types belong only to driver/provide
 | `MetadataProvider` | Generic metadata queries; vendor dictionary SQL stays in the vendor provider. |
 | `WorkspaceService` | Non-transactional workspace, profiles, history, settings, layout state. |
 
+Per [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) D2, `DatabaseConnection` is the
+driver-contract trait (`db-driver-api`; `Send`, not `Sync`; `&mut self`), while `DatabaseSession` is a
+`db-core` type, not a driver-contract trait — it owns a connection, that connection's dedicated
+worker thread, its `Arc<dyn CancelHandle>`, and its conservative transaction state. The driver
+contract stops at `DatabaseConnection`.
+
 `reldex-core-poc` exercises these modules without a full UI (`SPEC.md` §26).
 
 ## 4. Driver boundary
@@ -88,9 +94,11 @@ driver-native error --> normalize --> DbError
                                         `- native database error code preserved
 ```
 
-Only the two properties above are settled; the concrete `DbError` shape and its category set are
-open (§13). Permission-dependent metadata and monitoring failures must be distinguishable from
-genuine driver/connection failures.
+The concrete `DbError` shape and category set are now settled by
+[ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) D3:
+`DbError{kind, message, native, position, session_state, retryable, source}`, with a stable,
+`#[non_exhaustive]` `ErrorKind` whose `Permission` variant keeps permission-dependent metadata and
+monitoring failures distinguishable from genuine driver/connection failures.
 
 ## 5. Session and transaction model
 
@@ -127,8 +135,11 @@ Rules:
 - The core owns its execution model; the UI submits work and observes results, it does not drive
   threads across the FFI boundary.
 
-The concrete execution model (async runtime vs. dedicated per-session threads) and the
-cancellation mechanism are open (§13) and must be chosen from Phase 0 measurements.
+The execution model is chosen: per [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md)
+D1/D2, `db-core` runs one dedicated worker thread per session (no async runtime below the FFI line),
+and cancellation from another control path goes through a separate, cloneable `Arc<dyn CancelHandle>`
+obtained before a call blocks — never through the worker thread itself. The driver-level cancellation
+mechanism and its latency per platform remain open (§13 item 5).
 
 ## 7. FFI and Qt adapter boundary
 
@@ -196,17 +207,22 @@ reconnect (`SPEC.md` §25; `phase-0.md` Workstream G). Emulator/simulator result
 
 ## 11. Planned repository layout (provisional)
 
-Only crates the current documents name. Layout is provisional until Phase 0 Workstream A lands and
-an ADR records it.
+Only crates the current documents name. Layout is provisional until an ADR records it (Phase 0
+Workstream A landed empty, skeleton-only crates at the paths below; see §13 item 10).
 
 ```text
-db-driver-api/          vendor-neutral driver contract + DbError
-db-core/                sessions, transactions, query, results, metadata, workspace
-drivers/oracle/thin/    thin driver implementation (vendor code isolated here)
-drivers/<mock>/         test-support/mock driver for core tests
-reldex-core-poc/        Phase 0 validation harness (no full UI)
+crates/db-driver-api/          vendor-neutral driver contract + DbError
+crates/db-core/                sessions, transactions, query, results, metadata, workspace
+crates/drivers/oracle-thin/    thin driver: wraps Oracle's `oracledb` crate (ADR-0001); vendor code isolated here
+crates/drivers/mock/           test-support/mock driver for core tests
+crates/reldex-core-poc/        Phase 0 validation harness (no full UI)
 docs/architecture/, docs/decisions/, docs/exec-plans/
 ```
+
+Note: `docs/exec-plans/active/phase-0.md` Workstream A names the thin driver path as
+`drivers/oracle/thin`; the actual crate lives at `crates/drivers/oracle-thin` (flattened, no nested
+`oracle/` directory). This layout, including that naming, remains provisional pending the crate
+layout ADR (§13 item 10).
 
 ## 12. Architectural invariants
 
@@ -231,26 +247,42 @@ A change is non-compliant if it breaks any of these without an approved ADR:
 Each item must be resolved by Phase 0 evidence and recorded as an ADR under `docs/decisions/`.
 Until then, no code should assume an answer.
 
-1. **Thin driver selection.** Which pure/thin Rust driver implementation backs `drivers/oracle/thin`,
-   and what are its maturity, platform, and TCPS constraints across Tier 1-3 targets?
+1. **Thin driver selection — RESOLVED by [ADR-0001](../decisions/0001-database-driver-strategy.md).**
+   The primary driver is Oracle's official `oracledb` crate (`oracle/rust-oracledb`; pure Rust, thin,
+   blocking), pinned to an exact version and wrapped by `crates/drivers/oracle-thin`. Still open and
+   tracked by the ADR's spike plan: statement cancellation (no public cancel API yet), beta maturity,
+   TCPS, and Android/iOS viability.
 2. **FFI mechanism.** Which Rust/C++ interop approach provides a stable, typed, small boundary, and
    how is ABI/version compatibility guaranteed?
-3. **Threading and callbacks across FFI.** How does the core deliver completion and progress to the
-   Qt thread — polling, callbacks, or a queue — and what are the thread-affinity and reentrancy rules?
-4. **Async runtime vs. threads.** Does the core use an async runtime or dedicated per-session
-   threads, and what does each cost on mobile (binary size, battery, background behavior)?
-5. **Cancellation mechanism.** How is a running statement cancelled from another control path, and
-   what cancellation latency is achievable per platform?
+3. **Threading and callbacks across FFI — constrained, still open.** [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md)
+   D1 fixes one input: each session's calls run on that session's dedicated worker thread, so
+   completion must be marshalled off that thread to the Qt thread either way (e.g. a queue the
+   adapter drains via a `QEvent`/queued signal). The concrete mechanism, and the thread-affinity and
+   reentrancy rules, are not yet decided.
+4. **Async runtime vs. threads — RESOLVED by [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) D1.**
+   No async runtime below the FFI line; `db-core` uses one dedicated worker thread per session, owning
+   `Box<dyn DatabaseConnection>` for that session's lifetime.
+5. **Cancellation mechanism — contract RESOLVED by [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) D2;
+   driver-level mechanism still open.** The contract is a separate `Arc<dyn CancelHandle>`,
+   `CancelKind::{Native, CallTimeout, Unsupported}`, and `SessionState::{Usable, NeedsValidation, Lost}`
+   reported on every `DbError`. Which mechanism the primary driver actually offers, and the
+   cancellation latency achievable per platform, remain open (ADR-0001 C1, spike S4).
 6. **Result store representation.** What is the in-memory row/batch layout, bounded-memory policy,
    and spill/eviction behavior? Does Arrow earn its place by benchmark (deferred to Phase 3)?
-7. **Error model shape.** What are the `DbError` categories, the retryability/classification rules,
-   and how are permission-dependent failures separated from driver failures?
+7. **Error model shape — RESOLVED by [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) D3.**
+   `DbError{kind, message, native, position, session_state, retryable, source}`; `ErrorKind` is a
+   stable, `#[non_exhaustive]`, vendor-neutral category set including `Permission`, which keeps
+   permission-dependent metadata/monitoring failures separable from driver failures.
 8. **Metadata cache design.** Cache keying and per-database identity isolation, TTL and
    invalidation strategy, and behavior at 100,000+ objects.
 9. **Credential storage abstraction.** What single core abstraction spans the four platform secure
    stores, and what is the fallback when none is available?
 10. **Crate layout.** Final workspace layout, crate boundaries, and feature flags (provisional in §11).
-11. **Type mapping.** Rust representation, NULL handling, precision-loss risk, and lazy/streaming
-    behavior per database type (`phase-0.md` Workstream D).
+11. **Type mapping — PARTLY RESOLVED by [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) D5.**
+    The API-level representation is decided: a lossless, allocation-free 38-digit `Number` (no `f64`
+    path), one `Timestamp` type covering DATE/TIMESTAMP/TIMESTAMP WITH TIME ZONE (named IANA regions
+    normalized to an offset, a documented limitation), explicit NULL via variant plus a per-column
+    validity mask, and lazy `LobStream` for LOBs. Still open: per-type driver-mapping evidence against
+    a real database, pending the Workstream D spikes (`phase-0.md`).
 12. **Script/statement boundary parsing.** Where the SQL/PL/SQL block-boundary parser lives and how
     it is shared between core and editor (`SPEC.md` §15).

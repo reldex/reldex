@@ -1,0 +1,1161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Reldex — Progress Dashboard</title>
+<style>
+  :root {
+    --bg: #f6f5f1;
+    --surface: #ffffff;
+    --surface-alt: #eeece5;
+    --border: #d8d5cb;
+    --border-strong: #b9b6a9;
+    --text: #201f1b;
+    --text-muted: #5d5a50;
+    --accent: #2b5797;
+    --accent-strong: #1d3d6e;
+    --accent-soft: #e4ecf7;
+    --done: #2f7a4f;
+    --done-soft: #e3f1e7;
+    --progress: #9a6a06;
+    --progress-soft: #f5ecd9;
+    --todo: #6b6860;
+    --todo-soft: #ececE6;
+    --blocked: #b3261e;
+    --blocked-soft: #fbe9e7;
+    --focus-ring: #2b5797;
+    --radius: 4px;
+    --font-sans: "Leelawadee UI", "Noto Sans Thai", Tahoma, -apple-system, BlinkMacSystemFont,
+      "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a;
+      --surface: #1b1e24;
+      --surface-alt: #21242b;
+      --border: #343841;
+      --border-strong: #474c57;
+      --text: #e9e7e0;
+      --text-muted: #a7a397;
+      --accent: #7fa8e8;
+      --accent-strong: #a9c6f2;
+      --accent-soft: #1f2c40;
+      --done: #74c98f;
+      --done-soft: #17301f;
+      --progress: #e0ab4a;
+      --progress-soft: #332708;
+      --todo: #a7a397;
+      --todo-soft: #262a31;
+      --blocked: #f08b83;
+      --blocked-soft: #3a1c19;
+      --focus-ring: #7fa8e8;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  html { color-scheme: light dark; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent-strong); }
+  a:hover { text-decoration-thickness: 2px; }
+
+  :focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 2px;
+  }
+
+  .tabular { font-variant-numeric: tabular-nums; }
+
+  .wrap {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 0 20px;
+  }
+
+  /* ---------- Header ---------- */
+  header.site-header {
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .header-inner {
+    padding: 22px 0 18px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 10px 18px;
+  }
+  .site-header h1 {
+    font-size: 1.5rem;
+    margin: 0;
+    letter-spacing: -0.01em;
+  }
+  .tagline {
+    color: var(--text-muted);
+    font-size: 0.92rem;
+    margin: 2px 0 0;
+    flex-basis: 100%;
+  }
+  .phase-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border: 1px solid var(--accent);
+    color: var(--accent-strong);
+    background: var(--accent-soft);
+    border-radius: var(--radius);
+    padding: 3px 9px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .updated-line {
+    color: var(--text-muted);
+    font-size: 0.82rem;
+    margin-left: auto;
+  }
+  .updated-line .raw {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+  }
+  .repo-link {
+    font-size: 0.82rem;
+  }
+
+  /* ---------- Layout ---------- */
+  main { padding: 28px 0 60px; }
+  section { margin-bottom: 40px; }
+  section > h2 {
+    font-size: 1.05rem;
+    margin: 0 0 14px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    letter-spacing: -0.005em;
+  }
+  .section-note {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    margin: -8px 0 14px;
+  }
+
+  /* ---------- Error banner ---------- */
+  #error-banner {
+    background: var(--blocked-soft);
+    border: 1px solid var(--blocked);
+    color: var(--blocked);
+    padding: 14px 18px;
+    border-radius: var(--radius);
+    margin: 18px auto 0;
+    max-width: 940px;
+    font-weight: 600;
+  }
+  #error-banner[hidden] { display: none; }
+
+  /* ---------- Status chips ---------- */
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    border-radius: 999px;
+    padding: 2px 9px 2px 6px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    line-height: 1.6;
+    white-space: nowrap;
+    border: 1px solid transparent;
+  }
+  .chip svg { width: 12px; height: 12px; flex: none; }
+  .chip.status-done       { color: var(--done);     background: var(--done-soft);     border-color: var(--done); }
+  .chip.status-in_progress{ color: var(--progress);  background: var(--progress-soft); border-color: var(--progress); }
+  .chip.status-todo       { color: var(--todo);      background: var(--todo-soft);     border-color: var(--border-strong); }
+  .chip.status-blocked    { color: var(--blocked);   background: var(--blocked-soft);  border-color: var(--blocked); }
+
+  /* ---------- Progress ---------- */
+  .progress-block { margin-bottom: 16px; }
+  .progress-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 12px;
+    font-size: 0.88rem;
+    margin-bottom: 5px;
+  }
+  .progress-head .name { font-weight: 600; }
+  .progress-head .stat { color: var(--text-muted); }
+  .progress-track {
+    height: 8px;
+    border-radius: 999px;
+    background: var(--surface-alt);
+    border: 1px solid var(--border);
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    background: var(--accent);
+    width: 0%;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .progress-fill { transition: width 0.4s ease; }
+  }
+
+  .overview-grid {
+    display: grid;
+    grid-template-columns: 1.1fr 1fr;
+    gap: 28px;
+  }
+  @media (max-width: 720px) {
+    .overview-grid { grid-template-columns: 1fr; }
+  }
+  .stat-row {
+    display: flex;
+    gap: 18px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+  }
+  .stat-row .stat {
+    font-size: 0.82rem;
+    color: var(--text-muted);
+  }
+  .stat-row .stat b {
+    display: block;
+    font-size: 1.15rem;
+    color: var(--text);
+  }
+  .phase-mini-list { display: flex; flex-direction: column; gap: 12px; }
+
+  /* ---------- Latest status ---------- */
+  .summary-text { max-width: 74ch; }
+  .status-columns {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+    margin-top: 18px;
+  }
+  @media (max-width: 640px) {
+    .status-columns { grid-template-columns: 1fr; }
+  }
+  .status-columns h3 {
+    font-size: 0.82rem;
+    text-transform: none;
+    color: var(--text-muted);
+    margin: 0 0 8px;
+    font-weight: 600;
+  }
+  .status-columns ol, .status-columns ul {
+    margin: 0;
+    padding-left: 1.15em;
+  }
+  .status-columns li { margin-bottom: 6px; }
+
+  /* ---------- Blockers & risks ---------- */
+  .no-blockers {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--done-soft);
+    border: 1px solid var(--done);
+    color: var(--done);
+    border-radius: var(--radius);
+    padding: 10px 14px;
+    font-weight: 600;
+    font-size: 0.9rem;
+  }
+  .no-blockers svg { width: 16px; height: 16px; flex: none; }
+  .card-list { display: grid; gap: 10px; }
+  .card {
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--border-strong);
+    background: var(--surface);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+  }
+  .card.blocker { border-left-color: var(--blocked); }
+  .card.risk { border-left-color: var(--progress); }
+  .card-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    align-items: baseline;
+    flex-wrap: wrap;
+  }
+  .card-head .title { font-weight: 600; }
+  .card-meta { color: var(--text-muted); font-size: 0.78rem; }
+  .card p { margin: 6px 0 0; font-size: 0.9rem; }
+  .card p.mitigation { color: var(--text-muted); }
+  .card p.mitigation::before { content: "Mitigation: "; font-weight: 600; color: var(--text); }
+
+  /* ---------- Tables ---------- */
+  .table-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    min-width: 640px;
+    font-size: 0.86rem;
+    background: var(--surface);
+  }
+  th, td {
+    text-align: left;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  thead th {
+    background: var(--surface-alt);
+    font-weight: 600;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    position: sticky;
+    top: 0;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  td.id-cell, th.id-cell { font-family: var(--font-mono); white-space: nowrap; }
+  td.box-cell { white-space: nowrap; }
+
+  /* ---------- Decisions ---------- */
+  .decision-list { display: grid; gap: 10px; }
+  .decision {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    padding: 12px 14px;
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    align-items: baseline;
+  }
+  .decision .id { font-family: var(--font-mono); color: var(--text-muted); font-size: 0.82rem; margin-right: 8px; }
+  .decision .title { font-weight: 600; }
+  .decision .meta { color: var(--text-muted); font-size: 0.8rem; }
+
+  /* ---------- Roadmap ---------- */
+  .filter-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+  .filter-bar button {
+    font-family: inherit;
+    font-size: 0.82rem;
+    padding: 5px 11px;
+    border-radius: 999px;
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+  }
+  .filter-bar button[aria-pressed="true"] {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  @media (prefers-color-scheme: dark) {
+    .filter-bar button[aria-pressed="true"] { color: #0b1220; }
+  }
+
+  details.phase {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    margin-bottom: 10px;
+    padding: 0;
+  }
+  details.phase > summary {
+    cursor: pointer;
+    list-style: none;
+    padding: 12px 14px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  details.phase > summary::-webkit-details-marker { display: none; }
+  details.phase > summary .caret {
+    width: 10px; height: 10px;
+    border-right: 2px solid var(--text-muted);
+    border-bottom: 2px solid var(--text-muted);
+    transform: rotate(-45deg);
+    flex: none;
+  }
+  details.phase[open] > summary .caret { transform: rotate(45deg); }
+  details.phase > summary .phase-title { font-weight: 600; flex: 1 1 auto; min-width: 160px; }
+  details.phase > summary .phase-count { color: var(--text-muted); font-size: 0.82rem; }
+  .phase-body { padding: 0 14px 14px; }
+  .phase-body .progress-block { margin-top: 0; margin-bottom: 14px; }
+  .group { margin-bottom: 14px; }
+  .group:last-child { margin-bottom: 0; }
+  .group h4 {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    font-weight: 600;
+    margin: 0 0 6px;
+  }
+  ul.task-list { list-style: none; margin: 0; padding: 0; }
+  ul.task-list li {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 5px 0;
+    border-top: 1px solid var(--border);
+    font-size: 0.88rem;
+  }
+  ul.task-list li:first-child { border-top: none; }
+  ul.task-list li[hidden] { display: none; }
+  .task-title { flex: 1 1 auto; }
+  .task-note { display: block; color: var(--text-muted); font-size: 0.78rem; margin-top: 2px; }
+
+  /* ---------- Activity ---------- */
+  .activity-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+  .activity-list li {
+    display: grid;
+    grid-template-columns: 100px 1fr;
+    gap: 12px;
+    font-size: 0.88rem;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .activity-list li:last-child { border-bottom: none; padding-bottom: 0; }
+  .activity-list time { color: var(--text-muted); font-size: 0.8rem; }
+  @media (max-width: 520px) {
+    .activity-list li { grid-template-columns: 1fr; gap: 2px; }
+  }
+
+  /* ---------- Footer ---------- */
+  footer.site-footer {
+    border-top: 1px solid var(--border);
+    padding: 20px 0 40px;
+    color: var(--text-muted);
+    font-size: 0.82rem;
+  }
+  footer.site-footer ul {
+    list-style: none;
+    margin: 0 0 10px;
+    padding: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+  }
+
+  /* ---------- Print ---------- */
+  @media print {
+    body { background: #fff; color: #000; }
+    .filter-bar { display: none; }
+    .progress-fill { background: #555 !important; }
+    a { color: #000; text-decoration: underline; }
+    details.phase { break-inside: avoid; border-color: #999; }
+  }
+</style>
+</head>
+<body>
+
+<!--
+  Data contract for coding agents (per AGENTS.md, "Progress dashboard (Task.html)").
+
+  Edit ONLY the JSON inside <script type="application/json" id="project-data"> below.
+  Do not restyle or restructure this page as part of a routine status update.
+
+  On every update:
+    1. Refresh "updatedAt" to the current time, ISO 8601 with a UTC offset
+       (e.g. "2026-09-20T09:15:00+07:00").
+    2. Prepend (do not append) a new entry to "activity" — newest first.
+    3. Use only these task/spike/decision statuses: "todo", "in_progress", "done", "blocked".
+    4. Report honestly: a failed spike, a blocker, or a known limitation must be recorded here,
+       never omitted. Leave "blockers" as [] only when there truly are none.
+    5. TASKS.md and the active plan under docs/exec-plans/active/ remain the source of truth for
+       task status; keep this JSON's "phases" in sync with them rather than drifting independently.
+
+  Schema:
+    project:      { name, tagline, repo }
+    updatedAt:    ISO 8601 timestamp with numeric UTC offset
+    updatedBy:    string
+    currentPhase: { id, title, goal, exitGate }
+    summary:      string, 2-4 sentences on latest status
+    focus:        [string]  — what is being worked on right now
+    blockers:     [{ title, detail, severity, since }]  — [] when none
+    risks:        [{ title, detail, mitigation }]
+    nextSteps:    [string]  — ordered
+    decisions:    [{ id, title, status, date, link }]  — link is a relative path or null
+    spikes:       [{ id, title, box, killCriterion, status, result }]
+    phases:       [{ id, title, status, groups: [{ title, tasks: [{ title, status, note? }] }] }]
+    activity:     [{ date, text }]  — newest first
+
+  Percentages and progress bars are computed from task statuses by the script below; never
+  hand-type a percentage anywhere in this file.
+-->
+<script type="application/json" id="project-data">
+{
+  "project": {
+    "name": "Reldex",
+    "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
+    "repo": "https://github.com/reldex/reldex"
+  },
+  "updatedAt": "2026-09-19T21:40:00+07:00",
+  "updatedBy": "Claude (lead) + workers",
+  "currentPhase": {
+    "id": "P0",
+    "title": "Phase 0 — Architecture Validation",
+    "goal": "Prove the Rust core, thin database connectivity, cancellation, transaction behavior, and mobile feasibility before substantial UI investment.",
+    "exitGate": "Desktop POC passes. Android/iOS feasibility is documented from physical-device tests."
+  },
+  "summary": "Reldex is in Phase 0 — Architecture Validation. The Cargo workspace skeleton, CI, and a local Oracle 19c Docker test database (tools/oracle-test-db/) are in place and verified. ADR-0001 (primary driver = Oracle's oracledb crate) is accepted, conditional on spikes S1–S5. ADR-0002 (driver API and concurrency model) is now accepted provisionally: its db-driver-api contract is implemented — 5 traits, ~45 types, zero production dependencies, 68 unit + 6 doc tests, fmt/clippy/test green — with an independent API review in progress and owner review still pending. db-core's session/transaction implementation, the mock driver, the oracledb wrapper, and all Phase 0 spikes have not started yet.",
+  "focus": [
+    "Independent API review of the db-driver-api contract (implemented per ADR-0002), then applying any resulting fixes",
+    "Building the mock driver and db-core's per-session worker-thread session/transaction layer against that contract",
+    "Wrapping the pinned oracledb crate in drivers/oracle-thin and preparing to run spikes S1–S5 against the verified local Oracle 19c test database",
+    "Code review, PR, and CI on Windows/Linux/macOS once the above lands"
+  ],
+  "blockers": [],
+  "risks": [
+    {
+      "title": "No public statement-cancel API in the primary driver",
+      "detail": "oracledb (oracle/rust-oracledb) exposes no public cancel/break/interrupt function; execute() holds the connection's mutex for the call duration, so a second thread cannot interleave a break today (ADR-0001 Conflict C1).",
+      "mitigation": "Spike S4 evaluates set_call_timeout as a coarse stand-in; an upstream enhancement request is being drafted; ADR-0001 is re-opened if S4's kill criterion fires."
+    },
+    {
+      "title": "Primary driver is pre-GA beta",
+      "detail": "oracledb is roughly two months old (first release 2026-08-06); its short issue history already includes two transaction/session-correctness bugs, both fixed within days (ADR-0001 Conflict C2).",
+      "mitigation": "Pin an exact version, keep it strictly behind db-driver-api, and add Reldex-owned contract tests so an upgrade that changes behaviour is caught in CI."
+    },
+    {
+      "title": "Mobile (Android/iOS) viability is unproven",
+      "detail": "Oracle names no tested target platforms for oracledb; Android/iOS are almost certainly untested upstream (ADR-0001 Conflict C3).",
+      "mitigation": "Spike S6 cross-compiles to aarch64-linux-android and aarch64-apple-ios; SPEC.md §25 requires physical-device evidence before any mobile direct-connect claim, regardless of build success."
+    },
+    {
+      "title": "Local test database has coverage limitations",
+      "detail": "tools/oracle-test-db/ uses the community image doctorkirk/oracle-19c:19.3 — 19.3 base release with no Release Updates, Single-Instance Non-CDB (most real 19c sites run CDB/PDB), unmaintained since 2021-03, amd64 only, and TCPS is not configured out of the box. Verification also found the container needs an explicit AL32UTF8 client charset (NLS_LANG) or multi-byte UTF-8 (including Thai) is corrupted on the wire — a real finding for Reldex's own driver, not just a test-harness quirk.",
+      "mitigation": "Treat spike results as Phase 0 driver-level evidence, not full production-topology coverage; every driver/client must declare AL32UTF8 explicitly; a CDB/PDB-capable official image is a documented optional later addition, not required for Phase 0. Follow-ups tracked for tools/oracle-test-db/: add a TCPS listener (wallet-based) before spike S8, and add a container memory cap (mem_limit / deploy.resources.limits.memory) plus an explicit SGA/PGA resize, since dbca currently auto-sizes to roughly 40% of host-visible memory (~12 GiB observed) rather than a container-bounded value."
+    }
+  ],
+  "nextSteps": [
+    "Complete independent API review of db-driver-api and apply any resulting fixes",
+    "Implement the mock driver and db-core's session/transaction layer (worker thread, cancel handle, conservative transaction tracking) against the db-driver-api contract",
+    "Wrap the pinned oracledb crate in drivers/oracle-thin and add Reldex-owned contract tests",
+    "Run Phase 0 spikes S1–S5 (connect, SELECT fidelity, session/transaction correctness, cancellation, REF CURSOR/binds/DBMS_OUTPUT) against the test database",
+    "Code review, PR, and CI on Windows/Linux/macOS"
+  ],
+  "decisions": [
+    {
+      "id": "ADR-0001",
+      "title": "Database driver strategy — primary driver is Oracle's oracledb (rust-oracledb)",
+      "status": "Accepted (conditional on spikes S1–S5)",
+      "date": "2026-09-19",
+      "link": "docs/decisions/0001-database-driver-strategy.md"
+    },
+    {
+      "id": "ADR-0002",
+      "title": "Driver API and concurrency model — blocking object-safe contract, per-session worker thread in db-core",
+      "status": "Accepted (provisional — implemented; independent API review in progress; owner review pending)",
+      "date": "2026-09-19",
+      "link": "docs/decisions/0002-driver-api-and-concurrency-model.md"
+    }
+  ],
+  "spikes": [
+    { "id": "S1", "title": "Connect + authenticate to 19c: Easy Connect, service name, full descriptor", "box": "0.5 d", "killCriterion": "Cannot authenticate against a stock 19c account after verifier workaround", "status": "todo", "result": "" },
+    { "id": "S2", "title": "SELECT fidelity: NUMBER precision at 38 digits, DATE, TIMESTAMP, TIMESTAMP TZ, NVARCHAR2/NCLOB with Thai text, RAW", "box": "1 d", "killCriterion": "Silent precision loss in NUMBER, or Thai/NCHAR corruption", "status": "todo", "result": "Not yet run against the driver. Pre-spike finding from raw sqlplus testing of the test-DB harness: Thai text was corrupted (U+FFFD) until the client set NLS_LANG=AMERICAN_AMERICA.AL32UTF8 — S2 must prove the Thai/NCHAR round-trip through the oracledb driver itself, not just sqlplus." },
+    { "id": "S3", "title": "Session/transaction correctness: auto-commit OFF, uncommitted state across statements, SAVEPOINT + ROLLBACK TO via SQL, second session cannot see uncommitted data", "box": "1 d", "killCriterion": "SAVEPOINT unusable, or session state leaks between connections", "status": "todo", "result": "" },
+    { "id": "S4", "title": "Cancel a long-running statement from another control path; measure latency", "box": "1.5 d", "killCriterion": "No mechanism achieves cancel within ~2 s and leaves the session usable — even via set_call_timeout", "status": "todo", "result": "" },
+    { "id": "S5", "title": "REF CURSOR + IN/OUT/IN OUT binds + DBMS_OUTPUT", "box": "1 d", "killCriterion": "REF CURSOR or OUT binds unusable", "status": "todo", "result": "" },
+    { "id": "S6", "title": "Cross-compile checks: cargo build --target aarch64-linux-android and aarch64-apple-ios", "box": "0.5 d", "killCriterion": "Either target fails to build and no provider swap fixes it", "status": "todo", "result": "" },
+    { "id": "S7", "title": "CLOB/BLOB streaming ≥100 MB with bounded RSS; confirm issue #18 impact", "box": "1 d", "killCriterion": "Memory grows with LOB size, or non-ASCII CLOBs unreadable", "status": "todo", "result": "" },
+    { "id": "S8", "title": "TCPS against a TLS-enabled listener", "box": "1 d", "killCriterion": "TCPS cannot be established without Instant Client", "status": "todo", "result": "" },
+    { "id": "S9", "title": "Network-loss detection and reconnect semantics; N concurrent sessions under load", "box": "1 d", "killCriterion": "Lost sessions are hidden rather than surfaced", "status": "todo", "result": "" }
+  ],
+  "phases": [
+    {
+      "id": "P0",
+      "title": "Phase 0 — Architecture Validation",
+      "status": "in_progress",
+      "groups": [
+        {
+          "title": "Test infrastructure",
+          "tasks": [
+            { "title": "Local Oracle 19c Docker test database (tools/oracle-test-db)", "status": "done", "note": "Verified: connection details, AL32UTF8/NLS_LANG requirement, and limitations documented in tools/oracle-test-db/README.md." }
+          ]
+        },
+        {
+          "title": "Repository bootstrap",
+          "tasks": [
+            { "title": "Create GitHub Organization and reldex/reldex repository", "status": "done" },
+            { "title": "Prepare initial project documentation", "status": "done" },
+            { "title": "Commit README.md, SPEC.md, ROADMAP.md, AGENTS.md", "status": "done" },
+            { "title": "Add .gitignore and .editorconfig", "status": "done" },
+            { "title": "Add repository-local skill under .agents/skills/reldex-development/", "status": "done" },
+            { "title": "Enable branch protection when repository becomes collaborative/public", "status": "todo" },
+            { "title": "Decide Community/Pro licensing before public release", "status": "todo" },
+            { "title": "Run trademark/domain clearance before commercial launch", "status": "todo" }
+          ]
+        },
+        {
+          "title": "Driver/core",
+          "tasks": [
+            { "title": "Create Rust workspace", "status": "done" },
+            { "title": "Create db-driver-api", "status": "done", "note": "Implemented per ADR-0002: 5 traits (DatabaseDriver, DatabaseConnection, CancelHandle, Cursor, LobStream), ~45 types, zero production dependencies, 68 unit + 6 doc tests, fmt/clippy/test green. Independent API review in progress; owner review pending." },
+            { "title": "Create db-core", "status": "in_progress", "note": "Skeleton crate at crates/db-core; depends only on db-driver-api. Session/worker-thread implementation against the now-implemented contract not started." },
+            { "title": "Create initial database driver implementation — wrap Oracle's official oracledb crate (oracle/rust-oracledb, pinned exact version) in crates/drivers/oracle-thin", "status": "todo", "note": "Per ADR-0001. Skeleton crate exists at crates/drivers/oracle-thin; wrapper not started." },
+            { "title": "Add driver contract tests that detect behaviour changes on oracledb upgrades", "status": "todo" },
+            { "title": "Draft upstream request to oracle/rust-oracledb for a public statement-cancel API (owner to submit)", "status": "todo" },
+            { "title": "Add normalized DbError", "status": "done", "note": "Implemented in db-driver-api per ADR-0002 D3: DbError{kind, message, native, position, session_state, retryable, source}; ErrorKind is a stable, #[non_exhaustive] vendor-neutral category set." },
+            { "title": "Add connection/profile model", "status": "in_progress", "note": "Driver-level connection params (ConnectionParams, Secret, Extensions) implemented in db-driver-api per ADR-0002 D7; user-facing profile model pending." },
+            { "title": "Add session abstraction", "status": "in_progress", "note": "Contract only: DatabaseConnection trait implemented in db-driver-api (ADR-0002); db-core's DatabaseSession (worker thread, cancel handle, transaction tracking) not yet implemented." },
+            { "title": "Add transaction abstraction", "status": "in_progress", "note": "Contract only: commit/rollback/savepoint/transaction_state on DatabaseConnection implemented in db-driver-api (ADR-0002 D4); db-core implementation pending." },
+            { "title": "Add cancellation abstraction", "status": "done", "note": "Contract implemented: Arc<dyn CancelHandle>, CancelKind::{Native,CallTimeout,Unsupported}, SessionState (ADR-0002 D2). Driver-level cancel mechanism pending spike S4 — oracledb has no public cancel API yet." }
+          ]
+        },
+        {
+          "title": "Functional POC",
+          "tasks": [
+            { "title": "Connect/disconnect/ping", "status": "todo" },
+            { "title": "SELECT", "status": "todo" },
+            { "title": "DML", "status": "todo" },
+            { "title": "PL/SQL anonymous block", "status": "todo" },
+            { "title": "IN/OUT/IN OUT binds", "status": "todo" },
+            { "title": "REF CURSOR", "status": "todo" },
+            { "title": "COMMIT/ROLLBACK/SAVEPOINT", "status": "todo" },
+            { "title": "CLOB/NCLOB/BLOB", "status": "todo" },
+            { "title": "DBMS_OUTPUT", "status": "todo" },
+            { "title": "Long-running query cancellation", "status": "todo" },
+            { "title": "TCPS", "status": "todo" },
+            { "title": "Network-loss behavior", "status": "todo" },
+            { "title": "Concurrent independent sessions", "status": "todo" }
+          ]
+        },
+        {
+          "title": "Platform validation",
+          "tasks": [
+            { "title": "Windows x64", "status": "todo" },
+            { "title": "Linux x64", "status": "todo" },
+            { "title": "macOS ARM64", "status": "todo" },
+            { "title": "Android ARM64 physical device", "status": "todo" },
+            { "title": "iOS/iPadOS ARM64 physical device", "status": "todo" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "P1",
+      "title": "Phase 1 — Windows Desktop MVP",
+      "status": "todo",
+      "groups": [
+        {
+          "title": "Desktop MVP",
+          "tasks": [
+            { "title": "Qt Quick application shell", "status": "todo" },
+            { "title": "Thin C++ ↔ Rust FFI adapter", "status": "todo" },
+            { "title": "Connection Manager", "status": "todo" },
+            { "title": "Workspace shell", "status": "todo" },
+            { "title": "SQL Worksheet", "status": "todo" },
+            { "title": "Multiple independent sessions", "status": "todo" },
+            { "title": "Run current statement", "status": "todo" },
+            { "title": "Run selection", "status": "todo" },
+            { "title": "Run script", "status": "todo" },
+            { "title": "PL/SQL execution", "status": "todo" },
+            { "title": "Bind-variable dialog", "status": "todo" },
+            { "title": "Cancel", "status": "todo" },
+            { "title": "Commit/Rollback", "status": "todo" },
+            { "title": "Result Store", "status": "todo" },
+            { "title": "Virtualized Result Grid", "status": "todo" },
+            { "title": "Query History", "status": "todo" },
+            { "title": "DBMS_OUTPUT panel", "status": "todo" },
+            { "title": "Basic Object Browser", "status": "todo" },
+            { "title": "Production connection indicator", "status": "todo" },
+            { "title": "Secure credential integration on Windows", "status": "todo" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "P2",
+      "title": "Phase 2 — Professional IDE",
+      "status": "todo",
+      "groups": [
+        {
+          "title": "IDE capabilities",
+          "tasks": [
+            { "title": "PL/SQL object editor", "status": "todo" },
+            { "title": "Compile source", "status": "todo" },
+            { "title": "Map compile errors to editor positions", "status": "todo" },
+            { "title": "Table Inspector", "status": "todo" },
+            { "title": "DDL viewer", "status": "todo" },
+            { "title": "Explain Plan tree/text", "status": "todo" },
+            { "title": "Metadata cache", "status": "todo" },
+            { "title": "Basic autocomplete", "status": "todo" },
+            { "title": "Streaming CSV/TSV/JSON export", "status": "todo" },
+            { "title": "macOS packaging", "status": "todo" },
+            { "title": "Linux packaging", "status": "todo" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "P3",
+      "title": "Phase 3 — Performance & DBA",
+      "status": "todo",
+      "groups": [
+        {
+          "title": "Performance / DBA",
+          "tasks": [
+            { "title": "Session Monitor", "status": "todo" },
+            { "title": "Locks / blockers", "status": "todo" },
+            { "title": "Long operations", "status": "todo" },
+            { "title": "Wait events", "status": "todo" },
+            { "title": "SQL statistics", "status": "todo" },
+            { "title": "DBMS_XPLAN display cursor", "status": "todo" },
+            { "title": "Plan comparison", "status": "todo" },
+            { "title": "Evaluate Arrow-backed Result Store", "status": "todo" },
+            { "title": "Add benchmark suite", "status": "todo" },
+            { "title": "Establish memory budgets from measurements", "status": "todo" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "P4",
+      "title": "Phase 4 — Tablet",
+      "status": "todo",
+      "groups": [
+        {
+          "title": "Tablet",
+          "tasks": [
+            { "title": "Android tablet UI", "status": "todo" },
+            { "title": "iPad UI", "status": "todo" },
+            { "title": "Adaptive workspace layout", "status": "todo" },
+            { "title": "External keyboard shortcuts", "status": "todo" },
+            { "title": "Trackpad/mouse support", "status": "todo" },
+            { "title": "Touch-specific grid behavior", "status": "todo" },
+            { "title": "Validate background/resume session handling", "status": "todo" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "P5",
+      "title": "Phase 5 — Phone",
+      "status": "todo",
+      "groups": [
+        {
+          "title": "Phone",
+          "tasks": [
+            { "title": "Phone navigation model", "status": "todo" },
+            { "title": "Editor/result/output adaptive pages", "status": "todo" },
+            { "title": "Result card mode", "status": "todo" },
+            { "title": "Direct connection on supported platforms", "status": "todo" },
+            { "title": "Mobile secure credential storage", "status": "todo" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "P6",
+      "title": "Phase 6 — Pro",
+      "status": "todo",
+      "groups": [
+        {
+          "title": "Pro candidates",
+          "tasks": [
+            { "title": "Schema Compare", "status": "todo" },
+            { "title": "Data Compare", "status": "todo" },
+            { "title": "Advanced Monitoring", "status": "todo" },
+            { "title": "Performance Analyzer", "status": "todo" },
+            { "title": "Automation", "status": "todo" },
+            { "title": "Advanced Export", "status": "todo" },
+            { "title": "AI Assistant", "status": "todo" },
+            { "title": "Optional Gateway", "status": "todo" },
+            { "title": "Team features", "status": "todo" }
+          ]
+        }
+      ]
+    }
+  ],
+  "activity": [
+    { "date": "2026-09-19", "text": "Local Oracle 19c Docker test DB up and verified" },
+    { "date": "2026-09-19", "text": "ADR-0002 accepted provisionally; db-driver-api contract implemented (68 unit + 6 doc tests)" },
+    { "date": "2026-09-19", "text": "README refreshed; Task.html dashboard introduced" },
+    { "date": "2026-09-19", "text": "Task.html progress dashboard introduced at the repository root." },
+    { "date": "2026-09-19", "text": "ADR-0002 proposed: blocking, object-safe db-driver-api contract with a per-session worker thread in db-core." },
+    { "date": "2026-09-19", "text": "Local Oracle 19c Docker test database verified end-to-end (tools/oracle-test-db/): connection details, AL32UTF8/NLS_LANG requirement, and known limitations documented." },
+    { "date": "2026-09-19", "text": "ADR-0001 accepted (conditional on spikes S1–S5): Oracle's oracledb crate adopted as the primary database driver." },
+    { "date": "2026-09-19", "text": "Cargo workspace skeleton (db-driver-api, db-core, drivers/mock, drivers/oracle-thin, reldex-core-poc) and GitHub Actions CI added." },
+    { "date": "2026-09-19", "text": "Repository bootstrap commit: initial README, SPEC, ROADMAP, AGENTS.md, and repository-local skill." }
+  ]
+}
+</script>
+
+<div id="error-banner" role="alert" hidden></div>
+
+<header class="site-header">
+  <div class="wrap header-inner">
+    <h1 id="project-name">Reldex</h1>
+    <span class="phase-badge" id="phase-badge">Loading…</span>
+    <span class="updated-line" id="updated-line"></span>
+    <p class="tagline" id="project-tagline"></p>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <section aria-labelledby="h-overview">
+    <h2 id="h-overview">Progress</h2>
+    <div class="overview-grid">
+      <div>
+        <div class="progress-block" id="overall-progress"></div>
+        <div class="stat-row" id="overall-stats"></div>
+      </div>
+      <div>
+        <div class="phase-mini-list" id="phase-mini-list"></div>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="h-status">
+    <h2 id="h-status">Latest status</h2>
+    <p class="summary-text" id="summary-text"></p>
+    <div class="status-columns">
+      <div>
+        <h3>Current focus</h3>
+        <ul id="focus-list"></ul>
+      </div>
+      <div>
+        <h3>Next steps</h3>
+        <ol id="next-steps-list"></ol>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="h-blockers">
+    <h2 id="h-blockers">Blockers &amp; risks</h2>
+    <div id="blockers-container"></div>
+    <div id="risks-container" class="card-list" style="margin-top:14px;"></div>
+  </section>
+
+  <section aria-labelledby="h-spikes">
+    <h2 id="h-spikes">Phase 0 spike plan</h2>
+    <p class="section-note">Ordered, time-boxed, cheapest-kill-first (see ADR-0001). Run against the local Oracle 19c test database.</p>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th class="id-cell" scope="col">ID</th>
+            <th scope="col">Spike</th>
+            <th scope="col">Box</th>
+            <th scope="col">Kill criterion</th>
+            <th scope="col">Status</th>
+            <th scope="col">Result</th>
+          </tr>
+        </thead>
+        <tbody id="spikes-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section aria-labelledby="h-decisions">
+    <h2 id="h-decisions">Decisions</h2>
+    <div class="decision-list" id="decisions-list"></div>
+  </section>
+
+  <section aria-labelledby="h-roadmap">
+    <h2 id="h-roadmap">Roadmap</h2>
+    <div class="filter-bar" role="group" aria-label="Filter tasks by status" id="filter-bar"></div>
+    <div id="phases-container"></div>
+  </section>
+
+  <section aria-labelledby="h-activity">
+    <h2 id="h-activity">Activity log</h2>
+    <ul class="activity-list" id="activity-list"></ul>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <ul>
+      <li><a href="TASKS.md">TASKS.md</a></li>
+      <li><a href="docs/exec-plans/active/phase-0.md">Active plan (phase-0.md)</a></li>
+      <li><a href="docs/decisions/README.md">Decisions index</a></li>
+      <li id="footer-repo-link"></li>
+    </ul>
+    <p><code>TASKS.md</code> is the source of truth for task status; this page mirrors it.</p>
+  </div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  var ICONS = {
+    done: '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M3 8.5l3 3 7-7"/></svg>',
+    in_progress: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 8 L8 3.2 A4.8 4.8 0 0 1 12.8 8 Z" fill="currentColor"/></svg>',
+    todo: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2"/></svg>',
+    blocked: '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" d="M8 1.5 14.8 13.5 1.2 13.5 Z"/><line x1="8" y1="6" x2="8" y2="9.2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="8" cy="11.3" r="0.9" fill="currentColor"/></svg>'
+  };
+
+  var STATUS_LABEL = {
+    done: "Done",
+    in_progress: "In progress",
+    todo: "To do",
+    blocked: "Blocked"
+  };
+
+  var FILTERS = [
+    { key: "all", label: "All" },
+    { key: "todo", label: "To do" },
+    { key: "in_progress", label: "In progress" },
+    { key: "done", label: "Done" },
+    { key: "blocked", label: "Blocked" }
+  ];
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function el(html) {
+    var t = document.createElement("template");
+    t.innerHTML = html.trim();
+    return t.content.firstElementChild;
+  }
+
+  function statusChip(status) {
+    var s = STATUS_LABEL.hasOwnProperty(status) ? status : "todo";
+    return '<span class="chip status-' + s + '">' + ICONS[s] + esc(STATUS_LABEL[s]) + "</span>";
+  }
+
+  function countTasks(tasks) {
+    var c = { done: 0, in_progress: 0, todo: 0, blocked: 0, total: tasks.length };
+    tasks.forEach(function (t) {
+      if (c.hasOwnProperty(t.status)) c[t.status]++;
+    });
+    return c;
+  }
+
+  function allTasksOf(phase) {
+    var out = [];
+    phase.groups.forEach(function (g) { out = out.concat(g.tasks); });
+    return out;
+  }
+
+  function progressBlock(label, counts, idAttr) {
+    var pct = counts.total > 0 ? Math.round((counts.done / counts.total) * 100) : 0;
+    return (
+      '<div class="progress-block"' + (idAttr ? ' id="' + idAttr + '"' : "") + '>' +
+      '<div class="progress-head"><span class="name">' + esc(label) + '</span>' +
+      '<span class="stat tabular">' + counts.done + '/' + counts.total + ' done · ' + pct + '%</span></div>' +
+      '<div class="progress-track" role="progressbar" aria-valuenow="' + pct +
+      '" aria-valuemin="0" aria-valuemax="100" aria-label="' + esc(label) + ' progress">' +
+      '<div class="progress-fill" style="width:' + pct + '%"></div></div></div>'
+    );
+  }
+
+  function formatUpdated(iso) {
+    // Deliberately NOT relative to the viewer's clock ("2 days ago"): this file may be
+    // opened long before or after the data was written, and the viewer's system clock
+    // is not a reliable signal of that gap. Instead, format the ISO value itself into a
+    // stable, human-readable label plus its UTC offset, using only the string's own
+    // components (never the viewer's local timezone), so "human" and "raw" always agree.
+    var raw = iso;
+    var m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?([+-]\d{2}:?\d{2}|Z)?$/.exec(iso);
+    if (!m) return { human: "unknown", raw: raw };
+    var months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    var year = m[1], month = months[parseInt(m[2], 10) - 1], day = String(parseInt(m[3], 10));
+    var hh = m[4], mm = m[5];
+    var offset = m[7] === "Z" ? "UTC" : (m[7] ? "UTC" + m[7] : "");
+    var human = day + " " + month + " " + year + ", " + hh + ":" + mm + (offset ? " " + offset : "");
+    return { human: human, raw: raw };
+  }
+
+  function render(data) {
+    document.getElementById("project-name").textContent = data.project.name;
+    document.getElementById("project-tagline").textContent = data.project.tagline || "";
+    document.title = data.project.name + " — Progress Dashboard";
+
+    var badge = document.getElementById("phase-badge");
+    badge.textContent = data.currentPhase.id + " · " + data.currentPhase.title.replace(/^Phase \d+\s*—\s*/, "");
+    badge.title = data.currentPhase.goal || "";
+
+    var upd = formatUpdated(data.updatedAt);
+    document.getElementById("updated-line").innerHTML =
+      "Updated " + esc(upd.human) + ' by ' + esc(data.updatedBy || "unknown") +
+      ' · <span class="raw tabular">' + esc(upd.raw) + "</span>";
+
+    if (data.project.repo) {
+      document.getElementById("footer-repo-link").innerHTML =
+        '<a href="' + esc(data.project.repo) + '">Repository</a>';
+    }
+
+    // ---- Overview / progress ----
+    var allTasks = [];
+    data.phases.forEach(function (p) { allTasks = allTasks.concat(allTasksOf(p)); });
+    var overall = countTasks(allTasks);
+    document.getElementById("overall-progress").outerHTML = progressBlock("Overall (all phases)", overall, "overall-progress");
+    var statsHtml =
+      '<div class="stat tabular"><b>' + overall.done + '</b>Done</div>' +
+      '<div class="stat tabular"><b>' + overall.in_progress + '</b>In progress</div>' +
+      '<div class="stat tabular"><b>' + overall.todo + '</b>To do</div>' +
+      '<div class="stat tabular"><b>' + overall.blocked + '</b>Blocked</div>';
+    document.getElementById("overall-stats").innerHTML = statsHtml;
+
+    var miniHtml = "";
+    data.phases.forEach(function (p) {
+      var c = countTasks(allTasksOf(p));
+      miniHtml += progressBlock(p.id + " — " + p.title.replace(/^Phase \d+\s*—\s*/, ""), c);
+    });
+    document.getElementById("phase-mini-list").innerHTML = miniHtml;
+
+    // ---- Latest status ----
+    document.getElementById("summary-text").textContent = data.summary || "";
+    document.getElementById("focus-list").innerHTML =
+      (data.focus || []).map(function (f) { return "<li>" + esc(f) + "</li>"; }).join("");
+    document.getElementById("next-steps-list").innerHTML =
+      (data.nextSteps || []).map(function (s) { return "<li>" + esc(s) + "</li>"; }).join("");
+
+    // ---- Blockers & risks ----
+    var blockersEl = document.getElementById("blockers-container");
+    if (!data.blockers || data.blockers.length === 0) {
+      blockersEl.innerHTML =
+        '<div class="no-blockers">' + ICONS.done + "<span>No blockers</span></div>";
+    } else {
+      blockersEl.innerHTML = '<div class="card-list">' + data.blockers.map(function (b) {
+        return '<div class="card blocker"><div class="card-head"><span class="title">' + esc(b.title) +
+          '</span><span class="card-meta">' + esc(b.severity || "") +
+          (b.since ? " · since " + esc(b.since) : "") + '</span></div>' +
+          '<p>' + esc(b.detail || "") + "</p></div>";
+      }).join("") + "</div>";
+    }
+    document.getElementById("risks-container").innerHTML = (data.risks || []).map(function (r) {
+      return '<div class="card risk"><div class="card-head"><span class="title">' + esc(r.title) + "</span></div>" +
+        '<p>' + esc(r.detail || "") + "</p>" +
+        (r.mitigation ? '<p class="mitigation">' + esc(r.mitigation) + "</p>" : "") +
+        "</div>";
+    }).join("");
+
+    // ---- Spikes ----
+    document.getElementById("spikes-body").innerHTML = (data.spikes || []).map(function (s) {
+      return "<tr><td class=\"id-cell\">" + esc(s.id) + "</td><td>" + esc(s.title) +
+        "</td><td class=\"box-cell tabular\">" + esc(s.box) + "</td><td>" + esc(s.killCriterion) +
+        "</td><td>" + statusChip(s.status) + "</td><td>" + esc(s.result || "Not yet run") + "</td></tr>";
+    }).join("");
+
+    // ---- Decisions ----
+    document.getElementById("decisions-list").innerHTML = (data.decisions || []).map(function (d) {
+      var titleHtml = d.link ? '<a href="' + esc(d.link) + '">' + esc(d.title) + "</a>" : esc(d.title);
+      return '<div class="decision"><div><span class="id">' + esc(d.id) + "</span><span class=\"title\">" +
+        titleHtml + "</span></div><div class=\"meta\">" + statusChip2(d.status) +
+        (d.date ? " · " + esc(d.date) : "") + "</div></div>";
+    }).join("");
+
+    function statusChip2(text) {
+      // Decision statuses are free text (e.g. "Accepted (conditional on spikes S1-S5)"),
+      // not the fixed task/spike status set, so render as plain emphasized text.
+      return "<strong>" + esc(text) + "</strong>";
+    }
+
+    // ---- Roadmap ----
+    var filterBar = document.getElementById("filter-bar");
+    var currentFilter = "all";
+    filterBar.innerHTML = FILTERS.map(function (f, i) {
+      return '<button type="button" data-filter="' + f.key + '" aria-pressed="' + (i === 0 ? "true" : "false") + '">' + esc(f.label) + "</button>";
+    }).join("");
+
+    var phasesContainer = document.getElementById("phases-container");
+    phasesContainer.innerHTML = data.phases.map(function (p, idx) {
+      var c = countTasks(allTasksOf(p));
+      var isCurrent = p.id === data.currentPhase.id;
+      var groupsHtml = p.groups.map(function (g) {
+        var tasksHtml = g.tasks.map(function (t) {
+          return '<li data-status="' + esc(t.status) + '"><span aria-hidden="true" style="margin-top:3px;">' +
+            ICONS[ICONS.hasOwnProperty(t.status) ? t.status : "todo"] + '</span>' +
+            '<span class="task-title">' + esc(t.title) +
+            (t.note ? '<span class="task-note">' + esc(t.note) + "</span>" : "") +
+            "</span>" + statusChip(t.status) + "</li>";
+        }).join("");
+        return '<div class="group"><h4>' + esc(g.title) + '</h4><ul class="task-list">' + tasksHtml + "</ul></div>";
+      }).join("");
+      return (
+        '<details class="phase" data-phase="' + esc(p.id) + '"' + (isCurrent ? " open" : "") + ">" +
+        '<summary><span class="caret"></span><span class="phase-title">' + esc(p.id) + " — " + esc(p.title.replace(/^Phase \d+\s*—\s*/, "")) +
+        (isCurrent ? " (current)" : "") + '</span>' + statusChip(p.status) +
+        '<span class="phase-count tabular">' + c.done + "/" + c.total + " done</span></summary>" +
+        '<div class="phase-body">' + progressBlock("Phase progress", c) + groupsHtml + "</div>" +
+        "</details>"
+      );
+    }).join("");
+
+    function applyFilter(key) {
+      currentFilter = key;
+      var items = phasesContainer.querySelectorAll("ul.task-list > li");
+      items.forEach(function (li) {
+        var status = li.getAttribute("data-status");
+        li.hidden = key !== "all" && status !== key;
+      });
+      var groups = phasesContainer.querySelectorAll(".group");
+      groups.forEach(function (g) {
+        var visible = g.querySelectorAll("ul.task-list > li:not([hidden])").length;
+        g.style.display = visible === 0 ? "none" : "";
+      });
+    }
+
+    filterBar.addEventListener("click", function (ev) {
+      var btn = ev.target.closest("button[data-filter]");
+      if (!btn) return;
+      filterBar.querySelectorAll("button").forEach(function (b) {
+        b.setAttribute("aria-pressed", b === btn ? "true" : "false");
+      });
+      applyFilter(btn.getAttribute("data-filter"));
+    });
+
+    // ---- Activity ----
+    document.getElementById("activity-list").innerHTML = (data.activity || []).map(function (a) {
+      return "<li><time datetime=\"" + esc(a.date) + "\">" + esc(a.date) + "</time><span>" + esc(a.text) + "</span></li>";
+    }).join("");
+
+    // ---- Print: expand all phases while printing, restore afterwards ----
+    var openState = null;
+    window.addEventListener("beforeprint", function () {
+      var details = phasesContainer.querySelectorAll("details.phase");
+      openState = Array.prototype.map.call(details, function (d) { return d.open; });
+      details.forEach(function (d) { d.open = true; });
+    });
+    window.addEventListener("afterprint", function () {
+      if (!openState) return;
+      var details = phasesContainer.querySelectorAll("details.phase");
+      details.forEach(function (d, i) { d.open = openState[i]; });
+      openState = null;
+    });
+  }
+
+  function showError(message) {
+    var banner = document.getElementById("error-banner");
+    banner.textContent = message;
+    banner.hidden = false;
+  }
+
+  try {
+    var raw = document.getElementById("project-data").textContent;
+    var data = JSON.parse(raw);
+    render(data);
+  } catch (err) {
+    showError(
+      "This dashboard could not load its data: " + (err && err.message ? err.message : String(err)) +
+      ". The embedded JSON in #project-data is invalid — fix the JSON block and reload."
+    );
+  }
+})();
+</script>
+
+</body>
+</html>

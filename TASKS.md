@@ -24,16 +24,20 @@ This file is the human-readable current task board. Detailed active execution pl
 
 See `docs/exec-plans/active/phase-0.md`.
 
+- [x] Local Oracle 19c Docker test database (tools/oracle-test-db)
+
 ### Driver/core
-- [ ] Create Rust workspace
-- [ ] Create `db-driver-api`
-- [ ] Create `db-core`
-- [ ] Create initial database driver implementation
-- [ ] Add normalized `DbError`
-- [ ] Add connection/profile model
-- [ ] Add session abstraction
-- [ ] Add transaction abstraction
-- [ ] Add cancellation abstraction
+- [x] Create Rust workspace
+- [x] Create `db-driver-api`
+- [~] Create `db-core`
+- [ ] Create initial database driver implementation — wrap Oracle's official `oracledb` crate (`oracle/rust-oracledb`, pinned exact version) in `crates/drivers/oracle-thin` (ADR-0001)
+- [ ] Add driver contract tests that detect behaviour changes on `oracledb` upgrades
+- [ ] Draft upstream request to `oracle/rust-oracledb` for a public statement-cancel API (owner to submit)
+- [x] Add normalized `DbError`
+- [~] Add connection/profile model (driver-level connection params done; user-facing profile model pending)
+- [~] Add session abstraction (contract in db-driver-api; db-core implementation pending)
+- [~] Add transaction abstraction (contract in db-driver-api; db-core implementation pending)
+- [x] Add cancellation abstraction (contract; driver-level cancel pending spike S4)
 
 ### Functional POC
 - [ ] Connect/disconnect/ping

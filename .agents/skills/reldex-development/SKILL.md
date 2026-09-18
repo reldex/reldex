@@ -98,6 +98,7 @@ Require physical-device evidence for:
 If a change affects:
 - product behavior → update `SPEC.md`;
 - architecture → update `docs/architecture/ARCHITECTURE.md` and add/update an ADR;
-- execution scope/status → update `TASKS.md` and the active plan.
+- execution scope/status → update `TASKS.md` and the active plan;
+- progress/plan/ADR status → update `Task.html` (data block only) per `AGENTS.md`.
 
 See `references/review-checklist.md` before declaring a substantial task complete.

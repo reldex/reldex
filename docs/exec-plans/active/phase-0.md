@@ -8,7 +8,8 @@
 Phase 0 is complete when:
 
 1. the generic driver/session API exists;
-2. the selected thin driver can connect to the reference database;
+2. the selected thin driver — Oracle's official `oracledb` crate (`oracle/rust-oracledb`), per
+   ADR-0001 — can connect to the reference database;
 3. transaction behavior is correct;
 4. query cancellation is demonstrated;
 5. required datatypes/PLSQL behaviors are integration-tested;
@@ -16,15 +17,22 @@ Phase 0 is complete when:
 7. Android/iOS direct-connect feasibility has physical-device evidence or a clearly documented blocker;
 8. no full desktop UI implementation was required to prove these results.
 
+## Driver decision
+
+The primary database driver is Oracle's official [`oracle/rust-oracledb`](https://github.com/oracle/rust-oracledb)
+(crate `oracledb`) — see [ADR-0001](../../decisions/0001-database-driver-strategy.md), including its ordered spike plan
+(S1–S9) and kill criteria. Local integration tests run against the Docker database in `tools/oracle-test-db/`.
+
 ## Workstream A — Rust workspace
 
-- [ ] Initialize Cargo workspace.
-- [ ] Add `db-driver-api`.
-- [ ] Add `db-core`.
-- [ ] Add `drivers/oracle/thin`.
-- [ ] Add test-support/mock driver.
-- [ ] Define normalized `DbError`.
-- [ ] Define connection/session/query/result identifiers.
+- [x] Initialize Cargo workspace.
+- [x] Add `db-driver-api`. (implemented per ADR-0002: 5 traits — `DatabaseDriver`, `DatabaseConnection`, `CancelHandle`, `Cursor`, `LobStream` — ~45 types, zero production dependencies, 68 unit + 6 doc tests, fmt/clippy/test green; independent API review in progress, owner review pending)
+- [ ] Add `db-core`. (skeleton crate created at `crates/db-core`; session/worker-thread implementation against the now-implemented `db-driver-api` contract not started)
+- [ ] Add `drivers/oracle/thin` wrapping Oracle's `oracledb` crate, pinned to an exact version (ADR-0001). (skeleton crate created at `crates/drivers/oracle-thin` — path deviates from this plan's `drivers/oracle/thin`; see `docs/architecture/ARCHITECTURE.md` §11)
+- [ ] Add Reldex-owned driver contract tests so an `oracledb` upgrade that changes behaviour is detected (ADR-0001).
+- [ ] Add test-support/mock driver. (skeleton crate created at `crates/drivers/mock`)
+- [x] Define normalized `DbError`. (implemented in `db-driver-api` per ADR-0002 D3: `DbError{kind, message, native, position, session_state, retryable, source}`)
+- [x] Define connection/session/query/result identifiers. (implemented in `db-driver-api` per ADR-0002 D7: `ConnectionId`/`SessionId`/`StatementId`/`ResultSetId` as `u64` newtypes)
 
 ## Workstream B — Session correctness
 
@@ -46,7 +54,7 @@ Phase 0 is complete when:
 - [ ] REF CURSOR.
 - [ ] Multiple concurrent sessions.
 - [ ] Long-running query.
-- [ ] Cancellation from another control path.
+- [ ] Cancellation from another control path. (ADR-0001 C1 / spike S4: `oracledb` has no public cancel API yet; Phase 0 may demonstrate cancellation via call-timeout semantics while an upstream request is pending — the limitation must be reported, not hidden.)
 
 ## Workstream D — Data types
 
@@ -85,6 +93,9 @@ For every mapping, document:
 - [ ] timeout behavior.
 - [ ] network-loss behavior.
 - [ ] reconnect semantics.
+
+Known unsupported configurations of the primary driver (ADR-0001): Native Network Encryption and
+11G password verifiers. Record them as documented limitations, not as driver failures.
 
 ## Workstream G — Platforms
 
