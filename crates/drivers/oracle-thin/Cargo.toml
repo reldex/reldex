@@ -8,5 +8,39 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Opt-in integration tests that need the live Oracle test database
+# (`tools/oracle-test-db/`). Off by default so `cargo test --workspace` stays
+# green on CI without a database (`AGENTS.md`, "Testing").
+oracle-it = []
+
 [dependencies]
 reldex-db-driver-api = { path = "../../db-driver-api" }
+
+# Oracle's own pure-Rust thin driver (`oracle/rust-oracledb`), adopted by
+# ADR-0001 and pinned to an **exact** version because it is pre-GA and its API
+# is explicitly "subject to change". `=26.0.0-beta.3` is the newest published
+# version as of 2026-09-19 (crates.io: 26.0.0-beta.1 2026-08-06,
+# beta.2 2026-08-20, beta.3 2026-09-08; the 0.x line is a different, yanked
+# community crate). No `oracledb` type appears in this crate's public API.
+#
+# TLS: the crate's `rustls` dependency defaults to the `aws-lc-rs` crypto
+# provider, which compiles C and assembly and therefore needs a C toolchain
+# (MSVC here). See this crate's `lib.rs` "Dependencies" section and
+# `docs/exec-plans/active/phase-0-spike-results.md` for the build result and
+# the `ring` fallback that was evaluated.
+oracledb = "=26.0.0-beta.3"
+
+[dev-dependencies]
+# Connection settings are read from the environment in the opt-in integration
+# tests, so credentials never appear in test source (`AGENTS.md`, "Code
+# quality"). No external crate is needed: `tests/common/mod.rs` reads them, and
+# `tools/oracle-test-db/run-it.ps1` (or `.sh`) puts them there.
+#
+# `oracledb` appears here as well as above for exactly one reason: spike S4 has
+# to show, against a live database, that the upstream client holds one mutex for
+# the whole of a round trip, which is what makes a cancel-on-demand impossible
+# (ADR-0001 C1). That measurement cannot be taken through this crate's own API,
+# because this crate is built so that no caller can reach an `oracledb` type.
+# Nothing else in the tests uses it, and nothing public does.
+oracledb = "=26.0.0-beta.3"

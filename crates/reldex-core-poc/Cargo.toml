@@ -9,4 +9,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-reldex-db-core = { path = "../db-core" }
+# Phase 0 Workstream A: this harness exercises the **driver contract** on its
+# own, so a failure here is unambiguously a driver problem. It is the
+# composition root, which is why it may name a concrete driver; see the
+# documented deviation in `src/main.rs`. `reldex-db-core` returns as a
+# dependency when its session layer lands.
+reldex-db-driver-api = { path = "../db-driver-api" }
+reldex-driver-oracle-thin = { path = "../drivers/oracle-thin" }
