@@ -8,16 +8,25 @@ Reldex is an independent project and is not affiliated with, endorsed by, or spo
 
 ## Current status
 
-**Phase 0 — Architecture Validation.** Spikes S1–S5, S7 and S9 ran against a live Oracle Database
-19.3 (Docker) on 2026-09-19; full evidence is in
-[`docs/exec-plans/active/phase-0-spike-results.md`](docs/exec-plans/active/phase-0-spike-results.md).
+**Phase 0 — Architecture Validation.** Spikes S1–S5, S7, S8 and S9 ran against a live Oracle Database
+19.3 (Docker) on 2026-09-19; the evidence-gap spikes S10–S14 (network loss/reconnect, NCLOB, developer
+features, privileged connections, large result) ran against the same database on 2026-09-19; the
+mobile cross-compile spike S6 ran in CI on 2026-09-19. Full evidence is in
+[`docs/exec-plans/active/phase-0-spike-results.md`](docs/exec-plans/active/phase-0-spike-results.md)
+and, for S6,
+[`docs/exec-plans/active/phase-0-s6-mobile-cross-compile.md`](docs/exec-plans/active/phase-0-s6-mobile-cross-compile.md).
 
-**What works against a real Oracle 19c today:** connect via Easy Connect or a full TNS descriptor;
-SELECT/DML/DDL; PL/SQL blocks, procedures, functions and packages with IN/OUT/IN OUT binds and
-DBMS_OUTPUT; REF CURSOR fetched to exhaustion; COMMIT/ROLLBACK/SAVEPOINT with auto-commit off and no
-session-state leakage; CLOB/BLOB streamed in bounded memory (100 MB for +4.7 MB working set); NUMBER
-and character data (including Thai and non-BMP text) read back exact; 8 concurrent sessions running
-independently.
+**What works against a real Oracle 19c today:** connect via Easy Connect or a full TNS descriptor,
+including `AS SYSDBA`/`AS SYSOPER` privileged connections; SELECT/DML/DDL; PL/SQL blocks, procedures,
+functions and packages with IN/OUT/IN OUT binds and DBMS_OUTPUT; REF CURSOR fetched to exhaustion;
+COMMIT/ROLLBACK/SAVEPOINT with auto-commit off and no session-state leakage; CLOB/BLOB/NCLOB streamed
+in bounded memory (100 MB CLOB/BLOB for +4.7 MB working set; NCLOB Thai/non-BMP text byte-exact); 1
+million rows streamed for about 1 MB of working-set growth; NUMBER and character data (including Thai
+and non-BMP text) read back exact; developer features — EXPLAIN PLAN, DBMS_XPLAN, `V$` views, ten
+dictionary views and `LONG`/`LONG RAW` columns; network-loss detection (a dead socket is reported in
+microseconds) and reconnect semantics (nothing silently reconnects or inherits old session state);
+one-way TLS 1.2 (TCPS) with certificate and host-name verification, trusting a user-supplied CA; 8
+concurrent sessions running independently. Mobile cross-compile (Android/iOS) is proven in CI.
 
 **Known limitations, stated plainly:**
 
@@ -31,14 +40,28 @@ independently.
 - **NUMBER bind restrictions**: certain decimal shapes (an odd count of leading zeros below 0.1, or a
   40-digit value at specific decimal-point positions) are refused on bind rather than corrupted or
   crashed.
+- **A connect cannot be bounded, and there is no dead-link keepalive.** `ConnectionParams::connect_timeout`
+  is accepted by the contract and ignored by the driver (a connect can take 22 s against an unroutable
+  address, or hang indefinitely against a black hole); no TCP keepalive exists upstream and
+  `SQLNET.EXPIRE_TIME` is parsed and never acted on, so a client that goes silent mid-transaction can
+  hold a row lock indefinitely (spike S10, U-15…U-17).
+- **`CREATE TRIGGER` with `:NEW`/`:OLD` cannot be executed directly** — the upstream parser treats them
+  as bind placeholders even inside DDL (U-18). A documented `EXECUTE IMMEDIATE` workaround exists.
+- **TCPS is narrower than most enterprise deployments expect**: no mutual TLS combined with a private
+  CA, no Oracle wallet file support, no OS trust store, no certificate revocation, and
+  `SSL_SERVER_DN_MATCH` is silently ignored upstream (spike S8, U-12…U-14).
 - **Native Network Encryption and 11G password verifiers are unsupported** by the primary driver.
-- **Mobile is unproven.** Android/iOS cross-compile has not been attempted (needs the NDK / a macOS
-  host); no physical-device evidence exists for either platform.
+- **Mobile has no physical-device evidence yet.** Android/iOS/iOS-simulator cross-compile and link are
+  proven in CI (spike S6, no local NDK/Xcode needed) — that is cross-compile evidence only, not mobile
+  support. The blocker is that no physical test device has been provided; see
+  [`phase-0-s6-mobile-cross-compile.md`](docs/exec-plans/active/phase-0-s6-mobile-cross-compile.md)
+  "Next step toward physical-device validation".
 
 - [ADR-0001](docs/decisions/0001-database-driver-strategy.md) — **Accepted — owner decision
-  2026-09-20: stay on oracledb; pre-armed deadline + honest UI; upstream issues pending**: the primary
-  database driver remains Oracle's official `oracledb` crate (`oracle/rust-oracledb`); the owner
-  accepted the cancellation limitation rather than changing drivers.
+  2026-09-20: stay on oracledb; pre-armed deadline + honest UI; upstream issues #21–#25 filed
+  2026-09-20**: the primary database driver remains Oracle's official `oracledb` crate
+  (`oracle/rust-oracledb`); the owner accepted the cancellation limitation rather than changing
+  drivers.
 - [ADR-0002](docs/decisions/0002-driver-api-and-concurrency-model.md) (driver API and concurrency
   model) — **Accepted (owner confirmed 2026-09-20) — implemented; independently reviewed twice with
   must-fix findings applied; amended after the Phase 0 spikes**.
@@ -49,7 +72,9 @@ independently.
 - A local Oracle 19c Docker test database under [`tools/oracle-test-db/`](tools/oracle-test-db/),
   verified (AL32UTF8, Thai round-trip, Non-CDB).
 
-**Not started yet:** the Qt Quick/QML UI; driver-upgrade contract tests; network-loss/reconnect behavior; Android/iOS validation.
+**Not started yet:** the Qt Quick/QML UI; driver-upgrade contract tests; honouring `connect_timeout`
+(C-5); Android/iOS physical-device validation (cross-compile is done; a test device is not yet
+available).
 
 [`Task.html`](Task.html) (open it in a browser) is the live, human-facing progress dashboard: current focus, blockers/risks, spike results, and recent activity. [`TASKS.md`](TASKS.md) and the active plan under [`docs/exec-plans/active/phase-0.md`](docs/exec-plans/active/phase-0.md) remain the source of truth for task status; `Task.html` mirrors them.
 
@@ -58,7 +83,7 @@ independently.
 - **Core:** Rust.
 - **UI:** Qt Quick/QML with a thin C++ adapter over a stable Rust FFI boundary — planned, not started.
 - **Primary database driver:** Oracle's official [`oracledb`](https://github.com/oracle/rust-oracledb) crate (pure Rust, thin, blocking; no Instant Client/OCI required), pinned to an exact pre-GA beta version (`=26.0.0-beta.3`), per [ADR-0001](docs/decisions/0001-database-driver-strategy.md). It is encapsulated behind `db-driver-api` so it can be swapped if a kill criterion in the ADR's spike plan fires. Spike S4's cancellation kill criterion fired, and on 2026-09-20 the owner decided to accept the limitation — ship the pre-armed deadline with an honest UI and pursue upstream fixes — rather than change drivers; see the current limitations above.
-- **Known gaps in the primary driver**, stated honestly: no on-demand statement-cancel API (Phase 0 falls back to a pre-armed deadline; four upstream issues are drafted, none submitted yet); it is pre-GA/beta software with at least one defect that can abort the whole process if an unhandled input reaches it; Native Network Encryption and 11G password verifiers are unsupported; Android/iOS viability is unproven and requires physical-device evidence before any mobile claim.
+- **Known gaps in the primary driver**, stated honestly: no on-demand statement-cancel API (Phase 0 falls back to a pre-armed deadline; five of seven drafted upstream issues were submitted 2026-09-20, #21–#25, F and G await the owner's go-ahead); a connect cannot be bounded and there is no dead-link keepalive; `CREATE TRIGGER` with `:NEW`/`:OLD` cannot be executed directly (documented workaround); it is pre-GA/beta software with at least one defect that can abort the whole process if an unhandled input reaches it; Native Network Encryption and 11G password verifiers are unsupported; Android/iOS cross-compile is proven in CI but physical-device evidence is still required before any mobile-support claim.
 - **Initial compatibility target:** Oracle Database 19c+.
 
 ## Running the integration suite
@@ -104,7 +129,7 @@ tools/
   oracle-test-db/          local Oracle 19c Docker test database for integration tests
 .agents/skills/            repository-local skill shared by all coding agents (reldex-development)
 .claude/skills/            Claude Code entry point; thin wrapper around .agents/skills
-.github/workflows/         CI (fmt, clippy, test)
+.github/workflows/         CI (fmt, clippy, test) and mobile-cross-compile.yml (Android/iOS build+link check, spike S6)
 AGENTS.md                  repository rules for coding agents
 CLAUDE.md                  Claude Code entry point; imports AGENTS.md
 SPEC.md                    product and technical specification
@@ -127,6 +152,12 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+`.github/workflows/mobile-cross-compile.yml` separately builds and links the core/driver crates for
+`aarch64-linux-android`, `aarch64-apple-ios` and `aarch64-apple-ios-sim` on GitHub-hosted runners (no
+local NDK/Xcode) — this is spike S6; see
+[`phase-0-s6-mobile-cross-compile.md`](docs/exec-plans/active/phase-0-s6-mobile-cross-compile.md) for
+what it does and does not prove.
 
 Run the Phase 0 validation harness:
 

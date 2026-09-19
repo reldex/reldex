@@ -33,7 +33,7 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [x] Create `db-core` (session layer implemented: worker-thread-per-session, FIFO queue, out-of-band cancel, conservative transaction tracking incl. locking queries, `CloseDisposition`, terminal `Lost`/`Closed` lifecycle, core-owned `ResultId`/`LobHandle`, bounded `Drop`, `SessionLimits`, panic containment; independently reviewed, 7 must-fix applied, commit `86f79d7`)
 - [x] Create initial database driver implementation — wrap Oracle's official `oracledb` crate (`oracle/rust-oracledb`, pinned exact version `=26.0.0-beta.3`) in `crates/drivers/oracle-thin` (ADR-0001); independently reviewed, 4 must-fix applied, commit `db38c14`
 - [ ] Add driver contract tests that detect behaviour changes on `oracledb` upgrades
-- [x] **(S4 critical path)** Draft upstream request to `oracle/rust-oracledb` for a public statement-cancel/break API — plus accessors for `OracleNumber` digits and the connection's transaction-in-progress flag (four issues drafted in full: `docs/exec-plans/active/phase-0-spike-results.md` §6 — nothing has been submitted; see the separate owner task below)
+- [x] **(S4 critical path)** Draft upstream request to `oracle/rust-oracledb` for a public statement-cancel/break API — plus accessors for `OracleNumber` digits and the connection's transaction-in-progress flag (seven issues drafted in full: `docs/exec-plans/active/phase-0-spike-results.md` §6 — A–E submitted 2026-09-20 (#21–#25), F and G await owner go-ahead; see the separate owner task below)
 - [x] Add normalized `DbError`
 - [~] Add connection/profile model (driver-level connection params done; user-facing profile model pending)
 - [x] Add session abstraction (`db-core` `DatabaseSession` implemented and hardened; see above)
@@ -48,28 +48,32 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [x] IN/OUT/IN OUT binds (spike S5 — pass)
 - [x] REF CURSOR (spike S5 — pass, after contract fix C-1)
 - [x] COMMIT/ROLLBACK/SAVEPOINT (spike S3 — pass)
-- [x] CLOB/NCLOB/BLOB (spike S7 — pass; 100 MB CLOB and BLOB streamed, +4.7 MB working set)
+- [x] CLOB/NCLOB/BLOB (spike S7 — pass, CLOB/BLOB; 100 MB each streamed, +4.7 MB working set. Spike S11 — pass, NCLOB; Thai/non-BMP text byte-exact, 1.2M characters in 55 bounded chunks)
 - [x] DBMS_OUTPUT (spike S5 — pass, including Thai text)
 - [!] Long-running query cancellation — accepted limitation (owner decision 2026-09-20): pre-armed deadline only; blocked on upstream cancel API (see ADR-0001 "Spike outcome" and "Owner decision" sections and `phase-0-spike-results.md` §4)
 - [x] TCPS (spike S8 — pass with limits, 2026-09-20: one-way TLS 1.2, verification on, PEM-supplied trust; no mTLS + private CA, no Oracle wallet files, no revocation — upstream U-12…U-14)
-- [ ] Network-loss behavior (not directly spiked; only recovery-path failure modes seen incidentally during S4, recorded as U-6/U-7)
+- [x] Network-loss behavior (spike S10 — pass, with two upstream gaps: a black-holed link never returns without a caller-set deadline, U-17; a dead client's row lock blocked a second session for the full 20 s measured because `SQLNET.EXPIRE_TIME` is unset and upstream has no keepalive — see `phase-0-spike-results.md` §3 S10)
 - [x] Concurrent independent sessions (spike S9 — pass; 8 sessions, 400 inserts, 283 ms)
 
 ### Platform validation
 - [x] Windows x64 (build, connect, and the full spike matrix all run locally, 2026-09-19)
 - [~] Linux x64 (build + fmt + clippy -D warnings + `cargo test --workspace` green on CI `ubuntu-latest`, PR #1, 2026-09-20 — https://github.com/reldex/reldex/actions/runs/35419377082; no database connect yet)
 - [~] macOS ARM64 (build + fmt + clippy -D warnings + `cargo test --workspace` green on CI `macos-latest` (Apple Silicon), PR #1, 2026-09-20 — https://github.com/reldex/reldex/actions/runs/35419377082; no database connect yet)
-- [ ] Android ARM64 physical device (spike S6 not run — needs the Android NDK; owner approval to download)
-- [ ] iOS/iPadOS ARM64 physical device (not started)
+- [ ] Android ARM64 physical device (cross-compile + link proven in CI — spike S6, PR #3; physical-device evidence still needed, needs a test device from the owner)
+- [ ] iOS/iPadOS ARM64 physical device (cross-compile + link proven in CI — spike S6, PR #3; physical-device evidence still needed, needs a Mac + Apple Developer account + device)
 
 - [x] Owner: decide cancellation path (ADR-0001 re-opened) [decision 2026-09-20: stay on `oracledb`; ship the pre-armed per-statement deadline with an honest UI; pursue upstream fixes via the four drafted issues — see ADR-0001 "Owner decision (2026-09-20)"]
-- [ ] Owner: submit the four drafted upstream issues (`docs/exec-plans/active/phase-0-spike-results.md` §6, Issue B first)
+- [x] Owner: submit the drafted upstream issues — five submitted 2026-09-20 (#21–#25) (`docs/exec-plans/active/phase-0-spike-results.md` §6)
+- [ ] Owner: approve submission of drafted upstream issues F and G (results file §6)
 - [ ] Track upstream `oracle/rust-oracledb` releases; re-run the integration suite and the ignored abort-repro tests on each new beta
 - [ ] Third-party notices file before any binary distribution (dependency licences — 63 third-party crates in the oracle-thin graph, all permissive but attribution is required; see `phase-0-spike-results.md` §1)
 - [x] Test DB: TCPS listener (S8) — `127.0.0.1:2484`, idempotent startup hook, wallet material untracked
 - [x] Test DB: container memory cap — 1.5 GiB SGA / 512 MiB PGA, `mem_limit: 4g` (~2.0 GiB resident)
 - [ ] Owner: decide how TCPS support is described to users and whether to refuse descriptors carrying `SSL_SERVER_DN_MATCH` (results file §9 items 6–7)
-- [ ] S6 Android/iOS cross-compile check (needs NDK / macOS)
+- [x] S6 Android/iOS cross-compile check — pass, kill criterion did not fire (PR #3: https://github.com/reldex/reldex/pull/3); physical-device validation still needed
+- [ ] Driver: honour `connect_timeout` (C-5) — `ConnectionParams::connect_timeout` is accepted and ignored (`phase-0-spike-results.md` §7 C-5)
+- [ ] Owner decisions §9 items 8–12 (default deadline, `EXPIRE_TIME` recommendation, trigger DDL rewrite, default fetch batch size, C-5 approach)
+- [ ] Android physical-device harness (needs a test device from the owner + local NDK)
 
 ## P1 — Desktop MVP
 

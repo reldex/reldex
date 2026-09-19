@@ -3,9 +3,13 @@
 **Status:** Active  
 **Goal:** Prove the core database architecture before significant Reldex UI development.
 **Spike evidence:** [`docs/exec-plans/active/phase-0-spike-results.md`](phase-0-spike-results.md) —
-S1–S5, S7 and S9 ran against the live Phase 0 test database on 2026-09-19. All checkboxes below are
-ticked only where that file (or `db-core`'s own tests) records a pass; where it records a failure or
-a limitation, the item is annotated rather than ticked or hidden.
+S1–S5, S7 and S9 ran against the live Phase 0 test database on 2026-09-19; the evidence-gap spikes
+S10–S14 (network loss/reconnect, NCLOB, developer features, privileged connections, large result) ran
+against the same database on 2026-09-19. **Mobile cross-compile spike S6** ran in CI on 2026-09-19
+(PR #3) and is written up separately in
+[`docs/exec-plans/active/phase-0-s6-mobile-cross-compile.md`](phase-0-s6-mobile-cross-compile.md). All
+checkboxes below are ticked only where one of those files (or `db-core`'s own tests) records a pass;
+where it records a failure or a limitation, the item is annotated rather than ticked or hidden.
 
 ## Success criteria
 
@@ -29,9 +33,9 @@ Phase 0 is complete when:
 | 2 | **Done.** Spike S1 — pass: Easy Connect and a full TNS descriptor both authenticate; 119.5 ms median connect (10 sequential cycles). |
 | 3 | **Done.** Spike S3 — pass. |
 | 4 | **Not met — accepted limitation (owner decision 2026-09-20).** Spike S4 fails for the requirement: only a pre-armed per-round-trip deadline exists, and it destroys the session whenever the server cannot answer promptly. `SPEC.md` §10/§24.8 is not satisfied by `oracledb` 26.0.0-beta.3. The owner reviewed ADR-0001's re-opening and decided to stay on `oracledb`, ship the pre-armed deadline with an honest UI, and pursue upstream fixes rather than change drivers — see ADR-0001 "Owner decision (2026-09-20)". This criterion remains **not met** for the Phase 0 go/no-go decision below; the decision was to accept the gap, not to close it. |
-| 5 | **Done, with documented limits.** Spikes S2 (conditional go — NUMBER-bind and TIMESTAMP WITH TIME ZONE restrictions contained by refusal, not silent corruption), S5 (pass) and S7 (pass) all ran against the live database. |
+| 5 | **Done, with documented limits.** Spikes S2 (conditional go — NUMBER-bind and TIMESTAMP WITH TIME ZONE restrictions contained by refusal, not silent corruption), S5 (pass), S7 (pass) and S11 (NCLOB — pass) all ran against the live database. |
 | 6 | **Partial.** Windows x64 fully validated locally (build, connect, full spike matrix). Linux x64 and macOS ARM64 build in CI (fmt/clippy/test) but this branch has not yet gone through a PR/CI run, and neither has database access in CI. |
-| 7 | **Documented blocker, no evidence yet.** Spike S6 (cross-compile) has not run — it needs the Android NDK (owner approval to download) and a macOS host for iOS. No physical-device testing has been attempted for either platform. |
+| 7 | **Cross-compile proven; physical-device evidence still outstanding.** Spike S6 passed 2026-09-19 (PR #3): `aarch64-linux-android`, `aarch64-apple-ios` and `aarch64-apple-ios-sim` all compile and link in CI with no local NDK/Xcode needed (`phase-0-s6-mobile-cross-compile.md`). No physical-device testing has been attempted for either platform; the blocker is that no test device has been provided. |
 | 8 | **Done.** `reldex-core-poc` is a ping/query/exec CLI harness; no Qt/QML UI exists. |
 
 ## Driver decision
@@ -102,8 +106,10 @@ found, not what was hoped for.
 - [x] RAW. Pass, byte-exact.
 - [x] CLOB. Pass (spike S7): 100 MB streamed via `LobStream::read_chunk` with +4.7 MB working set
   across 200 MB.
-- [ ] NCLOB. **Not directly tested.** CLOB/BLOB streaming (S7) and NVARCHAR2/Thai character fidelity
-  (S2) were each tested separately; no NCLOB-specific spike ran.
+- [x] NCLOB. **Pass (spike S11).** Thai and non-BMP text byte-exact through the lazy stream at six
+  buffer sizes, including ones that land inside a surrogate pair; `NULL` and `EMPTY_CLOB()` stay
+  distinguishable; 1.2M characters streamed in 55 bounded chunks. Reported as `LobKind::NationalCharacter`,
+  never collapsed into `Character`.
 - [x] BLOB. Pass (spike S7).
 - [x] JSON where applicable. **Honest split.** 19c has no native `JSON` column type — JSON there is
   `VARCHAR2`/`CLOB`/`BLOB` with `IS JSON`, all of which are covered by the character/LOB rows above.
@@ -120,15 +126,18 @@ For every mapping, document:
 ## Workstream E — Database-specific development features
 
 - [x] DBMS_OUTPUT. (spike S5 — pass, including a Thai-text line through an OUT bind)
-- [x] metadata dictionary query. **Partial evidence, not a dedicated spike.** `USER_ERRORS` was
-  queried successfully as part of S5's PL/SQL compile-error test (`PLS-00201` at the correct line and
-  column). No broader dictionary-query spike ran.
-- [x] V$ query where permissions allow. **Partial evidence, not a dedicated spike.** `V$SESSION` was
-  queried successfully as part of S4's privileged-cancel candidate (locating a session by
-  `DBMS_APPLICATION_INFO.SET_CLIENT_INFO` tag), which incidentally confirms V$ queries work through
-  the driver; this was not tested as a Workstream E capability in its own right.
-- [ ] EXPLAIN PLAN. Not run; no evidence in the results file.
-- [ ] DBMS_XPLAN. Not run; no evidence in the results file.
+- [x] metadata dictionary query. **Pass (spike S12).** Ten `ALL_*` dictionary views queried against one
+  fixture per `SPEC.md` §16 object group; `LONG`/`LONG RAW` columns (`ALL_VIEWS.TEXT`,
+  `ALL_TRIGGERS.TRIGGER_BODY`, `ALL_TAB_COLUMNS.DATA_DEFAULT`) read exact, including a 73,926-character
+  value; `DBMS_METADATA.GET_DDL` streamed as a CLOB locator. 63,414-row `all_objects` scan at ≈72,800
+  rows/s. Supersedes the earlier `USER_ERRORS`-only incidental evidence from S5.
+- [x] V$ query where permissions allow. **Pass (spike S12).** `v$version`, `v$session`, `v$parameter`
+  and `v$instance` all queried on the existing `SELECT ANY DICTIONARY`/`SELECT_CATALOG_ROLE` grants.
+  Supersedes the earlier S4-incidental `V$SESSION` evidence.
+- [x] EXPLAIN PLAN. **Pass (spike S12).** `EXPLAIN PLAN … FOR` writes to `PLAN_TABLE` via the public
+  synonym with no extra grant.
+- [x] DBMS_XPLAN. **Pass (spike S12).** Both `DBMS_XPLAN.DISPLAY` (26 lines, correct plan) and
+  `DBMS_XPLAN.DISPLAY_CURSOR` (35 lines) return real plans.
 
 ## Workstream F — Network/security
 
@@ -145,10 +154,25 @@ For every mapping, document:
   about 0.5 s past the deadline with the session intact, but a fired deadline on a PL/SQL block the
   server will not interrupt promptly costs the connection entirely (upstream recovery defect U-6,
   load-dependent by construction — see `phase-0-spike-results.md` U-6). This is timeout behavior, not
-  cancellation; see Workstream C for why it does not satisfy `SPEC.md` §24.8.
-- [ ] network-loss behavior. **Not evidenced.** Only recovery-path failure modes seen incidentally
-  during S4 (U-6, U-7) — no dedicated network-loss spike ran.
-- [ ] reconnect semantics. **Not evidenced.** No reconnect spike ran.
+  cancellation; see Workstream C for why it does not satisfy `SPEC.md` §24.8. **Extended by spike S10:**
+  a connect cannot be bounded at all — `ConnectionParams::connect_timeout()` is accepted and ignored
+  by the driver (contract gap C-5) — and a black-holed link with no deadline armed never returns
+  (U-15, U-17).
+- [x] network-loss behavior. **Pass, with two upstream gaps (spike S10).** A dead socket (hard drop)
+  is detected in 54 µs–568 µs and reported `NetworkLost`/`Lost`; loss mid-statement, mid-fetch and
+  mid-LOB-stream all report and retire the handle cleanly; an in-doubt commit is surfaced as unknown,
+  never guessed as success. But a **black-holed** link (sockets stay open) never returns without a
+  caller-set deadline (U-17), the only deadline that ends it destroys the session (U-6), and a dead
+  client's row lock blocked a second session for the full 20 s measured because
+  `SQLNET.EXPIRE_TIME` is unset on the test database and upstream has no keepalive of its own.
+- [x] reconnect semantics. **Pass (spike S10).** Nothing reconnects by itself — after a loss every
+  call fails and the test proxy saw no second TCP connection. A fresh `connect()` opens a new server
+  session (SID/serial# differ) carrying none of the old session's state (an `ALTER SESSION` setting
+  was gone). `SPEC.md` §18's "never silently replace a lost transactional session" is satisfied.
+- [x] privileged connections. **Pass (spike S13).** `AS SYSDBA` over the listener connects in 119 ms —
+  the same as an ordinary connect — through the existing `SessionRole` contract (`AUTH_MODE_SYSDBA`);
+  `AS SYSOPER` also connects and is reported as the non-DBA account it is. No contract gap, no
+  upstream gap. Privilege does not leak to a concurrently open ordinary session.
 
 Known unsupported configurations of the primary driver (ADR-0001): Native Network Encryption and
 11G password verifiers. Record them as documented limitations, not as driver failures.
@@ -171,8 +195,10 @@ Known unsupported configurations of the primary driver (ADR-0001): Native Networ
 - [ ] Core smoke matrix. Not attempted.
 
 ### Android ARM64 physical device
-- [ ] Cross-compile. **Not started** — spike S6 has not run; it needs the Android NDK, which needs
-  owner approval to download.
+- [x] Cross-compile. **Pass (spike S6, 2026-09-19, PR #3).** `aarch64-linux-android` compiles and
+  links (`cargo-ndk`, API 26) on an ordinary GitHub-hosted runner with no local NDK; `.so` 2,676,128 B
+  unstripped / 2,285,896 B stripped. Cross-compile evidence only, not device evidence — see
+  [`phase-0-s6-mobile-cross-compile.md`](phase-0-s6-mobile-cross-compile.md).
 - [ ] Package minimal native harness.
 - [ ] Connect over TCP.
 - [ ] Connect over TCPS.
@@ -184,7 +210,10 @@ Known unsupported configurations of the primary driver (ADR-0001): Native Networ
 - [ ] reconnect/lost-session behavior.
 
 ### iOS/iPadOS ARM64 physical device
-- [ ] Cross-compile. **Not started** — needs a macOS host, not available to this workstream.
+- [x] Cross-compile. **Pass (spike S6, 2026-09-19, PR #3).** `aarch64-apple-ios` and
+  `aarch64-apple-ios-sim` both compile and link on `macos-latest` CI (Xcode 26.6); device `.dylib`
+  2,338,312 B, `.a` 10,692,824 B unstripped / 6,990,520 B stripped. Cross-compile evidence only, not
+  device evidence — see [`phase-0-s6-mobile-cross-compile.md`](phase-0-s6-mobile-cross-compile.md).
 - [ ] Package minimal native harness.
 - [ ] Connect over TCP.
 - [ ] Connect over TCPS.
@@ -204,32 +233,55 @@ Windows 11 Pro, `rustc 1.98.1` MSVC target). Full method notes are in
 - **Connection latency** — 119.5 ms median connect (118.6–123.7 ms range, 10 sequential
   connect/ping/close cycles, `Instant::now()` around each, median of sorted samples); `ping` 769 µs
   median. Method: `connection_latency_is_measured_over_ten_attempts` (spike S1).
-- **Fetch throughput** — not comprehensively benchmarked; LOB streaming rates only (see below).
+- **Fetch throughput** — **1,000,000 rows** (NUMBER/VARCHAR2(40)/DATE), streamed via `fetch_batch`
+  with every batch dropped as it arrives: 52,300–59,400 rows/s at `fetch_rows=100`, 50,500–92,100
+  rows/s at `fetch_rows=1,000`, 14,800–17,700 rows/s at `fetch_rows=10,000`. Throughput is **not**
+  monotonic in the batch size — 10,000 was consistently ~3.5× slower than the best of the other two
+  and cost up to 1.1 s to the first batch, against 5 ms at 100. Method: one session, wall clock from
+  before `execute` to after the last `fetch_batch`, two runs on one machine (spike S14). Do not assume
+  a larger default batch is faster when Reldex picks one (results file §9 item 12).
 - **Memory during large fetch** — LOB streaming: process working set grew **4.7 MB** while streaming
-  200 MB (100 MB CLOB + 100 MB BLOB) through a 64 KiB caller buffer. Method: working set sampled via
-  `tasklist /FI "PID eq <self>" /FO CSV /NH` before the first read and every 200 chunks, peak taken as
-  the maximum sample (spike S7).
-- **Cancellation latency** — a pre-armed 2.0 s deadline stopped a long SQL statement after 2.5 s with
-  the session intact, but the same deadline on a PL/SQL sleep took 4.0 s and destroyed the connection
-  (spike S4, §4 candidate 1). A privileged `ALTER SYSTEM CANCEL SQL` stopped the statement server-side
-  in 2.7 ms to issue / ~507 ms to take effect, but the blocked client did not notice until its own
-  20 s safety deadline expired at 23.0 s (spike S4, §4 candidate 2). No mechanism achieves an
-  observable on-demand cancel in the general case — see Workstream C.
+  200 MB (100 MB CLOB + 100 MB BLOB) through a 64 KiB caller buffer (spike S7). Row streaming: the same
+  1,000,000-row scan above grew the working set by only **~1 MB** (+480–504 KB at `fetch_rows=100`,
+  +996–1,032 KB at 1,000, +1,204–6,772 KB at 10,000) — a driver that materialized the result would need
+  at least 56 MB, so `SPEC.md` §12's bounded-memory claim holds (spike S14). Method: working set
+  sampled via `tasklist /FI "PID eq <self>" /FO CSV /NH` before the first read/execute and
+  periodically thereafter, growth = peak minus the pre-read sample.
+- **Cancellation/deadline latency** — a pre-armed 2.0 s deadline stopped a long SQL statement after
+  2.5 s with the session intact, but the same deadline on a PL/SQL sleep took 4.0 s and destroyed the
+  connection (spike S4, §4 candidate 1). A privileged `ALTER SYSTEM CANCEL SQL` stopped the statement
+  server-side in 2.7 ms to issue / ~507 ms to take effect, but the blocked client did not notice until
+  its own 20 s safety deadline expired at 23.0 s (spike S4, §4 candidate 2). No mechanism achieves an
+  observable on-demand cancel in the general case — see Workstream C. **Connect-time deadlines
+  (spike S10):** a connect to a discarded address (`192.0.2.1`) returned after 22.0 s — the operating
+  system's own SYN budget, nothing the driver chose — and a connect into a black hole was still
+  outstanding after 30 s even with `ConnectionParams::with_connect_timeout(2 s)` set (U-15/C-5); a
+  black-holed `ping` with no deadline had not returned after 30 s, while the same call with a 3 s
+  deadline returned after 6.0 s and destroyed the session (U-6/U-17).
 - **Concurrency** — 8 concurrent sessions, 400 inserts (50 per thread) plus commit and read-back,
   282.8 ms wall clock (spike S9).
-- **Binary/package constraints per platform** — measured with `cargo tree -p reldex-driver-oracle-thin
-  --target x86_64-pc-windows-msvc` and `cargo metadata`: **55** third-party crates at run time, **63**
-  including build-only crates (`aws-lc-sys`'s C/assembly build pulls in `cc`, `cmake`, `jobserver`,
-  `shlex`, `find-msvc-tools`, `dunce`, `fs_extra`, plus `autocfg`). Every licence is permissive (no
-  copyleft); a generated third-party notices file is required before any binary distribution (see
-  TASKS.md).
+- **Binary/package constraints per platform** — Desktop (Windows x64): measured with
+  `cargo tree -p reldex-driver-oracle-thin --target x86_64-pc-windows-msvc` and `cargo metadata`:
+  **55** third-party crates at run time, **63** including build-only crates (`aws-lc-sys`'s C/assembly
+  build pulls in `cc`, `cmake`, `jobserver`, `shlex`, `find-msvc-tools`, `dunce`, `fs_extra`, plus
+  `autocfg`). Every licence is permissive (no copyleft); a generated third-party notices file is
+  required before any binary distribution (see TASKS.md). Mobile (spike S6, release build, CI):
+  Android `aarch64-linux-android` — `libmobile_link_check.so` 2,676,128 B unstripped / 2,285,896 B
+  stripped (`llvm-strip --strip-all`), `.a` 15,390,220 B, `reldex-core-poc` 4,849,112 B unstripped /
+  3,932,024 B stripped; iOS device `aarch64-apple-ios` — `.dylib` 2,338,312 B, `.a` 10,692,824 B
+  unstripped / 6,990,520 B after `strip -S` (34.6% smaller), `reldex-core-poc` 4,258,352 B; iOS
+  simulator `aarch64-apple-ios-sim` — `.dylib` 2,373,200 B, `.a` 10,716,016 B, `reldex-core-poc`
+  4,308,224 B. Method: `phase-0-s6-mobile-cross-compile.md` — these are intermediate build products
+  from the link-check probe crate, not shipped app sizes.
 
 Do not make comparative performance claims without recording the method and environment.
 
 ## Phase 0 exit assessment (draft)
 
 This restates the eight success criteria above as a single input for the owner's Phase 1 go/no-go
-decision. It is a draft assessment, not the decision itself — see the note at the end.
+decision. It is a draft assessment, not the decision itself — see the note at the end. Rewritten
+2026-09-20 against the evidence-gap spikes (S10–S14) and the mobile cross-compile spike (S6); no
+criterion's honest status is softened to make the table look more finished than the evidence supports.
 
 | # | Criterion | Assessment | Evidence |
 | --- | --- | --- | --- |
@@ -237,23 +289,35 @@ decision. It is a draft assessment, not the decision itself — see the note at 
 | 2 | Selected thin driver connects to the reference database | **Met** | Spike S1 — pass; `phase-0-spike-results.md` §3 |
 | 3 | Transaction behavior is correct | **Met** | Spike S3 — pass; `phase-0-spike-results.md` §3 |
 | 4 | Query cancellation is demonstrated | **Not met — accepted limitation (owner decision 2026-09-20)** | Spike S4; ADR-0001 "Spike outcome (2026-09-20)" and "Owner decision (2026-09-20)"; `phase-0-spike-results.md` §4 |
-| 5 | Required datatypes/PL-SQL behaviors are integration-tested | **Partially met** | Spikes S2 (conditional go), S5 (pass), S7 (pass); NCLOB not directly tested — `phase-0-spike-results.md` §3 |
-| 6 | Desktop platform viability is established | **Partially met** | Windows x64 fully validated locally; Linux x64 and macOS ARM64 build/fmt/clippy/test green on CI (PR #1) but no database connect exercised in CI — see `README.md` "Current status" |
-| 7 | Android/iOS direct-connect feasibility: physical-device evidence or a documented blocker | **Not met, documented blocker** | Spike S6 not run — needs Android NDK (owner approval to download) and a macOS host for iOS; no physical-device evidence for either platform |
+| 5 | Required datatypes/PL-SQL behaviors are integration-tested | **Met, with limits** | Spikes S2 (conditional go — NUMBER-bind and TIMESTAMP WITH TIME ZONE restrictions), S5 (pass), S7 (pass), S11 (NCLOB — pass), S12 (developer features — pass, but `CREATE TRIGGER … :NEW` is impossible, U-18) — `phase-0-spike-results.md` §3, §5 |
+| 6 | Desktop platform viability is established | **Met, with limits** | Windows x64 fully validated locally; Linux x64 and macOS ARM64 build/fmt/clippy/test green on CI (PR #1) but no database connect exercised in CI — see `README.md` "Current status" |
+| 7 | Android/iOS direct-connect feasibility: physical-device evidence or a documented blocker | **Met, with limits — stated honestly.** Cross-compile and link are proven; no physical-device evidence exists; the blocker is documented, not silent | Spike S6 — pass 2026-09-19, PR #3, `aarch64-linux-android`/`aarch64-apple-ios`/`aarch64-apple-ios-sim` all compile and link in CI with no local NDK/Xcode (`phase-0-s6-mobile-cross-compile.md`). **What is still missing:** no device has run any of connect/SQL/transaction/cancel/LOB/TCPS/background-resume; the documented blocker is that **no physical Android or iOS test device has been provided** (iOS additionally needs a Mac + Apple Developer account) — see that file's "Next step toward physical-device validation" |
 | 8 | No full desktop UI required to prove these results | **Met** | `reldex-core-poc` is a CLI harness; no Qt/QML UI exists |
 
 **What remains before a Phase 1 go decision:**
 
+- **Android physical-device validation** — needs a physical Android device (arm64, API 26+) from the
+  owner, USB debugging, and network access to a reachable Oracle instance, plus a local Android NDK to
+  build the harness (`phase-0-s6-mobile-cross-compile.md` "Next step").
+- **iOS physical-device validation** — needs a Mac with Xcode (CI already confirms the toolchain), an
+  Apple Developer account (a free personal-team identity suffices for a 7-day local debug build), and
+  a physical iPhone/iPad.
 - TCPS (spike S8) — done 2026-09-20, pass with limits (see Workstream F); the remaining TCPS questions
   are owner decisions (results file §9 items 6–7).
-- Android/iOS cross-compile (spike S6) — pending Android NDK approval and a macOS host; criterion 7
-  needs either physical-device evidence or to remain a clearly documented blocker, not silence.
-- Network-loss/reconnect behavior — not evidenced at all in Phase 0 (Workstream F).
-- NCLOB — not directly spiked (CLOB/BLOB streaming and NVARCHAR2/Thai character fidelity were each
-  tested separately; no NCLOB-specific spike ran).
-- EXPLAIN PLAN / DBMS_XPLAN — not run (Workstream E).
-- Metadata/dictionary access as a capability in its own right — only incidental evidence so far
-  (`USER_ERRORS`, `V$SESSION`, each exercised only for another test's own purpose).
+- Driver fix or owner-approved workaround for **C-5** (`ConnectionParams::connect_timeout` accepted
+  and ignored) — three options are set out in the results file §7 C-5; recommendation is to implement
+  it on a helper thread, but it changes `connect()`'s threading for every caller and needs the owner.
+- Owner approval to submit drafted upstream **issues F and G** (results file §6) — U-15…U-17
+  (timeouts/dead-link detection) and U-18 (`CREATE TRIGGER`).
+- **Owner decisions outstanding** (results file §9, full list): item 4 (relax the NUMBER-bind refusal
+  U-1 — recommendation: no), items 6–7 (how far TCPS is advertised to customers; whether to guard
+  against `SSL_SERVER_DN_MATCH` being silently ignored, U-14), item 8 (C-5 above), item 9 (whether
+  Reldex arms a default deadline on every call, and what the UI says about a silent link — U-6/U-17),
+  item 10 (whether the Phase 0 test database, and Reldex's customer guidance, should set
+  `SQLNET.EXPIRE_TIME`), item 11 (whether the editor should offer to rewrite `CREATE TRIGGER` DDL
+  through the `EXECUTE IMMEDIATE` workaround, U-18), item 12 (default fetch batch size — S14 found
+  throughput is not monotonic in batch size, which rules out assuming "bigger is faster" but is not
+  enough evidence to pick a number).
 
 This is a draft assessment for the owner's use, not a go/no-go decision — per "Deliverables" below,
 that decision is the owner's to make.

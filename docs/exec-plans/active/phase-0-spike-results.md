@@ -18,7 +18,8 @@ Where something failed, it is written down as a failure.
 > connections, **S14** large-result throughput and memory. Four new upstream
 > defects came out of them (**U-15** to **U-18**), two drafted as issues **F**
 > and **G**, and one new contract problem (**C-5**). Two driver fixes were made
-> and are covered by tests. Nothing has been posted to GitHub.
+> and are covered by tests. Issues F and G have not been posted to GitHub
+> (A–E were submitted on 2026-09-20 — see §6).
 
 > **Updated 2026-09-19, after the first run.** Two of the problems this
 > document recorded have been fixed and the fixes re-verified against the same
@@ -187,7 +188,7 @@ Two consequences worth recording now rather than at release time:
 | S12 developer features | **Pass, with one upstream blocker** | EXPLAIN PLAN, both `DBMS_XPLAN` entry points, `V$`, ten dictionary views, `LONG`/`LONG RAW` (exact, including 73 926 characters) and `DBMS_METADATA.GET_DDL` all work. `CREATE TRIGGER` with `:NEW` does **not** (U-18) |
 | S13 privileged connection | **Pass** | `AS SYSDBA` over the listener in 119 ms through the existing `SessionRole` contract; no contract gap, no upstream gap |
 | S14 large result | **Pass** | 1 000 000 rows streamed for **~1 MB** of working-set growth; 50 000–92 000 rows/s. Throughput is **not** monotonic in the batch size |
-| S6 | **Not run** | Out of scope for this workstream (metadata queries) |
+| S6 mobile cross-compile | **Pass** | `aarch64-linux-android`, `aarch64-apple-ios`, `aarch64-apple-ios-sim` all compile and link in CI (PR #3); no extra tools needed for `aws-lc-sys`; provider swap to `ring` confirmed unavailable without forking. Cross-compile evidence only — physical-device validation still open |
 
 Test counts, as measured on **2026-09-19** after the review fixes and the
 evidence-gap spikes:
@@ -466,9 +467,18 @@ produced these behaviour changes. Each has a test; most need no database.
 | A socket-level timeout during **connect** is `ErrorKind::Connection`, not `Timeout` | Upstream turns every `TimedOut` I/O error into `CallTimeoutExceeded` (U-16), so a 22-second TCP connect failure was reported as "the call timeout armed for this statement expired" — about a session that never existed, with a session state attached to it | `a_connect_that_times_out_in_the_socket_is_not_reported_as_a_call_timeout` (no database), `a_connect_to_an_unroutable_address_measures_the_operating_systems_patience` (live) |
 | A missing bind value for a statement that declared **no** binds is `ErrorKind::Unsupported` with the cause and the workaround | Upstream's parser reads `:NEW` in a trigger body as a placeholder (U-18); passing its message on blamed the caller for something they did not write, and left them with nothing to do about it | `a_trigger_body_that_mentions_new_is_refused_with_the_reason` |
 
-### S6 — **Not run**
+### S6 — mobile cross-compile — **Pass**
 
-S6 (metadata queries) belongs to a later slice and was not attempted.
+Run 2026-09-19, evidence PR [reldex/reldex#3](https://github.com/reldex/reldex/pull/3). ADR-0001's S6
+kill criterion — "either target fails to build and no provider swap fixes it" — did **not** fire:
+`aarch64-linux-android`, `aarch64-apple-ios` and `aarch64-apple-ios-sim` all **compile and link** on
+ordinary GitHub-hosted runners, no local NDK or Xcode, and no extra tools (no `cmake`, no
+`bindgen`/`libclang`) were needed for `aws-lc-sys`. A provider swap to `ring` is confirmed
+unavailable without forking `oracledb` (feature unification pulls in `aws-lc-rs` regardless). This is
+cross-compile-and-link evidence only — **not mobile support** — and does not change Phase 0 success
+criterion 7 (`phase-0.md`), which still needs physical-device evidence. Full detail, per-target sizes
+and next steps toward device validation:
+[`phase-0-s6-mobile-cross-compile.md`](phase-0-s6-mobile-cross-compile.md).
 
 ### S8 — TCPS — **Pass, with limits**
 
@@ -1618,7 +1628,9 @@ untouched (`Usable`), which the test asserts. Drafted as **Issue G**.
 
 ---
 
-## 6. Drafted upstream issues — **for the owner to submit; nothing has been posted**
+## 6. Drafted upstream issues — **five submitted 2026-09-20; F and G await the owner's go-ahead**
+
+> **Submitted 2026-09-20 by the owner's account (SupawitNu):** B → [oracle/rust-oracledb#21](https://github.com/oracle/rust-oracledb/issues/21) (NUMBER bind ×10), C → [#22](https://github.com/oracle/rust-oracledb/issues/22) (process aborts: NUMBER index OOB, region TSTZ `todo!()`, poisoned-mutex double panic), D → [#23](https://github.com/oracle/rust-oracledb/issues/23) (call-timeout recovery closes the connection; server-side cancel not observed), A → [#24](https://github.com/oracle/rust-oracledb/issues/24) (public break/interrupt API), E → [#25](https://github.com/oracle/rust-oracledb/issues/25) (TCPS trust / `SSL_SERVER_DN_MATCH`). Issues **F** and **G** below are drafted but **not yet submitted**, pending the owner's go-ahead.
 
 ### Issue A — the one ADR-0001 asks for
 
