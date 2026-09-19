@@ -104,7 +104,7 @@ fn a_ref_cursor_out_bind_becomes_a_result_handle_on_the_worker_thread() {
 #[test]
 fn a_nested_result_is_released_when_the_session_closes() {
     let scenario = script_a_ref_cursor(3);
-    let mut session = support::open(&scenario);
+    let session = support::open(&scenario);
     let outcome = session
         .execute(Statement::new(OPEN_CURSOR))
         .wait()

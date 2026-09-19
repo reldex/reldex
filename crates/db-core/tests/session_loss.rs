@@ -4,9 +4,43 @@
 
 mod support;
 
-use reldex_db_core::{SessionState, Statement};
-use reldex_db_driver_api::ErrorKind;
+use reldex_db_core::{CloseDisposition, CloseError, SessionLifecycle, SessionState, Statement};
+use reldex_db_driver_api::{ErrorKind, NativeError};
 use reldex_driver_mock::{Action, ColumnSpec, QueryPlan, QuerySource, ScriptValue, ScriptedError};
+
+fn insert_action(row: &str) -> Action {
+    Action::Dml {
+        rows_affected: 1,
+        insert: Some(("t".to_owned(), vec![ScriptValue::from(row)])),
+    }
+}
+
+/// Opens a session, runs one DML, then loses the network under it.
+fn session_with_a_lost_transaction(
+    scenario: &std::sync::Arc<reldex_driver_mock::Scenario>,
+) -> reldex_db_core::DatabaseSession {
+    scenario.on_sql("INSERT INTO t VALUES ('a')", insert_action("a"));
+    scenario.on_sql(
+        "SELECT 1 FROM dual",
+        Action::Fail(
+            ScriptedError::new(ErrorKind::NetworkLost, "connection reset")
+                .with_native(3113, "ORA-03113: end-of-file on communication channel"),
+        ),
+    );
+    let session = support::open(scenario);
+    session
+        .execute(Statement::new("INSERT INTO t VALUES ('a')"))
+        .wait()
+        .expect("insert");
+    assert!(session.has_possibly_active_transaction());
+    let error = session
+        .execute(Statement::new("SELECT 1 FROM dual"))
+        .wait()
+        .expect_err("scripted network loss");
+    assert_eq!(error.kind(), ErrorKind::NetworkLost);
+    assert!(session.is_lost());
+    session
+}
 
 #[test]
 fn network_loss_mid_fetch_marks_the_session_lost_and_fails_fast_afterwards() {
@@ -17,7 +51,7 @@ fn network_loss_mid_fetch_marks_the_session_lost_and_fails_fast_afterwards() {
         2,
         ScriptedError::new(ErrorKind::NetworkLost, "connection reset mid-fetch"),
     );
-    scenario.on_sql("SELECT * FROM big", Action::Query(QuerySource::Fixed(plan)));
+    scenario.on_sql("SELECT * FROM big", Action::query(QuerySource::Fixed(plan)));
 
     let session = support::open(&scenario);
     let outcome = session
@@ -43,7 +77,8 @@ fn network_loss_mid_fetch_marks_the_session_lost_and_fails_fast_afterwards() {
         session.is_lost(),
         "a NetworkLost error must move the session to Lost"
     );
-    assert_eq!(session.session_state(), SessionState::Lost);
+    assert_eq!(session.session_state(), SessionLifecycle::Lost);
+    assert!(!session.session_state().is_usable());
 
     let connection_id = session.connection_id();
 
@@ -72,5 +107,130 @@ fn network_loss_mid_fetch_marks_the_session_lost_and_fails_fast_afterwards() {
         session.connection_id(),
         connection_id,
         "db-core must never silently reconnect or replace a lost session"
+    );
+}
+
+/// `close(Some(Commit))` on a lost session used to return `Ok(())` while
+/// committing nothing at all.
+///
+/// The repro from the review: DML, network loss, `close(None)` says a decision
+/// is required, the user picks Commit, `close` reports success — and the table
+/// is empty. That is the silent data loss `SPEC.md` §10 exists to prevent, told
+/// backwards: the user was assured their work was saved.
+#[test]
+fn close_with_commit_on_a_lost_session_reports_the_loss_instead_of_succeeding() {
+    let scenario = support::scenario();
+    let session = session_with_a_lost_transaction(&scenario);
+
+    let error = session
+        .close(Some(CloseDisposition::Commit))
+        .expect_err("nothing could be committed, so close must not report success");
+    let CloseError::Failed(cause) = &error else {
+        panic!("expected a failed close, got {error:?}");
+    };
+    assert_eq!(cause.session_state(), SessionState::Lost);
+    let rendered = cause.to_string();
+    assert!(
+        rendered.contains("nothing was committed"),
+        "the error must say the commit did not happen: {rendered}"
+    );
+    assert!(
+        scenario.committed_rows("t").is_empty(),
+        "and nothing may actually have been committed"
+    );
+    // Resources are still released, and closing again is the usual no-op.
+    assert_eq!(scenario.counts().connections_closed, 1);
+    session.close(None).expect("closing again is a no-op");
+}
+
+/// `close(None)` on a lost session must report the loss, not ask for a decision
+/// about a transaction that no longer exists.
+#[test]
+fn close_without_a_disposition_on_a_lost_session_reports_the_loss() {
+    let scenario = support::scenario();
+    let session = session_with_a_lost_transaction(&scenario);
+    assert!(
+        session.has_possibly_active_transaction(),
+        "core-side tracking still believes a transaction was open"
+    );
+
+    let error = session
+        .close(None)
+        .expect_err("the loss must be reported, not hidden behind a prompt");
+    assert!(
+        !matches!(error, CloseError::DecisionRequired),
+        "asking the user to choose between Commit and Rollback for a transaction the server \
+         already rolled back is a question with no true answer"
+    );
+    assert!(!error.session_is_still_open());
+}
+
+/// The fail-fast error a lost session gives every later command must keep the
+/// original classification, not flatten it into a sentence.
+#[test]
+fn the_terminal_error_keeps_the_kind_and_native_code_of_the_loss() {
+    let scenario = support::scenario();
+    let session = session_with_a_lost_transaction(&scenario);
+
+    let error = session
+        .execute(Statement::new("SELECT 1 FROM dual"))
+        .wait()
+        .expect_err("the session is lost");
+    assert_eq!(
+        error.kind(),
+        ErrorKind::NetworkLost,
+        "a UI cannot tell the user why the session went away if every later error is `Connection`"
+    );
+    assert_eq!(error.native().map(NativeError::code), Some(3113));
+    assert!(
+        error
+            .native()
+            .is_some_and(|native| native.message().contains("ORA-03113")),
+        "the server's own text must survive"
+    );
+    assert_eq!(error.session_state(), SessionState::Lost);
+}
+
+/// A failed revalidation `ping` must fail the command it was validating for,
+/// not let it run anyway.
+#[test]
+fn a_failed_revalidation_ping_fails_the_command_instead_of_running_it() {
+    let scenario = support::scenario();
+    scenario.on_sql(
+        "SELECT slow FROM dual",
+        Action::Fail(ScriptedError::new(ErrorKind::Timeout, "deadline elapsed")),
+    );
+    scenario.on_sql(
+        "SELECT 1 FROM dual",
+        Action::query(QuerySource::Fixed(QueryPlan::new(
+            vec![ColumnSpec::new("N", reldex_db_driver_api::SqlType::Number)],
+            vec![vec![ScriptValue::from(1_i64)]],
+        ))),
+    );
+
+    let session = support::open(&scenario);
+    let error = session
+        .execute(Statement::new("SELECT slow FROM dual"))
+        .wait()
+        .expect_err("scripted timeout");
+    assert_eq!(error.session_state(), SessionState::NeedsValidation);
+    assert_eq!(session.session_state(), SessionLifecycle::NeedsValidation);
+
+    // The session did not survive validation.
+    scenario.fail_ping(ScriptedError::new(ErrorKind::NetworkLost, "gone"));
+
+    let error = session
+        .execute(Statement::new("SELECT 1 FROM dual"))
+        .wait()
+        .expect_err("a command whose revalidation failed must not be executed");
+    assert_eq!(error.session_state(), SessionState::Lost);
+    assert!(
+        session.is_lost(),
+        "the failed ping must have moved the session to Lost"
+    );
+    assert_eq!(
+        session.session_state(),
+        SessionLifecycle::Lost,
+        "and it must stay there"
     );
 }

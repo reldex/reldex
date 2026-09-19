@@ -390,6 +390,10 @@ impl DbError {
     /// on a connection that no longer exists (ADR-0002 D2, handle lifecycle).
     /// The session is [`SessionState::Lost`] because it is, by construction,
     /// gone.
+    ///
+    /// This is for *operations*. [`crate::Cursor::close`] is the exception and
+    /// must not use it: releasing something that is already released is
+    /// `Ok(())`, not a failure.
     #[must_use]
     pub fn connection_closed(handle: &str) -> Self {
         Self::new(

@@ -487,15 +487,25 @@ pub trait DatabaseDriver: Send + Sync {
 ///
 /// - After [`DatabaseConnection::close`], every outstanding [`crate::Cursor`]
 ///   and [`crate::LobStream`] returns
-///   [`crate::DbError::connection_closed`] from every operation. `close`
-///   consumes the connection, so `db-core` is expected to have dropped them
-///   first; a driver must survive it not having done so.
+///   [`crate::DbError::connection_closed`] from every operation — with one
+///   deliberate exception: [`crate::Cursor::close`] is idempotent and reports
+///   `Ok(())` when there is nothing left to release. A release path that fails
+///   because there is nothing to release only teaches callers to ignore its
+///   result. `close` consumes the connection, so `db-core` is expected to have
+///   dropped or closed its handles first; a driver must survive it not having
+///   done so.
 /// - After [`DatabaseConnection::commit`] or
 ///   [`DatabaseConnection::rollback`], open cursors and LOB locators may be
 ///   invalid — see those methods.
 /// - After any error from a cursor, the only legal call on it is
 ///   [`crate::Cursor::close`]; after any error from a LOB stream, the only legal
-///   action is to drop it. Drivers enforce this by reporting, not by trusting.
+///   action is to drop it. Drivers enforce this by reporting, not by trusting —
+///   and specifically, a cursor that has failed must keep reporting that
+///   failure rather than returning the empty batch that means "exhausted",
+///   which would turn a partial result into one that looks complete.
+/// - Dropping a derived handle is itself driver work, so it happens on the
+///   owning worker thread like everything else — including dropping a
+///   [`crate::RowBatch`] whose locators have not been taken out; see that type.
 pub trait DatabaseConnection: Send {
     /// This connection's identifier.
     fn id(&self) -> ConnectionId;
@@ -599,9 +609,10 @@ pub trait DatabaseConnection: Send {
     /// prompting before it gets here.
     ///
     /// Any cursor or LOB stream still alive afterwards must return
-    /// [`crate::DbError::connection_closed`] from every operation — never a
-    /// panic, never a block on a socket that is gone. See the trait's "Lifetime
-    /// of derived handles".
+    /// [`crate::DbError::connection_closed`] from every operation except
+    /// [`crate::Cursor::close`], which reports `Ok(())` because there is
+    /// nothing left to release — never a panic, never a block on a socket that
+    /// is gone. See the trait's "Lifetime of derived handles".
     ///
     /// # Errors
     ///

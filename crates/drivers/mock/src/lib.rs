@@ -25,7 +25,7 @@
 //! let scenario = Scenario::new();
 //! scenario.on_sql(
 //!     "SELECT name FROM dual",
-//!     Action::Query(QuerySource::Fixed(QueryPlan::new(
+//!     Action::query(QuerySource::Fixed(QueryPlan::new(
 //!         vec![ColumnSpec::new("NAME", reldex_db_driver_api::SqlType::VARCHAR)],
 //!         vec![vec![ScriptValue::from("hello")]],
 //!     ))),
@@ -54,6 +54,6 @@ mod scenario;
 pub use connection::{MockConnection, MockDriver};
 pub use cursor::MockCursor;
 pub use scenario::{
-    Action, BlockGate, BlockSpec, ColumnSpec, Matcher, QueryPlan, QuerySource, Scenario,
+    Action, BlockGate, BlockSpec, ColumnSpec, Counts, Matcher, QueryPlan, QuerySource, Scenario,
     ScriptValue, ScriptedError,
 };

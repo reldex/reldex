@@ -6,11 +6,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use reldex_db_driver_api::{
     BytesColumn, Column, ColumnData, ColumnKind, ColumnMetadata, ConnectionId, Cursor, DbError,
-    DbResult, LobKind, LobLocator, LobStream, NullMask, Number, ResultSetId, RowBatch, SqlType,
-    TextColumn, Timestamp,
+    DbResult, ErrorKind, LobKind, LobLocator, LobStream, NullMask, Number, ResultSetId, RowBatch,
+    SessionState, SqlType, TextColumn, Timestamp,
 };
 
-use crate::scenario::{ColumnSpec, QueryPlan, Scenario, ScriptValue};
+use crate::scenario::{ColumnSpec, QueryPlan, Scenario, ScriptValue, TransactionEpoch};
 
 /// A large object served from an in-memory byte buffer, in caller-sized
 /// chunks, never splitting a UTF-8 sequence for a character kind (contract
@@ -22,15 +22,20 @@ pub(crate) struct MockLobStream {
     position: usize,
     scenario: Arc<Scenario>,
     closed: Arc<AtomicBool>,
+    epoch: TransactionEpoch,
+    /// Set once a read reported an error. "After any error the stream is
+    /// finished" (ADR-0002 D2), so it must keep reporting rather than resume.
+    failed: bool,
 }
 
 impl MockLobStream {
-    fn new(
+    pub(crate) fn new(
         connection_id: ConnectionId,
         kind: LobKind,
         bytes: Vec<u8>,
         scenario: Arc<Scenario>,
         closed: Arc<AtomicBool>,
+        epoch: TransactionEpoch,
     ) -> Self {
         Self {
             connection_id,
@@ -39,7 +44,23 @@ impl MockLobStream {
             position: 0,
             scenario,
             closed,
+            epoch,
+            failed: false,
         }
+    }
+}
+
+impl Drop for MockLobStream {
+    /// Releasing a locator is driver work, so it records the thread like every
+    /// other driver call.
+    ///
+    /// A real driver's locator `Drop` talks to the connection (or at least to
+    /// the client object that owns it), which is exactly why a `RowBatch` still
+    /// holding one may not be dropped off the owning worker thread. Recording
+    /// here is what lets a test *see* that happen instead of taking the rule on
+    /// trust.
+    fn drop(&mut self) {
+        self.scenario.record_thread(self.connection_id);
     }
 }
 
@@ -59,7 +80,18 @@ impl LobStream for MockLobStream {
     fn read_chunk(&mut self, buf: &mut [u8]) -> DbResult<usize> {
         self.scenario.record_thread(self.connection_id);
         if self.closed.load(Ordering::SeqCst) {
+            self.failed = true;
             return Err(DbError::connection_closed("LOB stream"));
+        }
+        if let Some(error) = self.epoch.check("LOB locator") {
+            self.failed = true;
+            return Err(error);
+        }
+        if self.failed {
+            return Err(DbError::internal(
+                "reldex-driver-mock: LOB stream read after a failure; the only legal action \
+                 was to drop it",
+            ));
         }
         let remaining = &self.bytes[self.position..];
         if remaining.is_empty() || buf.is_empty() {
@@ -98,6 +130,7 @@ fn build_column(
     connection_id: ConnectionId,
     scenario: &Arc<Scenario>,
     closed: &Arc<AtomicBool>,
+    epoch: &TransactionEpoch,
 ) -> DbResult<Column> {
     let len = rows.len();
     let mut nulls = NullMask::new(len);
@@ -191,6 +224,7 @@ fn build_column(
                             bytes.clone(),
                             Arc::clone(scenario),
                             Arc::clone(closed),
+                            epoch.clone(),
                         );
                         values.push(Some(LobLocator::new(Box::new(stream))));
                     }
@@ -252,8 +286,14 @@ pub struct MockCursor {
     fail_on_batch: Option<(usize, crate::scenario::ScriptedError)>,
     calls: usize,
     exhausted: bool,
+    /// The error this cursor reported, kept so every later `fetch_batch`
+    /// reports it again. "After any error the only legal call is `close()`"
+    /// (ADR-0002 D2) — and a driver enforces that by *reporting*, never by
+    /// returning an empty batch that reads as a complete result.
+    failed: Option<(ErrorKind, String, SessionState)>,
     scenario: Arc<Scenario>,
     closed: Arc<AtomicBool>,
+    epoch: TransactionEpoch,
 }
 
 impl MockCursor {
@@ -262,6 +302,7 @@ impl MockCursor {
         plan: QueryPlan,
         scenario: Arc<Scenario>,
         closed: Arc<AtomicBool>,
+        epoch: TransactionEpoch,
     ) -> Self {
         let metadata = build_metadata(&plan.columns);
         Self {
@@ -274,9 +315,37 @@ impl MockCursor {
             fail_on_batch: plan.fail_on_batch,
             calls: 0,
             exhausted: false,
+            failed: None,
             scenario,
             closed,
+            epoch,
         }
+    }
+
+    /// Remembers enough of `error` to report it again, and hands it back.
+    /// ([`DbError`] is not `Clone`, so the parts are kept rather than the
+    /// value.)
+    fn fail(&mut self, error: DbError) -> DbError {
+        self.exhausted = true;
+        self.failed = Some((
+            error.kind(),
+            error.message().to_owned(),
+            error.session_state(),
+        ));
+        error
+    }
+
+    fn repeat_failure(&self) -> Option<DbError> {
+        self.failed.as_ref().map(|(kind, message, session_state)| {
+            DbError::new(*kind, message.clone()).with_session_state(*session_state)
+        })
+    }
+}
+
+impl Drop for MockCursor {
+    /// Dropping a cursor is driver work too; see [`MockLobStream`]'s `Drop`.
+    fn drop(&mut self) {
+        self.scenario.record_thread(self.connection_id);
     }
 }
 
@@ -295,9 +364,17 @@ impl Cursor for MockCursor {
 
     fn fetch_batch(&mut self, max_rows: std::num::NonZeroUsize) -> DbResult<RowBatch> {
         self.scenario.record_thread(self.connection_id);
+        // A cursor that already failed keeps reporting. Returning the empty
+        // batch that means "exhausted" would turn a partial result into one
+        // that looks complete, which is the failure `SPEC.md` §2 ranks worst.
+        if let Some(error) = self.repeat_failure() {
+            return Err(error);
+        }
         if self.closed.load(Ordering::SeqCst) {
-            self.exhausted = true;
-            return Err(DbError::connection_closed("cursor"));
+            return Err(self.fail(DbError::connection_closed("cursor")));
+        }
+        if let Some(error) = self.epoch.check("cursor") {
+            return Err(self.fail(error));
         }
         if self.exhausted {
             return Ok(RowBatch::empty());
@@ -305,8 +382,8 @@ impl Cursor for MockCursor {
         self.calls += 1;
         if let Some((n, error)) = &self.fail_on_batch {
             if self.calls == *n {
-                self.exhausted = true;
-                return Err(error.build());
+                let error = error.build();
+                return Err(self.fail(error));
             }
         }
         if self.position >= self.rows.len() {
@@ -324,6 +401,7 @@ impl Cursor for MockCursor {
                     self.connection_id,
                     &self.scenario,
                     &self.closed,
+                    &self.epoch,
                 )
             })
             .collect::<DbResult<Vec<_>>>()?;
@@ -338,8 +416,16 @@ impl Cursor for MockCursor {
         self.exhausted
     }
 
+    /// Releases the cursor.
+    ///
+    /// Always `Ok(())`, including after the connection was closed: per the
+    /// reconciled rule in ADR-0002 D2, `close` is idempotent and reports
+    /// success when there is nothing left to release. Every *other* method on a
+    /// handle whose connection is gone reports
+    /// [`DbError::connection_closed`].
     fn close(self: Box<Self>) -> DbResult<()> {
         self.scenario.record_thread(self.connection_id);
+        self.scenario.record_cursor_closed();
         Ok(())
     }
 }

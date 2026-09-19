@@ -46,9 +46,17 @@ impl LobKind {
 /// `db-core` worker thread. Using it anywhere else would issue protocol traffic
 /// on a connection another thread believes it owns.
 ///
-/// Only plain data ([`crate::RowBatch`]) crosses threads. Nothing in the type
-/// system enforces this, which is precisely why
-/// [`LobStream::connection_id`] exists: `db-core` asserts against it.
+/// **Dropping counts as using it.** A stream's `Drop` releases a driver-side
+/// locator, which is driver work like any other, so a stream — and a
+/// [`crate::RowBatch`] still holding one, and a [`LobLocator`] inside a
+/// [`crate::Value`] — must be dropped on the owning worker thread too. With a
+/// driver that serialises its calls through an internal mutex, getting this
+/// wrong is a deadlock rather than a diagnosable error.
+///
+/// Only plain data crosses threads: a [`crate::RowBatch`] whose locators have
+/// all been taken out. Nothing in the type system enforces this, which is
+/// precisely why [`LobStream::connection_id`] exists: `db-core` asserts against
+/// it, and takes every locator out of a batch before the batch goes anywhere.
 ///
 /// # Lifecycle
 ///
@@ -105,7 +113,8 @@ pub trait LobStream: Send {
 /// taken out of a batch rather than borrowed from it.
 ///
 /// It carries the thread-affinity and lifecycle rules of the [`LobStream`] it
-/// wraps; read those before implementing or consuming one.
+/// wraps — including that **dropping** it is driver work and belongs on the
+/// owning worker thread; read those before implementing or consuming one.
 pub struct LobLocator {
     stream: Box<dyn LobStream>,
 }

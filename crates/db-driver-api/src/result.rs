@@ -266,6 +266,10 @@ pub enum ColumnData {
     /// Large objects that have not been read. `None` means the locator has
     /// already been taken out of the batch — which is *not* the same as SQL
     /// NULL; see [`Column::take_lob`].
+    ///
+    /// These are live driver handles. A column that still holds any of them
+    /// pins its whole [`RowBatch`] to the connection's owning worker thread,
+    /// for dropping as much as for reading; see [`RowBatch`].
     Lob(Vec<Option<LobLocator>>),
     /// Values of a type the contract has no variant for, rendered by the driver
     /// as best-effort text.
@@ -431,6 +435,10 @@ impl Column {
     ///
     /// Returns `None` for any other column kind, an out-of-range row, a row that
     /// is SQL NULL, or a locator that was already taken.
+    ///
+    /// Taking must happen on the worker thread that owns the connection, and so
+    /// must dropping a batch from which locators have *not* been taken; see
+    /// [`RowBatch`]'s "Thread affinity while it still holds locators".
     pub fn take_lob(&mut self, row: usize) -> Option<LobLocator> {
         if self.nulls.is_null(row) {
             return None;
@@ -443,6 +451,22 @@ impl Column {
 }
 
 /// A batch of rows fetched from a cursor.
+///
+/// # Thread affinity while it still holds locators
+///
+/// A batch is `Send`, and once every [`ColumnData::Lob`] locator has been taken
+/// out of it with [`Column::take_lob`] it is exactly what D1 calls "plain data,
+/// no handles" and may go anywhere. **Until then it is not.** A
+/// [`crate::LobLocator`] is a handle derived from the connection, and dropping
+/// one runs driver code — so a batch that still holds un-taken locators must be
+/// consumed *or dropped* on the worker thread that owns its connection.
+/// Dropping it elsewhere issues driver work on a thread that does not own the
+/// connection, which with a driver that serialises through an internal mutex is
+/// a deadlock rather than a diagnosable error.
+///
+/// `db-core` satisfies this by taking every locator out on the worker thread
+/// before the batch is sent anywhere, and handing the caller its own handles
+/// instead; the cells it emptied read back as [`ValueRef::Taken`].
 #[derive(Debug)]
 pub struct RowBatch {
     columns: Vec<Column>,
@@ -551,9 +575,11 @@ impl RowBatch {
 ///   this is enforced.
 /// - **After the owning connection is closed**
 ///   ([`DatabaseConnection::close`](crate::DatabaseConnection::close)), every
-///   cursor derived from it returns
-///   [`DbError::connection_closed`] from `fetch_batch` and from `close`. It must
-///   never panic and never block on a connection that no longer exists.
+///   cursor derived from it returns [`DbError::connection_closed`] from
+///   `fetch_batch` — and from every method **except** [`Cursor::close`], which
+///   is always idempotent and reports `Ok(())` when there is nothing left to
+///   release. It must never panic and never block on a connection that no
+///   longer exists.
 /// - **A commit or rollback may invalidate an open cursor.** Servers differ, and
 ///   `ROLLBACK` in particular commonly closes cursors. A driver must not pretend
 ///   otherwise: the next `fetch_batch` reports an ordinary [`DbError`]
@@ -597,13 +623,23 @@ pub trait Cursor: Send {
 
     /// Releases the cursor's server-side and client-side resources.
     ///
-    /// This is the one call that stays legal after a failed fetch.
+    /// This is the one call that stays legal after a failed fetch, and after the
+    /// owning connection has been closed. It is **idempotent and
+    /// infallible-in-spirit**: when there is nothing left to release — because
+    /// the connection is gone, or the fetch already failed — it reports
+    /// `Ok(())`. Only a *real* failure to release something is an error.
+    ///
+    /// This is deliberately the opposite of the rule for every other method on a
+    /// derived handle, which reports [`DbError::connection_closed`] once its
+    /// connection is gone. The asymmetry is the useful one: `close` exists to
+    /// let go, and a release path that fails when there is nothing to release
+    /// only teaches callers to ignore its result.
     ///
     /// # Errors
     ///
-    /// Any [`DbError`] the release produced. Dropping a cursor without calling
-    /// this is allowed; the driver must then release resources on drop and
-    /// swallow the error.
+    /// Any [`DbError`] the release actually produced. Dropping a cursor without
+    /// calling this is allowed; the driver must then release resources on drop
+    /// and swallow the error.
     fn close(self: Box<Self>) -> DbResult<()>;
 }
 

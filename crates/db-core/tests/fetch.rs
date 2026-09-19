@@ -17,7 +17,7 @@ fn multi_batch_fetch_runs_to_exhaustion() {
     let rows: Vec<Vec<ScriptValue>> = (0..7_i64).map(|v| vec![ScriptValue::from(v)]).collect();
     scenario.on_sql(
         "SELECT * FROM t",
-        Action::Query(QuerySource::Fixed(QueryPlan::new(columns, rows))),
+        Action::query(QuerySource::Fixed(QueryPlan::new(columns, rows))),
     );
 
     let session = support::open(&scenario);
@@ -68,7 +68,7 @@ fn unsupported_column_does_not_fail_the_batch() {
     ];
     scenario.on_sql(
         "SELECT * FROM t",
-        Action::Query(QuerySource::Fixed(QueryPlan::new(columns, rows))),
+        Action::query(QuerySource::Fixed(QueryPlan::new(columns, rows))),
     );
 
     let session = support::open(&scenario);
@@ -105,7 +105,7 @@ fn lob_streaming_reads_in_chunks_on_the_worker_thread() {
     let content = "hello, this is a lob read in small pieces";
     scenario.on_sql(
         "SELECT doc FROM t",
-        Action::Query(QuerySource::Fixed(QueryPlan::new(
+        Action::query(QuerySource::Fixed(QueryPlan::new(
             columns,
             vec![vec![ScriptValue::Lob {
                 kind: LobKind::Character,
@@ -121,30 +121,33 @@ fn lob_streaming_reads_in_chunks_on_the_worker_thread() {
         .wait()
         .expect("execute");
     let result = outcome.result.expect("cursor");
-    let mut batch = session
+    let batch = session
         .fetch_batch(result, support::n(10))
         .wait()
         .expect("fetch");
 
-    let locator = batch
-        .column_mut(0)
-        .and_then(|column| column.take_lob(0))
-        .expect("row 0 holds a LOB");
+    // The locator never reached this thread: the worker took it out of the
+    // batch and left the cell reading back as `Taken`, which is not NULL.
+    let lob = batch.lob(0, 0).expect("row 0 holds a LOB");
+    assert!(matches!(
+        batch.value(0, 0),
+        Some(reldex_db_core::ValueRef::Taken)
+    ));
+    assert!(!batch.value(0, 0).expect("cell").is_null());
 
-    let mut locator = locator;
     let mut collected = Vec::new();
     loop {
-        let (returned, chunk) = session
-            .read_lob_chunk(locator, support::n(5))
+        let chunk = session
+            .read_lob_chunk(lob, support::n(5))
             .wait()
             .expect("reading a chunk should succeed");
-        locator = returned;
         if chunk.is_empty() {
             break;
         }
         collected.extend_from_slice(&chunk);
     }
     assert_eq!(String::from_utf8(collected).expect("valid utf-8"), content);
+    session.close_lob(lob).wait().expect("close_lob");
 
     // The read happened on the session's one worker thread, never on this
     // test's own calling thread.
@@ -162,7 +165,7 @@ fn caller_thread_never_executes_driver_code() {
     let scenario = support::scenario();
     scenario.on_sql(
         "SELECT 1 FROM dual",
-        Action::Query(QuerySource::Fixed(QueryPlan::new(
+        Action::query(QuerySource::Fixed(QueryPlan::new(
             vec![ColumnSpec::new("N", SqlType::Number)],
             vec![vec![ScriptValue::from(1_i64)]],
         ))),

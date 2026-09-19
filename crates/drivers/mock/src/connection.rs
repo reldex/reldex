@@ -1,19 +1,19 @@
 //! [`MockDriver`] and [`MockConnection`]: the driver-contract implementation
 //! that runs a [`Scenario`].
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use reldex_db_driver_api::{
     CancelHandle, CancelKind, CancelOutcome, Capabilities, ConnectionId, DatabaseConnection,
-    DatabaseDriver, DbError, DbResult, ErrorKind, ExecutionOutcome, OutValues, SavepointName,
-    SessionState, Statement, StatementKind, TransactionState, Value,
+    DatabaseDriver, DbError, DbResult, ErrorKind, ExecutionOutcome, LobLocator, OutValues,
+    SavepointName, SessionState, Statement, StatementKind, TransactionState, Value,
 };
 
-use crate::cursor::MockCursor;
+use crate::cursor::{MockCursor, MockLobStream};
 use crate::scenario::{
-    Action, BlockSpec, ParkOutcome, QueryPlan, QuerySource, Scenario, ScriptValue,
+    Action, BlockSpec, ParkOutcome, QueryPlan, QuerySource, Scenario, ScriptValue, TransactionEpoch,
 };
 
 /// The uncommitted table-store overlay for one connection.
@@ -73,10 +73,18 @@ struct MockCancelHandle {
     kind: CancelKind,
     active_gate: Arc<Mutex<Option<Arc<crate::scenario::BlockGate>>>>,
     armed_deadline: Arc<Mutex<Option<Instant>>>,
+    /// A cancel requested while nothing was running, kept for the next
+    /// statement. Only ever set when the scenario asks for it; see
+    /// [`Scenario::set_late_cancel_lands_on_next_statement`].
+    latched: Arc<AtomicBool>,
+    scenario: Arc<Scenario>,
 }
 
 impl CancelHandle for MockCancelHandle {
     fn request_cancel(&self) -> DbResult<CancelOutcome> {
+        // A scripted failure wins over the class: discovering the session is
+        // gone is something a real cancel path can do whatever it advertises.
+        self.scenario.cancel_behavior()?;
         match self.kind {
             CancelKind::Unsupported => Err(DbError::new(
                 ErrorKind::Unsupported,
@@ -88,10 +96,15 @@ impl CancelHandle for MockCancelHandle {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
-                if let Some(gate) = gate {
-                    gate.request_cancel();
+                match gate {
+                    Some(gate) => gate.request_cancel(),
+                    None if self.scenario.latches_late_cancel() => {
+                        self.latched.store(true, Ordering::SeqCst);
+                    }
+                    // Idempotent no-op when nothing is running, per the
+                    // contract.
+                    None => {}
                 }
-                // Idempotent no-op when nothing is running, per the contract.
                 Ok(CancelOutcome::Requested)
             }
             CancelKind::PreArmedDeadline => {
@@ -162,8 +175,12 @@ pub struct MockConnection {
     overlay: TxOverlay,
     transaction_state: TransactionState,
     closed: Arc<AtomicBool>,
+    /// Bumped whenever a transaction ends, so handles opened inside it can be
+    /// invalidated the way a real server's are.
+    transaction_epoch: Arc<AtomicU64>,
     active_gate: Arc<Mutex<Option<Arc<crate::scenario::BlockGate>>>>,
     armed_deadline: Arc<Mutex<Option<Instant>>>,
+    latched_cancel: Arc<AtomicBool>,
     cancel_handle: Arc<MockCancelHandle>,
 }
 
@@ -172,10 +189,13 @@ impl MockConnection {
         let capabilities = scenario.capabilities();
         let active_gate = Arc::new(Mutex::new(None));
         let armed_deadline = Arc::new(Mutex::new(None));
+        let latched_cancel = Arc::new(AtomicBool::new(false));
         let cancel_handle = Arc::new(MockCancelHandle {
             kind: capabilities.cancel(),
             active_gate: Arc::clone(&active_gate),
             armed_deadline: Arc::clone(&armed_deadline),
+            latched: Arc::clone(&latched_cancel),
+            scenario: Arc::clone(&scenario),
         });
         // A precise driver genuinely knows a fresh connection has no
         // transaction yet. An imprecise one (`exact_transaction_state ==
@@ -195,8 +215,10 @@ impl MockConnection {
             overlay: TxOverlay::default(),
             transaction_state,
             closed: Arc::new(AtomicBool::new(false)),
+            transaction_epoch: Arc::new(AtomicU64::new(0)),
             active_gate,
             armed_deadline,
+            latched_cancel,
             cancel_handle,
         }
     }
@@ -209,8 +231,42 @@ impl MockConnection {
         Arc::clone(&self.closed)
     }
 
+    fn epoch(&self) -> TransactionEpoch {
+        TransactionEpoch::new(
+            &self.transaction_epoch,
+            self.scenario.invalidates_handles_on_transaction_end(),
+        )
+    }
+
+    fn end_transaction(&mut self) {
+        self.transaction_epoch.fetch_add(1, Ordering::SeqCst);
+        self.transaction_state = TransactionState::Inactive;
+    }
+
     fn record(&self) {
         self.scenario.record_thread(self.id);
+    }
+
+    fn new_cursor(&self, plan: QueryPlan) -> MockCursor {
+        self.scenario.record_cursor_opened();
+        MockCursor::new(
+            self.id,
+            plan,
+            Arc::clone(&self.scenario),
+            self.closed_flag(),
+            self.epoch(),
+        )
+    }
+
+    fn new_lob(&self, kind: reldex_db_driver_api::LobKind, bytes: Vec<u8>) -> LobLocator {
+        LobLocator::new(Box::new(MockLobStream::new(
+            self.id,
+            kind,
+            bytes,
+            Arc::clone(&self.scenario),
+            self.closed_flag(),
+            self.epoch(),
+        )))
     }
 
     fn resolve_query_source(&self, source: &QuerySource) -> QueryPlan {
@@ -225,23 +281,30 @@ impl MockConnection {
     }
 
     /// Updates the driver-reported transaction state after a non-blocking
-    /// statement of `kind` ran successfully. See the module documentation on
-    /// [`Capabilities::exact_transaction_state`] for the two modes this
-    /// mock offers.
-    fn note_statement_kind(&mut self, kind: StatementKind) {
+    /// statement ran successfully.
+    ///
+    /// `opens_transaction` is the scripted answer to the question no
+    /// [`StatementKind`] can settle: a `SELECT … FOR UPDATE` is a `Query` and
+    /// still opens a transaction.
+    fn note_statement(&mut self, kind: StatementKind, opens_transaction: bool) {
+        let opens =
+            opens_transaction || matches!(kind, StatementKind::Dml | StatementKind::PlSqlBlock);
         if self.capabilities.exact_transaction_state() {
-            if matches!(kind, StatementKind::Dml | StatementKind::PlSqlBlock) {
+            if opens {
                 self.transaction_state = TransactionState::Active;
             }
-        } else if matches!(
-            kind,
-            StatementKind::Dml | StatementKind::PlSqlBlock | StatementKind::Other
-        ) {
+        } else if opens || matches!(kind, StatementKind::Other) {
             self.transaction_state = TransactionState::Unknown;
         }
     }
 
     fn run_block(&mut self, spec: &BlockSpec, statement: &Statement) -> DbResult<ExecutionOutcome> {
+        // A cancel that arrived while nothing was running, latched by a driver
+        // that has no way to tell which statement it was meant for.
+        if self.latched_cancel.swap(false, Ordering::SeqCst) {
+            return Err(Self::cancelled_error(spec));
+        }
+
         let deadline = statement.deadline().map(|d| Instant::now() + d);
         if self.capabilities.cancel() == CancelKind::PreArmedDeadline {
             *self
@@ -254,7 +317,7 @@ impl MockConnection {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&spec.gate));
 
-        let outcome = spec.gate.park(deadline);
+        let outcome = spec.gate.park(deadline, spec.observe_cancel);
 
         *self
             .active_gate
@@ -267,7 +330,7 @@ impl MockConnection {
 
         match outcome {
             ParkOutcome::Released => {
-                self.note_statement_kind(spec.release_statement_kind);
+                self.note_statement(spec.release_statement_kind, false);
                 let mut result =
                     ExecutionOutcome::new().with_statement_kind(spec.release_statement_kind);
                 if let Some(rows_affected) = spec.release_rows_affected {
@@ -275,32 +338,37 @@ impl MockConnection {
                 }
                 Ok(result)
             }
-            ParkOutcome::Cancelled => {
-                let mut error = DbError::cancelled();
-                if let Some(session_state) = spec.cancelled_session_state {
-                    error = error.with_session_state(session_state);
-                }
-                Err(error)
-            }
-            ParkOutcome::TimedOut => Err(DbError::new(
-                ErrorKind::Timeout,
-                "reldex-driver-mock: statement deadline elapsed",
-            )
-            .with_session_state(SessionState::NeedsValidation)),
+            ParkOutcome::Cancelled => Err(Self::cancelled_error(spec)),
+            ParkOutcome::TimedOut => Err(spec.timeout_error.as_ref().map_or_else(
+                || {
+                    DbError::new(
+                        ErrorKind::Timeout,
+                        "reldex-driver-mock: statement deadline elapsed",
+                    )
+                    .with_session_state(SessionState::NeedsValidation)
+                },
+                |scripted| scripted.build(),
+            )),
         }
+    }
+
+    fn cancelled_error(spec: &BlockSpec) -> DbError {
+        let mut error = DbError::cancelled();
+        if let Some(session_state) = spec.cancelled_session_state {
+            error = error.with_session_state(session_state);
+        }
+        error
     }
 
     fn run_action(&mut self, action: &Action, statement: &Statement) -> DbResult<ExecutionOutcome> {
         match action {
-            Action::Query(source) => {
+            Action::Query {
+                source,
+                opens_transaction,
+            } => {
                 let plan = self.resolve_query_source(source);
-                self.note_statement_kind(StatementKind::Query);
-                let cursor = MockCursor::new(
-                    self.id,
-                    plan,
-                    Arc::clone(&self.scenario),
-                    self.closed_flag(),
-                );
+                self.note_statement(StatementKind::Query, *opens_transaction);
+                let cursor = self.new_cursor(plan);
                 Ok(ExecutionOutcome::new()
                     .with_cursor(Box::new(cursor))
                     .with_statement_kind(StatementKind::Query))
@@ -312,7 +380,7 @@ impl MockConnection {
                 if let Some((table, row)) = insert {
                     self.overlay.insert(table.clone(), row.clone());
                 }
-                self.note_statement_kind(StatementKind::Dml);
+                self.note_statement(StatementKind::Dml, false);
                 Ok(ExecutionOutcome::new()
                     .with_rows_affected(*rows_affected)
                     .with_statement_kind(StatementKind::Dml))
@@ -322,14 +390,15 @@ impl MockConnection {
                 // pending overlay rather than discarding it (ADR-0002 D4/S9).
                 self.scenario.apply_commit(&self.overlay.ops);
                 self.overlay.clear();
-                self.transaction_state = TransactionState::Inactive;
+                self.end_transaction();
                 Ok(ExecutionOutcome::new().with_statement_kind(StatementKind::Ddl))
             }
             Action::Execute {
                 statement_kind,
                 rows_affected,
+                opens_transaction,
             } => {
-                self.note_statement_kind(*statement_kind);
+                self.note_statement(*statement_kind, *opens_transaction);
                 let mut outcome = ExecutionOutcome::new().with_statement_kind(*statement_kind);
                 if let Some(rows_affected) = rows_affected {
                     outcome = outcome.with_rows_affected(*rows_affected);
@@ -338,13 +407,8 @@ impl MockConnection {
             }
             Action::RefCursorOut { name, source } => {
                 let plan = self.resolve_query_source(source);
-                self.note_statement_kind(StatementKind::PlSqlBlock);
-                let cursor = MockCursor::new(
-                    self.id,
-                    plan,
-                    Arc::clone(&self.scenario),
-                    self.closed_flag(),
-                );
+                self.note_statement(StatementKind::PlSqlBlock, false);
+                let cursor = self.new_cursor(plan);
                 Ok(ExecutionOutcome::new()
                     .with_statement_kind(StatementKind::PlSqlBlock)
                     .with_out_values(OutValues::Named(vec![(
@@ -352,8 +416,19 @@ impl MockConnection {
                         Value::Cursor(Box::new(cursor)),
                     )])))
             }
+            Action::LobOut { name, kind, bytes } => {
+                self.note_statement(StatementKind::PlSqlBlock, false);
+                let locator = self.new_lob(*kind, bytes.clone());
+                Ok(ExecutionOutcome::new()
+                    .with_statement_kind(StatementKind::PlSqlBlock)
+                    .with_out_values(OutValues::Named(vec![(
+                        name.as_str().into(),
+                        Value::Lob(locator),
+                    )])))
+            }
             Action::Fail(error) => Err(error.build()),
             Action::Block(spec) => self.run_block(spec, statement),
+            Action::Panic(message) => panic!("{message}"),
         }
     }
 }
@@ -390,16 +465,20 @@ impl DatabaseConnection for MockConnection {
 
     fn commit(&mut self) -> DbResult<()> {
         self.record();
+        // A failed commit leaves the transaction exactly where it was: the
+        // overlay is not flushed and not discarded.
+        self.scenario.commit_behavior()?;
         self.scenario.apply_commit(&self.overlay.ops);
         self.overlay.clear();
-        self.transaction_state = TransactionState::Inactive;
+        self.end_transaction();
         Ok(())
     }
 
     fn rollback(&mut self) -> DbResult<()> {
         self.record();
+        self.scenario.rollback_behavior()?;
         self.overlay.clear();
-        self.transaction_state = TransactionState::Inactive;
+        self.end_transaction();
         Ok(())
     }
 
@@ -417,7 +496,11 @@ impl DatabaseConnection for MockConnection {
         if !self.capabilities.savepoints() {
             return Err(DbError::unsupported("savepoints"));
         }
-        self.overlay.rollback_to_savepoint(name.as_str())
+        self.overlay.rollback_to_savepoint(name.as_str())?;
+        // The transaction stays open, but handles opened before the savepoint
+        // can still be invalidated; that is what a real rollback does.
+        self.transaction_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     fn transaction_state(&self) -> TransactionState {
@@ -431,7 +514,8 @@ impl DatabaseConnection for MockConnection {
 
     fn close(self: Box<Self>) -> DbResult<()> {
         self.record();
+        self.scenario.record_connection_closed();
         self.closed.store(true, Ordering::SeqCst);
-        Ok(())
+        self.scenario.close_behavior()
     }
 }

@@ -16,14 +16,15 @@
 //! # Threading (ADR-0002 D1/D2)
 //!
 //! Each [`DatabaseSession`] owns one dedicated worker thread, which owns the
-//! driver's `Box<dyn DatabaseConnection>` and every cursor derived from it
-//! for the session's whole lifetime. No database or network call ever runs on
-//! the caller's thread. Requests are sent over a channel and processed
-//! strictly in the order they arrive; each returns a [`Completion`] the
-//! caller can [`Completion::wait`] on or [`Completion::poll`] — deliberately
-//! shaped so a later FFI/Qt adapter can turn completions into events instead
-//! of dedicating a thread to each one. See [`mod@worker`] for the queueing
-//! policy.
+//! driver's `Box<dyn DatabaseConnection>`, every cursor derived from it and
+//! every large-object locator it produced, for the session's whole lifetime.
+//! No database or network call ever runs on the caller's thread. Requests are
+//! sent over a channel and processed strictly in the order they arrive; each
+//! returns a [`Completion`] the caller can [`Completion::wait`] on,
+//! [`Completion::poll`], or [`Completion::wait_timeout`] — deliberately shaped
+//! so a later FFI/Qt adapter can turn completions into events instead of
+//! dedicating a thread to each one. See [`mod@worker`] for the queueing policy
+//! and for what a caught driver panic does.
 //!
 //! Cancellation is the one thing that reaches a session from outside that
 //! queue: [`DatabaseSession::cancel`] calls the driver's
@@ -36,45 +37,57 @@
 //! [`DatabaseSession::has_possibly_active_transaction`] combines the driver's
 //! own (possibly [`reldex_db_driver_api::TransactionState::Unknown`]) report
 //! with core-side tracking derived from
-//! [`reldex_db_driver_api::StatementKind`]. [`DatabaseSession::close`]
-//! refuses to close over a possibly-active transaction without an explicit
-//! [`CloseDisposition`] — it never silently commits or rolls back.
+//! [`reldex_db_driver_api::StatementKind`], and is conservative: a statement is
+//! treated as possibly transaction-opening unless a driver with exact
+//! transaction state says otherwise, because `SELECT … FOR UPDATE` and
+//! `SET TRANSACTION` open transactions and no `StatementKind` can tell them
+//! from a plain query. [`DatabaseSession::close`] refuses to close over a
+//! possibly-active transaction without an explicit [`CloseDisposition`], and
+//! decides that on the worker thread once the queue has drained. It never
+//! silently commits or rolls back, and **dropping** a session never commits at
+//! all: `close` is the only path that can.
 //!
 //! When a driver reports [`reldex_db_driver_api::SessionState::Lost`] (or a
-//! revalidating `ping` fails), the session moves to a terminal lost state:
-//! every later request fails fast, open results are invalidated, and nothing
-//! here ever reconnects or replaces the session on its own — a reconnect is
-//! the caller explicitly opening a new one, which gets a new [`SessionId`].
+//! revalidating `ping` fails), the session moves to the terminal
+//! [`SessionLifecycle::Lost`] state: every later request fails fast with an
+//! error that keeps the original kind and native code, open results are
+//! released, and nothing here ever reconnects or replaces the session on its
+//! own — a reconnect is the caller explicitly opening a new one, which gets a
+//! new [`SessionId`].
 //!
-//! # LOB handles cross threads inside a `RowBatch`, but reading them must not
+//! # Only plain data crosses threads
 //!
-//! A fetched [`reldex_db_driver_api::RowBatch`] can carry a
-//! [`reldex_db_driver_api::LobLocator`] in a LOB column, and the batch itself
-//! is `Send` and does cross to the caller's thread — that part of the driver
-//! contract is unavoidable, since delivering rows is the point. But a locator
-//! is still a handle derived from the connection, so
-//! [`DatabaseSession::read_lob_chunk`] exists to keep the actual read on the
-//! worker thread that owns it: take the locator out of the batch
-//! ([`reldex_db_driver_api::Column::take_lob`]) and hand it to that method
-//! instead of calling [`reldex_db_driver_api::LobLocator::read_chunk`]
-//! directly.
+//! A driver puts live `LobLocator`s straight into a fetched batch's LOB
+//! columns, and a locator is a handle derived from the connection: using it, or
+//! even dropping it, on another thread runs driver code on the wrong thread.
+//! So `db-core` takes every locator out of a batch before the batch leaves the
+//! worker and parks it beside the cursors; the caller receives a
+//! [`FetchedBatch`] — plain data plus opaque [`LobHandle`]s — and reads through
+//! [`DatabaseSession::read_lob_chunk`]. With that, the invariant ADR-0002 D1
+//! states is literally true: of everything a fetch produces, only plain data
+//! crosses a thread boundary.
 
 mod ids;
 mod session;
 mod shared;
 mod worker;
 
-pub use ids::SessionId;
+pub use ids::{LobHandle, ResultId, SessionId};
 pub use session::{
-    CloseDisposition, CloseError, Completion, DatabaseSession, ExecuteOutcome, OutValue, OutValues,
-    SessionManager,
+    CloseDisposition, CloseError, Completion, DROP_SHUTDOWN_TIMEOUT, DatabaseSession,
+    ExecuteOutcome, FetchedBatch, OutValue, OutValues, SessionLimits, SessionManager,
 };
+pub use shared::SessionLifecycle;
 
 // Re-exported so most callers need only this crate for session-level work,
 // without reaching into `reldex-db-driver-api` directly for vendor-neutral
 // contract types this API's own signatures already use.
+//
+// `LobLocator` is deliberately **not** re-exported: a locator never leaves a
+// session's worker thread, so nothing above `db-core` should be able to name
+// one. [`LobHandle`] is what callers get instead.
 pub use reldex_db_driver_api::{
-    CancelKind, CancelOutcome, ConnectionId, ConnectionParams, DatabaseDriver, DbError, DbResult,
-    ErrorKind, LobLocator, ResultSetId, RowBatch, SavepointName, SessionState, Statement,
-    StatementKind, TransactionState, Warning,
+    CancelKind, CancelOutcome, Column, ConnectionId, ConnectionParams, DatabaseDriver, DbError,
+    DbResult, ErrorKind, RowBatch, SavepointName, SessionState, Statement, StatementKind,
+    TransactionState, ValueRef, Warning,
 };

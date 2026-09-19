@@ -5,39 +5,164 @@
 //! the handle only ever reads it, which is why every method takes `&self`
 //! and a plain [`std::sync::Mutex`] is enough — this is not a hot path.
 
+use std::fmt;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use reldex_db_driver_api::{DbError, ErrorKind, SessionState, StatementKind, TransactionState};
+use reldex_db_driver_api::{
+    DbError, ErrorKind, NativeError, SessionState, SqlPosition, StatementKind, TransactionState,
+};
+
+/// Where a session is in its lifecycle.
+///
+/// The driver's [`SessionState`] ladder (`Usable`/`NeedsValidation`/`Lost`)
+/// describes a *connection*; it has no way to say "this session was closed on
+/// purpose". Reporting a closed session as `Usable` — which is what happened
+/// before this type existed — tells a caller it can still submit work, so the
+/// core keeps its own four-state lifecycle and maps the driver's three rungs
+/// onto it.
+///
+/// Deliberately **not** `#[non_exhaustive]`, for the same reason
+/// [`SessionState`] is not (ADR-0002, amendment S1): it is a closed state
+/// machine every call site must handle explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionLifecycle {
+    /// The session is usable.
+    Usable,
+    /// The worker must `ping` before the next command runs.
+    NeedsValidation,
+    /// Terminal: the session is gone and is never silently replaced
+    /// (`SPEC.md` §18). Takes precedence over [`SessionLifecycle::Closed`],
+    /// because *why* a session ended matters more than that it ended.
+    Lost,
+    /// Terminal: the session was closed deliberately. Distinct from
+    /// [`SessionLifecycle::Lost`] — nothing failed — but equally not usable.
+    Closed,
+}
+
+impl SessionLifecycle {
+    /// Whether work can still be submitted.
+    #[must_use]
+    pub const fn is_usable(self) -> bool {
+        matches!(self, Self::Usable | Self::NeedsValidation)
+    }
+
+    /// Whether the session ended, for any reason.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Lost | Self::Closed)
+    }
+}
+
+impl fmt::Display for SessionLifecycle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::Usable => "usable",
+            Self::NeedsValidation => "needs-validation",
+            Self::Lost => "lost",
+            Self::Closed => "closed",
+        };
+        f.write_str(text)
+    }
+}
+
+/// The rendered `source` chain of the error that lost a session.
+///
+/// [`DbError`] is not [`Clone`] and its `source` is a boxed trait object, so the
+/// chain cannot be kept as-is for the fail-fast errors every later command gets.
+/// Keeping its *rendering* as a real [`std::error::Error`] means the cause still
+/// arrives through `Error::source`, where a UI already looks for it, instead of
+/// being flattened into the message and lost.
+#[derive(Debug)]
+struct LostCause(String);
+
+impl fmt::Display for LostCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LostCause {}
+
+/// Everything worth keeping from the error that lost the session.
+///
+/// The previous implementation kept `error.to_string()` and rebuilt a generic
+/// `ErrorKind::Connection` failure from it, so the UI could no longer tell a
+/// network loss from a killed session from a driver bug, and the native
+/// `ORA-nnnnn` code was reduced to a substring of a sentence.
+#[derive(Debug)]
+struct LostReason {
+    kind: ErrorKind,
+    message: String,
+    native: Option<NativeError>,
+    position: Option<SqlPosition>,
+    cause: Option<String>,
+}
+
+impl LostReason {
+    fn capture(error: &DbError) -> Self {
+        Self {
+            kind: error.kind(),
+            message: error.message().to_owned(),
+            native: error
+                .native()
+                .map(|native| NativeError::new(native.code(), native.message())),
+            position: error.position().copied(),
+            cause: std::error::Error::source(error).map(ToString::to_string),
+        }
+    }
+
+    /// Rebuilds a reportable error, keeping the original classification.
+    fn to_error(&self, context: &str) -> DbError {
+        let mut error = DbError::new(
+            self.kind,
+            format!("reldex-db-core: {context}: {}", self.message),
+        )
+        .with_session_state(SessionState::Lost);
+        if let Some(native) = &self.native {
+            error = error.with_native(NativeError::new(native.code(), native.message()));
+        }
+        if let Some(position) = self.position {
+            error = error.with_position(position);
+        }
+        if let Some(cause) = &self.cause {
+            error = error.with_source(LostCause(cause.clone()));
+        }
+        error
+    }
+}
 
 struct State {
-    /// The session-loss ladder (`SPEC.md` §18): `Usable`, `NeedsValidation`
-    /// (the worker must `ping` before the next command runs), or `Lost`
-    /// (terminal; every further command fails fast).
-    session_state: SessionState,
+    /// Where the session is in its lifecycle; see [`SessionLifecycle`].
+    lifecycle: SessionLifecycle,
     /// Core-side conservative transaction tracking, derived from
-    /// `StatementKind` (ADR-0002 D4/D6): true once a statement that may have
-    /// opened a transaction ran, false again after a commit/rollback or an
-    /// implicit commit (DDL).
+    /// `StatementKind` and the driver's own report (ADR-0002 D4/D6): true once
+    /// a statement that may have opened a transaction ran, false again after a
+    /// commit/rollback or an implicit commit (DDL).
     core_possibly_active: bool,
     /// The driver's own last-reported [`TransactionState`], which may be
     /// [`TransactionState::Unknown`].
     driver_transaction_state: TransactionState,
-    /// A human-readable snapshot of the error that lost the session, for the
-    /// fail-fast errors every later command gets. `DbError` is not `Clone`,
-    /// so this stores its rendering rather than the value itself.
-    lost_reason: Option<String>,
+    /// Why the session was lost, kept in full so the fail-fast errors every
+    /// later command gets can say more than "something went wrong".
+    lost_reason: Option<LostReason>,
 }
 
 /// State shared between a [`crate::DatabaseSession`] and its worker thread.
 pub(crate) struct SessionShared {
     state: Mutex<State>,
+    /// How many commands the worker is currently inside. Kept outside the mutex
+    /// so [`crate::DatabaseSession::cancel`] — which runs on a control path
+    /// while the worker is blocked in driver code — never waits on a lock the
+    /// worker might hold.
+    in_flight: AtomicUsize,
 }
 
 impl SessionShared {
     pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(State {
-                session_state: SessionState::Usable,
+                lifecycle: SessionLifecycle::Usable,
                 core_possibly_active: false,
                 // `TransactionState::default()` is `Unknown` for the same
                 // reason: nobody has classified this connection yet, so the
@@ -45,6 +170,7 @@ impl SessionShared {
                 driver_transaction_state: TransactionState::default(),
                 lost_reason: None,
             }),
+            in_flight: AtomicUsize::new(0),
         }
     }
 
@@ -54,28 +180,40 @@ impl SessionShared {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The session-loss state as of the last command the worker processed.
-    pub(crate) fn session_state(&self) -> SessionState {
-        self.lock().session_state
+    /// Where the session is in its lifecycle, as of the last command the worker
+    /// processed.
+    pub(crate) fn lifecycle(&self) -> SessionLifecycle {
+        self.lock().lifecycle
     }
 
     /// Whether the session is in the terminal `Lost` state.
     pub(crate) fn is_lost(&self) -> bool {
-        self.lock().session_state == SessionState::Lost
+        self.lock().lifecycle == SessionLifecycle::Lost
     }
 
     /// Whether the worker believes it must `ping` before the next command.
     pub(crate) fn needs_validation(&self) -> bool {
-        self.lock().session_state == SessionState::NeedsValidation
+        self.lock().lifecycle == SessionLifecycle::NeedsValidation
     }
 
     /// A successful `ping` clears `NeedsValidation` back to `Usable`. Never
-    /// used to clear `Lost`: `SPEC.md` §18 forbids silently resurrecting a
-    /// session once it is gone.
+    /// used to clear `Lost` or `Closed`: `SPEC.md` §18 forbids silently
+    /// resurrecting a session once it is gone.
     pub(crate) fn mark_validated(&self) {
         let mut state = self.lock();
-        if state.session_state == SessionState::NeedsValidation {
-            state.session_state = SessionState::Usable;
+        if state.lifecycle == SessionLifecycle::NeedsValidation {
+            state.lifecycle = SessionLifecycle::Usable;
+        }
+    }
+
+    /// Records that the session was closed deliberately.
+    ///
+    /// `Lost` wins: a session that failed and was then closed still reports why
+    /// it failed.
+    pub(crate) fn mark_closed(&self) {
+        let mut state = self.lock();
+        if state.lifecycle != SessionLifecycle::Lost {
+            state.lifecycle = SessionLifecycle::Closed;
         }
     }
 
@@ -83,8 +221,8 @@ impl SessionShared {
     /// errors. Used when a revalidating `ping` itself fails.
     pub(crate) fn mark_lost_from(&self, error: &DbError) {
         let mut state = self.lock();
-        state.session_state = SessionState::Lost;
-        state.lost_reason = Some(error.to_string());
+        state.lifecycle = SessionLifecycle::Lost;
+        state.lost_reason = Some(LostReason::capture(error));
     }
 
     /// Applies the [`SessionState`] a [`DbError`] reported: worsens the
@@ -92,30 +230,55 @@ impl SessionShared {
     /// (a successful `ping`) moves it back toward `Usable`.
     pub(crate) fn note_error(&self, error: &DbError) {
         let mut state = self.lock();
+        if state.lifecycle == SessionLifecycle::Lost {
+            return;
+        }
         match error.session_state() {
             SessionState::Usable => {}
             SessionState::NeedsValidation => {
-                if state.session_state != SessionState::Lost {
-                    state.session_state = SessionState::NeedsValidation;
+                if state.lifecycle == SessionLifecycle::Usable {
+                    state.lifecycle = SessionLifecycle::NeedsValidation;
                 }
             }
             SessionState::Lost => {
-                state.session_state = SessionState::Lost;
-                state.lost_reason = Some(error.to_string());
+                state.lifecycle = SessionLifecycle::Lost;
+                state.lost_reason = Some(LostReason::capture(error));
             }
         }
     }
 
-    /// Core-side conservative update from a successfully executed
-    /// statement's kind (ADR-0002 D4/D6): `Dml`/`PlSqlBlock`/`Other` may have
-    /// opened a transaction; everything else leaves the flag as it was
-    /// (over-prompting is acceptable, a missed one is not).
-    pub(crate) fn note_statement_kind(&self, kind: StatementKind) {
-        if matches!(
-            kind,
-            StatementKind::Dml | StatementKind::PlSqlBlock | StatementKind::Other
-        ) {
-            self.lock().core_possibly_active = true;
+    /// Core-side conservative update after a statement executed successfully
+    /// (ADR-0002 D4/D6).
+    ///
+    /// `Dml` and `PlSqlBlock` always mark the transaction possibly active.
+    /// Everything else — `Query`, `TransactionControl`, `SessionControl`,
+    /// `Other` — does too, **unless** the driver reports exact transaction
+    /// state and says [`TransactionState::Inactive`] straight afterwards. That
+    /// asymmetry is the point: `SELECT … FOR UPDATE`, `SET TRANSACTION` and
+    /// `LOCK TABLE` all open a transaction, and neither the core (which must
+    /// not parse SQL) nor a `StatementKind` can tell them from a plain
+    /// `SELECT`. An extra prompt is acceptable; a silent commit is not
+    /// (`SPEC.md` §10).
+    ///
+    /// No kind ever *clears* the flag. Only a commit, a rollback or an implicit
+    /// commit does, through [`SessionShared::note_commit_or_rollback`].
+    pub(crate) fn note_statement(
+        &self,
+        kind: StatementKind,
+        driver_state: TransactionState,
+        exact: bool,
+    ) {
+        let mut state = self.lock();
+        state.driver_transaction_state = driver_state;
+        let definitely_inactive = exact && driver_state == TransactionState::Inactive;
+        let opens = match kind {
+            StatementKind::Dml | StatementKind::PlSqlBlock => true,
+            // `StatementKind` is `#[non_exhaustive]`; an unknown kind is
+            // treated like `Other`, which is the conservative arm anyway.
+            _ => !definitely_inactive,
+        };
+        if opens {
+            state.core_possibly_active = true;
         }
     }
 
@@ -138,25 +301,61 @@ impl SessionShared {
         state.core_possibly_active || state.driver_transaction_state.may_be_open()
     }
 
+    /// The worker is about to run a command, so a cancel has something to aim
+    /// at.
+    pub(crate) fn enter_driver_call(&self) {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The worker finished a command.
+    pub(crate) fn leave_driver_call(&self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Whether the worker is currently inside a command.
+    ///
+    /// Read by [`crate::DatabaseSession::cancel`] so a cancel issued when
+    /// nothing is running is answered as the idempotent no-op the contract
+    /// allows, instead of being handed to a driver that may latch it onto the
+    /// *next* statement. It narrows that race; it cannot close it — see
+    /// `DatabaseSession::cancel`.
+    pub(crate) fn driver_call_in_flight(&self) -> bool {
+        self.in_flight.load(Ordering::SeqCst) > 0
+    }
+
     /// The error every command gets once the session is lost or closed.
     ///
-    /// Callers only reach this after failing to send a command to the
-    /// worker's channel, which happens only once the worker thread has
-    /// already exited — so "not lost" here always means "closed".
+    /// For a lost session this keeps the original [`ErrorKind`], native code
+    /// and text, statement position and cause, so the UI can show *why* the
+    /// session went away rather than a flattened sentence.
     pub(crate) fn terminal_error(&self) -> DbError {
         let state = self.lock();
-        if state.session_state == SessionState::Lost {
-            let reason = state.lost_reason.as_deref().unwrap_or("no further detail");
-            DbError::new(
+        match &state.lost_reason {
+            Some(reason) => reason.to_error("session is lost; open a new session to reconnect"),
+            None => DbError::new(ErrorKind::Connection, "reldex-db-core: session is closed")
+                .with_session_state(SessionState::Lost),
+        }
+    }
+
+    /// The error [`crate::DatabaseSession::close`] reports when the connection
+    /// is already gone.
+    ///
+    /// Closing a lost session is not a silent success: whatever transaction it
+    /// held went with it, and a `Commit` disposition in particular committed
+    /// nothing. Saying so is the whole point (`SPEC.md` §10, §18).
+    pub(crate) fn lost_transaction_error(&self) -> DbError {
+        let state = self.lock();
+        match &state.lost_reason {
+            Some(reason) => reason.to_error(
+                "the session was already lost, so nothing was committed and any \
+                 transaction it held is gone",
+            ),
+            None => DbError::new(
                 ErrorKind::Connection,
-                format!(
-                    "reldex-db-core: session is lost ({reason}); open a new session to reconnect"
-                ),
+                "reldex-db-core: the connection was already gone, so nothing was committed \
+                 and any transaction it held is gone",
             )
-            .with_session_state(SessionState::Lost)
-        } else {
-            DbError::new(ErrorKind::Connection, "reldex-db-core: session is closed")
-                .with_session_state(SessionState::Lost)
+            .with_session_state(SessionState::Lost),
         }
     }
 }
@@ -168,7 +367,7 @@ mod tests {
     #[test]
     fn starts_usable_with_no_possibly_active_transaction() {
         let shared = SessionShared::new();
-        assert_eq!(shared.session_state(), SessionState::Usable);
+        assert_eq!(shared.lifecycle(), SessionLifecycle::Usable);
         assert!(!shared.is_lost());
         // `TransactionState::default()` is `Unknown`, which `may_be_open()`.
         assert!(shared.has_possibly_active_transaction());
@@ -179,17 +378,33 @@ mod tests {
         let shared = SessionShared::new();
         shared.note_driver_transaction_state(TransactionState::Inactive);
         assert!(!shared.has_possibly_active_transaction());
-        shared.note_statement_kind(StatementKind::Dml);
+        shared.note_statement(StatementKind::Dml, TransactionState::Active, true);
         assert!(shared.has_possibly_active_transaction());
         shared.note_commit_or_rollback();
+        shared.note_driver_transaction_state(TransactionState::Inactive);
         assert!(!shared.has_possibly_active_transaction());
     }
 
     #[test]
-    fn query_does_not_mark_possibly_active() {
+    fn a_query_is_only_dismissed_when_an_exact_driver_says_inactive() {
+        // A plain SELECT on an exact driver: nothing is open.
         let shared = SessionShared::new();
+        shared.note_statement(StatementKind::Query, TransactionState::Inactive, true);
+        assert!(!shared.has_possibly_active_transaction());
+
+        // `SELECT … FOR UPDATE` on the same driver: the driver reports the lock,
+        // and the core must keep the flag.
+        let shared = SessionShared::new();
+        shared.note_statement(StatementKind::Query, TransactionState::Active, true);
+        assert!(shared.has_possibly_active_transaction());
+
+        // The same query on a driver that cannot observe transaction state:
+        // conservative, always.
+        let shared = SessionShared::new();
+        shared.note_statement(StatementKind::Query, TransactionState::Unknown, false);
+        assert!(shared.has_possibly_active_transaction());
+        shared.note_commit_or_rollback();
         shared.note_driver_transaction_state(TransactionState::Inactive);
-        shared.note_statement_kind(StatementKind::Query);
         assert!(!shared.has_possibly_active_transaction());
     }
 
@@ -199,23 +414,55 @@ mod tests {
         shared.note_error(&DbError::new(ErrorKind::Timeout, "slow"));
         assert!(shared.needs_validation());
         shared.mark_validated();
-        assert_eq!(shared.session_state(), SessionState::Usable);
+        assert_eq!(shared.lifecycle(), SessionLifecycle::Usable);
 
         shared.note_error(&DbError::new(ErrorKind::NetworkLost, "gone"));
         assert!(shared.is_lost());
         shared.mark_validated();
         assert!(shared.is_lost(), "a successful ping must never clear Lost");
+        shared.mark_closed();
+        assert!(shared.is_lost(), "closing a lost session must not hide why");
     }
 
     #[test]
-    fn terminal_error_reports_lost_reason_or_closed() {
+    fn closing_is_a_state_of_its_own_and_is_never_usable() {
+        let shared = SessionShared::new();
+        shared.mark_closed();
+        assert_eq!(shared.lifecycle(), SessionLifecycle::Closed);
+        assert!(!shared.lifecycle().is_usable());
+        assert!(shared.lifecycle().is_terminal());
+        assert!(!shared.is_lost());
+    }
+
+    #[test]
+    fn terminal_error_keeps_the_classification_of_the_loss() {
         let shared = SessionShared::new();
         let closed = shared.terminal_error();
         assert!(closed.to_string().contains("closed"));
+        assert_eq!(closed.kind(), ErrorKind::Connection);
 
-        shared.note_error(&DbError::new(ErrorKind::NetworkLost, "connection reset"));
+        shared.note_error(
+            &DbError::new(ErrorKind::NetworkLost, "connection reset")
+                .with_native(NativeError::new(3113, "ORA-03113: end-of-file on channel")),
+        );
         let lost = shared.terminal_error();
         assert_eq!(lost.session_state(), SessionState::Lost);
+        assert_eq!(
+            lost.kind(),
+            ErrorKind::NetworkLost,
+            "the UI must still be able to tell a network loss from a driver bug"
+        );
+        assert_eq!(lost.native().map(NativeError::code), Some(3113));
         assert!(lost.to_string().contains("lost"));
+    }
+
+    #[test]
+    fn in_flight_tracking_is_a_plain_counter() {
+        let shared = SessionShared::new();
+        assert!(!shared.driver_call_in_flight());
+        shared.enter_driver_call();
+        assert!(shared.driver_call_in_flight());
+        shared.leave_driver_call();
+        assert!(!shared.driver_call_in_flight());
     }
 }

@@ -187,3 +187,119 @@ fn a_default_constructed_state_is_the_safe_unknown_default() {
         "an imprecise driver must not be trusted to say Inactive on its own"
     );
 }
+
+/// `SELECT … FOR UPDATE` opens a transaction and is still a `Query`.
+///
+/// Core-side tracking used to key only on `StatementKind`, so on a driver with
+/// exact transaction state a locking query left
+/// `has_possibly_active_transaction()` false — and closing the worksheet
+/// silently discarded row locks and an open transaction. No statement kind can
+/// distinguish this from a plain `SELECT`, so the core has to be conservative
+/// and only dismiss a query when the driver says `Inactive` afterwards.
+#[test]
+fn a_locking_query_keeps_the_transaction_flag_even_on_an_exact_driver() {
+    let scenario = support::scenario();
+    let plan = reldex_driver_mock::QueryPlan::new(
+        vec![reldex_driver_mock::ColumnSpec::new(
+            "ID",
+            reldex_db_driver_api::SqlType::Number,
+        )],
+        vec![vec![ScriptValue::from(1_i64)]],
+    );
+    scenario.on_sql(
+        "SELECT id FROM t",
+        Action::query(reldex_driver_mock::QuerySource::Fixed(plan.clone())),
+    );
+    scenario.on_sql(
+        "SELECT id FROM t FOR UPDATE",
+        Action::locking_query(reldex_driver_mock::QuerySource::Fixed(plan)),
+    );
+    scenario.on_sql(
+        "SET TRANSACTION READ ONLY",
+        Action::Execute {
+            statement_kind: reldex_db_core::StatementKind::TransactionControl,
+            rows_affected: None,
+            opens_transaction: true,
+        },
+    );
+
+    let session = support::open(&scenario);
+
+    // A plain query on an exact driver leaves nothing open.
+    session
+        .execute(Statement::new("SELECT id FROM t"))
+        .wait()
+        .expect("plain select");
+    assert!(
+        !session.has_possibly_active_transaction(),
+        "an ordinary SELECT on an exact driver must not make the user answer a prompt"
+    );
+
+    // A locking one does.
+    session
+        .execute(Statement::new("SELECT id FROM t FOR UPDATE"))
+        .wait()
+        .expect("locking select");
+    assert!(
+        session.has_possibly_active_transaction(),
+        "SELECT … FOR UPDATE opened a transaction; closing over it must prompt"
+    );
+
+    session.rollback().wait().expect("rollback");
+    assert!(!session.has_possibly_active_transaction());
+
+    // And so does transaction control, which is also not DML.
+    session
+        .execute(Statement::new("SET TRANSACTION READ ONLY"))
+        .wait()
+        .expect("set transaction");
+    assert!(session.has_possibly_active_transaction());
+}
+
+/// A commit can invalidate every cursor and LOB locator it left open, and
+/// `db-core` must surface that rather than return a short result that looks
+/// complete.
+#[test]
+fn handles_invalidated_by_a_commit_report_rather_than_looking_exhausted() {
+    let scenario = support::scenario();
+    scenario.set_invalidate_handles_on_transaction_end(true);
+    scenario.on_sql("INSERT INTO t VALUES ('a')", insert_action("a"));
+    scenario.on_sql(
+        "SELECT id FROM t",
+        Action::query(reldex_driver_mock::QuerySource::Fixed(
+            reldex_driver_mock::QueryPlan::new(
+                vec![reldex_driver_mock::ColumnSpec::new(
+                    "ID",
+                    reldex_db_driver_api::SqlType::Number,
+                )],
+                (0..10_i64).map(|id| vec![ScriptValue::from(id)]).collect(),
+            ),
+        )),
+    );
+
+    let session = support::open(&scenario);
+    let outcome = session
+        .execute(Statement::new("SELECT id FROM t"))
+        .wait()
+        .expect("select");
+    let result = outcome.result.expect("cursor");
+    let batch = session
+        .fetch_batch(result, support::n(3))
+        .wait()
+        .expect("first batch");
+    assert_eq!(batch.row_count(), 3);
+
+    session
+        .execute(Statement::new("INSERT INTO t VALUES ('a')"))
+        .wait()
+        .expect("insert");
+    session.commit().wait().expect("commit");
+
+    // `db-core` releases every result a commit invalidates, so the handle is
+    // gone; what must never happen is an empty batch that reads as "complete".
+    let error = session
+        .fetch_batch(result, support::n(3))
+        .wait()
+        .expect_err("a result invalidated by the commit must report, not look exhausted");
+    assert!(error.message().contains("result handle"), "{error}");
+}

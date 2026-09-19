@@ -8,9 +8,24 @@
 //! built-in primitives, not a general query engine: it is just enough shared,
 //! transactional state to prove session-isolation invariants
 //! (`docs/exec-plans/active/phase-0.md` Workstream B).
+//!
+//! # The mock must be able to be as nasty as a real driver
+//!
+//! A test double that only ever behaves well proves nothing about the code that
+//! has to survive a real one. Everything the Phase 0 spikes found a real driver
+//! doing is therefore scriptable here: a failing `commit`, `rollback` or
+//! `close` ([`Scenario::fail_commit`] and friends); a fired deadline that
+//! destroys the session ([`BlockSpec::with_timeout_error`], spike U-6); cursors
+//! and LOB locators that stop working after a commit or rollback
+//! ([`Scenario::set_invalidate_handles_on_transaction_end`], ADR-0002 D2); a
+//! cancel the statement never observes ([`BlockSpec::with_unobserved_cancel`],
+//! spike U-7); a cancel that lands on the *next* statement
+//! ([`Scenario::set_late_cancel_lands_on_next_statement`]); and a driver call
+//! that panics outright ([`Action::Panic`], spike U-4).
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -209,7 +224,8 @@ pub struct QueryPlan {
     pub rows: Vec<Vec<ScriptValue>>,
     /// Fault injection: if set, the `n`th call to `fetch_batch` (counting
     /// from 1) fails with this error instead of returning rows, modelling
-    /// e.g. a network loss partway through a large fetch.
+    /// e.g. a network loss partway through a large fetch. Every later call
+    /// returns the same error, never an empty "complete" batch.
     pub fail_on_batch: Option<(usize, ScriptedError)>,
 }
 
@@ -333,7 +349,12 @@ impl BlockGate {
         !result.timed_out()
     }
 
-    pub(crate) fn park(&self, deadline: Option<Instant>) -> ParkOutcome {
+    /// Parks until released, cancelled or `deadline`.
+    ///
+    /// `observe_cancel` is false for the "unobserved cancel" case a real server
+    /// can produce (spike U-7): the request reaches the connection, and the
+    /// statement carries on until its own deadline regardless.
+    pub(crate) fn park(&self, deadline: Option<Instant>, observe_cancel: bool) -> ParkOutcome {
         let mut guard = self
             .state
             .lock()
@@ -345,7 +366,7 @@ impl BlockGate {
                 guard.parked -= 1;
                 return ParkOutcome::Released;
             }
-            if guard.cancelled {
+            if guard.cancelled && observe_cancel {
                 guard.parked -= 1;
                 return ParkOutcome::Cancelled;
             }
@@ -381,6 +402,8 @@ impl fmt::Debug for BlockGate {
 pub struct BlockSpec {
     pub(crate) gate: Arc<BlockGate>,
     pub(crate) cancelled_session_state: Option<SessionState>,
+    pub(crate) timeout_error: Option<ScriptedError>,
+    pub(crate) observe_cancel: bool,
     pub(crate) release_statement_kind: StatementKind,
     pub(crate) release_rows_affected: Option<u64>,
 }
@@ -392,6 +415,8 @@ impl BlockSpec {
         Self {
             gate,
             cancelled_session_state: None,
+            timeout_error: None,
+            observe_cancel: true,
             release_statement_kind: StatementKind::Other,
             release_rows_affected: None,
         }
@@ -402,6 +427,33 @@ impl BlockSpec {
     #[must_use]
     pub fn with_cancelled_session_state(mut self, session_state: SessionState) -> Self {
         self.cancelled_session_state = Some(session_state);
+        self
+    }
+
+    /// Replaces what a fired deadline reports.
+    ///
+    /// The default is a plain [`ErrorKind::Timeout`] with
+    /// [`SessionState::NeedsValidation`]. A real driver is not always that
+    /// kind: upstream's recovery path reads the reset reply with the expired
+    /// timeout still armed, so a deadline on a statement the server will not
+    /// interrupt returns `NetworkLost` with the **session destroyed** (spike
+    /// U-6). Scripting that is the only way to test what `db-core` does about
+    /// it.
+    #[must_use]
+    pub fn with_timeout_error(mut self, error: ScriptedError) -> Self {
+        self.timeout_error = Some(error);
+        self
+    }
+
+    /// Makes this statement ignore cancellation and stop only at its deadline.
+    ///
+    /// Models a cancel that reaches the server but that the client never
+    /// observes (spike U-7, `ALTER SYSTEM CANCEL SQL`): the request is
+    /// delivered, `request_cancel` reports success, and the blocked call
+    /// carries on until its own deadline fires.
+    #[must_use]
+    pub fn with_unobserved_cancel(mut self) -> Self {
+        self.observe_cancel = false;
         self
     }
 
@@ -425,7 +477,21 @@ impl BlockSpec {
 #[derive(Debug, Clone)]
 pub enum Action {
     /// Returns rows through a cursor.
-    Query(QuerySource),
+    ///
+    /// Build one with [`Action::query`] or, for the `SELECT … FOR UPDATE` case,
+    /// [`Action::locking_query`].
+    Query {
+        /// Where the rows come from.
+        source: QuerySource,
+        /// Whether this query opened a transaction, the way
+        /// `SELECT … FOR UPDATE` and `LOCK TABLE` do.
+        ///
+        /// It is still reported as [`StatementKind::Query`] — a driver has no
+        /// other honest classification for it — so this is precisely the case
+        /// where `db-core` cannot rely on the statement kind and has to be
+        /// conservative instead.
+        opens_transaction: bool,
+    },
     /// Reports `rows_affected` rows changed and `StatementKind::Dml`.
     ///
     /// If `insert` is set, the row is appended to the executing connection's
@@ -449,6 +515,9 @@ pub enum Action {
         statement_kind: StatementKind,
         /// Rows changed, if any.
         rows_affected: Option<u64>,
+        /// Whether the statement opened a transaction, the way
+        /// `SET TRANSACTION READ ONLY` does.
+        opens_transaction: bool,
     },
     /// Returns a nested `REF CURSOR` through a **named** output bind, the way
     /// a PL/SQL `OPEN :rc FOR …` does.
@@ -464,11 +533,52 @@ pub enum Action {
         /// Where the nested cursor's rows come from.
         source: QuerySource,
     },
+    /// Returns a large object through a **named** output bind.
+    ///
+    /// The other way a driver-owned handle reaches `db-core` through
+    /// `OutValues`, and the reason `OutValue::Lob` exists.
+    LobOut {
+        /// The output bind's name, without its placeholder prefix.
+        name: String,
+        /// What the object contains.
+        kind: LobKind,
+        /// The object's full content.
+        bytes: Vec<u8>,
+    },
     /// Fails immediately with a scripted error.
     Fail(ScriptedError),
     /// Blocks the worker thread until released or cancelled. See
     /// [`BlockSpec`].
     Block(BlockSpec),
+    /// Panics inside the driver call, with this message.
+    ///
+    /// A real driver can do this (spike U-2/U-3 found two inputs that panic
+    /// inside `oracledb`), and `db-core` promises to contain it rather than
+    /// letting it unwind across the worker boundary — a promise that needs a
+    /// test. Note that the *real* primary driver turns such a panic into a
+    /// process abort (spike U-4), which nothing can contain; this models the
+    /// well-behaved case the promise is actually about.
+    Panic(String),
+}
+
+impl Action {
+    /// A query that does not open a transaction: the ordinary `SELECT`.
+    #[must_use]
+    pub const fn query(source: QuerySource) -> Self {
+        Self::Query {
+            source,
+            opens_transaction: false,
+        }
+    }
+
+    /// A query that *does* open a transaction, like `SELECT … FOR UPDATE`.
+    #[must_use]
+    pub const fn locking_query(source: QuerySource) -> Self {
+        Self::Query {
+            source,
+            opens_transaction: true,
+        }
+    }
 }
 
 /// What a statement's SQL text must satisfy to run an [`Action`].
@@ -498,25 +608,47 @@ impl fmt::Debug for Matcher {
     }
 }
 
+/// How one scripted connection-level operation behaves.
 #[derive(Clone)]
-enum ConnectBehavior {
+enum Behavior {
     Succeed,
     Fail(ScriptedError),
 }
 
-#[derive(Clone)]
-enum PingBehavior {
-    Succeed,
-    Fail(ScriptedError),
+impl Behavior {
+    fn apply(&self) -> Result<(), DbError> {
+        match self {
+            Self::Succeed => Ok(()),
+            Self::Fail(error) => Err(error.build()),
+        }
+    }
+}
+
+/// What a test can count after the fact.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Counts {
+    /// How many cursors were opened.
+    pub cursors_opened: usize,
+    /// How many of them had `Cursor::close` called on them.
+    pub cursors_closed: usize,
+    /// How many connections had `DatabaseConnection::close` called on them.
+    pub connections_closed: usize,
 }
 
 struct Inner {
     capabilities: Capabilities,
-    connect: ConnectBehavior,
-    ping: PingBehavior,
+    connect: Behavior,
+    ping: Behavior,
+    cancel: Behavior,
+    commit: Behavior,
+    rollback: Behavior,
+    close: Behavior,
+    invalidate_handles_on_transaction_end: bool,
+    late_cancel_lands_on_next_statement: bool,
     responses: Vec<(Matcher, Action)>,
     tables: HashMap<String, Vec<Vec<ScriptValue>>>,
     thread_ids: HashMap<ConnectionId, std::collections::HashSet<ThreadId>>,
+    counts: Counts,
 }
 
 /// The scripted world one or more [`crate::MockConnection`]s connect to.
@@ -542,11 +674,18 @@ impl Default for Scenario {
                     .with_exact_transaction_state(true)
                     .with_lob_streaming(true)
                     .with_error_position(true),
-                connect: ConnectBehavior::Succeed,
-                ping: PingBehavior::Succeed,
+                connect: Behavior::Succeed,
+                ping: Behavior::Succeed,
+                cancel: Behavior::Succeed,
+                commit: Behavior::Succeed,
+                rollback: Behavior::Succeed,
+                close: Behavior::Succeed,
+                invalidate_handles_on_transaction_end: false,
+                late_cancel_lands_on_next_statement: false,
                 responses: Vec::new(),
                 tables: HashMap::new(),
                 thread_ids: HashMap::new(),
+                counts: Counts::default(),
             }),
         }
     }
@@ -583,17 +722,88 @@ impl Scenario {
 
     /// Makes every future `connect` fail with `error`.
     pub fn fail_connect(&self, error: ScriptedError) {
-        self.lock().connect = ConnectBehavior::Fail(error);
+        self.lock().connect = Behavior::Fail(error);
     }
 
     /// Makes every future `ping` fail with `error`.
     pub fn fail_ping(&self, error: ScriptedError) {
-        self.lock().ping = PingBehavior::Fail(error);
+        self.lock().ping = Behavior::Fail(error);
     }
 
     /// Makes every future `ping` succeed again.
     pub fn allow_ping(&self) {
-        self.lock().ping = PingBehavior::Succeed;
+        self.lock().ping = Behavior::Succeed;
+    }
+
+    /// Makes every future `request_cancel` report `error`, whatever the
+    /// connection's [`reldex_db_driver_api::CancelKind`] would otherwise say.
+    ///
+    /// A real cancel path can discover that the session is already gone — the
+    /// error it returns is then the *first* news of that, and must not be
+    /// dropped on the floor by whoever asked for the cancel.
+    pub fn fail_cancel(&self, error: ScriptedError) {
+        self.lock().cancel = Behavior::Fail(error);
+    }
+
+    /// Makes every future `request_cancel` behave normally again.
+    pub fn allow_cancel(&self) {
+        self.lock().cancel = Behavior::Succeed;
+    }
+
+    /// Makes every future `commit` fail with `error`, leaving the transaction
+    /// untouched.
+    pub fn fail_commit(&self, error: ScriptedError) {
+        self.lock().commit = Behavior::Fail(error);
+    }
+
+    /// Makes every future `commit` succeed again.
+    pub fn allow_commit(&self) {
+        self.lock().commit = Behavior::Succeed;
+    }
+
+    /// Makes every future `rollback` fail with `error`, leaving the
+    /// transaction untouched.
+    pub fn fail_rollback(&self, error: ScriptedError) {
+        self.lock().rollback = Behavior::Fail(error);
+    }
+
+    /// Makes every future `rollback` succeed again.
+    pub fn allow_rollback(&self) {
+        self.lock().rollback = Behavior::Succeed;
+    }
+
+    /// Makes every future `close` report `error`.
+    ///
+    /// The connection is still marked closed — `close` consumes it, so there is
+    /// no version of this where the connection survives; what is scripted is
+    /// the *report*.
+    pub fn fail_close(&self, error: ScriptedError) {
+        self.lock().close = Behavior::Fail(error);
+    }
+
+    /// Makes every future `close` succeed again.
+    pub fn allow_close(&self) {
+        self.lock().close = Behavior::Succeed;
+    }
+
+    /// Makes every cursor and LOB locator stop working after a `commit`,
+    /// `rollback` or `rollback to savepoint`, reporting
+    /// [`ErrorKind::Transaction`].
+    ///
+    /// This is what most servers really do — a LOB locator is scoped to its
+    /// transaction and `ROLLBACK` commonly closes cursors (ADR-0002 D2) — and
+    /// the default-off mock behaviour is the *lenient* one.
+    pub fn set_invalidate_handles_on_transaction_end(&self, invalidate: bool) {
+        self.lock().invalidate_handles_on_transaction_end = invalidate;
+    }
+
+    /// Makes a cancellation requested while nothing is running latch onto the
+    /// **next** statement instead of being discarded.
+    ///
+    /// The nastiest shape of the cancel race: nothing in the driver contract
+    /// carries statement identity, so a driver is free to do this.
+    pub fn set_late_cancel_lands_on_next_statement(&self, latch: bool) {
+        self.lock().late_cancel_lands_on_next_statement = latch;
     }
 
     /// Registers `action` for statements whose trimmed text equals `sql`
@@ -645,6 +855,15 @@ impl Scenario {
             .unwrap_or_default()
     }
 
+    /// How many cursors and connections were opened and closed.
+    ///
+    /// Lets a test assert that a handle `db-core` could no longer reach was
+    /// *released*, not merely forgotten.
+    #[must_use]
+    pub fn counts(&self) -> Counts {
+        self.lock().counts
+    }
+
     pub(crate) fn record_thread(&self, connection: ConnectionId) {
         self.lock()
             .thread_ids
@@ -653,18 +872,48 @@ impl Scenario {
             .insert(std::thread::current().id());
     }
 
+    pub(crate) fn record_cursor_opened(&self) {
+        self.lock().counts.cursors_opened += 1;
+    }
+
+    pub(crate) fn record_cursor_closed(&self) {
+        self.lock().counts.cursors_closed += 1;
+    }
+
+    pub(crate) fn record_connection_closed(&self) {
+        self.lock().counts.connections_closed += 1;
+    }
+
     pub(crate) fn connect_behavior(&self) -> Result<(), DbError> {
-        match &self.lock().connect {
-            ConnectBehavior::Succeed => Ok(()),
-            ConnectBehavior::Fail(error) => Err(error.build()),
-        }
+        self.lock().connect.apply()
     }
 
     pub(crate) fn ping_behavior(&self) -> Result<(), DbError> {
-        match &self.lock().ping {
-            PingBehavior::Succeed => Ok(()),
-            PingBehavior::Fail(error) => Err(error.build()),
-        }
+        self.lock().ping.apply()
+    }
+
+    pub(crate) fn cancel_behavior(&self) -> Result<(), DbError> {
+        self.lock().cancel.apply()
+    }
+
+    pub(crate) fn commit_behavior(&self) -> Result<(), DbError> {
+        self.lock().commit.apply()
+    }
+
+    pub(crate) fn rollback_behavior(&self) -> Result<(), DbError> {
+        self.lock().rollback.apply()
+    }
+
+    pub(crate) fn close_behavior(&self) -> Result<(), DbError> {
+        self.lock().close.apply()
+    }
+
+    pub(crate) fn invalidates_handles_on_transaction_end(&self) -> bool {
+        self.lock().invalidate_handles_on_transaction_end
+    }
+
+    pub(crate) fn latches_late_cancel(&self) -> bool {
+        self.lock().late_cancel_lands_on_next_statement
     }
 
     pub(crate) fn find_action(&self, sql: &str) -> Option<Action> {
@@ -684,5 +933,42 @@ impl Scenario {
                 .or_default()
                 .push(row.clone());
         }
+    }
+}
+
+/// The transaction epoch a connection's derived handles were created in.
+///
+/// Bumped on every `commit`, `rollback` and `rollback to savepoint`; a cursor
+/// or LOB stream created in an earlier epoch reports
+/// [`ErrorKind::Transaction`] when
+/// [`Scenario::set_invalidate_handles_on_transaction_end`] is on.
+#[derive(Debug, Clone)]
+pub(crate) struct TransactionEpoch {
+    counter: Arc<AtomicU64>,
+    created_at: u64,
+    invalidate: bool,
+}
+
+impl TransactionEpoch {
+    pub(crate) fn new(counter: &Arc<AtomicU64>, invalidate: bool) -> Self {
+        Self {
+            counter: Arc::clone(counter),
+            created_at: counter.load(Ordering::SeqCst),
+            invalidate,
+        }
+    }
+
+    /// The error a handle from an earlier transaction must report, if any.
+    pub(crate) fn check(&self, handle: &str) -> Option<DbError> {
+        if !self.invalidate || self.counter.load(Ordering::SeqCst) == self.created_at {
+            return None;
+        }
+        Some(DbError::new(
+            ErrorKind::Transaction,
+            format!(
+                "reldex-driver-mock: this {handle} was invalidated by the commit or rollback \
+                 that ended the transaction it was opened in"
+            ),
+        ))
     }
 }

@@ -24,7 +24,7 @@ fn eight_concurrent_sessions_make_progress_independently_and_never_share_state()
         );
         scenario.on_sql(
             format!("SELECT * FROM {table}"),
-            Action::Query(QuerySource::Table {
+            Action::query(QuerySource::Table {
                 table,
                 columns: vec![ColumnSpec::new(
                     "NAME",

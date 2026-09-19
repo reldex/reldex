@@ -1,10 +1,13 @@
 # 0002 — Driver API and Concurrency Model
 
 **Status:** Accepted (provisional — implemented; independent API review completed 2026-09-19 and its
-must-fix findings applied, see "Amendments after API review"; amended again after the ADR-0001
-Phase 0 spikes, see "Amendments after the Phase 0 spikes"; owner review pending)
+must-fix findings applied, see "Amendments after API review"; amended after the ADR-0001
+Phase 0 spikes, see "Amendments after the Phase 0 spikes"; amended again after the independent
+review of the `db-core` session layer, see "Amendments after the db-core session review"; owner
+review pending)
 **Date:** 2026-09-19
-**Amended:** 2026-09-19 (API review), 2026-09-19 (Phase 0 spikes)
+**Amended:** 2026-09-19 (API review), 2026-09-19 (Phase 0 spikes), 2026-09-19 (db-core session
+review)
 
 ## Context
 
@@ -590,6 +593,202 @@ API call as fetching anything else and closing the session releases it the same 
 "Notes for driver implementers" below described a structured upstream `DbError { code, offset }`
 that does not exist in the pinned version; see that section, which now names the version it
 describes and marks each note with what the spikes found.
+
+## Amendments after the db-core session review (2026-09-19)
+
+An independent review of the implemented `db-core` session layer (commit `3c7bcac`) returned "merge
+after must-fix" and reproduced every finding. The lead accepted all of them. This section records
+what changed in the *model* this ADR describes; findings that were purely `db-core` bugs against an
+unchanged contract are not repeated here. Numbering: `K` = db-core review.
+
+### K1 — Only plain data crosses threads, and now that is literally true
+
+D1 has always claimed that "of everything a fetch produces, only `RowBatch` — plain data, no handles
+— crosses a thread boundary". It was not true. A driver puts live `LobLocator`s straight into a
+batch's LOB columns, so the batch `db-core` handed to its caller carried driver handles, and the
+caller's thread could read them, and — worse, because it needs no API call at all — **drop** them.
+Dropping a locator runs the driver's release path; with the primary driver's `Arc<Mutex<Client>>`
+that is a deadlock or a soundness hazard, not a diagnosable error.
+
+The model is corrected rather than the claim weakened:
+
+- Before a batch leaves the worker thread, `db-core` takes **every** locator out of it with
+  `Column::take_lob` (the contract already had the `Taken` state for exactly this, amendment M6) and
+  parks it in a side table beside the cursors.
+- The caller receives a core-owned, opaque `LobHandle` in its place and reads through
+  `DatabaseSession::read_lob_chunk(LobHandle, max_bytes)` / `close_lob(LobHandle)`. The handle for a
+  cell is found with `FetchedBatch::lob(row, column)`; a `LobLocator` delivered through an OUT bind
+  becomes a handle the same way (`OutValue::Lob`).
+- Handles die with their result and with their session, so a locator is always released on the
+  thread that owns it.
+- `db-core` no longer re-exports `LobLocator`: nothing above the core should be able to name one.
+
+The contract itself is unchanged — this is a `db-core` responsibility — but its **documentation was
+wrong by omission** and now says so: `RowBatch`, `ColumnData::Lob`, `Column::take_lob`, `LobStream`
+and `LobLocator` all state that a batch still holding un-taken locators must be consumed *or dropped*
+on the owning worker thread, and that dropping a derived handle is driver work like any other.
+
+*Evidence:* `only_plain_data_crosses_threads_even_when_batches_and_handles_are_dropped_elsewhere` in
+`crates/db-core/tests/lob_handles.rs` moves batches and handles between threads and asserts the mock
+saw exactly one thread id for the connection.
+
+### K2 — `close()` on a derived handle is idempotent and infallible in spirit
+
+D2 and the `Cursor` trait documentation said that after the connection is closed, *every* operation
+on an outstanding cursor reports `DbError::connection_closed` — including `close()`. The Oracle
+wrapper returns `Ok(())` instead, and a spike test asserts that it does. Doc and code disagreed.
+
+**Decided: the wrapper is right and the ADR was wrong.** The rule is now:
+
+> `Cursor::close` is idempotent and infallible in spirit: when there is nothing left to release —
+> because the connection is gone, or the fetch already failed — it reports `Ok(())`. Only a real
+> failure to release something is an error. **Every other method** on a handle whose connection has
+> been closed reports `DbError::connection_closed`.
+
+The asymmetry is the useful one. `close` exists to let go; a release path that fails because there is
+nothing to release only teaches callers to ignore its result, and `db-core` closes cursors on paths
+(session close, commit invalidation, an undeliverable reply) where there is nothing sensible to do
+with such an error. Applied to the `db-driver-api` doc-comments (`Cursor::close`,
+`DatabaseConnection`, `DatabaseConnection::close`, `DbError::connection_closed`) and to the mock.
+**The oracle-thin wrapper needs no change**; the spike test that asserts `Ok(())` is now asserting
+the documented rule rather than contradicting it.
+
+The same paragraph also makes explicit what "report, never look complete" means for a *failed*
+cursor: after an error, `fetch_batch` must keep returning that error and must never return the empty
+batch that means "exhausted", because that turns a partial result into one that looks whole.
+
+### K3 — A cancel cannot be aimed at a statement, and the ADR now says so
+
+D2 rule 4 makes `request_cancel` idempotent and a no-op when nothing is running, and rule 6 makes the
+"statement finished first" race the caller's to handle. What neither said is the consequence: because
+nothing in the contract carries **statement identity**, a driver is free to latch a cancel that
+arrived while nothing was running and apply it to the *next* statement, and no layer above can tell
+that apart from a legitimate cancellation.
+
+A per-statement generation guard was considered and **cannot be implemented in `db-core`**: the
+cancel goes straight to the driver's `Arc<dyn CancelHandle>` — deliberately, because routing it
+through the command queue would let a blocked statement stall its own cancellation — so the core has
+no point at which it could attach or check a generation. Closing the race needs statement identity in
+the driver contract, and the primary driver could not honour it today (spike S4: it has no break API
+at all).
+
+So the race is **narrowed and documented, not hidden**:
+
+- `DatabaseSession::cancel` answers the "no command in flight" case itself with the
+  `CancelOutcome::Requested` no-op rule 4 already permits, instead of handing the request to a driver
+  that might keep it. This removes the whole class of "cancel issued while idle, lands on the next
+  statement".
+- The window that remains — the statement finishing between that check and the driver's own — is
+  stated on `DatabaseSession::cancel`: a caller that sees `ErrorKind::Cancelled` for a statement it
+  did not cancel is seeing this race, not a bug.
+- The mock can model the nasty driver (`Scenario::set_late_cancel_lands_on_next_statement`), so the
+  behaviour is tested rather than assumed.
+
+### K4 — `close` decides on the worker, and a failed disposition never costs the transaction
+
+`SPEC.md` §10 turns out to need three things this ADR left implicit. All three are now part of the
+model:
+
+1. **The "is a transaction open?" decision belongs on the worker thread**, after every command queued
+   ahead of the close has run. Deciding it on the caller's thread reads a flag that is by
+   construction a snapshot from before the statements still in flight, so a `close(None)` racing a
+   blocked DML discarded a live transaction and reported success.
+2. **A failed commit or rollback inside `close` leaves the session open.** Closing anyway would
+   destroy a transaction the user asked to keep because the attempt to keep it failed — the silent
+   data loss §10 exists to prevent, arrived at from the other direction. `CloseError` now names which
+   step failed (`CommitFailed`, `RollbackFailed`, `Failed`, `DecisionRequired`) and
+   `session_is_still_open()` says whether the caller can retry.
+3. **Closing a lost session reports the loss and never demands a disposition.** Asking a user to
+   choose Commit or Rollback for a transaction the server has already rolled back is a question with
+   no true answer, and answering `Ok(())` to `close(Some(Commit))` on a dead session told them their
+   work was saved when nothing was committed. The error says so in as many words, and resources are
+   released either way.
+
+### K5 — `Drop` bounds its wait and detaches; `close` is the only path that can commit
+
+Dropping a session must never hang, and `db-core` cannot interrupt a driver call — it can only ask,
+through `CancelHandle`, which on a `PreArmedDeadline` driver achieves nothing at all (spike S4). The
+model is therefore: **request the cancel, ask the worker to abandon and release everything, wait at
+most `DROP_SHUTDOWN_TIMEOUT` (500 ms), then detach the worker thread.** A detached worker still owns
+the connection, its cursors and its parked large objects and closes all of them when the blocked call
+returns, so the release is late but never lost.
+
+`Drop` never commits and never rolls back explicitly; it abandons, and the server's own
+rollback-on-disconnect is what protects the data. That makes "dropping a session cannot commit"
+structural rather than a promise, and **explicit `close` is the only path that can commit anything**.
+
+### K6 — Panic containment, and the driver class it applies to
+
+A caught driver panic marks the connection *torn*: `db-core` drops it on the worker thread and
+deliberately does **not** call `close()` on it, because the object's internal state is by definition
+unknown and a second call into it is as likely to panic again as to release anything. The same rule
+applies to every handle derived from it.
+
+This guarantee holds only for drivers that unwind. The intended primary driver does not: `oracledb`
+26.0.0-beta.3 locks a poisoned mutex in `impl Drop for StatementHolder`, so a panic inside a round
+trip panics again during unwinding and **aborts the process** (spike U-4). No wrapper can contain
+that and `catch_unwind` does not help, which is why the driver must refuse known-panicking inputs
+before they reach the crate.
+
+### K7 — Conservative transaction tracking covers locking queries
+
+D4 said `db-core` combines `StatementKind` with the driver's `transaction_state()`. In practice the
+core only set its flag for `Dml`/`PlSqlBlock`/`Other`, so `SELECT … FOR UPDATE`, `LOCK TABLE` and
+`SET TRANSACTION` left `has_possibly_active_transaction()` **false** on a driver with exact
+transaction state — and closing the worksheet discarded row locks and an open transaction in silence.
+No `StatementKind` can distinguish a locking query from a plain one; a driver has no honest
+classification for `SELECT … FOR UPDATE` other than `Query`.
+
+The rule is now stated as a rule: **no statement kind clears the flag, and every successful statement
+sets it unless a driver with `exact_transaction_state` reports `Inactive` immediately afterwards.**
+`Dml` and `PlSqlBlock` set it unconditionally. Over-prompting is acceptable and a missed prompt is
+not, which is the same trade-off D4 already makes for `TransactionState::Unknown`.
+
+### K8 — A session has a `Closed` state, and its handles are session-scoped
+
+Two smaller model corrections:
+
+- `SessionState` describes a *connection* and has no way to say "closed on purpose", so a closed
+  session reported `Usable` — telling callers they could still submit work. `db-core` now has its own
+  `SessionLifecycle { Usable, NeedsValidation, Lost, Closed }`. `Lost` takes precedence over
+  `Closed`, because why a session ended matters more than that it ended. `SessionState` in the
+  contract is unchanged.
+- `ResultId` and `LobHandle` are scoped to the session that issued them, so a handle used on another
+  session is rejected as *belongs to another session* rather than being mistaken for one that was
+  closed. This is what supersedes the narrower "assert `connection_id` in `read_lob_chunk`" fix: a
+  handle can no longer cross sessions at all.
+
+The fail-fast error a lost session gives every later command now keeps the original `ErrorKind`,
+native code and text, statement position and cause chain, instead of flattening them into a sentence.
+A UI cannot tell a network loss from a killed session from a driver bug if every later error says
+`Connection`.
+
+### K9 — Bounded damage: the queue is unbounded, the resources are not
+
+Stated explicitly because it was previously only implied. The per-session command channel is
+**unbounded on purpose**: a bounded one would make `execute` block the *calling* thread once it
+filled, which `SPEC.md` §11/§19 forbids, and the queue's real bound is that one session belongs to
+one worksheet. What is bounded instead is what a session can accumulate — `SessionLimits`
+(`max_open_results`, `max_lob_chunk_bytes`), with a clear `ErrorKind::Resource` failure rather than an
+unbounded allocation.
+
+### Deferred, and deliberately not built now
+
+Recorded so the design stays unblocked:
+
+- **Asynchronous `open_session`.** `connect` runs on the worker thread, but the caller still blocks
+  on the reply that the connection is ready. Making that a completion like every other request is
+  Phase 1 FFI work; nothing in the current shape prevents it, since the worker already exists before
+  the connection does.
+- **A per-session outbound completion/event queue for the FFI adapter.** D1 describes it; today each
+  request carries its own oneshot reply channel. Both shapes coexist — the adapter would drain one
+  queue instead of holding many `Completion`s — so this is additive.
+- **`Arc<DatabaseSession>` ergonomics: done, because it was trivial.** `close` takes `&self`, and the
+  session is now `Sync` as its documentation already claimed (a `std::sync::mpsc::Sender` is `Send`
+  but not `Sync`, so the claim had been false). `Completion::poll` and the new
+  `Completion::wait_timeout` consume the completion and hand it back on `Err`, which is what makes
+  them non-lossy: the reply exists exactly once and is not `Clone`, so a method that could both
+  return it and leave a `Completion` behind would have to fabricate something for the second caller.
 
 ## Notes for driver implementers
 

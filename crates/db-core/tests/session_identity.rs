@@ -28,7 +28,7 @@ fn session_id_is_stable_across_many_commands() {
     let scenario = support::scenario();
     scenario.on_sql(
         "SELECT 1 FROM dual",
-        Action::Query(QuerySource::Fixed(reldex_driver_mock::QueryPlan::new(
+        Action::query(QuerySource::Fixed(reldex_driver_mock::QueryPlan::new(
             vec![ColumnSpec::new("N", reldex_db_driver_api::SqlType::Number)],
             vec![vec![ScriptValue::from(1_i64)]],
         ))),
@@ -75,7 +75,7 @@ fn uncommitted_state_survives_multiple_statements_on_the_same_session() {
     );
     scenario.on_sql(
         "SELECT * FROM t",
-        Action::Query(QuerySource::Table {
+        Action::query(QuerySource::Table {
             table: "t".to_owned(),
             columns,
         }),
@@ -115,7 +115,7 @@ fn a_second_session_cannot_see_or_inherit_uncommitted_state() {
     );
     scenario.on_sql(
         "SELECT * FROM t",
-        Action::Query(QuerySource::Table {
+        Action::query(QuerySource::Table {
             table: "t".to_owned(),
             columns,
         }),
