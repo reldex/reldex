@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use reldex_db_driver_api::{
     ConnectionParams, Credentials, DatabaseConnection, DatabaseDriver, DbResult, Endpoint,
-    ExecutionOutcome, ExtensionValue, Extensions, RowBatch, Secret, Statement, ValueRef,
+    ExecutionOutcome, ExtensionValue, Extensions, RowBatch, Secret, Statement, TlsMode, ValueRef,
 };
 use reldex_driver_oracle_thin::OracleThinDriver;
 
@@ -41,6 +41,59 @@ pub const PASSWORD: &str = "RELDEX_TEST_ORACLE_PASSWORD";
 pub const SYSTEM_USER: &str = "RELDEX_TEST_ORACLE_SYSTEM_USER";
 /// Optional: that user's password.
 pub const SYSTEM_PASSWORD: &str = "RELDEX_TEST_ORACLE_SYSTEM_PASSWORD";
+/// Optional: the TCPS connect string spike S8 uses (`tcps://localhost:2484/…`).
+pub const TCPS_DSN: &str = "RELDEX_TEST_ORACLE_TCPS_DSN";
+/// Optional: a directory holding `ewallet.pem` with the test CA that signed the
+/// listener's certificate.
+pub const TCPS_CA_DIR: &str = "RELDEX_TEST_ORACLE_TCPS_CA_DIR";
+/// Optional: a directory holding `ewallet.pem` with a CA that signed **nothing**,
+/// for the negative case.
+pub const TCPS_WRONG_CA_DIR: &str = "RELDEX_TEST_ORACLE_TCPS_WRONG_CA_DIR";
+
+/// Reads an optional setting.
+pub fn optional(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// Parameters for a TCPS session with the test CA trusted, when the TLS
+/// listener is configured.
+///
+/// Returns `None` — so the S8 tests skip and say why — when
+/// `RELDEX_TEST_ORACLE_TCPS_DSN` or the CA directory is absent, which is the
+/// state of any checkout where `tools/oracle-test-db/startup/10_enable_tcps.sh`
+/// has not run.
+pub fn tcps_params() -> Option<ConnectionParams> {
+    // Both, not either: the helpers below call `setting(TCPS_DSN)`, which
+    // panics on a missing variable, so a half-configured environment has to skip
+    // rather than fail.
+    let directory = optional(TCPS_CA_DIR)?;
+    optional(TCPS_DSN)?;
+    Some(tcps_params_with_ca(&directory))
+}
+
+/// The same, with a caller-chosen wallet directory (or none at all).
+pub fn tcps_params_with_ca(wallet_dir: &str) -> ConnectionParams {
+    let mut extensions = Extensions::new();
+    if !wallet_dir.is_empty() {
+        extensions.set(
+            reldex_driver_oracle_thin::EXT_WALLET_DIR,
+            ExtensionValue::Text(wallet_dir.to_owned()),
+        );
+    }
+    tcps_params_bare().with_extensions(extensions)
+}
+
+/// TCPS parameters with no wallet at all: only the public web PKI is trusted.
+pub fn tcps_params_bare() -> ConnectionParams {
+    ConnectionParams::new(
+        Endpoint::ConnectString(setting(TCPS_DSN)),
+        Credentials::UserPassword {
+            username: setting(USER),
+            password: Secret::new(setting(PASSWORD)),
+        },
+    )
+    .with_tls(TlsMode::Required)
+}
 
 /// Reads a required setting, failing with the variable's name and never its
 /// value.

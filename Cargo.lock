@@ -651,6 +651,7 @@ version = "0.0.0"
 dependencies = [
  "oracledb",
  "reldex-db-driver-api",
+ "rustls",
 ]
 
 [[package]]

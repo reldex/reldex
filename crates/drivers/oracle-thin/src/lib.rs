@@ -54,32 +54,40 @@
 //! assembly and therefore needs a C toolchain — MSVC on Windows, which the
 //! Phase 0 machine has. It built without intervention, so the `ring` provider
 //! was not needed; see `docs/exec-plans/active/phase-0-spike-results.md` for
-//! the build measurement. TLS itself is **not** advertised in
-//! [`Capabilities`](reldex_db_driver_api::Capabilities): the Phase 0 test
-//! database has no TLS listener, so spike S8 has not run, and
-//! [`connect`](reldex_db_driver_api::DatabaseDriver::connect) refuses
-//! [`TlsMode::Required`](reldex_db_driver_api::TlsMode::Required) rather than
-//! silently opening a plaintext connection.
+//! the build measurement.
 //!
-//! **A note for whoever lands TCPS (spike S8).** This crate installs no `rustls`
-//! crypto provider, and does not need to: only `aws-lc-rs` is enabled, so
-//! `rustls` resolves its default unambiguously. The moment a second provider can
-//! be enabled — a `ring` feature for a platform without a C toolchain, or a
-//! dependency that turns one on transitively — that stops being true and
-//! `rustls` panics at the first handshake with "no process-level
-//! `CryptoProvider` available". The fix belongs in the application's startup,
-//! once, and must be idempotent, because a library that installs a provider
-//! steals the choice from its host:
+//! TCPS **is** advertised in
+//! [`Capabilities`](reldex_db_driver_api::Capabilities) as of spike S8, which
+//! ran against a TLS listener added to the Phase 0 container
+//! (`tools/oracle-test-db/startup/10_enable_tcps.sh`): TLS 1.2 with
+//! `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`, certificate and host name verified,
+//! against a **private** CA. [`TlsMode::Required`](reldex_db_driver_api::TlsMode::Required)
+//! turns an [`Endpoint::HostPort`](reldex_db_driver_api::Endpoint::HostPort)
+//! into a `tcps://` address and **refuses** a connect-string endpoint that does
+//! not itself say `(PROTOCOL=TCPS)`, rather than opening a plaintext session for
+//! a profile that requires TLS.
 //!
-//! ```ignore
-//! if rustls::crypto::CryptoProvider::get_default().is_none() {
-//!     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-//! }
-//! ```
+//! Trusting a private issuer goes through [`EXT_WALLET_DIR`], which is the one
+//! mechanism upstream offers: the directory's `ewallet.pem` is added to the root
+//! store when it holds no private key. What is **not** available is the rest of
+//! Oracle's TLS configuration surface — `SSL_SERVER_DN_MATCH` and
+//! `SSL_SERVER_CERT_DN` are parsed from a descriptor and sent to the server, but
+//! upstream's TLS layer never reads them; there is no mutual-TLS *and* private-CA
+//! combination, because one `ewallet.pem` is read as one or the other; and
+//! `orapki`'s own wallet files are not read at all. See [`EXT_WALLET_DIR`] and
+//! upstream gaps U-12 to U-14 in the spike results.
 //!
-//! This is a note rather than code on purpose: installing a provider from a
-//! driver crate would be a side effect on a global the host may already have
-//! configured.
+//! **The `rustls` crypto provider.** `rustls` resolves its default provider from
+//! the compiled-in features, which works while exactly one is enabled — today,
+//! `aws-lc-rs`. The moment a second one can be, that resolution becomes
+//! ambiguous and the first handshake panics with "no process-level
+//! `CryptoProvider` available": a run-time failure caused by a build-time
+//! change, in a code path that only runs when a customer turns TLS on.
+//! [`install_default_crypto_provider`] closes that hole, and
+//! [`connect`](reldex_db_driver_api::DatabaseDriver::connect) calls it when TLS
+//! is required. It installs **only** when nothing has installed one, so an
+//! application that chose FIPS or a hardware backend keeps its choice; call it
+//! yourself at start-up if you would rather the decision were explicit.
 //!
 //! # What this driver can and cannot do
 //!
@@ -245,4 +253,7 @@ mod error;
 mod lob;
 mod value;
 
-pub use conn::{EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE, EXT_STATEMENT_CACHE_SIZE, OracleThinDriver};
+pub use conn::{
+    EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE, EXT_STATEMENT_CACHE_SIZE, EXT_WALLET_DIR,
+    EXT_WALLET_PASSWORD, OracleThinDriver, install_default_crypto_provider,
+};

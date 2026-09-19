@@ -87,11 +87,12 @@ fn capabilities() -> Capabilities {
         .with_out_binds(true)
         .with_ref_cursor(true)
         .with_lob_streaming(true)
-        // Deliberately NOT advertised: `oracledb` implements TCPS, but the
-        // Phase 0 test database has no TLS listener, so spike S8 has not run
-        // and there is no Reldex evidence. `connect` refuses
-        // `TlsMode::Required` for the same reason.
-        .with_tls(false)
+        // Spike S8: proven against a TCPS listener on the Phase 0 container.
+        // TLS 1.2 with `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`, certificate and
+        // host name verified against a **private** CA supplied through
+        // [`EXT_WALLET_DIR`]. What this `true` does *not* claim is mutual TLS:
+        // see [`EXT_WALLET_DIR`] and the crate documentation.
+        .with_tls(true)
         // `Client::transaction_in_progress` exists upstream but is not exposed,
         // so this driver tracks the transaction conservatively.
         .with_exact_transaction_state(false)
@@ -142,14 +143,36 @@ impl DatabaseDriver for OracleThinDriver {
     }
 }
 
+/// Installs a process-wide `rustls` crypto provider, but only if nothing has
+/// installed one yet.
+///
+/// `rustls` resolves its default provider from the compiled-in features, which
+/// works while exactly one is enabled — today, `aws-lc-rs`. The moment a second
+/// one can be (a `ring` fallback for a platform without a C toolchain, or a
+/// dependency that turns one on transitively) that resolution becomes ambiguous
+/// and the **first TLS handshake panics** with "no process-level
+/// `CryptoProvider` available": a run-time failure from a build-time change,
+/// which is the worst shape a failure can have.
+///
+/// The guard is what makes this acceptable in a library. An application that
+/// installed its own provider — FIPS, a hardware backend, `ring` — keeps it,
+/// because `install_default` is only reached when `get_default()` is `None`, and
+/// its own result is discarded so a race between two threads arriving here at
+/// once is a no-op rather than a panic.
+///
+/// Callers who want the choice made explicitly should call this from their
+/// start-up before opening any connection; it is idempotent.
+pub fn install_default_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
 /// Builds the upstream configuration from vendor-neutral parameters.
 fn build_config(params: &reldex_db_driver_api::ConnectionParams) -> DbResult<Config> {
-    if params.tls() == TlsMode::Required {
-        return Err(DbError::new(
-            ErrorKind::Unsupported,
-            "encrypted transport is not validated by this driver yet \
-             (ADR-0001 spike S8); refusing rather than claiming TLS works",
-        ));
+    let tls = params.tls() == TlsMode::Required;
+    if tls {
+        install_default_crypto_provider();
     }
 
     let connect_string = match params.endpoint() {
@@ -168,7 +191,15 @@ fn build_config(params: &reldex_db_driver_api::ConnectionParams) -> DbResult<Con
             // says so through `Endpoint::ConnectString`.
             validate_easy_connect(host, "host")?;
             validate_easy_connect(service, "service name")?;
-            format!("{host}:{port}/{service}")
+            // Easy Connect defaults to plain TCP, so `TlsMode::Required` has to
+            // say `tcps://` explicitly — and the port has to be named, because
+            // upstream's parser defaults an unqualified port to 1521 whatever
+            // the protocol is.
+            if tls {
+                format!("tcps://{host}:{port}/{service}")
+            } else {
+                format!("{host}:{port}/{service}")
+            }
         }
         Endpoint::ConnectString(value) => value.clone(),
         _ => {
@@ -182,6 +213,60 @@ fn build_config(params: &reldex_db_driver_api::ConnectionParams) -> DbResult<Con
     let mut config = Config::default()
         .set_connect_string(&connect_string)
         .map_err(|error| crate::error::map(&error))?;
+
+    // `TlsMode::Required` promises the driver fails rather than falls back, and
+    // a descriptor is free text: `Endpoint::ConnectString` can carry
+    // `(PROTOCOL=TCP)` while the profile says TLS is mandatory. Upstream
+    // negotiates TLS from the **address**, not from anything this wrapper sets,
+    // so the only way to keep that promise is to look at the address upstream
+    // parsed and refuse when it is not TCPS.
+    if tls
+        && !config
+            .get_connect_descriptor()
+            .to_ascii_lowercase()
+            .contains("(protocol=tcps)")
+    {
+        return Err(DbError::new(
+            ErrorKind::Configuration,
+            "this connection requires encrypted transport, but its endpoint does not \
+             ask for TCPS. A connect-string endpoint must name (PROTOCOL=TCPS) — and \
+             the TLS port, usually 2484 — itself; this driver will not rewrite a \
+             descriptor, and it will not open a plaintext session for a profile that \
+             requires TLS",
+        ));
+    }
+
+    // The wallet directory is honoured whatever the mode says. A descriptor that
+    // asks for TCPS gets TLS from upstream regardless of `TlsMode`, and a
+    // connection that reaches a private CA only under `Required` would fail in a
+    // way that has nothing to do with what the caller changed.
+    match params.extensions().get(EXT_WALLET_DIR) {
+        Some(ExtensionValue::Text(directory)) => {
+            config = config.set_wallet_location(directory.clone());
+        }
+        Some(_) => {
+            return Err(DbError::new(
+                ErrorKind::Configuration,
+                format!("\"{EXT_WALLET_DIR}\" must be a text value: the path of a directory"),
+            ));
+        }
+        None => {}
+    }
+    match params.extensions().get(EXT_WALLET_PASSWORD) {
+        Some(ExtensionValue::Secret(password)) => {
+            config = config.set_wallet_password(password.expose());
+        }
+        Some(_) => {
+            return Err(DbError::new(
+                ErrorKind::Configuration,
+                format!(
+                    "\"{EXT_WALLET_PASSWORD}\" must be a secret value, so that it cannot \
+                     reach a log through an ordinary debug rendering"
+                ),
+            ));
+        }
+        None => {}
+    }
 
     match params.credentials() {
         Credentials::UserPassword { username, password } => {
@@ -310,6 +395,55 @@ pub const EXT_STATEMENT_CACHE_SIZE: &str = "oracle.statement_cache_size";
 /// value kills the application, which is not a trade a database tool should
 /// make for the user by default.
 pub const EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE: &str = "oracle.allow_timestamp_with_time_zone";
+
+/// Extension key: a directory containing **`ewallet.pem`**, whose certificates
+/// are added to the roots this connection will trust for TCPS.
+///
+/// This is how a **private CA** is trusted, and it is the only way. `oracledb`
+/// 26.0.0-beta.3 builds its `rustls` client configuration from
+/// `webpki_roots::TLS_SERVER_ROOTS` — the public web PKI and nothing else — and
+/// then, if a wallet location is set, reads `<directory>/ewallet.pem` and:
+///
+/// - **adds every certificate in it to the root store** when the file contains
+///   no private key. That is the enterprise case: put the internal CA (or the
+///   self-signed server certificate) in the file and the connection verifies
+///   against it *in addition to* the public roots;
+/// - treats the file as a **client** certificate instead when it does contain a
+///   private key, in which case none of its certificates are trusted as roots.
+///   So one file cannot do both jobs: a wallet exported for mutual TLS trusts
+///   no private issuer, and a wallet that trusts a private issuer presents no
+///   client certificate.
+///
+/// The file name is fixed — `ewallet.pem`, in the directory named here — and
+/// upstream reads nothing else: no `cwallet.sso`, no `ewallet.p12`, no
+/// `tnsnames.ora`-style `MY_WALLET_DIRECTORY`, and no `SSL_CERT_FILE`-style
+/// environment variable. An Oracle wallet produced by `orapki` therefore has to
+/// be converted before this driver can use it (`orapki wallet pkcs12_to_pem`, or
+/// simply the issuer's PEM, which is public).
+///
+/// # What is verified, and what cannot be turned off
+///
+/// The server certificate is checked by `rustls`'s default verifier: chain,
+/// validity, `serverAuth` extended key usage, and the **name** — matched against
+/// `subjectAltName` only. A common name of `localhost` is invisible to it, and
+/// so is Oracle's `SSL_SERVER_DN_MATCH` / `SSL_SERVER_CERT_DN`: upstream parses
+/// both out of a descriptor and sends them to the server in the connect data,
+/// but its TLS layer never reads them. The name that is verified is whatever the
+/// descriptor's `HOST` says, so `HOST=127.0.0.1` requires an IP address in the
+/// SAN and `HOST=db.example.internal` requires that DNS name.
+///
+/// There is no way to disable verification, and this driver would not offer one
+/// if there were.
+pub const EXT_WALLET_DIR: &str = "oracle.wallet_dir";
+
+/// Extension key: the password for an **encrypted private key** inside
+/// [`EXT_WALLET_DIR`]'s `ewallet.pem`.
+///
+/// It is only consulted for the client-certificate case — the private key is
+/// decrypted with it — so a wallet that merely carries a CA to trust needs no
+/// password. Must be an [`ExtensionValue::Secret`], not `Text`, so a debug
+/// rendering of the parameters cannot print it.
+pub const EXT_WALLET_PASSWORD: &str = "oracle.wallet_password";
 
 /// The cancel handle for a connection.
 ///
@@ -1159,8 +1293,8 @@ mod tests {
         assert!(capabilities.ref_cursor());
         assert!(capabilities.lob_streaming());
         assert!(
-            !capabilities.tls(),
-            "TCPS is unproven in Phase 0 (spike S8 not run)"
+            capabilities.tls(),
+            "TCPS is proven by spike S8 against the Phase 0 container's TLS listener"
         );
         assert!(
             !capabilities.exact_transaction_state(),
@@ -1203,17 +1337,103 @@ mod tests {
     }
 
     #[test]
-    fn requiring_tls_is_refused_rather_than_silently_downgraded() {
-        let error = refusal(
+    fn requiring_tls_turns_a_host_port_endpoint_into_a_tcps_address() {
+        let config = build_config(
             &params(Endpoint::HostPort {
-                host: "127.0.0.1".to_owned(),
-                port: 1521,
+                host: "localhost".to_owned(),
+                port: 2484,
                 service: "RELDEX".to_owned(),
             })
             .with_tls(TlsMode::Required),
+        )
+        .expect("valid parameters");
+        let descriptor = config.get_connect_descriptor().to_ascii_lowercase();
+        assert!(descriptor.contains("(protocol=tcps)"), "{descriptor}");
+        assert!(descriptor.contains("2484"), "{descriptor}");
+    }
+
+    #[test]
+    fn requiring_tls_over_a_plaintext_descriptor_is_refused_not_downgraded() {
+        // The dangerous direction: a profile that says TLS is mandatory, and a
+        // descriptor that quietly says TCP. Upstream negotiates from the
+        // address, so without this check the session would be plaintext and
+        // nothing would say so.
+        let error = refusal(
+            &params(Endpoint::ConnectString(
+                "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=1521))\
+                 (CONNECT_DATA=(SERVICE_NAME=RELDEX)))"
+                    .to_owned(),
+            ))
+            .with_tls(TlsMode::Required),
         );
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-        assert!(error.message().contains("S8"), "{error}");
+        assert_eq!(error.kind(), ErrorKind::Configuration);
+        assert!(error.message().contains("TCPS"), "{error}");
+
+        // The same descriptor with TCPS is accepted.
+        assert!(
+            build_config(
+                &params(Endpoint::ConnectString(
+                    "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=localhost)(PORT=2484))\
+                     (CONNECT_DATA=(SERVICE_NAME=RELDEX)))"
+                        .to_owned(),
+                ))
+                .with_tls(TlsMode::Required)
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_wallet_directory_is_accepted_and_its_password_must_be_a_secret() {
+        let mut extensions = Extensions::new();
+        extensions
+            .set(
+                EXT_WALLET_DIR,
+                ExtensionValue::Text("/etc/reldex".to_owned()),
+            )
+            .set(
+                EXT_WALLET_PASSWORD,
+                ExtensionValue::Secret(Secret::new("not-a-real-password")),
+            );
+        let parameters = params(Endpoint::ConnectString(
+            "tcps://localhost:2484/RELDEX".to_owned(),
+        ))
+        .with_tls(TlsMode::Required)
+        .with_extensions(extensions);
+        assert!(build_config(&parameters).is_ok());
+        assert!(!format!("{parameters:?}").contains("not-a-real-password"));
+
+        // A password passed as plain text is refused rather than accepted: the
+        // contract has a redacting type for exactly this, and taking `Text`
+        // would put the value in every `{:?}` of the parameters.
+        let mut wrong = Extensions::new();
+        wrong.set(
+            EXT_WALLET_PASSWORD,
+            ExtensionValue::Text("not-a-real-password".to_owned()),
+        );
+        let error = refusal(
+            &params(Endpoint::ConnectString("localhost:1521/RELDEX".to_owned()))
+                .with_extensions(wrong),
+        );
+        assert_eq!(error.kind(), ErrorKind::Configuration);
+
+        let mut wrong_dir = Extensions::new();
+        wrong_dir.set(EXT_WALLET_DIR, ExtensionValue::Flag(true));
+        let error = refusal(
+            &params(Endpoint::ConnectString("localhost:1521/RELDEX".to_owned()))
+                .with_extensions(wrong_dir),
+        );
+        assert_eq!(error.kind(), ErrorKind::Configuration);
+    }
+
+    #[test]
+    fn installing_the_crypto_provider_is_idempotent() {
+        // Called twice on purpose: the second call must not panic, because
+        // `connect` reaches it once per connection and two threads can arrive
+        // together.
+        install_default_crypto_provider();
+        install_default_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
     }
 
     #[test]

@@ -49,9 +49,17 @@ pub(crate) fn map(error: &oracledb::Error) -> DbError {
             ErrorKind::NetworkLost,
             "the connection could not be recovered and was closed",
         ),
-        OraErrorKind::StreamOperation => {
-            DbError::new(ErrorKind::NetworkLost, "the network stream failed")
-        }
+        // Upstream's own text for this kind is the fixed string "stream
+        // operation failed", but its `Display` appends the cause — and for a
+        // TCPS session the cause is the `rustls` failure: "invalid peer
+        // certificate: UnknownIssuer", "NotValidForName", "invalid peer
+        // certificate: Expired". An earlier version of this arm replaced the
+        // whole thing with a sentence of its own and threw that away, so every
+        // TLS failure read as "the network stream failed" and an untrusted CA
+        // could not be told from a host-name mismatch or from a dead socket.
+        // Spike S8 is what found it. The cause carries no credential — it is an
+        // I/O or certificate error — and `s8_tcps.rs` asserts as much.
+        OraErrorKind::StreamOperation => DbError::new(ErrorKind::NetworkLost, error.to_string()),
         OraErrorKind::NotConnected => DbError::connection_closed("connection"),
 
         // Listener / name resolution ----------------------------------------

@@ -31,6 +31,16 @@ reldex-db-driver-api = { path = "../../db-driver-api" }
 # the `ring` fallback that was evaluated.
 oracledb = "=26.0.0-beta.3"
 
+# Already in the graph: `oracledb` depends on it for TCPS and resolves to the
+# same 0.23 crate with the same (default) features, so this adds **no** new
+# crate and no new build cost. It is named here for one reason: the process-wide
+# `CryptoProvider` has to be installed exactly once and only when nothing has
+# installed one, and that guard cannot be written without the type.
+# `install_default_crypto_provider` in `lib.rs` is the whole of the use; see the
+# "Transport security" section there for why a driver crate touches a global at
+# all.
+rustls = "0.23"
+
 [dev-dependencies]
 # Connection settings are read from the environment in the opt-in integration
 # tests, so credentials never appear in test source (`AGENTS.md`, "Code

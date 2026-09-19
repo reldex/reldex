@@ -1,7 +1,7 @@
 # Phase 0 spike results — Oracle thin driver
 
-Workstream A, ADR-0001 spikes S1–S5 (plus S7 and S9). Everything below was run
-against the live Phase 0 test database on **2026-09-19**. Nothing here is
+Workstream A, ADR-0001 spikes S1–S5 (plus S7, S8 and S9). Everything below was
+run against the live Phase 0 test database on **2026-09-19**. Nothing here is
 projected, estimated or inferred from documentation: each row names the test
 that produced it, and every measurement says how it was taken.
 
@@ -56,7 +56,8 @@ Where something failed, it is written down as a failure.
 | Driver crate | `oracledb` **`=26.0.0-beta.3`** (exact pin) |
 | TLS stack | `rustls 0.23.45` with the default `aws-lc-rs 1.18.1` provider |
 | Database | Oracle Database 19c Enterprise Edition 19.0.0.0.0, Non-CDB, AL32UTF8 |
-| Container | `doctorkirk/oracle-19c:19.3` as `reldex-oracle19c`, listener `127.0.0.1:1521`, service name `RELDEX` |
+| Container | `doctorkirk/oracle-19c:19.3` as `reldex-oracle19c`, listener `127.0.0.1:1521` (TCP) and `127.0.0.1:2484` (TCPS, added for S8), service name `RELDEX` |
+| TCPS endpoint | TLS 1.2, `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`, server certificate signed by a throwaway private CA generated in the container (`tools/oracle-test-db/startup/10_enable_tcps.sh`) |
 | Test user | `RELDEX_TEST` (credentials only via environment; see §7) |
 | Date | 2026-09-19 |
 
@@ -85,15 +86,32 @@ crate alone are well under a second. The `ring` fallback was therefore
 considered but not needed, and is **not** configured — it would be an unused
 code path.
 
-TLS itself is **not** exercised: the Phase 0 container has no TCPS listener, so
-spike S8 has not run. The driver reports `tls = false` and refuses
-`TlsMode::Required` rather than silently opening a plaintext connection. One
-practical note for whoever runs S8: `rustls 0.23` needs a process-wide default
-crypto provider, and `aws-lc-rs` installs one only when it is the single
-provider compiled in. If a future dependency also pulls `ring`, connecting will
-fail at run time with "no process-level CryptoProvider available" until
-something calls `CryptoProvider::install_default`. The driver documents this and
-does **not** install one itself — that is the application's choice to make once.
+**Updated 2026-09-19 (S8).** TLS is now exercised: a TCPS listener was added to
+the container and §3's S8 section records what happened. Two things changed in
+the build picture as a result. `rustls` is now a **direct** dependency of
+`reldex-driver-oracle-thin` — the same 0.23 crate with the same default
+features that `oracledb` already pulled, so the dependency graph, the crate
+count and the licence set above are unchanged — and the driver now installs the
+process-wide crypto provider itself, guarded:
+
+```rust
+if rustls::crypto::CryptoProvider::get_default().is_none() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+```
+
+The earlier decision to leave this to the application was reversed deliberately.
+`aws-lc-rs` resolves as the default only while it is the single provider
+compiled in; the moment a second one is enabled — a `ring` fallback for a
+platform without a C toolchain, or a dependency that turns one on transitively —
+the first handshake panics with "no process-level CryptoProvider available".
+That is a run-time failure caused by a build-time change, in a code path that
+only runs when a customer turns TLS on, and it is the kind of thing that is
+found in the field rather than in CI. The guard keeps the host's choice intact
+(`install_default` is only reached when nothing has installed one, and its
+result is discarded so two threads racing is a no-op), and
+`install_default_crypto_provider` is public so an application that would rather
+decide explicitly still can.
 
 ### Dependencies and licences
 
@@ -148,15 +166,21 @@ Two consequences worth recording now rather than at release time:
 | S5 PL/SQL | **Pass** | Everything works, REF CURSOR included, after the additive contract change C-1 |
 | S7 LOB streaming | **Pass** | 100 MB CLOB and BLOB streamed with +4.7 MB working set |
 | S9 concurrency | **Pass** | 8 concurrent sessions, 400 inserts, 283 ms |
-| S6, S8 | **Not run** | Out of scope for this workstream (S6 metadata) / no TLS listener (S8) |
+| S8 TCPS | **Pass, with limits** | TLS 1.2 / `ECDHE-RSA-AES256-GCM-SHA384`, private CA trusted, certificate **and host name** verified, 39 ms handshake. The ADR-0001 kill criterion does not fire. No mutual TLS, no Oracle wallet, no DN matching — see S8 |
+| S6 | **Not run** | Out of scope for this workstream (metadata queries) |
 
 Test counts, as measured on **2026-09-19** after the review fixes:
 
 | | |
 |---|---|
-| DB-free, `cargo test -p reldex-driver-oracle-thin -p reldex-core-poc` | **65 unit tests** + **1 documentation test**, all pass (1 further doc test is `no_run`/ignored by design). `reldex-core-poc` is a binary with no tests of its own |
-| Opt-in, `--features oracle-it` | **54 integration tests** — **51 run and pass**, **3 are `#[ignore]`d** |
-| Per file | `s1_connect` 8, `s2_fidelity` 17 (14 + 3 ignored), `s3_session` 6, `s4_cancel` 7, `s5_plsql` 12, `s7_lob_and_s9_concurrency` 4 |
+| DB-free, `cargo test -p reldex-driver-oracle-thin -p reldex-core-poc` | **68 unit tests** + **1 documentation test**, all pass (1 further doc test is `no_run`/ignored by design). `reldex-core-poc` is a binary with no tests of its own |
+| Opt-in, `--features oracle-it` | **63 integration tests** — **60 run and pass**, **3 are `#[ignore]`d** |
+| Per file | `s1_connect` 8, `s2_fidelity` 17 (14 + 3 ignored), `s3_session` 6, `s4_cancel` 7, `s5_plsql` 12, `s7_lob_and_s9_concurrency` 4, `s8_tcps` 9 |
+
+(Re-measured on 2026-09-19 after S8. The unit-test count rose by three — one
+test of the old "TLS is refused" behaviour was replaced by four covering the new
+one. Every `s8_tcps` test skips itself, and says so, when the TLS listener is not
+configured, so the file is green on a checkout with a plain TCP container too.)
 
 The three ignored tests all **abort the process on purpose**, each recording a
 defect that a default in this driver now prevents, and each is the proof that
@@ -394,11 +418,176 @@ produced these behaviour changes. Each has a test; most need no database.
 | A LOB locator allocates its staging buffer on first read | A batch of unopened locators used to allocate one buffer each | `a_batch_of_unread_lob_locators_costs_almost_nothing` |
 | Dropping a connection marks it closed, so handles that outlive it report instead of touching a dead socket | `close()` did this; `drop` did not | `a_handle_outliving_a_dropped_connection_reports_too` |
 
-### S6, S8 — **Not run**
+### S6 — **Not run**
 
-S6 (metadata queries) belongs to a later slice and was not attempted. S8 (TLS)
-cannot be attempted: the Phase 0 container has no TCPS listener. The driver
-reports `tls = false` accordingly.
+S6 (metadata queries) belongs to a later slice and was not attempted.
+
+### S8 — TCPS — **Pass, with limits**
+
+ADR-0001's kill criterion for S8 is **"TCPS cannot be established without
+Instant Client."** It does not fire. A pure-Rust session was established against
+a TLS listener, with certificate and host-name verification **on**, trusting a
+**private** CA, and the server confirmed the transport:
+
+```text
+SELECT sys_context('USERENV','NETWORK_PROTOCOL') FROM dual  ->  tcps
+```
+
+The server side had to be built first; it is not in the image. The whole of it
+is `tools/oracle-test-db/startup/10_enable_tcps.sh`, mounted into the image's
+`/opt/oracle/scripts/startup` hook so it re-applies on every container start,
+writing `listener.ora` and `sqlnet.ora` through the symlinks that point into the
+persisted volume. Port 2484 is published to `127.0.0.1` only, like 1521.
+
+#### What was negotiated
+
+Measured with `openssl s_client` **inside** the container, before the driver was
+pointed at it, so the server side stands on its own evidence:
+
+| | |
+|---|---|
+| Protocol | **TLS 1.2** (19.3 has no TLS 1.3) |
+| Cipher suite | **`ECDHE-RSA-AES256-GCM-SHA384`** |
+| Chain | verified against the test CA, `Verify return code: 0 (ok)` |
+| Server key | RSA 2048, SHA-256 signature, CA RSA 3072 |
+| Certificate names | `subjectAltName = DNS:localhost, DNS:reldex-oracle19c`; `extendedKeyUsage = serverAuth` |
+| Client certificates | `SSL_CLIENT_AUTHENTICATION = FALSE` |
+
+The version and cipher pins are enforced: with `SSL_VERSION = 1.2` and
+`SSL_CIPHER_SUITES = (TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)` in `listener.ora`, `s_client -tls1_1` is
+refused and `AES256-SHA` — a suite in neither list — is refused. **In
+`sqlnet.ora` alone they do nothing**: with the pins there and not in
+`listener.ora`, TLS 1.1 completed a handshake with `ECDHE-RSA-AES256-SHA`. The
+script writes both files; only `listener.ora` is load-bearing for the listener,
+and the `sqlnet.ora` copy governs clients running inside the container.
+
+That intersection is the substance of the spike. 19.3 offers TLS 1.0–1.2;
+`rustls` speaks only 1.2 and 1.3, and for 1.2 only AEAD suites. The overlap is
+TLS 1.2 with the two ECDHE-RSA GCM suites above, and it is not empty — but a
+deployment that has hardened its listener down to TLS 1.0/1.1 or to CBC suites
+(still common on 19c estates) will not talk to this driver at all, and the
+failure will look like "stream operation failed" rather than like a negotiation
+problem.
+
+#### How a private CA is trusted — the finding that matters
+
+This was the open question, because every enterprise TCPS deployment uses a
+private CA, and the answer was not obvious from the documentation. Read from
+`oracledb` 26.0.0-beta.3's source (`src/transport.rs`):
+
+- `Transport::negotiate_tls` builds its `rustls::ClientConfig` from
+  `CustomClientCertResolver::new()`, whose root store is
+  **`webpki_roots::TLS_SERVER_ROOTS` and nothing else** — the public web PKI. No
+  system trust store, no `rustls-native-certs`, no `SSL_CERT_FILE`.
+- If `Config::set_wallet_location` was called, `populate()` reads exactly one
+  file: **`<wallet_location>/ewallet.pem`**. Then (`transport.rs:484-495`):
+  - if the file contains a private key, the certificates in it become a **client
+    certificate** for mutual TLS, and none of them is trusted as a root;
+  - if it contains **no** private key, every certificate in it is added to the
+    root store.
+
+So a private CA **can** be trusted, through the second branch: put the issuer's
+PEM — public material — in a directory as `ewallet.pem` and point
+`Config::set_wallet_location` at the directory. That is what the wrapper's
+`oracle.wallet_dir` extension does, and `s8_tcps.rs` proves both directions of
+it: with the test CA the session opens; with an unrelated CA, and with no wallet
+at all, it fails with `invalid peer certificate: UnknownIssuer`.
+
+**No upstream issue is needed for trust itself** — the mechanism exists and
+works. What is worth reporting upstream is that it is undocumented, that the
+file name is fixed and unrelated to any Oracle wallet format, and that one file
+cannot do both jobs (U-12, U-13, Issue E).
+
+#### Host-name verification
+
+`rustls`'s default verifier is used unchanged, so the name is matched against
+**`subjectAltName` only** — a common name of `localhost` is invisible to it —
+and the name verified is whatever the descriptor's `HOST` says. Connecting to
+the same socket by its numeric address, against a certificate whose SAN has no
+IP entry, fails:
+
+```text
+invalid peer certificate: certificate not valid for name "127.0.0.1";
+certificate is only valid for DnsName("localhost") or DnsName("reldex-oracle19c")
+```
+
+Oracle's own controls for this are **inert**. `SSL_SERVER_DN_MATCH` and
+`SSL_SERVER_CERT_DN` are parsed out of a descriptor by
+`config/connect_options.rs` and written into the `SECURITY` segment sent to the
+server — and the TLS layer never reads either of them (U-14). There is
+consequently no way to relax name checking and no way to match a DN instead of a
+SAN. For Reldex that is the right default and is left as it is; it does mean a
+customer whose server certificate carries only a CN, or who reaches the database
+by an address the certificate does not name, cannot connect at all.
+
+There is also no "insecure, no-verify" mode anywhere in the crate, so the
+separation the task allowed for — using one to tell "handshake works" apart from
+"trust works" — was neither possible nor needed: the `s_client` run had already
+proven the handshake independently.
+
+#### Measurements
+
+Method: `tcps_connect_latency_is_measured_against_tcp`, ten connect/close cycles
+per form, **interleaved** so a slow moment on the container lands on every
+series, median of ten. Run through `run-it.sh` on the machine in §1.
+
+| | Median |
+|---|---|
+| TCPS connect, `tcps://localhost:2484/RELDEX` | **2.2 s** |
+| TCP connect, **same host name**, `localhost:1521/RELDEX` | **2.1 s** |
+| TCP connect, numeric host, `127.0.0.1:1521/RELDEX` | **116.0 ms** |
+| **TLS handshake overhead** (TCPS − TCP, same host name) | **38.9 ms** |
+| Host-name resolution (same host name − numeric) | **2.0 s** |
+
+The 2 s is **not** TLS. Resolving `localhost` costs that on this Windows host
+whether the connection is encrypted or not — the same figure appears on a plain
+`localhost:1521/RELDEX` — and it is roughly twenty times a whole plaintext
+connect. The comparison is therefore made against the same host name; the
+honest TLS cost is **≈ 39 ms**, one extra handshake round trip on top of a
+116 ms connect. (The certificate has no IP SAN on purpose, which is what forces
+the TCPS DSN to use a name; see `tools/oracle-test-db/README.md`.)
+
+#### What the driver does now
+
+- `Capabilities::tls()` is **true**.
+- `TlsMode::Required` turns an `Endpoint::HostPort` into `tcps://host:port/service`,
+  and **refuses** an `Endpoint::ConnectString` that does not itself say
+  `(PROTOCOL=TCPS)`. Upstream negotiates TLS from the address, so a descriptor
+  saying TCP under a profile that requires TLS would have opened a plaintext
+  session silently; it is now `ErrorKind::Configuration`.
+- `oracle.wallet_dir` (text) and `oracle.wallet_password` (secret) are the two
+  new extension keys. The password must be an `ExtensionValue::Secret`; `Text`
+  is refused, so it cannot reach a log through an ordinary `{:?}`.
+- A TLS failure now carries the `rustls` reason. Upstream's `Display` appends
+  its cause, and this driver's error mapping used to replace the whole string
+  with "the network stream failed" — so every TLS failure read identically and
+  an untrusted CA could not be told from a name mismatch or a dead socket. The
+  upstream text is passed through instead; it contains no credential, and
+  `s8_tcps.rs` asserts that the password appears in neither the `Display` nor
+  the `Debug` of the failure.
+
+#### Limits — what S8 does **not** prove
+
+| | |
+|---|---|
+| **Mutual TLS (client certificates)** | Untested, and not combinable with a private CA: one `ewallet.pem` is read as a client certificate **or** as a set of roots, never both (U-13). The test listener runs `SSL_CLIENT_AUTHENTICATION = FALSE`. |
+| **Oracle wallets** | Not read at all. `cwallet.sso`, `ewallet.p12`, `MY_WALLET_DIRECTORY` in a descriptor: none of them reach the TLS layer. A customer with an existing wallet must export a PEM (U-12). |
+| **`SSL_SERVER_DN_MATCH` / `SSL_SERVER_CERT_DN`** | Parsed and sent to the server, never used by the client (U-14). |
+| **TLS 1.3, and anything but the two GCM suites** | 19.3 has no TLS 1.3. A listener hardened to TLS 1.0/1.1 or to CBC suites cannot talk to this driver. |
+| **Certificate revocation** | No CRL or OCSP anywhere in the crate. An expired certificate is caught; a revoked one is not. |
+| **Native Network Encryption** | Still absent upstream (ADR-0001, §5 table), and unrelated to TCPS. |
+| **Anything on a real network** | Loopback only. No latency, no MTU, no proxy (`HTTPS_PROXY` is parsed by upstream but untested here), no mobile. |
+
+The server-side work produced two findings worth keeping, both recorded in
+`tools/oracle-test-db/README.md`'s troubleshooting table because both cost real
+time: Oracle 19.3 will **not** serve a PKCS#12 produced by `openssl pkcs12
+-export`, however valid it is (`TNS-00540: SSL protocol adapter failure`, with
+no further detail) — the wallet must be built by `orapki`, with the key pair
+generated inside it and only the signed certificate imported; and OpenSSL 1.0.2
+ignores `-subj` when the config names a `distinguished_name` section under
+`prompt = no`, which quietly produced a CA and a server certificate with
+identical subject DNs.
 
 ---
 
@@ -918,6 +1107,67 @@ See §4 candidate 3 and the drafted issue in §6.
   pointer.
 - Typo in the public documentation: "Repreents a database type" (`db_type.rs:34`).
 
+### U-12 — **The only way to trust a private CA is an undocumented file name**
+
+Found in S8. `Transport::negotiate_tls` (`src/transport.rs:264-289`) trusts
+`webpki_roots::TLS_SERVER_ROOTS` and nothing else, and the sole extension point
+is `CustomClientCertResolver::populate` (`:428-498`), which opens exactly
+`<wallet_location>/ewallet.pem` and adds its certificates to the root store when
+the file holds no private key.
+
+It works — that is the important part, and it is what Reldex uses. What is wrong
+is everything around it:
+
+- `Config::set_wallet_location`'s documentation says "the location to use for
+  loading a wallet (ewallet.pem)" and nothing about trust, so the one mechanism
+  that makes TCPS usable against any real enterprise deployment is discoverable
+  only by reading `transport.rs`.
+- The file name is fixed and cannot be an Oracle wallet. `cwallet.sso` and
+  `ewallet.p12` — what `orapki` actually produces, and what every Oracle
+  administrator has — are not read. Neither is the operating system trust store,
+  nor `SSL_CERT_FILE`, nor `SSL_CERT_DIR`.
+- A descriptor's `MY_WALLET_DIRECTORY` **is** parsed
+  (`config/connect_options.rs:508`, into `ConnectOptions::wallet_location`) and
+  is then only echoed back into the `SECURITY` segment sent to the server: the
+  TLS layer reads `Config::wallet_location`, a different field. A connect string
+  that names a wallet directory therefore looks as though it configured
+  something and did not.
+
+No workaround is needed and none was invented; the request is documentation plus
+`ewallet.p12`/system-store support. Drafted as **Issue E**.
+
+### U-13 — **One `ewallet.pem` cannot both trust a private CA and present a client certificate**
+
+`populate` branches on whether the PEM contains a private key
+(`transport.rs:484-495`): with a key, the certificates become a `CertifiedKey`
+for mutual TLS and **none of them is added to the root store**; without one,
+they are all added as roots. There is one wallet location, so the two are
+mutually exclusive.
+
+That combination — internal CA on the server, client certificate on the
+connection — is ordinary in Oracle estates that use `SSL_CLIENT_AUTHENTICATION =
+TRUE`. As written, such a deployment can have mutual TLS or a trusted private
+issuer, not both, unless the internal CA happens to chain to a public root.
+Untested here (the Phase 0 listener runs with client authentication off); the
+branch is unambiguous in the source. Drafted as part of **Issue E**.
+
+### U-14 — **`SSL_SERVER_DN_MATCH` and `SSL_SERVER_CERT_DN` are parsed, sent, and never used**
+
+`config/connect_options.rs` parses both (`:502-507`), defaults
+`ssl_server_dn_match` to `true` (`:544`) and writes them into the descriptor's
+`SECURITY` segment (`:386-391`). Nothing in `transport.rs` reads either. Client
+name verification is `rustls`'s default verifier against `subjectAltName`, with
+the descriptor's `HOST` as the name, and cannot be influenced by these
+parameters at all.
+
+Two consequences: a connection that sets `SSL_SERVER_DN_MATCH=OFF` — the escape
+hatch every other Oracle client offers — still verifies the name and fails; and
+a server certificate that identifies itself only by DN, with no SAN, cannot be
+accepted by any configuration. Reldex wants the strict behaviour, so this is
+reported rather than worked around, but silently ignoring a security parameter
+is worse than rejecting it: a caller that believes it turned verification off
+should be told it did not. Drafted as part of **Issue E**.
+
 ---
 
 ## 6. Drafted upstream issues — **for the owner to submit; nothing has been posted**
@@ -1113,6 +1363,79 @@ See §4 candidate 3 and the drafted issue in §6.
 > Environment: `oracledb` 26.0.0-beta.3, Rust 1.98.1 MSVC, Windows 11, Oracle
 > Database 19.3 EE.
 
+### Issue E — the TLS trust story (U-12, U-13, U-14)
+
+Lowest priority of the five: nothing here is broken in the sense that data is
+wrong or a process dies, and the mechanism Reldex needs does exist. It is a
+documentation and completeness report, and the third part is a genuine security
+smell.
+
+**Title:** `TCPS: trusting a private CA is undocumented and PEM-only; SSL_SERVER_DN_MATCH is parsed but never applied`
+
+**Body:**
+
+> Using 26.0.0-beta.3 against Oracle Database 19.3 EE with a TCPS listener whose
+> certificate is signed by a private CA — the normal enterprise case — three
+> things stood out, all read from the source and confirmed by experiment.
+>
+> **1. The only way to trust a private issuer is undocumented, and it is not an
+> Oracle wallet.**
+>
+> `Transport::negotiate_tls` builds its root store from
+> `webpki_roots::TLS_SERVER_ROOTS` alone. The single extension point is
+> `CustomClientCertResolver::populate`, which reads
+> `<wallet_location>/ewallet.pem` and — when that file contains no private key —
+> adds its certificates to the root store. That works, and it is what we now do:
+>
+> ```rust
+> let config = Config::default()
+>     .set_connect_string("tcps://db.internal:2484/SVC")?
+>     .set_wallet_location("/etc/reldex/ca")   // holds ewallet.pem = the CA's PEM
+>     .set_credentials(user, password);
+> ```
+>
+> But `set_wallet_location`'s documentation says only "the location to use for
+> loading a wallet (ewallet.pem)", with nothing about trust, so this is
+> discoverable only by reading `transport.rs`. And the file cannot be an Oracle
+> wallet: `cwallet.sso` and `ewallet.p12` — what `orapki` produces and what every
+> Oracle administrator already has — are not read, nor is the OS trust store, nor
+> `SSL_CERT_FILE`. A descriptor's `MY_WALLET_DIRECTORY` is parsed into
+> `ConnectOptions::wallet_location` and only echoed back to the server; the TLS
+> layer reads `Config::wallet_location`, a different field, so a connect string
+> that names a wallet directory appears to configure something and does not.
+>
+> Could the documentation state the trust behaviour and the exact file name, and
+> could `ewallet.p12` (and ideally the platform trust store) be accepted?
+>
+> **2. A client certificate and a private CA cannot be used together.**
+>
+> `populate` branches on whether the PEM holds a private key: with one, the
+> certificates become a client `CertifiedKey` and none is added to the root
+> store; without one, they all are. With a single wallet location, a deployment
+> using `SSL_CLIENT_AUTHENTICATION = TRUE` behind an internal CA can have mutual
+> TLS or a trusted issuer, not both. A separate trust source — or simply adding
+> the certificates to the root store in both branches — would resolve it.
+>
+> **3. `SSL_SERVER_DN_MATCH` and `SSL_SERVER_CERT_DN` are parsed and never
+> applied.**
+>
+> Both are read from the descriptor in `config/connect_options.rs`,
+> `ssl_server_dn_match` defaults to `true`, and both are written into the
+> `SECURITY` segment sent to the server — but nothing in `transport.rs` reads
+> either. Name verification is rustls's default verifier against
+> `subjectAltName`, using the descriptor's `HOST`.
+>
+> We *want* the strict behaviour and are not asking for it to be relaxed. The
+> problem is that a caller who sets `SSL_SERVER_DN_MATCH=OFF` is silently
+> ignored: the parameter is accepted, has no effect, and the connection fails a
+> name check the caller believes it disabled. Rejecting an unsupported security
+> parameter would be much better than accepting it. (A server certificate
+> identified only by DN, with no SAN, is likewise unusable at any setting.)
+>
+> Environment: `oracledb` 26.0.0-beta.3, `rustls` 0.23.45 / `aws-lc-rs`, Rust
+> 1.98.1 MSVC, Windows 11, Oracle Database 19.3 EE, listener TLS 1.2 /
+> `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`.
+
 ---
 
 ## 7. Contract problems found in `reldex-db-driver-api`
@@ -1268,6 +1591,32 @@ credential appears in neither the `Display` nor the `Debug` rendering of the
 resulting error, and `the_password_never_reaches_a_message_or_a_debug_rendering`
 asserts the same for connection parameters.
 
+**Key material added by S8** (2026-09-19). The TCPS work generated a test CA, a
+server key and a wallet password. None of it is tracked, and none of it is
+printed:
+
+- everything private lives **inside the container's persisted volume** at
+  `/opt/oracle/oradata/dbconfig/RELDEX/wallet`, at mode 600 — the CA key, the
+  server key, and a wallet password generated randomly at setup time into
+  `.wallet-password`. The script never echoes any of them; the wallet is
+  auto-login, so the listener needs no password at start-up;
+- what reaches the host is **public**: the CA certificate, copied to
+  `tools/oracle-test-db/wallet/ewallet.pem` (and an unrelated CA to
+  `wallet-untrusted/ewallet.pem` for the negative test). `git check-ignore -v`
+  confirms both are ignored, by `.gitignore:68 wallet/` and `.gitignore:64
+  *.pem` respectively;
+- the new `oracle.wallet_password` extension key takes an
+  `ExtensionValue::Secret` and **refuses** `Text`, so a wallet password cannot
+  reach a log through an ordinary `{:?}` of the parameters;
+- `a_certificate_from_an_untrusted_issuer_is_refused_without_leaking_the_credential`
+  asserts that the database password appears in neither the `Display` nor the
+  `Debug` of a TLS failure — which matters more than it looks, because that
+  failure path now passes upstream's own error text through (see S8).
+
+Nothing in the wallet is a secret worth protecting — it belongs to a listener
+bound to `127.0.0.1` on one developer machine — but it is generated randomly and
+kept out of git regardless, because the alternative teaches the wrong habit.
+
 ---
 
 ## 9. Go / no-go per kill criterion
@@ -1283,6 +1632,7 @@ asserts the same for connection parameters.
 | **S5** PL/SQL / OUT binds unusable | **GO** | PL/SQL, OUT, IN OUT, DBMS_OUTPUT, compile-error reporting and error positions all work, and REF CURSOR is fetched to exhaustion with the parent connection usable throughout, after contract change C-1 (ADR-0002 P1) |
 | **S7** LOBs cannot be streamed in bounded memory | **GO** | 200 MB streamed for 4.7 MB of working set |
 | **S9** Concurrency | **GO** | 8 sessions, 400 inserts, 283 ms |
+| **S8** TCPS cannot be established without Instant Client | **GO** | The criterion does not fire: a pure-Rust TCPS session, TLS 1.2 / `ECDHE-RSA-AES256-GCM-SHA384`, certificate **and** host name verified against a private CA, `USERENV.NETWORK_PROTOCOL = tcps`, 39 ms of handshake on top of a 116 ms connect. Qualified by what is **not** covered: no mutual TLS, no Oracle wallet file, no DN matching, no revocation checking, and a 19c listener hardened below TLS 1.2 or to CBC suites cannot connect at all (U-12 to U-14) |
 
 ### What the owner has to decide
 
@@ -1308,3 +1658,20 @@ asserts the same for connection parameters.
 5. **`SPEC.md` §24.14 should scope "highlight the offending token" to PL/SQL**
    until U-8 is fixed upstream (C-2). Not changed here: `SPEC.md` is not owned
    by this task.
+6. **How far TCPS may be advertised to customers.** S8 passed, and the driver
+   now reports `tls = true` — but the honest scope is "one-way TLS 1.2 against a
+   listener that offers an AEAD suite, trusting a PEM the user supplies". Three
+   things a customer may reasonably expect are absent, and none of them is in
+   this driver's gift to add: **mutual TLS combined with a private CA** (U-13),
+   **reading an existing Oracle wallet** rather than an exported PEM (U-12), and
+   **certificate revocation**. The recommendation is to describe the supported
+   configuration precisely in `SPEC.md` §8 rather than to say "TCPS supported",
+   and to treat U-12's `ewallet.p12` support as the upstream request that most
+   affects real deployments. `SPEC.md` is not owned by this task.
+7. **Whether `SSL_SERVER_DN_MATCH` being silently ignored (U-14) needs a
+   Reldex-side guard.** A connection profile imported from another tool may
+   carry it; upstream accepts and ignores it, so the session verifies the name
+   anyway and fails where the user expected it to succeed. This driver could
+   refuse a descriptor containing it, with a message saying why. Not done:
+   `Endpoint::ConnectString` is deliberately opaque, and one more special case
+   in it needs the owner's call.
