@@ -1,0 +1,32 @@
+[package]
+name = "reldex-mobile-link-check"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+# Deliberately short (not `reldex_mobile_link_check`): this name is the
+# artifact stem CI records (`libmobile_link_check.so` / `.a`), matching
+# `docs/exec-plans/active/phase-0-s6-mobile-cross-compile.md`.
+name = "mobile_link_check"
+crate-type = ["staticlib", "cdylib"]
+
+[lints]
+workspace = true
+
+# The workspace denies `unsafe_code` (root `Cargo.toml`) because the *product*
+# FFI boundary design is an open question (`docs/architecture/ARCHITECTURE.md`
+# §13 item 2). This crate is not that boundary: it is a throwaway build/link
+# probe for spike S6 (`docs/decisions/0001-database-driver-strategy.md`,
+# "Platform viability" + the S6 spike-plan row), whose only reason to exist is
+# one `extern "C"` entry point a native (non-Rust) caller could invoke, which
+# in edition 2024 requires the `#[unsafe(no_mangle)]` attribute form. `cargo`
+# rejects mixing `[lints] workspace = true` with an overriding `[lints.rust]`
+# table in the same manifest ("cannot override `workspace.lints`"), so the
+# opt-out is a crate-level `#![allow(unsafe_code)]` in `src/lib.rs` instead —
+# see the comment there for the full reasoning.
+
+[dependencies]
+reldex-db-core = { path = "../db-core" }
+reldex-driver-oracle-thin = { path = "../drivers/oracle-thin" }
