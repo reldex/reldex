@@ -309,6 +309,11 @@ criterion's honest status is softened to make the table look more finished than 
   it on a helper thread, but it changes `connect()`'s threading for every caller and needs the owner.
 - Owner approval to submit drafted upstream **issues F and G** (results file §6) — U-15…U-17
   (timeouts/dead-link detection) and U-18 (`CREATE TRIGGER`).
+- **Watching for the fixes.** Each upstream defect that can be observed from a test now has a
+  canary asserting it is *still there*
+  (`crates/drivers/oracle-thin/tests/canary_upstream_{offline,live}.rs`), so a fix arrives as a
+  failing test that names the guard it makes removable; a version tripwire fails as soon as the pin
+  moves. See `oracledb-upgrade-checklist.md` for the per-U-number map and the manual checks.
 - **Owner decisions outstanding** (results file §9, full list): item 4 (relax the NUMBER-bind refusal
   U-1 — recommendation: no), items 6–7 (how far TCPS is advertised to customers; whether to guard
   against `SSL_SERVER_DN_MATCH` being silently ignored, U-14), item 8 (C-5 above), item 9 (whether

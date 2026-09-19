@@ -390,6 +390,14 @@ and NCHAR data (`SPEC.md` §14).
 `db-driver-api`; an upstream enhancement request for a cancel/break API; a watch on issues #6, #8
 and #18; a documented `oracle`-crate fallback path for desktop.
 
+**Tracking upstream releases.** Every upstream defect this ADR depends on has a canary in
+`crates/drivers/oracle-thin/tests/canary_upstream_{offline,live}.rs` that asserts the defect is
+still present, so a fix upstream shows up as a *failing* test naming the guard it makes removable.
+A version tripwire in the offline target fails as soon as the pin moves. The procedure — which
+canary covers which U-number, which guard depends on it, and what is only a manual check — is
+`docs/exec-plans/active/oracledb-upgrade-checklist.md`, and it must be followed before the pin is
+bumped.
+
 ## Alternatives considered
 
 - **Write our own thin driver in Rust.** Oracle's own thin implementations are readable references

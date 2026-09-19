@@ -114,7 +114,24 @@ PowerShell runner clears the password variables again in its `finally` block.
 | `RELDEX_TEST_ORACLE_DSN` / `_USER` / `_PASSWORD` | `RELDEX_TEST_PWD` | every spike |
 | `RELDEX_TEST_ORACLE_SYSTEM_USER` / `_SYSTEM_PASSWORD` | `ORACLE_PWD`, as `SYSTEM` | S4's privileged-cancel candidate only |
 | `RELDEX_TEST_ORACLE_SYSDBA_USER` / `_SYSDBA_PASSWORD` | `ORACLE_PWD`, as `SYS` | S13 (`AS SYSDBA` over the listener) only |
-| `RELDEX_TEST_ORACLE_TCPS_DSN` / `_TCPS_CA_DIR` / `_TCPS_WRONG_CA_DIR` | the exported CA PEMs, when present | S8 |
+| `RELDEX_TEST_ORACLE_TCPS_DSN` / `_TCPS_CA_DIR` / `_TCPS_WRONG_CA_DIR` | the exported CA PEMs, when present | S8, the U-14 canary |
+
+### Upstream canaries
+
+Besides the spikes, the driver crate carries a canary suite that asserts each
+upstream `oracledb` defect is **still present**, so a fix upstream arrives as a
+failing test naming the guard it makes removable. Run it whenever the pinned
+`oracledb` version moves:
+
+```powershell
+# no database needed; also runs in `cargo test --workspace`
+cargo test -p reldex-driver-oracle-thin --test canary_upstream_offline
+
+# the live half, single-threaded (it spawns child processes that abort on purpose)
+tools\oracle-test-db\run-it.ps1 canary_upstream_live -- --test-threads=1
+```
+
+The procedure is `docs/exec-plans/active/oracledb-upgrade-checklist.md`.
 
 Every test that needs one of the optional pairs **skips itself and says so**
 when the variables are absent, so an ordinary run never requires a DBA
