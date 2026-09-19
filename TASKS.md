@@ -57,8 +57,8 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 
 ### Platform validation
 - [x] Windows x64 (build, connect, and the full spike matrix all run locally, 2026-09-19)
-- [ ] Linux x64 (CI configured for build + unit tests only, no DB; not yet run for this branch — pending PR/CI)
-- [ ] macOS ARM64 (CI configured for build + unit tests only, no DB; not yet run for this branch — pending PR/CI)
+- [~] Linux x64 (build + fmt + clippy -D warnings + `cargo test --workspace` green on CI `ubuntu-latest`, PR #1, 2026-09-20 — https://github.com/reldex/reldex/actions/runs/35419377082; no database connect yet)
+- [~] macOS ARM64 (build + fmt + clippy -D warnings + `cargo test --workspace` green on CI `macos-latest` (Apple Silicon), PR #1, 2026-09-20 — https://github.com/reldex/reldex/actions/runs/35419377082; no database connect yet)
 - [ ] Android ARM64 physical device (spike S6 not run — needs the Android NDK; owner approval to download)
 - [ ] iOS/iPadOS ARM64 physical device (not started)
 

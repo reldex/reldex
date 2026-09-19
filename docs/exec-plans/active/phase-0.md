@@ -159,15 +159,12 @@ Known unsupported configurations of the primary driver (ADR-0001): Native Networ
 - [x] Full POC matrix. (spikes S1–S5, S7, S9 all run locally, 2026-09-19)
 
 ### Linux x64
-- [ ] Build. CI (`.github/workflows/ci.yml`) is configured to build + `cargo test --workspace` on
-  `ubuntu-latest`, but it triggers on push to `main` and on pull requests — this branch has not yet
-  gone through a PR, so no CI run exists for this code yet.
+- [x] Build. Green on CI `ubuntu-latest` for PR #1 on 2026-09-20 (fmt, `clippy -D warnings`, `cargo test --workspace`, incl. `aws-lc-sys`): https://github.com/reldex/reldex/actions/runs/35419377082
 - [ ] Connect. Not attempted; CI has no database access by design (unit tests only, no real DB).
 - [ ] Core smoke matrix. Not attempted.
 
 ### macOS ARM64
-- [ ] Build. Same CI configuration and same caveat as Linux x64 above (`macos-latest`, Apple Silicon)
-  — not yet run for this branch.
+- [x] Build. Green on CI `macos-latest` (Apple Silicon) for PR #1 on 2026-09-20 (same steps): https://github.com/reldex/reldex/actions/runs/35419377082
 - [ ] Connect. Not attempted; no database access in CI.
 - [ ] Core smoke matrix. Not attempted.
 

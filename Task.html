@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-20T14:30:00+07:00",
+  "updatedAt": "2026-09-20T15:30:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P0",
@@ -559,7 +559,6 @@
     }
   ],
   "nextSteps": [
-    "Open a PR for this branch and get CI green on Windows, Linux and macOS",
     "Merge after review",
     "Owner: decide the cancellation path (ADR-0001 re-opened)",
     "Owner: submit the four drafted upstream issues (phase-0-spike-results.md §6)",
@@ -848,13 +847,13 @@
             },
             {
               "title": "Linux x64",
-              "status": "todo",
-              "note": "CI configured for build + unit tests only, no DB; not yet run for this branch — pending PR/CI."
+              "status": "in_progress",
+              "note": "Build + fmt + clippy + tests green on CI ubuntu-latest (PR #1, 2026-09-20). No database connect yet."
             },
             {
               "title": "macOS ARM64",
-              "status": "todo",
-              "note": "CI configured for build + unit tests only, no DB; not yet run for this branch — pending PR/CI."
+              "status": "in_progress",
+              "note": "Build + fmt + clippy + tests green on CI macos-latest, Apple Silicon (PR #1, 2026-09-20). No database connect yet."
             },
             {
               "title": "Android ARM64 physical device",
@@ -1227,6 +1226,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-20",
+      "text": "PR #1 opened; CI green on Windows, Linux and macOS (Apple Silicon) — first build evidence for Linux x64 and macOS ARM64. Merged to main."
+    },
     {
       "date": "2026-09-20",
       "text": "Docs synced to the Phase 0 spike evidence: ADR-0001 status set to 'Accepted — S4 kill criterion FIRED; owner decision pending' with a Spike outcome section; ADR-0002 gets a JSON/XMLTYPE/VECTOR/OBJECT/BFILE describe-time-refusal carve-out; ARCHITECTURE.md, phase-0.md, TASKS.md, README.md and this dashboard updated to match; spec-change-proposals.md added for the owner."
