@@ -1,6 +1,14 @@
 # Spike S6 — mobile cross-compile (Android / iOS)
 
 **Status:** Complete. Kill criterion did **not** fire.
+**Superseded in part (Android):** the "Next step toward physical-device
+validation" below was carried out on 2026-09-20 —
+[`phase-0-android-device.md`](phase-0-android-device.md) records a physical
+arm64 Android phone running the core and driver against the live database
+(7/7). Everything this document says about what a cross-compile does *not*
+prove still stands for **iOS**, and for the Android *packaged-app* path; the
+per-item notes in "What this does NOT prove" below say which lines the Android
+run has since answered.
 **ADR:** [`docs/decisions/0001-database-driver-strategy.md`](../../decisions/0001-database-driver-strategy.md),
 "Platform viability" and the S6 row of the spike plan.
 **Workflow:** [`.github/workflows/mobile-cross-compile.yml`](../../../.github/workflows/mobile-cross-compile.yml)
@@ -174,14 +182,26 @@ evidence for that claim, not just upstream's.
 
 This is a cross-compile-and-link check only. It says nothing about:
 
+*(Android-only note, added 2026-09-20: the four items marked **[Android: now
+answered]** were answered for Android by
+[`phase-0-android-device.md`](phase-0-android-device.md). They remain
+unanswered for iOS, and none of them is answered for a packaged Android app.)*
+
 - Connecting to a real Oracle database from an Android or iOS device or
   simulator/emulator, over any transport (plaintext or TCPS/TLS).
+  **[Android: now answered]**
 - SQL or PL/SQL execution, transactions, SAVEPOINT/ROLLBACK, or query
-  cancellation on-device.
+  cancellation on-device. **[Android: partly answered]** — SQL, transactions
+  and the pre-armed deadline ran on the device; PL/SQL, SAVEPOINT and
+  on-demand cancel did not.
 - LOB streaming, NUMBER/DATE/TIMESTAMP fidelity, or any of the S1–S5/S7–S9
-  behavioral spikes, on-device.
+  behavioral spikes, on-device. **[Android: partly answered]** — NUMBER,
+  DATE, TIMESTAMP and Thai/non-BMP text fidelity ran on the device; LOB
+  streaming did not.
 - TLS handshake success on-device (the crypto provider was only *installed*,
   never used to negotiate a real connection, by `reldex_link_check`).
+  **[Android: now answered]** — a real handshake, with certificate and
+  host-name verification on, confirmed by the server.
 - Background/resume behavior, or lost-session/reconnect semantics, under a real
   mobile OS's process lifecycle (a mobile OS can suspend or kill the app
   mid-connection in ways a desktop process never experiences).
@@ -195,20 +215,31 @@ This is a cross-compile-and-link check only. It says nothing about:
   this run: the Android binaries are cross-compiled ELF objects a Linux
   x86_64 runner cannot execute, and the iOS binaries are unsigned Mach-O
   objects a Mac cannot run outside a simulator without a provisioning step
-  this spike did not attempt.
+  this spike did not attempt. **[Android: now answered]** — a sibling binary
+  in the same package, `reldex-device-check`, was pushed to a physical phone
+  and ran; `reldex-core-poc` itself ran there too.
 - Emulator/simulator behavior counting as validation: `AGENTS.md` and the
   `reldex-development` skill are explicit that "mobile support is claimed from
   emulator/simulator-only results" is an incomplete change. Nothing here,
   including the `aarch64-apple-ios-sim` build, changes that; the simulator
   target was built only because doing so was cheap alongside the device build.
 
-Phase 0 success criterion 7 (`docs/exec-plans/active/phase-0.md`) remains
+Phase 0 success criterion 7 (`docs/exec-plans/active/phase-0.md`) remained
 **documented feasibility evidence, not physical-device evidence** after this
-spike.
+spike. That changed for **Android only** on 2026-09-20; see
+[`phase-0-android-device.md`](phase-0-android-device.md).
 
 ## Next step toward physical-device validation
 
-**Android first** — cheaper and faster to get real hardware evidence:
+**Android — done 2026-09-20.** Option (a) below was taken: an `adb push`-able
+variant of the Phase 0 harness, run over `adb shell`, reaching the
+loopback-bound test database through `adb reverse`. The owner provided an OPPO
+CPH2399 (Android 16, arm64-v8a) with USB debugging. Results, timings and an
+honest scope statement are in
+[`phase-0-android-device.md`](phase-0-android-device.md); the repeatable runner
+is `tools/android-device/run-on-device.sh`. Option (b) — a real app loading the
+core through JNI — is **not** done and is what the packaged-app path still
+needs. The original plan, kept for the record:
 
 1. Build a minimal native harness: either (a) an `adb push`-able variant of
    `reldex-core-poc` invoked over `adb shell` against a database reachable from

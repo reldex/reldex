@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-19T23:20:00+07:00",
+  "updatedAt": "2026-09-20T07:30:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P0",
@@ -520,12 +520,6 @@
     {
       "title": "Owner action: approve submission of drafted upstream issues F and G (results file §6)",
       "detail": "Issues A–E were submitted 2026-09-20 by the owner's account (SupawitNu): B -> #21, C -> #22, D -> #23, A -> #24, E -> #25. F (U-15…U-17: connect cannot be bounded, timeout cause discarded, no keepalive/EXPIRE_TIME) and G (U-18: CREATE TRIGGER … :NEW impossible) are fully drafted in docs/exec-plans/active/phase-0-spike-results.md §6 but await the owner's go-ahead to submit.",
-      "severity": "blocked",
-      "since": "2026-09-19"
-    },
-    {
-      "title": "Owner action: provide an Android test device for physical-device validation (Phase 0 criterion 7)",
-      "detail": "Spike S6 proved Android/iOS/iOS-simulator cross-compile and link in CI (PR #3) with no local NDK/Xcode needed — that is cross-compile evidence only, not mobile support. Phase 0 success criterion 7 needs physical-device evidence: Android needs a physical arm64 device (API 26+) with USB debugging and network access to a reachable Oracle instance, plus a local Android NDK to build the harness. iOS additionally needs a Mac + Apple Developer account + a physical iPhone/iPad.",
       "severity": "blocked",
       "since": "2026-09-19"
     }
@@ -922,8 +916,8 @@
             },
             {
               "title": "Android ARM64 physical device",
-              "status": "todo",
-              "note": "Cross-compile + link proven in CI — spike S6, PR #3. Physical-device evidence still needed; needs a test device from the owner."
+              "status": "in_progress",
+              "note": "Native-binary evidence on a physical phone, 2026-09-20 (OPPO CPH2399, Android 16, arm64-v8a): connect/ping, exact typed data incl. Thai + emoji, transaction, 100k-row fetch (+0.6 MB RSS), TCPS with verification on, deadline path — 7/7 pass (docs/exec-plans/active/phase-0-android-device.md). Still open: the packaged-app path (APK, app sandbox, real Wi-Fi/cellular) — SPEC §25 stays unmet until then."
             },
             {
               "title": "iOS/iPadOS ARM64 physical device",
@@ -1015,8 +1009,8 @@
             },
             {
               "title": "Android physical-device harness",
-              "status": "todo",
-              "note": "Needs a test device from the owner + local NDK."
+              "status": "done",
+              "note": "tools/android-device/run-on-device.sh (bash-first; .ps1 twin): cross-builds with the local NDK (no cargo-ndk/cmake needed on Windows), pushes, adb reverse, runs 7 checks, redacted transcript."
             }
           ]
         }
@@ -1363,6 +1357,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-20",
+      "text": "Android physical-device run: the same Rust core + driver + TLS stack executed on an OPPO CPH2399 (Android 16, arm64) against Oracle 19c through adb reverse — 7/7 checks pass incl. TCPS with verification on. It is a native CLI binary over adb shell, not an APK: the packaged-app path and iOS device evidence remain open."
+    },
     {
       "date": "2026-09-19",
       "text": "Upstream canary suite added: each observable oracledb defect has a test asserting it is still present, so an upstream fix shows up as a failing test naming the guard that can be removed; a tripwire fails when the pinned version moves. While writing it, the U-12 catalogue entry was corrected (MY_WALLET_DIRECTORY is not parsed at all upstream)."

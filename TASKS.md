@@ -59,7 +59,7 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [x] Windows x64 (build, connect, and the full spike matrix all run locally, 2026-09-19)
 - [~] Linux x64 (build + fmt + clippy -D warnings + `cargo test --workspace` green on CI `ubuntu-latest`, PR #1, 2026-09-20 — https://github.com/reldex/reldex/actions/runs/35419377082; no database connect yet)
 - [~] macOS ARM64 (build + fmt + clippy -D warnings + `cargo test --workspace` green on CI `macos-latest` (Apple Silicon), PR #1, 2026-09-20 — https://github.com/reldex/reldex/actions/runs/35419377082; no database connect yet)
-- [ ] Android ARM64 physical device (cross-compile + link proven in CI — spike S6, PR #3; physical-device evidence still needed, needs a test device from the owner)
+- [~] Android ARM64 physical device — native-binary evidence on a physical phone, 2026-09-20 (OPPO CPH2399, Android 16, arm64-v8a): connect/ping, exact typed data incl. Thai + emoji, transaction, 100k-row fetch (+0.6 MB RSS), TCPS with verification on, deadline path — 7/7 pass (`docs/exec-plans/active/phase-0-android-device.md`). Still open: the packaged-app path (APK, app sandbox, real Wi-Fi/cellular network) — SPEC §25 stays unmet until then
 - [ ] iOS/iPadOS ARM64 physical device (cross-compile + link proven in CI — spike S6, PR #3; physical-device evidence still needed, needs a Mac + Apple Developer account + device)
 
 - [x] Owner: decide cancellation path (ADR-0001 re-opened) [decision 2026-09-20: stay on `oracledb`; ship the pre-armed per-statement deadline with an honest UI; pursue upstream fixes via the four drafted issues — see ADR-0001 "Owner decision (2026-09-20)"]
@@ -78,7 +78,7 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [ ] Contract: connect-time warning channel (C-6) — additive `take_connect_warnings`-style method on `DatabaseConnection`, collected once by `db-core` after connect; approved in principle 2026-09-19, detailed write-up in `phase-0-spike-results.md` §7 C-6; sequenced after pull request #5 (TCPS descriptor guard); record as an ADR-0002 amendment when implemented
 - [ ] Docs: recommend `SQLNET.EXPIRE_TIME` (e.g. 10 minutes) in user-facing connection troubleshooting docs (owner decision 2026-09-19, `phase-0-spike-results.md` §9 item 10)
 - [ ] Docs: note in `tools/oracle-test-db/README.md` that `SQLNET.EXPIRE_TIME` is left unset on the Phase 0 test database on purpose, so S10's measurements remain valid (follow-up; not edited in this change)
-- [ ] Android physical-device harness (needs a test device from the owner + local NDK)
+- [x] Android physical-device harness — `tools/android-device/run-on-device.sh` (bash-first; `.ps1` twin): cross-builds with the local NDK (no cargo-ndk/cmake needed on Windows), pushes, `adb reverse`, runs 7 checks, redacted transcript
 
 ## P1 — Desktop MVP
 
