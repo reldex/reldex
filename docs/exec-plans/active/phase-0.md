@@ -1,6 +1,10 @@
 # Execution Plan — Phase 0 Architecture Validation
 
-**Status:** Active  
+**Status:** Active — the owner gave the **GO for Phase 1 on 2026-09-19** (see "Phase 0 exit assessment"
+below); this plan stays under `active/`, not `completed/`, while Phase-0 tail work continues on
+`phase-0/driver-carryover` (C-5, U-18, C-6) and `phase-0/android-device` (Android physical-device
+validation), and iOS physical-device evidence is still outstanding. The Phase 1 execution plan is
+[`docs/exec-plans/active/phase-1.md`](phase-1.md).
 **Goal:** Prove the core database architecture before significant Reldex UI development.
 **Spike evidence:** [`docs/exec-plans/active/phase-0-spike-results.md`](phase-0-spike-results.md) —
 S1–S5, S7 and S9 ran against the live Phase 0 test database on 2026-09-19; the evidence-gap spikes
@@ -35,7 +39,7 @@ Phase 0 is complete when:
 | 4 | **Not met — accepted limitation (owner decision 2026-09-20).** Spike S4 fails for the requirement: only a pre-armed per-round-trip deadline exists, and it destroys the session whenever the server cannot answer promptly. `SPEC.md` §10/§24.8 is not satisfied by `oracledb` 26.0.0-beta.3. The owner reviewed ADR-0001's re-opening and decided to stay on `oracledb`, ship the pre-armed deadline with an honest UI, and pursue upstream fixes rather than change drivers — see ADR-0001 "Owner decision (2026-09-20)". This criterion remains **not met** for the Phase 0 go/no-go decision below; the decision was to accept the gap, not to close it. |
 | 5 | **Done, with documented limits.** Spikes S2 (conditional go — NUMBER-bind and TIMESTAMP WITH TIME ZONE restrictions contained by refusal, not silent corruption), S5 (pass), S7 (pass) and S11 (NCLOB — pass) all ran against the live database. |
 | 6 | **Partial.** Windows x64 fully validated locally (build, connect, full spike matrix). Linux x64 and macOS ARM64 build in CI (fmt/clippy/test) but this branch has not yet gone through a PR/CI run, and neither has database access in CI. |
-| 7 | **Cross-compile proven; physical-device evidence still outstanding.** Spike S6 passed 2026-09-19 (PR #3): `aarch64-linux-android`, `aarch64-apple-ios` and `aarch64-apple-ios-sim` all compile and link in CI with no local NDK/Xcode needed (`phase-0-s6-mobile-cross-compile.md`). No physical-device testing has been attempted for either platform; the blocker is that no test device has been provided. |
+| 7 | **Cross-compile proven; physical-device evidence still outstanding.** Spike S6 passed 2026-09-19 (PR #3): `aarch64-linux-android`, `aarch64-apple-ios` and `aarch64-apple-ios-sim` all compile and link in CI with no local NDK/Xcode needed (`phase-0-s6-mobile-cross-compile.md`). The owner provided an Android arm64 phone (OPPO CPH2399) on 2026-09-19 with NDK 28.2 already installed, and a physical-device validation run is in progress on branch `phase-0/android-device` (not finished; no results to cite yet). No physical-device testing has been attempted for iOS; the blocker there is still that no Mac + Apple Developer account + device has been provided. |
 | 8 | **Done.** `reldex-core-poc` is a ping/query/exec CLI harness; no Qt/QML UI exists. |
 
 ## Driver decision
@@ -279,12 +283,15 @@ Windows 11 Pro, `rustc 1.98.1` MSVC target). Full method notes are in
 
 Do not make comparative performance claims without recording the method and environment.
 
-## Phase 0 exit assessment (draft)
+## Phase 0 exit assessment
 
-This restates the eight success criteria above as a single input for the owner's Phase 1 go/no-go
-decision. It is a draft assessment, not the decision itself — see the note at the end. Rewritten
-2026-09-20 against the evidence-gap spikes (S10–S14) and the mobile cross-compile spike (S6); no
-criterion's honest status is softened to make the table look more finished than the evidence supports.
+This restates the eight success criteria above as the input the owner used for the Phase 1 go/no-go
+decision. **The owner reviewed this assessment and gave the GO for Phase 1 on 2026-09-19.** The GO is
+a decision to proceed, not a claim that every criterion is met: criterion 4 (cancellation) stays
+**not met**, accepted as a limitation, and the verdicts below are the historical record at go/no-go
+time — none of them is upgraded by the GO itself. Rewritten 2026-09-20 against the evidence-gap spikes
+(S10–S14) and the mobile cross-compile spike (S6); no criterion's honest status is softened to make the
+table look more finished than the evidence supports.
 
 | # | Criterion | Assessment | Evidence |
 | --- | --- | --- | --- |
@@ -294,25 +301,28 @@ criterion's honest status is softened to make the table look more finished than 
 | 4 | Query cancellation is demonstrated | **Not met — accepted limitation (owner decision 2026-09-20)** | Spike S4; ADR-0001 "Spike outcome (2026-09-20)" and "Owner decision (2026-09-20)"; `phase-0-spike-results.md` §4 |
 | 5 | Required datatypes/PL-SQL behaviors are integration-tested | **Met, with limits** | Spikes S2 (conditional go — NUMBER-bind and TIMESTAMP WITH TIME ZONE restrictions), S5 (pass), S7 (pass), S11 (NCLOB — pass), S12 (developer features — pass, but `CREATE TRIGGER … :NEW` is impossible, U-18) — `phase-0-spike-results.md` §3, §5 |
 | 6 | Desktop platform viability is established | **Met, with limits** | Windows x64 fully validated locally; Linux x64 and macOS ARM64 build/fmt/clippy/test green on CI (PR #1) but no database connect exercised in CI — see `README.md` "Current status" |
-| 7 | Android/iOS direct-connect feasibility: physical-device evidence or a documented blocker | **Met, with limits — stated honestly.** Cross-compile and link are proven; no physical-device evidence exists; the blocker is documented, not silent | Spike S6 — pass 2026-09-19, PR #3, `aarch64-linux-android`/`aarch64-apple-ios`/`aarch64-apple-ios-sim` all compile and link in CI with no local NDK/Xcode (`phase-0-s6-mobile-cross-compile.md`). **What is still missing:** no device has run any of connect/SQL/transaction/cancel/LOB/TCPS/background-resume; the documented blocker is that **no physical Android or iOS test device has been provided** (iOS additionally needs a Mac + Apple Developer account) — see that file's "Next step toward physical-device validation" |
+| 7 | Android/iOS direct-connect feasibility: physical-device evidence or a documented blocker | **Met, with limits — stated honestly.** Cross-compile and link are proven; no physical-device evidence exists yet; the blocker is documented, not silent | Spike S6 — pass 2026-09-19, PR #3, `aarch64-linux-android`/`aarch64-apple-ios`/`aarch64-apple-ios-sim` all compile and link in CI with no local NDK/Xcode (`phase-0-s6-mobile-cross-compile.md`). **What is still missing:** no device has run any of connect/SQL/transaction/cancel/LOB/TCPS/background-resume. An Android arm64 phone (OPPO CPH2399) was provided by the owner on 2026-09-19 (NDK 28.2 installed) and validation is **in progress on branch `phase-0/android-device`** (not finished, no results yet); iOS still needs a Mac + Apple Developer account + device, not yet provided — see that file's "Next step toward physical-device validation" |
 | 8 | No full desktop UI required to prove these results | **Met** | `reldex-core-poc` is a CLI harness; no Qt/QML UI exists |
 
-**What remains before a Phase 1 go decision:**
+**Carried into Phase 1 as Phase 0 tail work (owner gave the GO 2026-09-19):**
 
-- **Android physical-device validation** — needs a physical Android device (arm64, API 26+) from the
-  owner, USB debugging, and network access to a reachable Oracle instance, plus a local Android NDK to
-  build the harness (`phase-0-s6-mobile-cross-compile.md` "Next step").
-- **iOS physical-device validation** — needs a Mac with Xcode (CI already confirms the toolchain), an
-  Apple Developer account (a free personal-team identity suffices for a 7-day local debug build), and
-  a physical iPhone/iPad.
+- **Android physical-device validation** — the owner provided a physical Android device (arm64,
+  OPPO CPH2399, API 26+) on 2026-09-19; NDK 28.2 is already installed. Validation is **in progress on
+  branch `phase-0/android-device`** (not finished; no results to cite yet;
+  `phase-0-s6-mobile-cross-compile.md` "Next step").
+- **iOS physical-device validation** — still outstanding. Needs a Mac with Xcode (CI already confirms
+  the toolchain), an Apple Developer account (a free personal-team identity suffices for a 7-day local
+  debug build), and a physical iPhone/iPad; none of these has been provided yet.
 - TCPS (spike S8) — done 2026-09-20, pass with limits (see Workstream F); the remaining TCPS questions
-  are owner decisions (results file §9 items 6–7).
+  are owner decisions (results file §9 items 6–7), confirmed 2026-09-19 (see below).
 - Driver fix for **C-5** (`ConnectionParams::connect_timeout` accepted and ignored) — **approved
   2026-09-19**: implement on a helper thread, default 15 s, user-configurable per connection
   profile including "no limit" (results file §9 item 8, ADR-0001 2026-09-19 addendum).
-  **Implementation pending.**
-- Owner approval to submit drafted upstream **issues F and G** (results file §6) — U-15…U-17
-  (timeouts/dead-link detection) and U-18 (`CREATE TRIGGER`). **Still outstanding.**
+  **In progress on branch `phase-0/driver-carryover`** (not yet merged into `main`); Phase 1 M2.1
+  (`docs/exec-plans/active/phase-1.md`) consumes the result.
+- Upstream **issues F and G** (results file §6) — U-15…U-17 (timeouts/dead-link detection) and U-18
+  (`CREATE TRIGGER`). **Resolved, not pending:** the owner decided on 2026-09-19 **not** to submit them
+  for now; the drafts stay in `phase-0-spike-results.md` §6 for tracking only.
 - **Watching for the fixes.** Each upstream defect that can be observed from a test now has a
   canary asserting it is *still there*
   (`crates/drivers/oracle-thin/tests/canary_upstream_{offline,live}.rs`), so a fix arrives as a
@@ -320,19 +330,19 @@ criterion's honest status is softened to make the table look more finished than 
   moves. See `oracledb-upgrade-checklist.md` for the per-U-number map and the manual checks.
 - **Owner decisions from results file §9 — updated 2026-09-19.** Items 8–12 are now decided (see
   `phase-0-spike-results.md` §9 and ADR-0001's 2026-09-19 addendum), each made user-configurable per
-  the owner's requirement: item 8 (`connect_timeout`, C-5) — helper thread, default 15 s,
-  **implementation pending**; item 9 (default per-statement time limit) — default 600 s,
+  the owner's requirement: item 8 (`connect_timeout`, C-5) — helper thread, default 15 s, **in
+  progress on `phase-0/driver-carryover`**; item 9 (default per-statement time limit) — default 600 s,
   configurable at three levels (application default, connection profile, per worksheet/statement)
   including "no limit" with an explicit UI warning, `SPEC.md` §10 constraints unchanged; item 10
   (`SQLNET.EXPIRE_TIME`) — documentation recommendation only, Phase 0 test database stays unset;
   item 11 (`CREATE TRIGGER` U-18) — driver auto-rewrites via `EXECUTE IMMEDIATE` by default, always
-  reported to the user, off switch at connection level, **implementation pending**; item 12
-  (default fetch batch size) — deferred to a Phase 1 benchmark (S14 found throughput is not
+  reported to the user, off switch at connection level, **in progress on `phase-0/driver-carryover`**;
+  item 12 (default fetch batch size) — deferred to a Phase 1 benchmark (S14 found throughput is not
   monotonic in batch size), must be a user setting. A new **item 13** (connect-time warning
   channel, contract gap C-6) is approved in principle: one additive
   `take_connect_warnings`-style method on `DatabaseConnection`, collected once by `db-core` after
-  connect, recorded as an ADR-0002 amendment when implemented; its detailed write-up arrives with
-  pull request #5 (the TCPS descriptor guard), and implementation is sequenced after that PR.
+  connect, recorded as an ADR-0002 amendment when implemented; **in progress on
+  `phase-0/driver-carryover`**, sequenced after pull request #5 (the TCPS descriptor guard, merged).
   **Still outstanding and undecided:** item 4 (relax the NUMBER-bind refusal U-1 — recommendation:
   no).
   **Items 6–7 confirmed by the owner 2026-09-19** by accepting pull request #5: TCPS is described
@@ -340,8 +350,9 @@ criterion's honest status is softened to make the table look more finished than 
   `SSL_SERVER_CERT_DN` is refused unless `oracle.allow_unenforced_server_cert_dn` is set,
   `SSL_SERVER_DN_MATCH` is accepted with a warning (results file §9 items 6–7, U-14, C-6).
 
-This is a draft assessment for the owner's use, not a go/no-go decision — per "Deliverables" below,
-that decision is the owner's to make.
+This assessment was the input to the owner's Phase 1 go/no-go decision. **The decision: GO for
+Phase 1, given 2026-09-19.** The carry-over work listed above continues in parallel with Phase 1
+planning; see [`docs/exec-plans/active/phase-1.md`](phase-1.md) for the resulting execution plan.
 
 ## Deliverables
 
@@ -350,7 +361,7 @@ that decision is the owner's to make.
 - platform validation notes;
 - ADRs for driver/FFI decisions;
 - updated `TASKS.md`;
-- go/no-go decision for Phase 1.
+- go/no-go decision for Phase 1 — **decided: GO, 2026-09-19** (see "Phase 0 exit assessment" above).
 
 ## Explicit non-goals
 

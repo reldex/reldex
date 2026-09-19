@@ -8,6 +8,14 @@ Reldex is an independent project and is not affiliated with, endorsed by, or spo
 
 ## Current status
 
+**Phase 0 closed with a GO for Phase 1 from the owner on 2026-09-19.** The Phase 1 Desktop MVP plan
+(milestones M1–M6) is in [`docs/exec-plans/active/phase-1.md`](docs/exec-plans/active/phase-1.md), and
+[ADR-0003](docs/decisions/0003-qt-rust-integration.md) (Qt ↔ Rust integration) is drafted as
+**Proposed**, pending spike S15. M1 — and all of Phase 1 — is blocked on the owner's approval to
+install the Qt/CMake/Ninja toolchain. Phase 0 tail work continues in parallel on branch
+`phase-0/driver-carryover` (connect_timeout/C-5, `CREATE TRIGGER` rewrite/U-18, connect-warning
+channel/C-6) and `phase-0/android-device` (Android physical-device validation).
+
 **Phase 0 — Architecture Validation.** Spikes S1–S5, S7, S8 and S9 ran against a live Oracle Database
 19.3 (Docker) on 2026-09-19; the evidence-gap spikes S10–S14 (network loss/reconnect, NCLOB, developer
 features, privileged connections, large result) ran against the same database on 2026-09-19; the
@@ -83,7 +91,7 @@ available).
 - **Core:** Rust.
 - **UI:** Qt Quick/QML with a thin C++ adapter over a stable Rust FFI boundary — planned, not started.
 - **Primary database driver:** Oracle's official [`oracledb`](https://github.com/oracle/rust-oracledb) crate (pure Rust, thin, blocking; no Instant Client/OCI required), pinned to an exact pre-GA beta version (`=26.0.0-beta.3`), per [ADR-0001](docs/decisions/0001-database-driver-strategy.md). It is encapsulated behind `db-driver-api` so it can be swapped if a kill criterion in the ADR's spike plan fires. Spike S4's cancellation kill criterion fired, and on 2026-09-20 the owner decided to accept the limitation — ship the pre-armed deadline with an honest UI and pursue upstream fixes — rather than change drivers; see the current limitations above.
-- **Known gaps in the primary driver**, stated honestly: no on-demand statement-cancel API (Phase 0 falls back to a pre-armed deadline; five of seven drafted upstream issues were submitted 2026-09-20, #21–#25, F and G await the owner's go-ahead); a connect cannot be bounded and there is no dead-link keepalive; `CREATE TRIGGER` with `:NEW`/`:OLD` cannot be executed directly (documented workaround); it is pre-GA/beta software with at least one defect that can abort the whole process if an unhandled input reaches it; Native Network Encryption and 11G password verifiers are unsupported; Android/iOS cross-compile is proven in CI but physical-device evidence is still required before any mobile-support claim.
+- **Known gaps in the primary driver**, stated honestly: no on-demand statement-cancel API (Phase 0 falls back to a pre-armed deadline; five of seven drafted upstream issues were submitted 2026-09-20, #21–#25; the owner decided 2026-09-19 not to submit F and G for now, keeping the drafts for tracking only); a connect cannot be bounded and there is no dead-link keepalive; `CREATE TRIGGER` with `:NEW`/`:OLD` cannot be executed directly (documented workaround); it is pre-GA/beta software with at least one defect that can abort the whole process if an unhandled input reaches it; Native Network Encryption and 11G password verifiers are unsupported; Android/iOS cross-compile is proven in CI but physical-device evidence is still required before any mobile-support claim.
 - **Initial compatibility target:** Oracle Database 19c+.
 
 ## Running the integration suite

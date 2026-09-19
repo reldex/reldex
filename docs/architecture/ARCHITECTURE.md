@@ -276,7 +276,9 @@ Until then, no code should assume an answer.
    Android/iOS viability has cross-compile-and-link evidence (spike S6, `phase-0-s6-mobile-cross-compile.md`)
    but still needs physical-device evidence before any mobile-support claim.
 2. **FFI mechanism.** Which Rust/C++ interop approach provides a stable, typed, small boundary, and
-   how is ABI/version compatibility guaranteed?
+   how is ABI/version compatibility guaranteed? Proposed resolution:
+   [ADR-0003](../decisions/0003-qt-rust-integration.md) (**Proposed** — acceptance conditional on
+   spike S15; not yet accepted).
 3. **Threading and callbacks across FFI — core side settled; FFI event delivery still open.**
    [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) D1/D2 are now implemented in
    `db-core`, not just decided: one dedicated worker thread per session drains a FIFO command queue,
@@ -286,7 +288,9 @@ Until then, no code should assume an answer.
    the concrete mechanism that marshals a worker thread's completion to the Qt thread (e.g. a queue
    the C++ adapter drains via a `QEvent`/queued signal, per ADR-0002's "Deferred" section), plus the
    thread-affinity and reentrancy rules the adapter must enforce. Nothing here depends on which
-   cancellation mechanism ADR-0001 lands on.
+   cancellation mechanism ADR-0001 lands on. Proposed resolution for the FFI half:
+   [ADR-0003](../decisions/0003-qt-rust-integration.md) (**Proposed** — acceptance conditional on
+   spike S15; not yet accepted).
 4. **Async runtime vs. threads — RESOLVED by [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) D1.**
    No async runtime below the FFI line; `db-core` uses one dedicated worker thread per session, owning
    `Box<dyn DatabaseConnection>` for that session's lifetime.
@@ -316,6 +320,9 @@ Until then, no code should assume an answer.
 9. **Credential storage abstraction.** What single core abstraction spans the four platform secure
    stores, and what is the fallback when none is available?
 10. **Crate layout.** Final workspace layout, crate boundaries, and feature flags (provisional in §11).
+    Proposed resolution in part (the FFI/UI tier's crate layout — `crates/ffi`, `crates/sql-text`,
+    `ui/`): [ADR-0003](../decisions/0003-qt-rust-integration.md) (**Proposed** — acceptance conditional
+    on spike S15; not yet accepted).
 11. **Type mapping — PARTLY RESOLVED by [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) D5.**
     The API-level representation is decided: a lossless, allocation-free 38-digit `Number` (no `f64`
     path), one `Timestamp` type covering DATE/TIMESTAMP/TIMESTAMP WITH TIME ZONE (named IANA regions

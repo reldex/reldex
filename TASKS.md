@@ -33,7 +33,7 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [x] Create `db-core` (session layer implemented: worker-thread-per-session, FIFO queue, out-of-band cancel, conservative transaction tracking incl. locking queries, `CloseDisposition`, terminal `Lost`/`Closed` lifecycle, core-owned `ResultId`/`LobHandle`, bounded `Drop`, `SessionLimits`, panic containment; independently reviewed, 7 must-fix applied, commit `86f79d7`)
 - [x] Create initial database driver implementation — wrap Oracle's official `oracledb` crate (`oracle/rust-oracledb`, pinned exact version `=26.0.0-beta.3`) in `crates/drivers/oracle-thin` (ADR-0001); independently reviewed, 4 must-fix applied, commit `db38c14`
 - [x] Add driver contract tests that detect behaviour changes on `oracledb` upgrades — upstream canary suite (`crates/drivers/oracle-thin/tests/canary_upstream_{offline,live}.rs`): one canary per observable upstream defect, process-abort defects run in a child process, version tripwire on the pin; procedure in `docs/exec-plans/active/oracledb-upgrade-checklist.md`
-- [x] **(S4 critical path)** Draft upstream request to `oracle/rust-oracledb` for a public statement-cancel/break API — plus accessors for `OracleNumber` digits and the connection's transaction-in-progress flag (seven issues drafted in full: `docs/exec-plans/active/phase-0-spike-results.md` §6 — A–E submitted 2026-09-20 (#21–#25), F and G await owner go-ahead; see the separate owner task below)
+- [x] **(S4 critical path)** Draft upstream request to `oracle/rust-oracledb` for a public statement-cancel/break API — plus accessors for `OracleNumber` digits and the connection's transaction-in-progress flag (seven issues drafted in full: `docs/exec-plans/active/phase-0-spike-results.md` §6 — A–E submitted 2026-09-20 (#21–#25); F and G not submitted, owner decision 2026-09-19 — drafts kept for tracking only; see the owner decision task below)
 - [x] Add normalized `DbError`
 - [~] Add connection/profile model (driver-level connection params done; user-facing profile model pending)
 - [x] Add session abstraction (`db-core` `DatabaseSession` implemented and hardened; see above)
@@ -59,12 +59,13 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [x] Windows x64 (build, connect, and the full spike matrix all run locally, 2026-09-19)
 - [~] Linux x64 (build + fmt + clippy -D warnings + `cargo test --workspace` green on CI `ubuntu-latest`, PR #1, 2026-09-20 — https://github.com/reldex/reldex/actions/runs/35419377082; no database connect yet)
 - [~] macOS ARM64 (build + fmt + clippy -D warnings + `cargo test --workspace` green on CI `macos-latest` (Apple Silicon), PR #1, 2026-09-20 — https://github.com/reldex/reldex/actions/runs/35419377082; no database connect yet)
-- [ ] Android ARM64 physical device (cross-compile + link proven in CI — spike S6, PR #3; physical-device evidence still needed, needs a test device from the owner)
+- [~] Android ARM64 physical device (cross-compile + link proven in CI — spike S6, PR #3; device provided by the owner 2026-09-19 (OPPO CPH2399, NDK 28.2 installed); physical-device validation in progress on branch `phase-0/android-device`, not finished)
 - [ ] iOS/iPadOS ARM64 physical device (cross-compile + link proven in CI — spike S6, PR #3; physical-device evidence still needed, needs a Mac + Apple Developer account + device)
 
 - [x] Owner: decide cancellation path (ADR-0001 re-opened) [decision 2026-09-20: stay on `oracledb`; ship the pre-armed per-statement deadline with an honest UI; pursue upstream fixes via the four drafted issues — see ADR-0001 "Owner decision (2026-09-20)"]
 - [x] Owner: submit the drafted upstream issues — five submitted 2026-09-20 (#21–#25) (`docs/exec-plans/active/phase-0-spike-results.md` §6)
-- [ ] Owner: approve submission of drafted upstream issues F and G (results file §6)
+- [x] Owner decision 2026-09-19: issues F and G are NOT submitted for now; drafts kept for tracking (results file §6)
+- [x] Owner: Phase 0 go/no-go — GO for Phase 1 (2026-09-19)
 - [ ] Track upstream `oracle/rust-oracledb` releases; re-run the integration suite and the ignored abort-repro tests on each new beta
 - [ ] Third-party notices file before any binary distribution (dependency licences — 63 third-party crates in the oracle-thin graph, all permissive but attribution is required; see `phase-0-spike-results.md` §1)
 - [x] Test DB: TCPS listener (S8) — `127.0.0.1:2484`, idempotent startup hook, wallet material untracked
@@ -72,40 +73,106 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [x] Owner: decide how TCPS support is described to users and whether to refuse descriptors carrying `SSL_SERVER_DN_MATCH` (results file §9 items 6–7)
 - [x] Driver: TCPS descriptor guard (U-14) — refuse `SSL_SERVER_CERT_DN` unless explicitly allowed, warn on `SSL_SERVER_DN_MATCH` — implemented as the lead proposed and independently reviewed (3 must-fix applied); confirmed by the owner and merged 2026-09-19 (pull request #5).
 - [x] S6 Android/iOS cross-compile check — pass, kill criterion did not fire (PR #3: https://github.com/reldex/reldex/pull/3); physical-device validation still needed
-- [ ] Driver: honour `connect_timeout` (C-5) — `ConnectionParams::connect_timeout` is accepted and ignored (`phase-0-spike-results.md` §7 C-5); approved 2026-09-19: helper thread, default 15 s, user-configurable per connection profile including "no limit"
+- [~] Driver: honour `connect_timeout` (C-5) — `ConnectionParams::connect_timeout` is accepted and ignored (`phase-0-spike-results.md` §7 C-5); approved 2026-09-19: helper thread, default 15 s, user-configurable per connection profile including "no limit"; in progress on branch `phase-0/driver-carryover`, not yet merged — Phase 1 M2.1 consumes the result
 - [x] Owner decisions §9 items 8–12 — decided 2026-09-19: default per-statement deadline 600 s (three-level setting), `EXPIRE_TIME` documentation-only recommendation, trigger DDL auto-rewrite with an off switch, default fetch batch size deferred to a Phase 1 benchmark, C-5 helper-thread approach — every one made user-configurable per the owner's requirement (`phase-0-spike-results.md` §9)
-- [ ] Driver: `CREATE TRIGGER` auto-rewrite for `:NEW`/`:OLD` (U-18) — rewrite to `BEGIN EXECUTE IMMEDIATE q'[…]'; END;` on by default, always reported to the user as a warning with the statement actually sent available for inspection, off switch at connection level (approved 2026-09-19, `phase-0-spike-results.md` §9 item 11)
-- [ ] Contract: connect-time warning channel (C-6) — additive `take_connect_warnings`-style method on `DatabaseConnection`, collected once by `db-core` after connect; approved in principle 2026-09-19, detailed write-up in `phase-0-spike-results.md` §7 C-6; sequenced after pull request #5 (TCPS descriptor guard); record as an ADR-0002 amendment when implemented
+- [~] Driver: `CREATE TRIGGER` auto-rewrite for `:NEW`/`:OLD` (U-18) — rewrite to `BEGIN EXECUTE IMMEDIATE q'[…]'; END;` on by default, always reported to the user as a warning with the statement actually sent available for inspection, off switch at connection level (approved 2026-09-19, `phase-0-spike-results.md` §9 item 11); in progress on branch `phase-0/driver-carryover`, not yet merged — Phase 1 M2.2 consumes the result
+- [~] Contract: connect-time warning channel (C-6) — additive `take_connect_warnings`-style method on `DatabaseConnection`, collected once by `db-core` after connect; approved in principle 2026-09-19, detailed write-up in `phase-0-spike-results.md` §7 C-6; sequenced after pull request #5 (TCPS descriptor guard, merged); record as an ADR-0002 amendment when implemented; in progress on branch `phase-0/driver-carryover`, not yet merged — Phase 1 M2.3 consumes the result
 - [ ] Docs: recommend `SQLNET.EXPIRE_TIME` (e.g. 10 minutes) in user-facing connection troubleshooting docs (owner decision 2026-09-19, `phase-0-spike-results.md` §9 item 10)
 - [ ] Docs: note in `tools/oracle-test-db/README.md` that `SQLNET.EXPIRE_TIME` is left unset on the Phase 0 test database on purpose, so S10's measurements remain valid (follow-up; not edited in this change)
-- [ ] Android physical-device harness (needs a test device from the owner + local NDK)
+- [~] Android physical-device harness (device and NDK provided 2026-09-19; harness build and validation in progress on branch `phase-0/android-device`)
 
 ## P1 — Desktop MVP
 
-- [ ] Qt Quick application shell
-- [ ] Thin C++ ↔ Rust FFI adapter
-- [ ] Non-blocking `open_session` + per-session completion/event queue for the Qt adapter (deferred by ADR-0002 amendment)
-- [ ] Connection Manager
-- [ ] Workspace shell
-- [ ] SQL Worksheet
-- [ ] Multiple independent sessions
-- [ ] Run current statement
-- [ ] Run selection
-- [ ] Run script
-- [ ] PL/SQL execution
-- [ ] Bind-variable dialog
-- [ ] Cancel
-- [ ] UI (P1): statement time-limit control + explicit "Cancel unavailable with current driver" messaging (SPEC §10 interim note)
-- [ ] Default per-statement time limit (600 s) as a three-level setting — application default, connection profile, per worksheet/statement — including a "no limit" option with an explicit UI warning about the consequence (owner decision 2026-09-19, SPEC §10)
-- [ ] Commit/Rollback
-- [ ] Result Store
-- [ ] Fetch batch size as a user setting (application default + per connection profile, bounded range), informed by a Phase 1 benchmark to pick the shipped default (owner decision 2026-09-19, SPEC §12; `phase-0-spike-results.md` S14)
-- [ ] Virtualized Result Grid
-- [ ] Query History
-- [ ] DBMS_OUTPUT panel
-- [ ] Basic Object Browser
-- [ ] Production connection indicator
-- [ ] Secure credential integration on Windows
+Milestone plan M1–M6 per `docs/exec-plans/active/phase-1.md` §C.2 (which also carries the full
+owner/inputs/outputs/deps/acceptance table per task). ★ = independent review mandatory.
+
+### M1 — De-risk: toolchain, ADR-0003, and a real virtualized table
+
+- [!] M1.1 Owner approval + toolchain install (Qt, CMake, Ninja, cbindgen) (owner + sonnet) — blocked on owner decision (phase-1.md C.3 #1)
+- [x] M1.2 ★ Draft ADR-0003: Qt ↔ Rust integration (opus, review mandatory) — `docs/decisions/0003-qt-rust-integration.md` (Proposed)
+- [ ] M1.3 ★ `crates/ffi` skeleton: hub, session open/execute/fetch, batch views, errors, waker (opus, review mandatory)
+- [ ] M1.4 C smoke harness (`ui/tests/ffi_smoke`), no Qt, mock driver, ASan on Linux (sonnet)
+- [ ] M1.5 CMake + Corrosion + Qt project skeleton; QML module for the adapter (sonnet)
+- [ ] M1.6 ★ `ResultTableModel` over borrowed batch views; `Bridge` waker→`invokeMethod` drain (opus, review mandatory)
+- [ ] M1.7 Mock driver: 1M-row generator of the S14 shape with controllable latency and a 10 s blocking statement (sonnet)
+- [ ] M1.8 ★ Spike S15 measurement run + report against kill criteria K1–K7 (opus, review mandatory)
+- [ ] M1.9 Accept or re-open ADR-0003; update `ARCHITECTURE.md` §13 items 2/3/10, `TASKS.md`, `Task.html` (sonnet)
+
+### M2 — Core readiness: events, async open, settings, SQL text, driver leftovers
+
+- [~] M2.1 ★ Driver: honour `connect_timeout` on a helper thread (C-5/U-15) (opus, review mandatory) — carried over from Phase 0, in progress on `phase-0/driver-carryover`; M2 consumes the result
+- [~] M2.2 Driver: `CREATE TRIGGER` `:NEW`/`:OLD` auto-rewrite (U-18) (sonnet) — carried over from Phase 0, in progress on `phase-0/driver-carryover`; M2 consumes the result
+- [~] M2.3 ★ Contract: `take_connect_warnings` (C-6) + ADR-0002 amendment (opus, review mandatory) — carried over from Phase 0, in progress on `phase-0/driver-carryover`; M2 consumes the result
+- [ ] M2.4 `crates/sql-text`: lexer + statement splitter driven by a `SqlDialect` descriptor the driver supplies (sonnet)
+- [ ] M2.5 ★ `EventQueue`/`EventSink`/`SessionEvent`/`Waker` + `ReplyTo` refactor of the worker (opus, review mandatory)
+- [ ] M2.6 ★ `SessionRegistry` + non-blocking `open`, `abandon` semantics (opus, review mandatory)
+- [ ] M2.7 ★ Server output capability (DBMS_OUTPUT) in contract + driver + core polling when enabled (opus, review mandatory)
+- [ ] M2.8 Metadata catalog descriptor (`MetadataCatalog`) + Oracle dictionary SQL for the 9 object groups (sonnet)
+- [ ] M2.9 ★ Settings model: three-level resolution with provenance; profile model; SQLite store (opus, review mandatory)
+- [ ] M2.10 ★ Credential store: `CredentialStore` trait + Windows Credential Manager implementation (opus, review mandatory)
+- [ ] M2.11 FFI surface for M2.5–M2.10 + regenerate and verify header (sonnet)
+
+### M3 — Connect: shell, connection manager, first real session
+
+- [ ] M3.1 App shell: window, docking-free fixed layout (sidebar / worksheet tabs / output panes), light+dark theme, high-DPI (sonnet)
+- [ ] M3.2 Connection manager UI: list, create/edit/delete, environment, test-connect (sonnet)
+- [ ] M3.3 ★ Connect flow over the async path, with a bounded timeout and a cancellable "Connecting…" state (opus, review mandatory)
+- [ ] M3.4 Production indicator: persistent, not colour-only (icon + text + tab badge) (sonnet)
+- [ ] M3.5 ★ TCPS UI described exactly as `SPEC.md` §8; surfaces the descriptor-guard warnings from C-6 (opus, review mandatory)
+- [ ] M3.6 Settings UI: application defaults, per-profile overrides, provenance shown (sonnet)
+- [ ] M3.7 ★ Logging/diagnostics: `tracing` + rotating file sink, redaction layer, Qt messages forwarded through the FFI (opus, review mandatory)
+
+### M4 — Worksheet: editor, execution, transactions, honest limits
+
+- [ ] M4.1 ★ Editor component: `TextArea` + `QSyntaxHighlighter` on `QQuickTextDocument`, tokens from `reldex-sql-text` over FFI (opus, review mandatory)
+- [ ] M4.2 Editor essentials: line numbers, current-line, bracket matching, indentation, search/replace, font and theme settings (sonnet)
+- [ ] M4.3 Statement detection and run modes: current statement, selection, whole script (sonnet)
+- [ ] M4.4 Bind-variable dialog: detected placeholders, typed entry, IN/OUT/IN OUT (sonnet)
+- [ ] M4.5 ★ Transaction UX: auto-commit OFF, Commit/Rollback, savepoints, close-with-pending-transaction dialog (opus, review mandatory)
+- [ ] M4.6 ★ The honest no-Cancel UX: three-level time-limit control, "no limit" with its consequence, no Cancel button (opus, review mandatory) — on-demand Cancel itself stays out of scope/blocked (ADR-0001 owner decision; upstream issue #24)
+- [ ] M4.7 DBMS_OUTPUT pane: per-worksheet enable, size, clear, truncation notice (sonnet)
+- [ ] M4.8 ★ Error presentation: kind, ORA code, message, cause chain; caret highlighting only for PL/SQL positions (opus, review mandatory)
+- [ ] M4.9 Multiple independent worksheets: N sessions, per-tab state, one busy tab never blocks another (sonnet)
+- [ ] M4.10 Query history (per profile, SQLite), re-run into the current worksheet (sonnet)
+
+### M5 — Results at scale
+
+- [ ] M5.1 ★ ADR-0004 — Result Store representation, paging and bounded-memory policy (opus, review mandatory)
+- [ ] M5.2 ★ Result Store implementation in `db-core` + FFI batch lifetime rules (opus, review mandatory)
+- [ ] M5.3 Grid features: row numbers, NULL visualization, column resize/reorder, type-aware formatting via the bulk formatter, search-in-results (sonnet)
+- [ ] M5.4 Copy: cell, row, range, with/without headers (sonnet)
+- [ ] M5.5 CLOB/BLOB viewers over `read_lob_chunk`, paged, with a size warning (sonnet)
+- [ ] M5.6 ★ Fetch-batch benchmark across row shapes and a real network; pick and record the shipped default (opus, review mandatory)
+- [ ] M5.7 Perf gate re-run on the real database; record against M1's numbers (sonnet)
+
+### M6 — Browse, prove, package
+
+- [ ] M6.1 Object browser: lazy tree over the 9 `SPEC.md` §16 groups, server-side filter, row cap, columns of a selected table (sonnet)
+- [ ] M6.2 Workspace persistence: open worksheets, text, layout, active profile — non-transactional state only (sonnet)
+- [ ] M6.3 i18n baseline: `qsTr` everywhere, EN + TH catalogues, `lrelease` in the build; Thai rendering test (sonnet)
+- [ ] M6.4 Accessibility baseline: focus order, keyboard-only operation, `Accessible` properties, contrast check (sonnet)
+- [ ] M6.5 Third-party notices: `cargo about` for the Rust graph + Qt/LGPL attribution, shipped in the installer and an About dialog (sonnet)
+- [ ] M6.6 ★ Windows packaging: `windeployqt6`, unsigned installer, first-run layout (opus, review mandatory)
+- [ ] M6.7 CI: build the Qt project on all three OS; run offscreen QML/QTest and the C smoke harness; cache Qt and cargo (sonnet)
+- [ ] M6.8 ★ Phase 1 DoD review against `SPEC.md` §24, honest status per item; update `TASKS.md`, `phase-1.md`, `Task.html` (opus, review mandatory)
+
+### Owner decisions (Phase 1)
+
+- [ ] Owner: install Qt and the build tools per `phase-1.md` §C.0 — M1.1 is blocked on this (decision C.3 #1)
+- [ ] Owner: licence position — LGPLv3-compliant dynamic linking, ban GPL-only Qt modules, commercial licence deferred (decision C.3 #2)
+- [ ] Owner: Qt version policy — pin one exact Qt version, treat an upgrade as a reviewed change (decision C.3 #3)
+- [ ] Owner: approve the Phase 1 defer list (decision C.3 #4)
+- [ ] Owner: app identifier and branding — reverse-DNS id, executable/display name, installer publisher string, placeholder icon (decision C.3 #5)
+- [ ] Owner: code signing for Windows — ship Phase 1 unsigned? (decision C.3 #6)
+- [ ] Owner: secrets storage approach — Windows Credential Manager for Phase 1, no plaintext fallback ever (decision C.3 #7)
+- [ ] Owner: local store format — one SQLite file for profiles/settings/history/workspace (decision C.3 #8)
+- [ ] Owner: telemetry and logging policy — no telemetry, local rotating log, opt-in SQL-text debug logging (decision C.3 #9)
+- [ ] Owner: fetch-batch default sign-off once the M5.6 benchmark produces a number (decision C.3 #10)
+- [ ] Owner: wording sign-off for the no-Cancel UX and "no limit" strings, M4.6 (decision C.3 #11)
+- [x] Owner: Phase-0 leftovers (C-5, U-18, C-6) carried into Phase 1 M2 — confirmed 2026-09-19; in progress on `phase-0/driver-carryover` (decision C.3 #12)
+- [x] Owner: upstream issues F and G — decided 2026-09-19 not to submit for now; drafts kept for tracking only, results file §6 (decision C.3 #13)
+- [x] Owner: mobile test hardware — resolved 2026-09-19: Android arm64 phone (OPPO CPH2399) provided, NDK 28.2 installed; physical-device validation itself is separate Phase-0 tail work in progress on `phase-0/android-device`; iOS still needs a Mac + Apple Developer account + device, not provided (decision C.3 #14)
+- [ ] Owner: Community/Pro licensing decision before M6.6 so the notices file and About dialog are right the first time (decision C.3 #15)
 
 ## P2 — IDE capabilities
 

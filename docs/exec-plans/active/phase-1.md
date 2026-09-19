@@ -1,0 +1,457 @@
+# Execution Plan — Phase 1 Desktop MVP
+
+**Status:** Active — M1 blocked on owner approval of the toolchain install (§C.0, owner decision C.3 #1)
+**Date:** 2026-09-20
+**Depends on:** [ADR-0001](../../decisions/0001-database-driver-strategy.md) (database driver strategy),
+[ADR-0002](../../decisions/0002-driver-api-and-concurrency-model.md) (driver API and concurrency model),
+[ADR-0003](../../decisions/0003-qt-rust-integration.md) (Qt ↔ Rust integration — **Proposed**, acceptance
+conditional on spike S15), and [`phase-0.md`](phase-0.md) (Phase 0 exit assessment — the owner gave the
+**GO for Phase 1 on 2026-09-19**).
+
+**Purpose.** This is the Phase 1 (Desktop MVP) execution plan produced immediately after the Phase 1 GO:
+the core (`db-core`) changes needed before/with the UI (§B), the milestone plan M1–M6 with owner/inputs/
+outputs/dependencies/acceptance criteria per task (§C), and the risk register (§D). Neither ADR-0003 nor
+any of the owner decisions listed in §C.3 has been accepted yet, except where §C.3 explicitly records a
+decision already made. Status per task uses the same legend as `TASKS.md`: `[x]` done, `[~]` in progress,
+`[ ]` todo, `[!]` blocked.
+
+---
+
+## Preface — assumptions and repository-vs-brief notes
+
+Stated first because the repository wins over any brief when the two disagree; the notes below are the
+ones that remain true as of this plan's date.
+
+1. The brief that produced this plan said the workspace **forbids** `unsafe`. The repository
+   (`Cargo.toml`) sets `[workspace.lints.rust] unsafe_code = "deny"`, with the comment *"FFI crate(s)
+   will opt out of this once the FFI boundary is implemented"*. There is already a precedent:
+   `crates/mobile-link-check/Cargo.toml` documents that cargo rejects overriding `workspace.lints` in a
+   manifest, so the opt-out is a crate-level `#![allow(unsafe_code)]`. ADR-0003 uses that mechanism, not
+   a manifest override.
+2. **Phase 0's exit assessment is no longer a draft.** The owner gave the GO for Phase 1 on 2026-09-19
+   (recorded in `phase-0.md` and `TASKS.md`); the criteria verdicts in `phase-0.md` are unchanged by the
+   GO (a GO is not the same as every criterion being met — criterion 4, Cancel, stays **not met**,
+   accepted as a limitation). `phase-0.md` also lists open items that are Phase-0 leftovers, not new
+   Phase-1 work: driver `connect_timeout` (C-5), trigger auto-rewrite (U-18), connect-warning channel
+   (C-6), upstream issues F/G, and physical-device mobile validation. C-5/U-18/C-6 are carried into
+   Phase 1 Milestone 2 as explicit tasks (M2.1–M2.3) rather than assumed to have landed; per the owner's
+   2026-09-19 decision they are **already in progress right now as Phase 0 carry-over work on branch
+   `phase-0/driver-carryover`** (not yet merged into `main`) — M2 consumes that result rather than
+   duplicating it as fresh Phase 1 work. Upstream issues F and G are resolved, not pending: the owner
+   decided on 2026-09-19 **not** to submit them for now, keeping the drafts for tracking only (results
+   file §6; see §C.3 #13 below). Mobile device work stays out of Phase 1 scope (`SPEC.md` §25
+   unchanged); the owner separately provided an Android arm64 phone (OPPO CPH2399) on 2026-09-19 and a
+   physical-device validation run is in progress on branch `phase-0/android-device` (not finished, no
+   results to cite yet) — this is a Phase 0 tail, not Phase 1 work (see §C.3 #14).
+3. `SessionManager::open_session` already runs `connect` on the worker thread — what blocks is only the
+   *caller's wait for the reply*. Section B below solves the wait, not the I/O placement.
+4. `Number` carries **40** significant digits (ADR-0002 amendment S6), not 38.
+5. Dev machine: MSVC 2022 Community is installed and `cl.exe` is on PATH, but **CMake and Ninja are not**
+   and there is no `C:\Qt`. The install list in §C.0 reflects that, and M1.1 stays blocked on owner
+   approval of that install (owner decision C.3 #1) — Qt is not installed and installing it needs the
+   owner's explicit approval.
+
+---
+
+## B. Core changes needed before/with the UI
+
+Everything here is vendor-neutral, UI-independent, and **additive**: the existing `Completion<T>` API keeps working for `reldex-core-poc`, tests, and any blocking caller. ADR-0002's "Deferred" section already blessed both shapes coexisting; this section is the ADR-0002 amendment it anticipated.
+
+### B1 — What stays exactly as it is
+
+One worker thread per session owning the connection; the unbounded FIFO command channel (K9); out-of-band `cancel` that never queues (D2, K3); conservative transaction tracking including locking queries (K7); `close` deciding on the worker after the queue drains and never costing a transaction on a failed disposition (K4); `Drop` bounded at `DROP_SHUTDOWN_TIMEOUT` then detaching, never committing (K5); session-scoped `ResultId`/`LobHandle` and the "only plain data crosses threads" invariant (K1, K8); `SessionLimits`; panic containment (K6). `Completion<T>`'s consuming `poll`/`wait_timeout` shape is kept and is what the spike uses before B2 lands.
+
+### B2 — Event queue and sink
+
+```rust
+/// Caller-chosen correlation id. Opaque to the core; the adapter uses it to
+/// find the QObject that asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RequestId(pub u64);
+
+/// Producer side: cheap to clone, `Send + Sync`. Held by workers.
+#[derive(Clone)]
+pub struct EventSink { /* … */ }
+
+/// Consumer side: not `Clone`. One per application (or one per adapter).
+pub struct EventQueue { /* … */ }
+
+pub trait Waker: Send + Sync {
+    /// Called when the queue goes empty -> non-empty. Edge-triggered and
+    /// coalesced: a burst produces one call. MUST return promptly, MUST NOT
+    /// block, and MUST NOT call back into `db-core`.
+    fn wake(&self);
+}
+
+pub fn event_channel(caps: EventCaps) -> (EventSink, EventQueue);
+
+impl EventQueue {
+    /// Replacing or clearing the waker does not return while a `wake` is in
+    /// progress, so a consumer can be destroyed safely.
+    pub fn set_waker(&self, waker: Option<Arc<dyn Waker>>);
+    pub fn next(&self) -> Option<SessionEvent>;                    // never blocks
+    pub fn drain_into(&self, max: usize, out: &mut Vec<SessionEvent>) -> usize;
+    pub fn wait_timeout(&self, d: Duration) -> Option<SessionEvent>; // headless tests
+}
+
+#[non_exhaustive]
+pub enum SessionEvent {
+    // --- exactly one of these per accepted request, ever ---
+    Opened       { session: SessionId, request: RequestId, connection: ConnectionId,
+                   cancel_kind: CancelKind, warnings: Vec<Warning> },
+    OpenFailed   { session: SessionId, request: RequestId, error: DbError },
+    Executed     { session: SessionId, request: RequestId, outcome: DbResult<ExecuteOutcome> },
+    Fetched      { session: SessionId, request: RequestId, batch:   DbResult<FetchedBatch> },
+    LobChunk     { session: SessionId, request: RequestId, bytes:   DbResult<Vec<u8>> },
+    Completed    { session: SessionId, request: RequestId, result:  DbResult<()> },   // commit/rollback/savepoint/ping/close_result/close_lob
+    SessionClosed{ session: SessionId, request: RequestId, result:  Result<(), CloseError> },
+
+    // --- progress / unsolicited ---
+    /// The worker has *started* this statement (it is no longer queued), with
+    /// the deadline actually armed. This is what the honest no-Cancel UI shows.
+    Executing    { session: SessionId, request: RequestId, deadline: Option<Duration> },
+    ServerOutput { session: SessionId, lines: Vec<Box<str>>, dropped: u32 },
+    TransactionStateChanged { session: SessionId, possibly_active: bool },
+
+    /// Exactly once per session, at the transition. Never twice, never absent.
+    Terminal     { session: SessionId, lifecycle: SessionLifecycle, cause: Option<DbError> },
+}
+```
+
+**Thread safety.** `EventSink: Send + Sync + Clone`; `EventQueue: Send`, not `Sync` — one consumer. `SessionEvent: Send`, and by construction carries only plain data plus core-owned handles (K1 is preserved: a `FetchedBatch` has already had its locators parked).
+
+**Ordering guarantees (the contract the adapter may rely on):**
+
+1. Per session, events are delivered in the order the worker produced them.
+2. Every accepted request produces **exactly one** reply event for its `RequestId` — never zero, never two — including when the session is already `Lost` or `Closed` (the reply is then the failure, carrying the original kind and native code per K8).
+3. `Terminal` is delivered **exactly once** per session, after every reply for requests accepted before the transition. Requests submitted after it still get their one failure reply, which may follow `Terminal`.
+4. `Executing` precedes the matching `Executed` and follows any earlier request's reply on that session.
+5. **No ordering is promised across sessions.** The hub interleaves freely.
+
+**Back-pressure.** Reply events are bounded by outstanding requests, which is bounded by a new `SessionLimits::max_outstanding_requests` (default 1,024). Exceeding it is the **one synchronous failure** in the submit API — `Err(DbError)` with `ErrorKind::Resource`, no event — because producing an event for it would be circular. Unsolicited events (`ServerOutput`, `TransactionStateChanged`) use a bounded per-session ring with coalescing; drops are *counted and reported* on the next event (`dropped`) so the UI can say "output truncated" rather than silently lying. This mirrors K9: the command queue stays unbounded, the resources do not.
+
+### B3 — Non-blocking open and the session registry
+
+```rust
+pub struct SessionRegistry { /* Mutex<HashMap<SessionId, Arc<DatabaseSession>>> + EventSink */ }
+
+impl SessionRegistry {
+    pub fn new(manager: SessionManager, events: EventSink) -> Self;
+
+    /// Never blocks and never fails synchronously. The worker thread is spawned
+    /// here; `connect` runs on it and its outcome arrives as `Opened`/`OpenFailed`.
+    pub fn open(&self, driver: Arc<dyn DatabaseDriver>, params: ConnectionParams,
+                request: RequestId) -> SessionId;
+
+    pub fn get(&self, id: SessionId) -> Option<Arc<DatabaseSession>>;
+
+    /// Give up on a pending connect, or drop an open session without committing.
+    /// If the connect has not completed, the caller gets `OpenFailed{Cancelled}`
+    /// immediately, and the eventual connection is closed on arrival — exactly
+    /// one reply, and nothing is adopted late.
+    pub fn abandon(&self, id: SessionId);
+}
+
+impl SessionManager {
+    pub fn open_session(&self, driver, params) -> DbResult<DatabaseSession>; // unchanged, blocking
+}
+```
+
+`DatabaseSession` gains event-routed submission alongside the existing `Completion` methods. Implementation is one internal change — the worker's `Reply<T>` becomes `enum ReplyTo<T> { OneShot(Sender<DbResult<T>>), Event { sink: EventSink, request: RequestId } }` with a per-command wrapper into `SessionEvent` — so every correctness property already tested stays where it is:
+
+```rust
+impl DatabaseSession {
+    pub fn bind_events(&self, sink: EventSink);                 // once, at open
+
+    pub fn submit_execute(&self, request: RequestId, statement: Statement) -> DbResult<()>;
+    pub fn submit_fetch(&self, request: RequestId, result: ResultId, max_rows: NonZeroUsize) -> DbResult<()>;
+    pub fn submit_commit(&self, request: RequestId) -> DbResult<()>;
+    pub fn submit_rollback(&self, request: RequestId) -> DbResult<()>;
+    pub fn submit_savepoint(&self, request: RequestId, name: SavepointName) -> DbResult<()>;
+    pub fn submit_rollback_to_savepoint(&self, request: RequestId, name: SavepointName) -> DbResult<()>;
+    pub fn submit_ping(&self, request: RequestId) -> DbResult<()>;
+    pub fn submit_read_lob_chunk(&self, request: RequestId, lob: LobHandle, max: NonZeroUsize) -> DbResult<()>;
+    pub fn submit_close_result(&self, request: RequestId, result: ResultId) -> DbResult<()>;
+    pub fn submit_close_lob(&self, request: RequestId, lob: LobHandle) -> DbResult<()>;
+    pub fn submit_close(&self, request: RequestId, disposition: Option<CloseDisposition>) -> DbResult<()>;
+
+    // unchanged, synchronous, out-of-band:
+    pub fn cancel(&self) -> DbResult<CancelOutcome>;
+    pub fn cancel_kind(&self) -> CancelKind;
+    pub fn has_possibly_active_transaction(&self) -> bool;
+    pub fn session_state(&self) -> SessionLifecycle;
+}
+```
+
+**How the deadline and cancel state surface.** The armed deadline is a property of the `Statement` the caller built (`Statement::with_deadline`), and the resolved three-level setting is applied by the UI layer *before* submitting. The core echoes what was actually armed in `Executing { deadline }`, so the worksheet shows the real limit rather than what it hoped for. A fired deadline arrives as `ErrorKind::Timeout` (never relabelled `Cancelled`, ADR-0002 M5), typically with `SessionState::NeedsValidation` or `Lost`, and the resulting `Terminal` is the honest "the session did not survive the limit" the spec demands. `cancel_kind` is constant per session and is what the UI asks before offering anything.
+
+**How transaction state surfaces.** `TransactionStateChanged` is emitted whenever `has_possibly_active_transaction()` flips, so a worksheet's Commit/Rollback affordances and its close-prompt do not poll. It is advisory: `close` still re-decides on the worker after the queue drains (K4) and can still answer `CloseError::DecisionRequired`.
+
+**How `Lost`/`Closed` are delivered exactly once.** The worker already computes the transition in `SessionShared::note_error` / `mark_closed`. The change is that the transition — not each observation of it — emits `Terminal`, guarded by a one-shot flag in `SessionShared`. Sequence on loss: fail every already-queued command (each producing its own reply event), then emit `Terminal`, then stop. The session *handle* remains valid until the registry is told to release it; terminal is not free.
+
+### B4 — Additive `db-driver-api` items Phase 1 needs (each an ADR-0002 amendment)
+
+Three, and no more — each one is data or a capability flag, not new execution machinery:
+
+1. **Connect-time warnings (C-6, already approved in principle).** `DatabaseConnection::take_connect_warnings() -> Vec<Warning>`, collected once by `db-core` after connect and delivered in `Opened { warnings }`. This is how TCPS `SSL_SERVER_DN_MATCH` and the trigger-rewrite notice reach the user.
+2. **Server output (DBMS_OUTPUT).** `Capabilities::server_output`, `DatabaseConnection::set_server_output(enabled, buffer)` and `take_server_output() -> Vec<Box<str>>`. The vendor SQL (`DBMS_OUTPUT.ENABLE`/`GET_LINES`) stays inside the Oracle driver; the core polls only when a worksheet enabled the pane, because it costs a round trip per statement.
+3. **Metadata catalog — the light shape.** `DatabaseDriver::metadata_catalog() -> &dyn MetadataCatalog`, where the *driver* returns a prepared `Statement` plus a declared column contract for each vendor-neutral metadata query (`Schemas`, `ObjectsOfKind{schema, kind, name_filter, limit}`, `ColumnsOf{schema, table}`). `db-core` executes it through the ordinary path and gets an ordinary `RowBatch`. Vendor dictionary SQL stays in the vendor (invariant 2) and no new result plumbing, paging or caching is invented. A `MetadataProvider` trait with its own result types was considered and rejected for Phase 1: it duplicates the fetch path for no MVP benefit, and the SQLite metadata cache (`ARCHITECTURE.md` §13 item 8) is P2 anyway.
+
+Also additive, in `db-core` rather than the contract: a `SqlDialect` **descriptor** (keywords, quote and `q'[…]'` rules, block starters, terminator handling) that the driver supplies as data and `reldex-sql-text` consumes as the parameter to its lexer/splitter. See §C M2.4.
+
+### B5 — Risks in this design, and what is done about them
+
+| Risk | Consequence | Mitigation |
+| --- | --- | --- |
+| Worker blocked forever on a black-holed link with "no limit" | Every later command on that session queues forever; `close` cannot run | Default limit is 600 s and the "no limit" UI states the consequence; `abandon()` detaches within `DROP_SHUTDOWN_TIMEOUT` and the UI closes the worksheet; a process-level counter of detached workers is exposed in diagnostics so the leak is visible, not silent |
+| Unbounded connect attempts (U-15: a connect cannot be bounded upstream; C-5's helper thread is the fix) | Thread and socket accumulation on a bad network | C-5 must land (M2.1) *before* the connection manager ships; cap concurrent pending connects per process; `abandon` is answered immediately and the late connection is closed on arrival |
+| Waker use-after-free when the adapter is destroyed | Crash on exit or on window close | `set_waker` blocks until any in-flight wake returns; 10,000-iteration ASan teardown test is spike kill criterion K5 |
+| Re-entrancy from the waker into the core | Deadlock inside a session lock | Contract forbids it; debug thread-local guard returns `RELDEX_STATUS_REENTRANT`; the C++ trampoline only posts |
+| Event storm from `ServerOutput` on a chatty PL/SQL run | UI starves | Bounded per-session ring, coalescing, drop-count reported; drain budget in the adapter |
+| `Completion` and event paths diverge over time | Two semantics for the same operation | Both are the same `Command` with a different `ReplyTo`; the existing `db-core` test suite runs against both paths (parameterized) |
+| A request submitted after `Terminal` | Adapter confusion about lifetime | Uniform rule: it still gets exactly one failure reply; `Terminal` is a state announcement, not a queue close |
+
+---
+
+## C. Phase 1 plan — Desktop MVP
+
+## C.0 — Toolchain to install (needs owner approval before M1 starts)
+
+Already present on the dev machine: Rust stable MSVC, **Visual Studio 2022 Community with the MSVC 14.44 toolset**. Missing: CMake, Ninja, Qt.
+
+| Item | Version | What for | Size class |
+| --- | --- | --- | --- |
+| **Qt 6.8 LTS**, kit `msvc2022_64` | latest patch still published to open-source users | The UI | ~1.5–2.5 GB downloaded, ~4–5 GB on disk |
+| — module `qtbase` | | Core, Gui, Network(off if unused), `windeployqt` | included |
+| — module `qtdeclarative` | | Qt Quick, QML, Qt Quick Controls 2, `qmlcachegen` | included |
+| — module `qtshadertools` | | required by Quick | included |
+| — module `qtsvg` | | icons | small |
+| — module `qttools` | | `lupdate`/`lrelease`, Linguist (Thai/English) | small |
+| — **Qt Creator** | optional | convenience only; agents build from CLI | ~1 GB — recommend **skip** |
+| **CMake** ≥ 3.24 | | build driver (Corrosion needs ≥3.22; Qt6 needs ≥3.16, ≥3.21 for qml modules) | ~110 MB |
+| **Ninja** | 1.12+ | generator | ~1 MB |
+| `cbindgen` | latest | header generation (`cargo install`) | negligible |
+
+**Explicitly NOT installed, and not to be used:** Qt Charts, Qt Graphs / Data Visualization, Qt Virtual Keyboard, Qt Quick 3D (and Quick 3D Physics), Qt WebEngine, Qt Wayland *compositor*, qt5compat. The first group is published **GPLv3-only** in the open-source offering and would force Reldex itself to be GPL; WebEngine adds Chromium's bulk and its own licence tangle; qt5compat exists to drag Qt5 APIs forward and we have none.
+
+**Licence position (LGPLv3, for a possibly closed-source desktop app) — what we must do:**
+
+- **Link Qt dynamically.** Ship Qt as DLLs via `windeployqt`; never `-static`. Static linking under LGPLv3 obliges us to distribute relinkable object files of *our* application, which is incompatible with a closed-source Pro build.
+- **Ship the licence texts and attribution** (LGPLv3 + GPLv3 reference + Qt's third-party notices) alongside our own generated notices file (`cargo about` for the Rust graph — already a P0 task).
+- **State which Qt version we ship and where its source is**, plus any patches (we plan none). A written offer or a link to the exact upstream tarball satisfies this.
+- **Do not prevent the user replacing the Qt DLLs.** This is why the installer must not verify or lock the bundle contents.
+- Our own code, the QML, and the Rust core are unaffected: moc/rcc/uic output is covered by The Qt Company's GPL exception, and LGPL applies to the Qt libraries we distribute, not to our sources.
+- **Flagged now, decided later:** iOS distribution (Phase 4/5) requires static linking in practice and App Store DRM sits badly with LGPLv3 §4's installation-information requirement. That is the usual point where projects buy a commercial Qt licence. It is not a Phase 1 blocker but it is a Phase 1 *decision input* — see owner decision 2.
+- **Verify the per-module licence table for the exact Qt version before first distribution.** Qt's module licensing has changed between releases; treating the list above as final without checking would be exactly the kind of unverified claim the repository's own standards reject.
+
+## C.1 — Scope: in and out
+
+**IN (Phase 1 = Desktop MVP, Windows x64 first):** app shell and workspace layout; connection profiles with three-level settings and Windows Credential Manager; connect with a bounded timeout and honest TCPS wording; multiple independent worksheet sessions; SQL/PL-SQL editor with highlighting, line numbers, search/replace, bracket matching, Thai/IME/high-DPI, themes and fonts; statement splitting and run current/selection/script; bind-variable dialog; auto-commit OFF with explicit Commit/Rollback, close-with-pending-transaction dialog, savepoints; the honest no-Cancel UX with the three-level time limit; virtualized result grid with NULL visualization, row numbers, column resize/reorder, copy (cell/row/range, with headers), search-in-results, type-aware formatting, CLOB/BLOB viewers; DBMS_OUTPUT pane; error pane with PL/SQL position highlighting only; query history; minimal lazy object browser; workspace persistence; logging/diagnostics without secrets; Windows packaging; CI with headless QML tests on three OS; the fetch-batch benchmark and its shipped default; third-party notices; Thai+English UI baseline and an accessibility baseline.
+
+**OUT of Phase 1 — the defer list, with reasons:**
+
+| Deferred | To | Reason |
+| --- | --- | --- |
+| Streaming CSV/TSV/JSON/SQL export | P2 | `TASKS.md` already places it in P2; it needs the Result Store's streaming path settled (ADR-0004) and is not needed to prove the MVP workflow |
+| Explain Plan tree/text UI | P2 | `TASKS.md` P2. `SPEC.md` §24.15 is a **V1 DoD** item, not an MVP item; the driver side already passes (spike S12) |
+| PL/SQL object editor, compile, compile-error mapping, Table Inspector, DDL viewer | P2 | `TASKS.md` P2; each is its own vertical |
+| In-grid sorting and filtering | P2 | Client-side sort over a partially-fetched million-row result is a lie about completeness; the honest forms (re-execute with `ORDER BY`, or a full materialization) need ADR-0004 first |
+| Code folding, and files > 5 MB in the editor | P2 | `QQuickTextEdit` lays out the whole document; a fold model plus a virtualized document is a second editor project. MVP measures the limit and refuses beyond it honestly |
+| Autocomplete, signatures, diagnostics, go-to-definition | P2 | `SPEC.md` §14 requires only that the architecture *allows* them — the `reldex-sql-text` crate is that allowance |
+| SQLite metadata cache, 100k-object browsing | P2 | `ARCHITECTURE.md` §13 item 8 is unresolved; MVP browses server-side with a filter and a row cap |
+| macOS/Linux packaging | P2 | `TASKS.md` P2. Phase 1 keeps them **building and testing** in CI so they never rot |
+| Arrow evaluation, result spill/eviction | P3 | Benchmark-gated by `SPEC.md` §12 |
+| Mobile anything | P4/P5 | `SPEC.md` §25 needs devices the owner has not provided for Phase 1 (an Android phone was provided 2026-09-19 for the Phase 0 validation tail; iOS still needs a Mac + Apple Developer account + device) |
+| Pro features, entitlements service, gateway, AI | P6 | `SPEC.md` §22/§23 |
+| On-demand Cancel | blocked | ADR-0001 owner decision; upstream issue #24 |
+
+## C.2 — Milestones
+
+Six milestones. M1 is the de-risking gate and nothing downstream starts until it passes. ★ marks tasks where **independent review is mandatory** (per `AGENTS.md` and the `reldex-development` review checklist): architecture, FFI/`unsafe`, concurrency, security, and correctness-critical transaction paths. Status legend matches `TASKS.md`: `[x]` done, `[~]` in progress, `[ ]` todo, `[!]` blocked.
+
+---
+
+### M1 — De-risk: toolchain, ADR-0003, and a real virtualized table
+
+**Goal.** Prove the whole Qt↔Rust path end to end at scale before any product feature is built, and accept or kill ADR-0003 on evidence.
+
+**Exit gate (demonstrable).** A QML window shows a `TableView` scrolling 1,000,000 mock rows fed through the real `reldex-ffi` and a real `QAbstractTableModel`; the S15 measurement report records frame time (p50/p99), first-row latency, RSS, and per-batch boundary cost against the K1–K7 thresholds; ADR-0003's status is updated — moved to Accepted, or re-opened with the owner — on that evidence; CI builds the CMake+Corrosion+Qt project and runs offscreen tests on windows/ubuntu/macos.
+
+| ID | Status | Title | Owner | Inputs | Outputs | Deps | Acceptance | Size |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| M1.1 | `[!]` blocked — owner approval of the toolchain install (C.3 #1) | Owner approval + toolchain install (Qt, CMake, Ninja, cbindgen) | owner + `sonnet` | §C.0 list | Installed toolchain; `docs/exec-plans/active/phase-1-toolchain.md` recording exact versions and paths | — | `cmake --version`, `ninja --version`, `qmake -query` all report; a stock Qt Quick hello-world builds and runs | S |
+| M1.2 ★ | `[x]` done — ADR-0003 drafted as **Proposed** by this change | Draft ADR-0003 (this section A) | `opus` | §A | `docs/decisions/0003-qt-rust-integration.md` (Proposed) | — | Reviewed by a second `opus`; alternatives and kill criteria present | M |
+| M1.3 ★ | `[ ]` todo | `crates/ffi` skeleton: hub, session open/execute/fetch, batch views, errors, waker | `opus` | ADR-0003 D2–D7; `db-core` public API | `crates/ffi` + `crates/ffi/include/reldex.h` | M1.2 | `cbindgen --verify` clean; clippy `-D warnings`; every `unsafe` has SAFETY; Miri green on the crate's tests | L |
+| M1.4 | `[ ]` todo | C smoke harness (`ui/tests/ffi_smoke`), no Qt, mock driver, ASan on Linux | `sonnet` | M1.3 header | A C program exercising open→execute→fetch→close | M1.3 | Runs green on all 3 CI OS; ASan/UBSan clean on Linux | M |
+| M1.5 | `[ ]` todo | CMake + Corrosion + Qt project skeleton; QML module for the adapter | `sonnet` | M1.1, M1.3 | `ui/CMakeLists.txt`, `ui/adapter`, `ui/app` | M1.1, M1.3 | One-command build on Windows; `QT_QPA_PLATFORM=offscreen` test target runs | M |
+| M1.6 ★ | `[ ]` todo | `ResultTableModel : QAbstractTableModel` over borrowed batch views; `Bridge` waker→`invokeMethod` drain | `opus` | ADR-0003 D4/D5 | Adapter classes + `QAbstractItemModelTester` suite | M1.5 | Model tester green; K5 teardown test (10k iterations, ASan) green; no FFI call inside `data()` beyond pointer reads | L |
+| M1.7 | `[ ]` todo | Mock driver: 1M-row generator of the S14 shape with controllable latency and a 10 s blocking statement | `sonnet` | `crates/drivers/mock` | New `Scenario` cases | — (parallel with M1.3–M1.6) | Deterministic; DB-free; used by M1.4 and M1.8 | S |
+| M1.8 ★ | `[ ]` todo | Spike S15 measurement run + report | `opus` | M1.6, M1.7 | `docs/exec-plans/active/phase-1-s15-ffi-spike.md` with method, environment, numbers | M1.6, M1.7 | Every K1–K7 threshold has a measured number and a verdict; method recorded per `AGENTS.md` "Performance" | M |
+| M1.9 | `[ ]` todo | Accept or re-open ADR-0003; update `ARCHITECTURE.md` §13 items 2/3/10, `TASKS.md`, `Task.html` | `sonnet` | M1.8 | Updated docs | M1.8 | Status changed with evidence links; dashboard not stale | S |
+
+**Parallelism.** M1.7 runs alongside M1.3–M1.6. M1.4 and M1.6 can run in parallel once M1.3's header is stable. M1.2 must land before M1.3 begins coding.
+
+---
+
+### M2 — Core readiness: events, async open, settings, SQL text, driver leftovers
+
+**Goal.** Make `db-core` and the Oracle driver Phase-1-complete so every UI milestone consumes a finished contract.
+
+**Exit gate.** `db-core`'s existing test suite passes on *both* the `Completion` and event paths; a headless test opens 8 sessions asynchronously, runs statements concurrently, loses one, and observes exactly one `Terminal` each and exactly one reply per request; `connect_timeout` is honoured against a black-holed address; `CREATE TRIGGER … :NEW` succeeds with a reported rewrite; the three-level settings resolver has a truth-table test; the splitter passes a corpus of Oracle scripts.
+
+| ID | Status | Title | Owner | Inputs | Outputs | Deps | Acceptance | Size |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| M2.1 ★ | `[~]` in progress — carried over from Phase 0, in progress on `phase-0/driver-carryover`; M2 consumes the result | Driver: honour `connect_timeout` on a helper thread (C-5/U-15), default 15 s, "no limit" supported | `opus` | `phase-0-spike-results.md` §7 C-5 | `crates/drivers/oracle-thin` change + live test | — | A connect into a black hole returns at the limit; no session is adopted after it; abandoned attempt closed on arrival | M |
+| M2.2 | `[~]` in progress — carried over from Phase 0, in progress on `phase-0/driver-carryover`; M2 consumes the result | Driver: `CREATE TRIGGER` `:NEW`/`:OLD` auto-rewrite (U-18), on by default, reported as a warning with the submitted text, per-connection off switch | `sonnet` | SPEC §8 owner decision | Driver change + live test + canary update | — | Rewrite works; warning carries the exact statement sent; off switch restores the explanatory refusal | M |
+| M2.3 ★ | `[~]` in progress — carried over from Phase 0, in progress on `phase-0/driver-carryover`; M2 consumes the result | Contract: `take_connect_warnings` (C-6) + ADR-0002 amendment | `opus` | `phase-0-spike-results.md` §7 C-6 | `db-driver-api` + `db-core` + mock + oracle-thin | M2.1 | Warnings collected once after connect; TCPS `SSL_SERVER_DN_MATCH` warning reaches the caller | S |
+| M2.4 | `[ ]` todo | `crates/sql-text`: lexer + statement splitter driven by a `SqlDialect` descriptor the driver supplies | `sonnet` | SPEC §15; ADR-0002 D8 | New crate + Oracle dialect descriptor in the driver | — | A corpus of Oracle scripts (PL/SQL blocks, nested BEGIN, `/`, `q'[…]'`, comments, strings, Thai text) splits correctly; `tokenize_block(text, in_state) -> (tokens, out_state)` shaped for `QSyntaxHighlighter` | L |
+| M2.5 ★ | `[ ]` todo | `EventQueue`/`EventSink`/`SessionEvent`/`Waker` + `ReplyTo` refactor of the worker | `opus` | §B2 | `db-core` change | — | Ordering rules 1–5 each have a test; exactly-once `Terminal` test; drop-count reporting test; existing suite runs on both paths | L |
+| M2.6 ★ | `[ ]` todo | `SessionRegistry` + non-blocking `open`, `abandon` semantics | `opus` | §B3 | `db-core` change | M2.5 | `open` returns without blocking; abandon-before-open yields exactly one `OpenFailed{Cancelled}` and closes the late connection; ADR-0002 amendment recorded | M |
+| M2.7 ★ | `[ ]` todo | Server output capability (DBMS_OUTPUT) in contract + driver + core polling when enabled | `opus` | §B4.2 | Contract + driver + core | M2.5 | Thai text survives byte-exact (S5 precedent); no round trip when the pane is off | M |
+| M2.8 | `[ ]` todo | Metadata catalog descriptor (`MetadataCatalog`) + Oracle dictionary SQL for the 9 object groups | `sonnet` | SPEC §16; spike S12 | Contract + driver | M2.3 | Each group returns a declared column contract; server-side name filter and row cap; permission failures classify as `ErrorKind::Permission`, not driver failure | M |
+| M2.9 ★ | `[ ]` todo | Settings model: three-level resolution with provenance; profile model; SQLite store | `opus` | SPEC §17/§20; owner decisions | `db-core` workspace/settings module + schema | — | `effective = worksheet ?? profile ?? application ?? built-in`, with the source reported; truth-table test; schema migration path; **no secret ever written to SQLite** | L |
+| M2.10 ★ | `[ ]` todo | Credential store: `CredentialStore` trait + Windows Credential Manager implementation | `opus` | SPEC §17; ARCHITECTURE §13 item 9 | `crates/secrets` + core wiring | M2.9 | Password round-trips through Credential Manager keyed by profile UUID; absence of a store means **prompt each time**, never a plaintext fallback; nothing secret in logs or `Debug`; licence of every new dep recorded | M |
+| M2.11 | `[ ]` todo | FFI surface for M2.5–M2.10 + regenerate and verify header | `sonnet` | M1.3 | `crates/ffi` extension | M2.5–M2.10 | `cbindgen --verify` clean; C smoke harness extended | M |
+
+**Parallelism.** M2.1/M2.2 (driver), M2.4 (sql-text), M2.9/M2.10 (settings/secrets) and M2.5/M2.6 (events) are four independent tracks. M2.11 gates on all of them.
+**Mandatory review:** M2.1, M2.3, M2.5, M2.6, M2.7, M2.9, M2.10 — concurrency, contract change, and security.
+
+---
+
+### M3 — Connect: shell, connection manager, first real session
+
+**Goal.** A user can create a profile, store its password securely, connect to Oracle 19c, and see the session live — with honest wording for timeouts and TCPS.
+
+**Exit gate.** From a clean machine: create a profile (Easy Connect, service name, and a full descriptor), connect over TCP and over TCPS with a user-supplied CA PEM, see a Production profile's persistent indicator, and have the password survive a restart without ever appearing in the SQLite file or the log.
+
+| ID | Status | Title | Owner | Inputs | Outputs | Deps | Acceptance | Size |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| M3.1 | `[ ]` todo | App shell: window, docking-free fixed layout (sidebar / worksheet tabs / output panes), light+dark theme, high-DPI | `sonnet` | SPEC §14 | `ui/app` | M1 gate | Renders at 100/150/200% DPI; theme switch has no restart | M |
+| M3.2 | `[ ]` todo | Connection manager UI: list, create/edit/delete, environment, test-connect | `sonnet` | M2.9 | QML + `ProfileModel` | M2.11 | All `SPEC.md` §17 fields present; environments Dev/Test/UAT/Staging/Production/Custom | L |
+| M3.3 ★ | `[ ]` todo | Connect flow over the async path, with a bounded timeout and a cancellable "Connecting…" state | `opus` | §B3 | `SessionController` | M2.6, M2.11 | Cancelling a pending connect returns immediately and adopts nothing late; failures show kind + ORA code + cause chain | M |
+| M3.4 | `[ ]` todo | Production indicator: persistent, not colour-only (icon + text + tab badge) | `sonnet` | SPEC §17 | QML | M3.2 | Visible in every place a statement can be run; passes a greyscale check | S |
+| M3.5 ★ | `[ ]` todo | TCPS UI described exactly as `SPEC.md` §8: user-supplied CA PEM, verification always on; surfaces the descriptor-guard warnings from C-6 | `opus` | SPEC §8; spike S8; PR #5 | QML + wording | M2.3 | No control implies mTLS, wallet files, OS trust store or revocation; `SSL_SERVER_CERT_DN` refusal explains the opt-out rather than failing blankly | M |
+| M3.6 | `[ ]` todo | Settings UI: application defaults, per-profile overrides, provenance shown ("inherited from profile") | `sonnet` | M2.9 | QML | M3.2 | Every default in the product is reachable here (owner rule: every default is user-configurable) | M |
+| M3.7 ★ | `[ ]` todo | Logging/diagnostics: `tracing` + rotating file sink, redaction layer, Qt messages forwarded through the FFI | `opus` | AGENTS "do not log secrets" | `crates/ffi` + core | M2.11 | A test asserts no password, PEM, or token reaches the log at any level; SQL text logged only at `debug` behind an explicit opt-in; connection strings redacted | M |
+
+**Parallelism.** M3.1/M3.2/M3.6 (UI) run alongside M3.3/M3.5/M3.7 (integration). **Review:** M3.3, M3.5, M3.7.
+
+---
+
+### M4 — Worksheet: editor, execution, transactions, honest limits
+
+**Goal.** The core developer loop: type SQL/PL-SQL, run it against a stable session, see errors and output, and control the transaction explicitly.
+
+**Exit gate.** On the Phase 0 test database: run a statement, a selection, and a multi-statement script including a PL/SQL block with `:NEW` trigger DDL; bind values through the dialog; observe DBMS_OUTPUT including Thai; hit a per-statement time limit and read an honest explanation; close a worksheet with an open transaction and be asked Commit/Rollback/Cancel; have a commit failure leave the session open with the transaction intact.
+
+| ID | Status | Title | Owner | Inputs | Outputs | Deps | Acceptance | Size |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| M4.1 ★ | `[ ]` todo | Editor component decision + implementation: `TextArea` + `QSyntaxHighlighter` on `QQuickTextDocument`, tokens from `reldex-sql-text` over FFI | `opus` | SPEC §14; M2.4 | `ui/adapter/SqlHighlighter`, QML editor | M2.11 | Highlighting is per-block with carry state (maps 1:1 to `previousBlockState`); Thai + non-BMP text renders and edits correctly; IME composition works; 1 MB file loads in < 500 ms; the measured practical file-size limit is recorded and enforced with an honest message | L |
+| M4.2 | `[ ]` todo | Editor essentials: line numbers, current-line, bracket matching, indentation, search/replace, font and theme settings | `sonnet` | M4.1 | QML | M4.1 | Keyboard-first; every shortcut discoverable | M |
+| M4.3 | `[ ]` todo | Statement detection and run modes: current statement, selection, whole script | `sonnet` | M2.4 | `WorksheetController` | M4.1 | Cursor-in-statement resolution matches the splitter; script runs sequentially on one session, stopping or continuing per a user setting | M |
+| M4.4 | `[ ]` todo | Bind-variable dialog: detected placeholders, typed entry, IN/OUT/IN OUT | `sonnet` | ADR-0002 D6 | QML + controller | M4.3 | Re-executable (`Statement` is `Clone`); refuses the two unsafe NUMBER bind shapes with the driver's own explanation (U-1/U-2), never silently | M |
+| M4.5 ★ | `[ ]` todo | Transaction UX: auto-commit OFF, Commit/Rollback, savepoints, close-with-pending-transaction dialog mapped to `CloseDisposition` | `opus` | SPEC §10; ADR-0002 K4 | QML + controller | M2.5 | `DecisionRequired` → dialog; `CommitFailed`/`RollbackFailed` → session stays open and the user is told the transaction is unchanged; a lost session's close says nothing was committed; **no path commits without an explicit user action** | L |
+| M4.6 ★ | `[ ]` todo | The honest no-Cancel UX: three-level time-limit control, "no limit" with its consequence, no Cancel button, "Disconnect worksheet…" as the only stop | `opus` | SPEC §10 interim note; ADR-0001 | QML + wording | M2.5 | Nothing in the UI is labelled Cancel; the running state shows the *armed* deadline from `Executing`; choosing "no limit" states plainly that only disconnecting can end a hung statement, and that disconnecting loses the transaction | M |
+| M4.7 | `[ ]` todo | DBMS_OUTPUT pane: per-worksheet enable, size, clear, truncation notice | `sonnet` | M2.7 | QML | M2.7 | Off by default (it costs a round trip); truncation is reported, never silent | S |
+| M4.8 ★ | `[ ]` todo | Error presentation: kind, ORA code, message, cause chain; caret highlighting **only** for PL/SQL positions | `opus` | ADR-0002 D3/S3; SPEC §24.14 | QML + offset mapping | M2.11 | PL/SQL `ORA-06550` line/column maps to the right character in a Thai/non-BMP document via the UTF-16 conversion; a plain SQL error shows no caret and says why position is unavailable | M |
+| M4.9 | `[ ]` todo | Multiple independent worksheets: N sessions, per-tab state, one busy tab never blocks another | `sonnet` | SPEC §24.17 | Controller + shell | M3.3 | 8 concurrent sessions, one blocked 20 s, UI stays at frame budget (measured) | M |
+| M4.10 | `[ ]` todo | Query history (per profile, SQLite), re-run into the current worksheet | `sonnet` | M2.9 | Store + QML | M2.9 | Bounded size; secrets never captured; text stored verbatim | S |
+
+**Parallelism.** M4.1–M4.4 (editor track) and M4.5–M4.8 (execution/transaction track) are independent after M2; M4.9/M4.10 follow. **Review:** M4.1 (FFI + text correctness), M4.5, M4.6, M4.8.
+
+---
+
+### M5 — Results at scale
+
+**Goal.** A million-row result behaves, and the fetch default is chosen by measurement, not taste.
+
+**Exit gate.** A 1,000,000-row query from the real database scrolls at the M1 frame budget; memory stays within the ADR-0004 policy; the batch-size benchmark report exists and the shipped default is set from it; LOB viewers open a 100 MB CLOB without materializing it.
+
+| ID | Status | Title | Owner | Inputs | Outputs | Deps | Acceptance | Size |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| M5.1 ★ | `[ ]` todo | **ADR-0004 — Result Store representation, paging and bounded-memory policy** | `opus` | ARCHITECTURE §13 item 6; spike S14 | `docs/decisions/0004-result-store.md` | M1 gate | Decides: retain the fetched prefix in core, fetch-on-demand as the view scrolls, configurable row/byte caps with an explicit "fetched N rows (limit reached)" state; spill/eviction and Arrow explicitly deferred to P3 with the benchmark that would reopen it | M |
+| M5.2 ★ | `[ ]` todo | Result Store implementation in `db-core` + FFI batch lifetime rules | `opus` | M5.1 | `db-core` + `crates/ffi` | M5.1 | Random access O(1) over the fetched prefix; batch release rules tested; no locator ever crosses a thread (K1 test extended) | L |
+| M5.3 | `[ ]` todo | Grid features: row numbers, NULL visualization, column resize/reorder, type-aware formatting via the bulk formatter, search-in-results | `sonnet` | ADR-0003 D4 | QML + model | M5.2 | NULL, `Taken` and `Unsupported` are three *visibly different* states — never all shown as empty | M |
+| M5.4 | `[ ]` todo | Copy: cell, row, range, with/without headers | `sonnet` | M5.3 | Controller | M5.3 | Large range copy streams rather than materializing; delimiter configurable | S |
+| M5.5 | `[ ]` todo | CLOB/BLOB viewers over `read_lob_chunk`, paged, with a size warning | `sonnet` | `db-core` LOB API | QML | M5.2 | 100 MB CLOB opens with bounded memory (S7 method); NCLOB Thai/non-BMP byte-exact (S11 method) | M |
+| M5.6 ★ | `[ ]` todo | **Fetch-batch benchmark** across row shapes and a real network; pick and record the shipped default | `opus` | spike S14 | `docs/exec-plans/active/phase-1-fetch-benchmark.md` | M5.2 | ≥3 row shapes × ≥4 batch sizes × local and a latency-injected link; method and environment recorded; the default is a *setting* with a bounded range, and the number is justified by the data (S14 showed throughput is not monotonic) | M |
+| M5.7 | `[ ]` todo | Perf gate re-run on the real database; record against M1's numbers | `sonnet` | M1.8 method | Updated measurement report | M5.3 | Frame time, first-row latency, RSS, fetch throughput all recorded; regressions vs M1 explained | S |
+
+**Parallelism.** M5.3–M5.5 run in parallel after M5.2; M5.6 runs alongside them. **Review:** M5.1, M5.2, M5.6.
+
+---
+
+### M6 — Browse, prove, package
+
+**Goal.** Close the MVP: minimal object browser, workspace persistence, the non-functional obligations, and a Windows installer.
+
+**Exit gate.** A fresh Windows machine installs Reldex from the produced artefact, connects, runs a query, browses objects, restarts with its workspace restored, shows Thai UI correctly, and ships a complete third-party notices file. CI is green on all three OS including offscreen QML tests.
+
+| ID | Status | Title | Owner | Inputs | Outputs | Deps | Acceptance | Size |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| M6.1 | `[ ]` todo | Object browser: lazy tree over the 9 `SPEC.md` §16 groups, server-side filter, row cap, columns of a selected table | `sonnet` | M2.8 | QML + model | M2.8 | Uses its own metadata session (never the worksheet's); a permission failure reads as a permission message, not a driver error; no freeze with a large schema (measured) | L |
+| M6.2 | `[ ]` todo | Workspace persistence: open worksheets, text, layout, active profile — **non-transactional state only** | `sonnet` | SPEC §20/§24.16 | Store + shell | M2.9 | Restores after restart; never restores or implies a session or a transaction | M |
+| M6.3 | `[ ]` todo | i18n baseline: `qsTr` everywhere, EN + TH catalogues, `lrelease` in the build; Thai rendering test in editor, grid and dialogs | `sonnet` | SPEC §14 | `.ts` files + test | M4.2 | A screenshot test (offscreen) covers Thai and non-BMP in all three surfaces; no clipped or tofu glyphs; font setting documented | M |
+| M6.4 | `[ ]` todo | Accessibility baseline: focus order, keyboard-only operation, `Accessible` properties, no colour-only meaning, contrast check | `sonnet` | SPEC §14 | QML + checklist | M3.4 | Every primary flow completable from the keyboard; Windows Narrator smoke pass recorded | M |
+| M6.5 | `[ ]` todo | Third-party notices: `cargo about` for the Rust graph + Qt/LGPL attribution, shipped in the installer and an About dialog | `sonnet` | SPEC §22; TASKS P0 | `NOTICES` artefact + build step | M6.6 | Covers the full transitive graph (63 crates in the oracle-thin graph alone) plus Qt and its third-party content; generated by the build, not by hand | M |
+| M6.6 ★ | `[ ]` todo | Windows packaging: `windeployqt6`, unsigned installer, first-run layout | `opus` | §C.0 licence position | Installer + `docs/packaging.md` | M6.1–M6.4 | Qt linked dynamically; DLLs replaceable; no GPL-only module present (verified by an inventory step); installs and runs on a machine with no dev tools | M |
+| M6.7 | `[ ]` todo | CI: build the Qt project on all three OS; run offscreen QML/QTest and the C smoke harness; cache Qt and cargo | `sonnet` | M1.5 | `.github/workflows/ui.yml` | M1.5 | Cold job under the agreed time budget; `QT_QPA_PLATFORM=offscreen`; keeps the existing fast hermetic Rust job untouched | M |
+| M6.8 ★ | `[ ]` todo | Phase 1 DoD review against `SPEC.md` §24, honest status per item; update `TASKS.md`, `phase-1.md`, `Task.html` | `opus` | everything | Exit assessment | all | Every DoD item marked met / met-with-limits / not-met with evidence; §24.8 Cancel stays **not met**; nothing softened | S |
+
+**Parallelism.** M6.1/M6.2 (features) run alongside M6.3/M6.4 (non-functional) and M6.5/M6.7 (build). **Review:** M6.6, M6.8.
+
+## C.3 — Owner decisions required (numbered; recommendation for each; current status per the 2026-09-20 facts)
+
+1. **Install Qt and the build tools per §C.0?** — *Recommend yes*, Qt 6.8 LTS `msvc2022_64`, modules `qtbase`/`qtdeclarative`/`qtshadertools`/`qtsvg`/`qttools` only, **without Qt Creator**, plus CMake and Ninja. ~2 GB download, ~5 GB on disk. Nothing starts without this.
+   **Status:** Open — not yet decided. M1.1 is blocked on this.
+2. **Licence position.** — *Recommend*: ship Community under **LGPLv3-compliant dynamic linking**, ban GPL-only Qt modules, and treat a commercial Qt licence as a decision deferred to the first of (a) iOS distribution, (b) a closed-source Pro build that needs static linking. Budget implication to be aware of now, not to spend now.
+   **Status:** Open — not yet decided.
+3. **Qt version policy.** — *Recommend* pinning one exact Qt version in `phase-1-toolchain.md` and treating an upgrade as a reviewed change (same discipline as the `oracledb` pin). Note that LTS patch releases move to commercial-only after the open-source window; the pinned version must be one we can still legally obtain.
+   **Status:** Open — not yet decided.
+4. **Approve the defer list (§C.1).** — *Recommend yes as written.* The sharpest cuts: Explain Plan and export move to P2 even though `SPEC.md` §24 lists them, because §24 is the **V1** Definition of Done, not the MVP. If you want either in Phase 1, say which milestone loses a task to pay for it.
+   **Status:** Open — not yet decided.
+5. **App identifier and branding.** — Needs: reverse-DNS id, executable name, display name, installer publisher string, and a placeholder icon. *Recommend* `com.reldex.reldex` / `Reldex.exe` / "Reldex", with `AGENTS.md`'s rule enforced by an automated check that no vendor trademark appears in any of them. Vendor names remain allowed in driver and compatibility text.
+   **Status:** Open — not yet decided.
+6. **Code signing for Windows.** — *Recommend* shipping Phase 1 **unsigned** (internal/early users see a SmartScreen warning) and buying a certificate only before public distribution. Signing an unsigned-today build later is cheap; buying early is not.
+   **Status:** Open — not yet decided.
+7. **Secrets storage.** — *Recommend* Windows Credential Manager via the `windows` crate (MIT/Apache-2.0) for Phase 1, with the `keyring` crate evaluated for macOS/Linux in P2. Rejected for now: `keyring` on Windows-only, because its Linux path drags in zbus/D-Bus we do not need yet. **No plaintext fallback ever** — if no store is available, Reldex prompts every time.
+   **Status:** Open — not yet decided.
+8. **Local store format.** — *Recommend* one SQLite file (rusqlite, bundled SQLite) for profiles, settings, history, workspace: atomic, no half-written config, and it is needed for history regardless. Trade-off accepted: settings are not hand-editable; an export/import to TOML can come later if support needs it.
+   **Status:** Open — not yet decided.
+9. **Telemetry and logging.** — *Recommend* no telemetry at all in Phase 1; local rotating log file, default level `info`, SQL text logged only at `debug` behind an explicit opt-in, secrets redacted by construction and asserted by test.
+   **Status:** Open — not yet decided.
+10. **Fetch-batch default (M5.6).** — *Recommend* the owner signs off the number the benchmark produces rather than pre-committing one. S14 showed 10,000 rows/batch was ~3.5× *slower* than the best of 100 and 1,000, so intuition is actively wrong here.
+    **Status:** Open — not yet decided (deferred to the M5.6 benchmark by design).
+11. **Wording sign-off for the no-Cancel UX and "no limit" (M4.6).** — *Recommend* the owner reads and approves the exact strings, because this is the product's honesty commitment in user-visible form. Proposed: Cancel is absent, not disabled; the run bar shows "Time limit 10 min (from profile)"; "no limit" reads *"A statement with no limit can only be ended by disconnecting this worksheet, which loses its transaction."*
+    **Status:** Open — not yet decided.
+12. **Phase-0 leftovers carried into M2 (C-5, U-18, C-6).** — *Recommend* treating them as Phase 1 M2 tasks (as planned above) rather than blocking the Phase 1 start on them. Confirm.
+    **Status:** Resolved — the carry-over approach is confirmed and the work is already in progress as Phase 0 carry-over on branch `phase-0/driver-carryover` (not yet merged); M2 consumes the result (M2.1–M2.3 above).
+13. **Upstream issues F and G** (U-15…U-18) — still awaiting your go-ahead from Phase 0. *Recommend* submitting; F in particular is the connect-timeout gap M2.1 works around locally.
+    **Status:** Resolved — the owner decided on 2026-09-19 **not** to submit F and G for now; the drafts are kept for tracking only (results file §6). This is a decision, not a pending recommendation.
+14. **Mobile test hardware.** — Not needed for Phase 1, but *recommend* acquiring an Android arm64 device (API 26+) during Phase 1 so P4 is not gated on procurement. iOS additionally needs a Mac and an Apple Developer account.
+    **Status:** Partially resolved — the owner provided an Android arm64 phone (OPPO CPH2399) on 2026-09-19; NDK 28.2 is already installed and a physical-device validation run is in progress on branch `phase-0/android-device` (not finished; no results to cite yet). This validation is Phase-0 scope, not Phase 1. iOS still needs a Mac + Apple Developer account + device — not yet provided.
+15. **Community/Pro licensing decision** (open since P0). — Blocks first distribution, not Phase 1 development. *Recommend* deciding before M6.6 so the notices file and About dialog are right the first time.
+    **Status:** Open — not yet decided.
+
+---
+
+## D. Risks and unknowns
+
+| # | Risk | Impact | Mitigation | Earliest task that retires it |
+| --- | --- | --- | --- | --- |
+| R1 | Qt Quick `TableView` + a custom model cannot hold 60 FPS over 1M rows on the dev machine | The whole UI choice is wrong; Phase 1 has no foundation | Measure it first, with the real boundary, before any feature exists; kill criteria K1/K3 stated in advance | **M1.8** |
+| R2 | The waker → `invokeMethod` path has a lifetime or reentrancy defect that only appears under load or on shutdown | Intermittent crashes that are expensive to find later | Contract rules in ADR-0003 D5; `set_waker` blocks on in-flight wakes; 10k-iteration ASan teardown test | **M1.6 / M1.8 (K5)** |
+| R3 | Hand-written FFI introduces UB that tests do not catch | Memory corruption in the most critical layer | One crate, no logic, SAFETY comments, Miri, ASan C harness, mandatory independent review of every FFI change | **M1.3 + M1.4** |
+| R4 | `QQuickTextEdit` is unusable for real SQL files (large documents, Thai shaping, IME) | The editor — the product's core surface — needs a rewrite mid-phase | Measure the limit in M4.1 with Thai and non-BMP corpora before building features on it; documented fallback is a custom `QQuickItem` editor with a Rust-side text model, costed as an L task | **M4.1** |
+| R5 | A blocked worker with "no limit" accumulates detached threads and sockets | Slow resource leak that looks like a hang to the user | 600 s default; `abandon` detaches within 500 ms (K5); detached-worker counter surfaced in diagnostics; C-5 bounds the connect half | **M2.1 + M2.6** |
+| R6 | The event refactor (`ReplyTo`) regresses one of ADR-0002's hard-won correctness properties (K1, K4, K5, K7, K8) | Silent commit, lost transaction, or a handle on the wrong thread — the failures `SPEC.md` §2 ranks worst | Run the **existing** `db-core` suite parameterized over both reply paths; no new semantics, only a new delivery channel; mandatory independent review | **M2.5** |
+| R7 | `oracledb` 26.0.0-beta.3 aborts the process on an unhandled input reaching it (U-4) | A crash no layer can contain, now with a GUI and unsaved editor text in play | Driver keeps refusing known-panicking inputs; **add**: periodic editor-text autosave to the workspace store so an abort never costs the user's SQL | **M6.2** (autosave); canary suite already tracks the defect |
+| R8 | Retaining a fetched million-row prefix breaks the bounded-memory promise on wide rows | Memory blowout in normal use | ADR-0004 makes the cap explicit, configurable and *visible* ("fetched N rows, limit reached") instead of implicit | **M5.1 / M5.2** |
+| R9 | Qt licence obligations are misjudged (module licensing, static linking, iOS) | Legal exposure, or a forced rewrite before shipping Pro | Module inventory step in the packaging task; verify Qt's per-module licence table for the pinned version before first distribution; owner decision 2 taken with eyes open | **M6.6** |
+| R10 | Qt in CI is slow or flaky enough to stop being a gate | Regressions land unnoticed; the three-OS promise rots | Separate workflow from the fast hermetic Rust job; cache Qt and cargo; offscreen only; a time budget the job must meet | **M6.7** (proven in **M1.5**) |
+| R11 | Statement splitting disagrees with the server on real scripts | Wrong statement executed — a correctness failure, not a UI bug | Corpus-driven tests in M2.4 including `q'[…]'`, nested blocks, comments and Thai; the splitter never drives transaction policy (classification stays in the driver, ADR-0002 D4/S9) | **M2.4** |
+| R12 | Thai/non-BMP position mapping is wrong, so error carets point at the wrong token | Misleading diagnostics in exactly the market the product targets | Core supplies scalar→UTF-16 conversion; tested against the S11 corpora; fragment offsets added in one place | **M4.8** |
+| R13 | Upstream `oracledb` ships a breaking beta while Phase 1 is mid-flight | Unplanned rework in the driver layer | The pin, the canary suite and `oracledb-upgrade-checklist.md` already exist; treat an upgrade as its own reviewed task, never as incidental | already retired (Phase 0) |
+| R14 | Phase 0's `SPEC.md` §24.8 Cancel gap becomes a support/marketing problem once real users see it | Trust damage if it is discovered rather than disclosed | The UI states it plainly (M4.6), the README already does, and the DoD review keeps it marked **not met** | **M4.6 / M6.8** |
+
+**Known unknowns, deliberately not guessed:** the practical editor file-size ceiling (M4.1 measures it); the shipped fetch-batch default (M5.6); whether a `ping` between statements is cheap enough to use as a liveness probe in the UI (measure in M5.7 — S1 measured 769 µs median, which suggests yes); and whether Qt's offscreen platform gives frame timings worth gating on in CI (assume not; gate on the dev machine).
