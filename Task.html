@@ -503,27 +503,21 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-20T07:30:00+07:00",
+  "updatedAt": "2026-09-20T08:30:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
-    "id": "P0",
-    "title": "Phase 0 — Architecture Validation",
-    "goal": "Prove the Rust core, thin database connectivity, cancellation, transaction behavior, and mobile feasibility before substantial UI investment.",
-    "exitGate": "Desktop POC passes. Android/iOS feasibility is documented from physical-device tests."
+    "id": "P1",
+    "title": "Phase 1 — Desktop MVP",
+    "goal": "Ship a Windows desktop MVP: Qt Quick UI over a stable Rust FFI boundary, connect to Oracle 19c, run SQL/PL-SQL with explicit transaction control, and browse and export results at scale, all under the honest no-Cancel and configurable-defaults constraints the owner has set.",
+    "exitGate": "A fresh Windows machine installs Reldex from the produced artefact, connects, runs a query, browses objects, restarts with its workspace restored, shows Thai UI correctly, and ships a complete third-party notices file; CI is green on all three OS including offscreen QML tests (phase-1.md M6 exit gate)."
   },
-  "summary": "Phase 0 — Architecture Validation. Core stack proven against Oracle 19.3: vendor-neutral driver contract, db-core session layer, and a wrapper over Oracle's official oracledb crate (pinned beta). Spikes S1, S3, S5, S7, S8 (TCPS, with limits), S9, S10 (network loss/reconnect, two upstream gaps), S11 (NCLOB), S12 (developer features, one upstream blocker), S13 (privileged connections) and S14 (large result) all pass; S2 is partial (NUMBER bind restrictions); S4 cancel is an accepted limitation (owner decision 2026-09-20: pre-armed per-statement deadline + honest UI; SPEC §24.8 unmet until upstream ships a break API). S6 (mobile cross-compile) passed 2026-09-19 in CI (PR #3) — cross-compile and link only, physical-device validation still outstanding. Five of seven drafted upstream issues (A–E) were submitted 2026-09-20 (#21–#25); F and G await the owner's go-ahead.",
+  "summary": "Phase 0 closed: the owner gave the GO for Phase 1 on 2026-09-19, with its limits stated honestly — no on-demand statement Cancel (accepted limitation, upstream fixes pursued), and mobile support proven only as cross-compile-and-link in CI, with an Android physical-device validation run now in progress (device provided 2026-09-19) and iOS device evidence still outstanding. The Phase 1 execution plan (docs/exec-plans/active/phase-1.md, milestones M1-M6) and ADR-0003 (Qt <-> Rust integration, hand-written C ABI in crates/ffi) are now Proposed, pending spike S15 and owner acceptance. M1 — and the whole plan — is blocked on the owner's approval to install the Qt/CMake/Ninja toolchain; C-5/U-18/C-6 continue as Phase 0 carry-over work on branch phase-0/driver-carryover, feeding Phase 1 milestone M2.",
   "focus": [
-    "Phase 0 closed: owner gave the go for Phase 1 on 2026-09-19",
-    "Carry-over driver work: connect_timeout (C-5), CREATE TRIGGER auto-rewrite (U-18), connect-time warning channel (C-6)"
+    "Phase 1 plan (M1-M6) and ADR-0003 (Qt <-> Rust integration) drafted 2026-09-20, both Proposed; nothing accepted yet",
+    "M1 blocked on owner approval to install Qt 6.8 LTS + CMake + Ninja (phase-1.md C.3 #1) — nothing downstream of M1 starts first",
+    "Phase 0 carry-over continues in parallel: connect_timeout/C-5, CREATE TRIGGER rewrite/U-18, connect-warning channel/C-6 on phase-0/driver-carryover; Android physical-device validation on phase-0/android-device"
   ],
-  "blockers": [
-    {
-      "title": "Owner action: approve submission of drafted upstream issues F and G (results file §6)",
-      "detail": "Issues A–E were submitted 2026-09-20 by the owner's account (SupawitNu): B -> #21, C -> #22, D -> #23, A -> #24, E -> #25. F (U-15…U-17: connect cannot be bounded, timeout cause discarded, no keepalive/EXPIRE_TIME) and G (U-18: CREATE TRIGGER … :NEW impossible) are fully drafted in docs/exec-plans/active/phase-0-spike-results.md §6 but await the owner's go-ahead to submit.",
-      "severity": "blocked",
-      "since": "2026-09-19"
-    }
-  ],
+  "blockers": [],
   "risks": [
     {
       "title": "On-demand Cancel unavailable — accepted limitation (owner decision 2026-09-20)",
@@ -563,21 +557,53 @@
     {
       "title": "Black-holed connection hangs without a deadline; no keepalive upstream (U-15…U-17)",
       "detail": "Spike S10: a connect cannot be bounded at all (ConnectionParams::connect_timeout is accepted and ignored, C-5) — 22.0 s against an unroutable address, still outstanding after 30 s against a black hole. A black-holed link with no deadline armed never returns; the only deadline that ends it destroys the session (U-6). No TCP keepalive exists upstream and SQLNET.EXPIRE_TIME is parsed and never acted on, so a dead client's row lock blocked a second session for the full 20 s measured.",
-      "mitigation": "Documented as U-15…U-17 and drafted as upstream Issue F (awaiting the owner's go-ahead to submit). C-5 (connect_timeout) approved 2026-09-19: helper thread, default 15 s, user-configurable, implementation pending. Default per-statement time limit approved 2026-09-19: 600 s, a three-level user setting including \"no limit\" with an explicit UI warning (results file §9 items 8–9). SQLNET.EXPIRE_TIME server-side recommendation approved as documentation only (item 10); Reldex cannot enforce it."
+      "mitigation": "Documented as U-15…U-17 and drafted as upstream Issue F; the owner decided 2026-09-19 not to submit it for now, kept for tracking only (results file §6). C-5 (connect_timeout) approved 2026-09-19: helper thread, default 15 s, user-configurable, implementation pending. Default per-statement time limit approved 2026-09-19: 600 s, a three-level user setting including \"no limit\" with an explicit UI warning (results file §9 items 8–9). SQLNET.EXPIRE_TIME server-side recommendation approved as documentation only (item 10); Reldex cannot enforce it."
     },
     {
       "title": "Trigger DDL with :NEW/:OLD cannot be executed directly (U-18) — workaround documented",
       "detail": "oracledb's SQL parser scans every statement, DDL included, for :name and treats each hit as a bind placeholder, so CREATE TRIGGER … BEGIN :NEW.col := …; END; fails with a missing-bind-values error.",
-      "mitigation": "The driver reports ErrorKind::Unsupported naming the cause and the workaround: submit the DDL inside BEGIN EXECUTE IMMEDIATE q'[…]'; END;, which the parser skips (proven in spike S12). Drafted as upstream Issue G (awaiting the owner's go-ahead). Auto-rewrite approved 2026-09-19 (results file §9 item 11): the driver rewrites the DDL to BEGIN EXECUTE IMMEDIATE q'[…]'; END; by default, always reports the rewrite to the user with the sent statement available for inspection, and can be turned off per connection."
+      "mitigation": "The driver reports ErrorKind::Unsupported naming the cause and the workaround: submit the DDL inside BEGIN EXECUTE IMMEDIATE q'[…]'; END;, which the parser skips (proven in spike S12). Drafted as upstream Issue G; the owner decided 2026-09-19 not to submit it for now, kept for tracking only (results file §6). Auto-rewrite approved 2026-09-19 (results file §9 item 11): the driver rewrites the DDL to BEGIN EXECUTE IMMEDIATE q'[…]'; END; by default, always reports the rewrite to the user with the sent statement available for inspection, and can be turned off per connection."
+    },
+    {
+      "title": "Qt Quick TableView + a custom model may not hold 60 FPS over 1M rows",
+      "detail": "If the boundary and model cannot sustain the frame budget at scale, the whole Phase 1 UI foundation (ADR-0003) is wrong and has to be redesigned before any feature work is safe to build on it.",
+      "mitigation": "Spike S15 measures this first, with the real FFI boundary and a real QAbstractTableModel, before any product feature exists; kill criteria K1 (frame time) and K3 (memory) are stated in advance in ADR-0003."
+    },
+    {
+      "title": "The waker -> invokeMethod path may have a lifetime or reentrancy defect",
+      "detail": "A defect here would surface as intermittent crashes under load or on shutdown — expensive to find later once product code depends on the boundary.",
+      "mitigation": "ADR-0003 D5 states the waker contract as a hard rule (must not block, must not call back into reldex_*); set_waker blocks until any in-flight wake returns; a 10,000-iteration ASan teardown test is spike kill criterion K5."
+    },
+    {
+      "title": "Hand-written FFI in crates/ffi could introduce undefined behaviour that tests miss",
+      "detail": "This is the most correctness-critical new boundary in the product; memory corruption here is worse than in any other layer.",
+      "mitigation": "One crate, no business logic, mandatory SAFETY comments on every unsafe block, Miri over the crate's unit tests, an ASan/UBSan C smoke harness, and mandatory independent review of every FFI change."
+    },
+    {
+      "title": "The M2.5 event-queue refactor (ReplyTo) could regress ADR-0002's hard-won correctness properties",
+      "detail": "A regression here risks a silent commit, a lost transaction, or a handle crossing to the wrong thread — the failure modes SPEC.md ranks worst.",
+      "mitigation": "The existing db-core test suite is run parameterized over both the Completion and event reply paths; the refactor introduces no new semantics, only a new delivery channel; mandatory independent review."
+    },
+    {
+      "title": "Qt licence obligations could be misjudged (module licensing, static linking, iOS)",
+      "detail": "A misjudgement here is legal exposure now, or a forced rewrite before a Pro/iOS build ships later.",
+      "mitigation": "Dynamic linking only, no GPL-only modules, a module-inventory step in packaging (M6.6), and verifying Qt's per-module licence table for the pinned version before first distribution (owner decision C.3 #2/#3 taken with eyes open)."
     }
   ],
   "nextSteps": [
-    "Owner: approve submission of drafted upstream issues F and G (results file §6)",
-    "Owner: provide an Android physical test device (+ local NDK) for physical-device validation; iOS needs a Mac + Apple Developer account + device",
-    "Implement approved 2026-09-19 decisions: connect_timeout (C-5) helper thread with a 15 s default, CREATE TRIGGER auto-rewrite (U-18) with an off switch, and the connect-time warning channel (C-6, sequenced after pull request #5)",
-    "Phase 0 go/no-go → Phase 1 (Qt Quick shell, thin C++/Rust FFI adapter)"
+    "Spike S15 (M1.3–M1.8): crates/ffi, C++ adapter, 1M-row virtualized table; measure kill criteria K1–K7, then accept or re-open ADR-0003",
+    "Owner: decide the remaining open items in phase-1.md §C.3 (#2-#11, #15) — licence position, branding, secrets storage, local store format, telemetry, code signing, Community/Pro licensing",
+    "Once approved: install Qt/CMake/Ninja/cbindgen, then start M1.3-M1.9 (crates/ffi skeleton, CMake+Corrosion+Qt skeleton, ResultTableModel, spike S15) to accept or re-open ADR-0003",
+    "Continue Phase 0 carry-over: land phase-0/driver-carryover (C-5, U-18, C-6) and phase-0/android-device (Android physical-device validation); iOS device evidence still needed"
   ],
   "decisions": [
+    {
+      "id": "OWNER-2026-09-20",
+      "title": "Phase 1 kickoff decisions approved as recommended (phase-1.md C.3 #1–#9)",
+      "status": "Accepted — owner decision 2026-09-20: stay on oracledb; pre-armed deadline + honest UI; upstream issues pending — upstream issues #21–#25 filed 2026-09-20",
+      "date": "2026-09-20",
+      "link": "Toolchain install (Qt 6.8 LTS msvc2022_64 + CMake + Ninja + cbindgen, no Qt Creator); LGPLv3 dynamic linking with GPL-only Qt modules banned; pinned Qt version; the Phase 1 defer list; app identity com.reldex.reldex / Reldex.exe / Reldex; unsigned Windows builds in Phase 1; Windows Credential Manager with no plaintext fallback; one SQLite store; no telemetry. Also: Git Bash is the project's primary script shell, and the lead may proceed through later phases without a separate go/no-go, reporting each exit gate honestly. Still open: fetch-batch default (after the M5.6 benchmark), the no-Cancel wording (at M4.6), Community/Pro licensing."
+    },
     {
       "id": "ADR-0001",
       "title": "Database driver strategy — primary driver is Oracle's oracledb (rust-oracledb)",
@@ -598,6 +624,27 @@
       "status": "Decided 2026-09-19, accepting the lead's recommendation for each with one added requirement: every behaviour must be user-configurable. Implementation pending for items 8, 11 and 13; items 9–10 are default/documentation only; item 12 deferred to a Phase 1 benchmark.",
       "date": "2026-09-19",
       "link": "docs/exec-plans/active/phase-0-spike-results.md"
+    },
+    {
+      "id": "OWNER-2026-09-19-GO",
+      "title": "Phase 0 go/no-go — GO for Phase 1",
+      "status": "Decided 2026-09-19. Criterion 4 (on-demand Cancel) stays not met, accepted as a limitation; the GO is a decision to proceed, not a claim every criterion is met. Phase 0 carry-over work (C-5, U-18, C-6, Android device validation) continues alongside Phase 1 planning.",
+      "date": "2026-09-19",
+      "link": "docs/exec-plans/active/phase-0.md"
+    },
+    {
+      "id": "OWNER-2026-09-19-FG",
+      "title": "Upstream issues F and G — not submitted for now",
+      "status": "Decided 2026-09-19: F (U-15...U-17, connect/dead-link timeouts) and G (U-18, CREATE TRIGGER) stay drafted and unsubmitted by owner decision; kept for tracking only (results file §6). Not a pending recommendation.",
+      "date": "2026-09-19",
+      "link": "docs/exec-plans/active/phase-0-spike-results.md"
+    },
+    {
+      "id": "ADR-0003",
+      "title": "Qt <-> Rust integration — hand-written stable C ABI in crates/ffi, cbindgen header, thin C++/Qt adapter",
+      "status": "Proposed — acceptance conditional on spike S15 (kill criteria K1-K7). Not yet accepted by the owner.",
+      "date": "2026-09-20",
+      "link": "docs/decisions/0003-qt-rust-integration.md"
     }
   ],
   "spikes": [
@@ -712,6 +759,14 @@
       "killCriterion": "— (evidence spike, no kill criterion)",
       "status": "done",
       "result": "Pass: 1,000,000 rows streamed for about 1 MB of working-set growth (SPEC.md §12's bounded-memory claim holds); throughput 50,000–92,000 rows/s and not monotonic in the batch size."
+    },
+    {
+      "id": "S15",
+      "title": "FFI/virtualized table spike: real reldex-ffi + cbindgen header + Corrosion build + QAbstractTableModel + wake->invokeMethod path, mock driver, 1,000,000 rows",
+      "box": "1-2 d",
+      "killCriterion": "Any of K1-K7 fires (frame time, first-row latency, retained memory, per-batch boundary cost, waker teardown safety, no UI stall, three-OS CI build) — see ADR-0003",
+      "status": "todo",
+      "result": "Not run yet. ADR-0003 stays Proposed until this spike is run and reported; M1.8 is the task that runs it, gated on M1.6 and M1.7, which are gated on the owner's toolchain approval (M1.1)."
     }
   ],
   "phases": [
@@ -797,7 +852,7 @@
             {
               "title": "(S4 critical path) Draft upstream request to oracle/rust-oracledb for a public statement-cancel/break API — plus accessors for OracleNumber digits and the transaction-in-progress flag (owner to submit)",
               "status": "done",
-              "note": "Seven issues drafted in full: docs/exec-plans/active/phase-0-spike-results.md §6 (public break API; NUMBER-bind data corruption; the two process aborts; the recovery/cancel-observation defects; TCPS trust; timeouts/dead-link detection; CREATE TRIGGER). A–E submitted 2026-09-20 (#21–#25); F and G await the owner's go-ahead — see the separate owner task."
+              "note": "Seven issues drafted in full: docs/exec-plans/active/phase-0-spike-results.md §6 (public break API; NUMBER-bind data corruption; the two process aborts; the recovery/cancel-observation defects; TCPS trust; timeouts/dead-link detection; CREATE TRIGGER). A–E submitted 2026-09-20 (#21–#25); F and G not submitted — owner decision 2026-09-19, drafts kept for tracking only."
             },
             {
               "title": "Add normalized DbError",
@@ -940,8 +995,12 @@
               "note": "Five submitted 2026-09-20 by the owner's account (SupawitNu): B -> #21, C -> #22, D -> #23, A -> #24, E -> #25."
             },
             {
-              "title": "Owner: approve submission of drafted upstream issues F and G (results file §6)",
-              "status": "todo"
+              "title": "Owner decision 2026-09-19: issues F and G are NOT submitted for now; drafts kept for tracking (results file §6)",
+              "status": "done"
+            },
+            {
+              "title": "Owner: Phase 0 go/no-go — GO for Phase 1 (2026-09-19)",
+              "status": "done"
             },
             {
               "title": "Track upstream oracle/rust-oracledb releases; re-run the integration suite and the ignored abort-repro tests on each new beta",
@@ -979,8 +1038,8 @@
             },
             {
               "title": "Driver: honour connect_timeout (C-5)",
-              "status": "todo",
-              "note": "ConnectionParams::connect_timeout is accepted and ignored (phase-0-spike-results.md §7 C-5); approved 2026-09-19: helper thread, default 15 s, user-configurable per connection profile including \"no limit\"."
+              "status": "in_progress",
+              "note": "ConnectionParams::connect_timeout is accepted and ignored (phase-0-spike-results.md §7 C-5); approved 2026-09-19: helper thread, default 15 s, user-configurable per connection profile including \"no limit\"; in progress on branch phase-0/driver-carryover, not yet merged — Phase 1 M2.1 (docs/exec-plans/active/phase-1.md) consumes the result."
             },
             {
               "title": "Owner decisions §9 items 8–12",
@@ -989,13 +1048,13 @@
             },
             {
               "title": "Driver: CREATE TRIGGER auto-rewrite for :NEW/:OLD (U-18)",
-              "status": "todo",
-              "note": "Rewrite to BEGIN EXECUTE IMMEDIATE q'[…]'; END; on by default, always reported to the user as a warning with the statement actually sent available for inspection, off switch at connection level (approved 2026-09-19, phase-0-spike-results.md §9 item 11)."
+              "status": "in_progress",
+              "note": "Rewrite to BEGIN EXECUTE IMMEDIATE q'[…]'; END; on by default, always reported to the user as a warning with the statement actually sent available for inspection, off switch at connection level (approved 2026-09-19, phase-0-spike-results.md §9 item 11); in progress on branch phase-0/driver-carryover, not yet merged — Phase 1 M2.2 consumes the result."
             },
             {
               "title": "Contract: connect-time warning channel (C-6)",
-              "status": "todo",
-              "note": "Additive take_connect_warnings-style method on DatabaseConnection, collected once by db-core after connect; approved in principle 2026-09-19, sequenced after pull request #5 (TCPS descriptor guard); record as an ADR-0002 amendment when implemented."
+              "status": "in_progress",
+              "note": "Additive take_connect_warnings-style method on DatabaseConnection, collected once by db-core after connect; approved in principle 2026-09-19, sequenced after pull request #5 (TCPS descriptor guard); record as an ADR-0002 amendment when implemented; in progress on branch phase-0/driver-carryover, not yet merged — Phase 1 M2.3 consumes the result."
             },
             {
               "title": "Docs: recommend SQLNET.EXPIRE_TIME in user-facing connection troubleshooting docs",
@@ -1018,109 +1077,308 @@
     },
     {
       "id": "P1",
-      "title": "Phase 1 — Windows Desktop MVP",
-      "status": "todo",
+      "title": "Phase 1 — Desktop MVP",
+      "status": "blocked",
       "groups": [
         {
-          "title": "Desktop MVP",
+          "title": "M1 — De-risk: toolchain, ADR-0003, and a real virtualized table",
           "tasks": [
             {
-              "title": "Qt Quick application shell",
+              "title": "M1.1 Owner approval + toolchain install (Qt, CMake, Ninja, cbindgen) (owner + sonnet) — approved and installed 2026-09-20: Qt 6.8.3 msvc2022_64, CMake 4.4.3, Ninja 1.13.2, cbindgen 0.29.4; no GPL-only module present (docs/exec-plans/active/phase-1-toolchain.md, tools/dev-env/env.sh)",
+              "status": "done"
+            },
+            {
+              "title": "M1.2 ★ Draft ADR-0003: Qt ↔ Rust integration (opus, review mandatory) — docs/decisions/0003-qt-rust-integration.md (Proposed)",
+              "status": "done"
+            },
+            {
+              "title": "M1.3 ★ crates/ffi skeleton: hub, session open/execute/fetch, batch views, errors, waker (opus, review mandatory)",
               "status": "todo"
             },
             {
-              "title": "Thin C++ ↔ Rust FFI adapter",
+              "title": "M1.4 C smoke harness (ui/tests/ffi_smoke), no Qt, mock driver, ASan on Linux (sonnet)",
               "status": "todo"
             },
             {
-              "title": "Non-blocking open_session + per-session completion/event queue for the Qt adapter",
-              "status": "todo",
-              "note": "Deferred by ADR-0002 amendment."
-            },
-            {
-              "title": "Connection Manager",
+              "title": "M1.5 CMake + Corrosion + Qt project skeleton; QML module for the adapter (sonnet)",
               "status": "todo"
             },
             {
-              "title": "Workspace shell",
+              "title": "M1.6 ★ ResultTableModel over borrowed batch views; Bridge waker→invokeMethod drain (opus, review mandatory)",
               "status": "todo"
             },
             {
-              "title": "SQL Worksheet",
+              "title": "M1.7 Mock driver: 1M-row generator of the S14 shape with controllable latency and a 10 s blocking statement (sonnet)",
               "status": "todo"
             },
             {
-              "title": "Multiple independent sessions",
+              "title": "M1.8 ★ Spike S15 measurement run + report against kill criteria K1–K7 (opus, review mandatory)",
               "status": "todo"
             },
             {
-              "title": "Run current statement",
+              "title": "M1.9 Accept or re-open ADR-0003; update ARCHITECTURE.md §13 items 2/3/10, TASKS.md, Task.html (sonnet)",
+              "status": "todo"
+            }
+          ]
+        },
+        {
+          "title": "M2 — Core readiness: events, async open, settings, SQL text, driver leftovers",
+          "tasks": [
+            {
+              "title": "M2.1 ★ Driver: honour connect_timeout on a helper thread (C-5/U-15) (opus, review mandatory) — carried over from Phase 0, in progress on phase-0/driver-carryover; M2 consumes the result",
+              "status": "in_progress"
+            },
+            {
+              "title": "M2.2 Driver: CREATE TRIGGER :NEW/:OLD auto-rewrite (U-18) (sonnet) — carried over from Phase 0, in progress on phase-0/driver-carryover; M2 consumes the result",
+              "status": "in_progress"
+            },
+            {
+              "title": "M2.3 ★ Contract: take_connect_warnings (C-6) + ADR-0002 amendment (opus, review mandatory) — carried over from Phase 0, in progress on phase-0/driver-carryover; M2 consumes the result",
+              "status": "in_progress"
+            },
+            {
+              "title": "M2.4 crates/sql-text: lexer + statement splitter driven by a SqlDialect descriptor the driver supplies (sonnet)",
               "status": "todo"
             },
             {
-              "title": "Run selection",
+              "title": "M2.5 ★ EventQueue/EventSink/SessionEvent/Waker + ReplyTo refactor of the worker (opus, review mandatory)",
               "status": "todo"
             },
             {
-              "title": "Run script",
+              "title": "M2.6 ★ SessionRegistry + non-blocking open, abandon semantics (opus, review mandatory)",
               "status": "todo"
             },
             {
-              "title": "PL/SQL execution",
+              "title": "M2.7 ★ Server output capability (DBMS_OUTPUT) in contract + driver + core polling when enabled (opus, review mandatory)",
               "status": "todo"
             },
             {
-              "title": "Bind-variable dialog",
+              "title": "M2.8 Metadata catalog descriptor (MetadataCatalog) + Oracle dictionary SQL for the 9 object groups (sonnet)",
               "status": "todo"
             },
             {
-              "title": "Cancel",
+              "title": "M2.9 ★ Settings model: three-level resolution with provenance; profile model; SQLite store (opus, review mandatory)",
               "status": "todo"
             },
             {
-              "title": "UI (P1): statement time-limit control + explicit \"Cancel unavailable with current driver\" messaging (SPEC §10 interim note)",
+              "title": "M2.10 ★ Credential store: CredentialStore trait + Windows Credential Manager implementation (opus, review mandatory)",
               "status": "todo"
             },
             {
-              "title": "Default per-statement time limit (600 s) as a three-level setting",
-              "status": "todo",
-              "note": "Application default, connection profile, per worksheet/statement; including a \"no limit\" option with an explicit UI warning about the consequence (owner decision 2026-09-19, SPEC §10)."
-            },
+              "title": "M2.11 FFI surface for M2.5–M2.10 + regenerate and verify header (sonnet)",
+              "status": "todo"
+            }
+          ]
+        },
+        {
+          "title": "M3 — Connect: shell, connection manager, first real session",
+          "tasks": [
             {
-              "title": "Commit/Rollback",
+              "title": "M3.1 App shell: window, docking-free fixed layout (sidebar / worksheet tabs / output panes), light+dark theme, high-DPI (sonnet)",
               "status": "todo"
             },
             {
-              "title": "Result Store",
+              "title": "M3.2 Connection manager UI: list, create/edit/delete, environment, test-connect (sonnet)",
               "status": "todo"
             },
             {
-              "title": "Fetch batch size as a user setting",
-              "status": "todo",
-              "note": "Application default + per connection profile, bounded range, informed by a Phase 1 benchmark to pick the shipped default (owner decision 2026-09-19, SPEC §12; phase-0-spike-results.md S14)."
-            },
-            {
-              "title": "Virtualized Result Grid",
+              "title": "M3.3 ★ Connect flow over the async path, with a bounded timeout and a cancellable \"Connecting…\" state (opus, review mandatory)",
               "status": "todo"
             },
             {
-              "title": "Query History",
+              "title": "M3.4 Production indicator: persistent, not colour-only (icon + text + tab badge) (sonnet)",
               "status": "todo"
             },
             {
-              "title": "DBMS_OUTPUT panel",
+              "title": "M3.5 ★ TCPS UI described exactly as SPEC.md §8; surfaces the descriptor-guard warnings from C-6 (opus, review mandatory)",
               "status": "todo"
             },
             {
-              "title": "Basic Object Browser",
+              "title": "M3.6 Settings UI: application defaults, per-profile overrides, provenance shown (sonnet)",
               "status": "todo"
             },
             {
-              "title": "Production connection indicator",
+              "title": "M3.7 ★ Logging/diagnostics: tracing + rotating file sink, redaction layer, Qt messages forwarded through the FFI (opus, review mandatory)",
+              "status": "todo"
+            }
+          ]
+        },
+        {
+          "title": "M4 — Worksheet: editor, execution, transactions, honest limits",
+          "tasks": [
+            {
+              "title": "M4.1 ★ Editor component: TextArea + QSyntaxHighlighter on QQuickTextDocument, tokens from reldex-sql-text over FFI (opus, review mandatory)",
               "status": "todo"
             },
             {
-              "title": "Secure credential integration on Windows",
+              "title": "M4.2 Editor essentials: line numbers, current-line, bracket matching, indentation, search/replace, font and theme settings (sonnet)",
+              "status": "todo"
+            },
+            {
+              "title": "M4.3 Statement detection and run modes: current statement, selection, whole script (sonnet)",
+              "status": "todo"
+            },
+            {
+              "title": "M4.4 Bind-variable dialog: detected placeholders, typed entry, IN/OUT/IN OUT (sonnet)",
+              "status": "todo"
+            },
+            {
+              "title": "M4.5 ★ Transaction UX: auto-commit OFF, Commit/Rollback, savepoints, close-with-pending-transaction dialog (opus, review mandatory)",
+              "status": "todo"
+            },
+            {
+              "title": "M4.6 ★ The honest no-Cancel UX: three-level time-limit control, \"no limit\" with its consequence, no Cancel button (opus, review mandatory) — on-demand Cancel itself stays out of scope/blocked (ADR-0001 owner decision; upstream issue #24)",
+              "status": "todo"
+            },
+            {
+              "title": "M4.7 DBMS_OUTPUT pane: per-worksheet enable, size, clear, truncation notice (sonnet)",
+              "status": "todo"
+            },
+            {
+              "title": "M4.8 ★ Error presentation: kind, ORA code, message, cause chain; caret highlighting only for PL/SQL positions (opus, review mandatory)",
+              "status": "todo"
+            },
+            {
+              "title": "M4.9 Multiple independent worksheets: N sessions, per-tab state, one busy tab never blocks another (sonnet)",
+              "status": "todo"
+            },
+            {
+              "title": "M4.10 Query history (per profile, SQLite), re-run into the current worksheet (sonnet)",
+              "status": "todo"
+            }
+          ]
+        },
+        {
+          "title": "M5 — Results at scale",
+          "tasks": [
+            {
+              "title": "M5.1 ★ ADR-0004 — Result Store representation, paging and bounded-memory policy (opus, review mandatory)",
+              "status": "todo"
+            },
+            {
+              "title": "M5.2 ★ Result Store implementation in db-core + FFI batch lifetime rules (opus, review mandatory)",
+              "status": "todo"
+            },
+            {
+              "title": "M5.3 Grid features: row numbers, NULL visualization, column resize/reorder, type-aware formatting via the bulk formatter, search-in-results (sonnet)",
+              "status": "todo"
+            },
+            {
+              "title": "M5.4 Copy: cell, row, range, with/without headers (sonnet)",
+              "status": "todo"
+            },
+            {
+              "title": "M5.5 CLOB/BLOB viewers over read_lob_chunk, paged, with a size warning (sonnet)",
+              "status": "todo"
+            },
+            {
+              "title": "M5.6 ★ Fetch-batch benchmark across row shapes and a real network; pick and record the shipped default (opus, review mandatory)",
+              "status": "todo"
+            },
+            {
+              "title": "M5.7 Perf gate re-run on the real database; record against M1's numbers (sonnet)",
+              "status": "todo"
+            }
+          ]
+        },
+        {
+          "title": "M6 — Browse, prove, package",
+          "tasks": [
+            {
+              "title": "M6.1 Object browser: lazy tree over the 9 SPEC.md §16 groups, server-side filter, row cap, columns of a selected table (sonnet)",
+              "status": "todo"
+            },
+            {
+              "title": "M6.2 Workspace persistence: open worksheets, text, layout, active profile — non-transactional state only (sonnet)",
+              "status": "todo"
+            },
+            {
+              "title": "M6.3 i18n baseline: qsTr everywhere, EN + TH catalogues, lrelease in the build; Thai rendering test (sonnet)",
+              "status": "todo"
+            },
+            {
+              "title": "M6.4 Accessibility baseline: focus order, keyboard-only operation, Accessible properties, contrast check (sonnet)",
+              "status": "todo"
+            },
+            {
+              "title": "M6.5 Third-party notices: cargo about for the Rust graph + Qt/LGPL attribution, shipped in the installer and an About dialog (sonnet)",
+              "status": "todo"
+            },
+            {
+              "title": "M6.6 ★ Windows packaging: windeployqt6, unsigned installer, first-run layout (opus, review mandatory)",
+              "status": "todo"
+            },
+            {
+              "title": "M6.7 CI: build the Qt project on all three OS; run offscreen QML/QTest and the C smoke harness; cache Qt and cargo (sonnet)",
+              "status": "todo"
+            },
+            {
+              "title": "M6.8 ★ Phase 1 DoD review against SPEC.md §24, honest status per item; update TASKS.md, phase-1.md, Task.html (opus, review mandatory)",
+              "status": "todo"
+            }
+          ]
+        },
+        {
+          "title": "Owner decisions (Phase 1)",
+          "tasks": [
+            {
+              "title": "Owner: install Qt and the build tools per phase-1.md §C.0 — approved 2026-09-20, without Qt Creator (decision C.3 #1)",
+              "status": "done"
+            },
+            {
+              "title": "Owner: licence position — LGPLv3-compliant dynamic linking, ban GPL-only Qt modules, commercial licence deferred (decision C.3 #2) — approved 2026-09-20 as recommended",
+              "status": "done"
+            },
+            {
+              "title": "Owner: Qt version policy — pin one exact Qt version, treat an upgrade as a reviewed change (decision C.3 #3) — approved 2026-09-20 as recommended",
+              "status": "done"
+            },
+            {
+              "title": "Owner: approve the Phase 1 defer list (decision C.3 #4) — approved 2026-09-20 as recommended",
+              "status": "done"
+            },
+            {
+              "title": "Owner: app identifier and branding — reverse-DNS id, executable/display name, installer publisher string, placeholder icon (decision C.3 #5) — approved 2026-09-20 as recommended",
+              "status": "done"
+            },
+            {
+              "title": "Owner: code signing for Windows — ship Phase 1 unsigned? (decision C.3 #6) — approved 2026-09-20 as recommended",
+              "status": "done"
+            },
+            {
+              "title": "Owner: secrets storage approach — Windows Credential Manager for Phase 1, no plaintext fallback ever (decision C.3 #7) — approved 2026-09-20 as recommended",
+              "status": "done"
+            },
+            {
+              "title": "Owner: local store format — one SQLite file for profiles/settings/history/workspace (decision C.3 #8) — approved 2026-09-20 as recommended",
+              "status": "done"
+            },
+            {
+              "title": "Owner: telemetry and logging policy — no telemetry, local rotating log, opt-in SQL-text debug logging (decision C.3 #9) — approved 2026-09-20 as recommended",
+              "status": "done"
+            },
+            {
+              "title": "Owner: fetch-batch default sign-off once the M5.6 benchmark produces a number (decision C.3 #10)",
+              "status": "todo"
+            },
+            {
+              "title": "Owner: wording sign-off for the no-Cancel UX and \"no limit\" strings, M4.6 (decision C.3 #11)",
+              "status": "todo"
+            },
+            {
+              "title": "Owner: Phase-0 leftovers (C-5, U-18, C-6) carried into Phase 1 M2 — confirmed 2026-09-19; in progress on phase-0/driver-carryover (decision C.3 #12)",
+              "status": "done"
+            },
+            {
+              "title": "Owner: upstream issues F and G — decided 2026-09-19 not to submit for now; drafts kept for tracking only, results file §6 (decision C.3 #13)",
+              "status": "done"
+            },
+            {
+              "title": "Owner: mobile test hardware — resolved 2026-09-19: Android arm64 phone (OPPO CPH2399) provided, NDK 28.2 installed; physical-device validation itself is separate Phase-0 tail work in progress on phase-0/android-device; iOS still needs a Mac + Apple Developer account + device, not provided (decision C.3 #14)",
+              "status": "done"
+            },
+            {
+              "title": "Owner: Community/Pro licensing decision before M6.6 so the notices file and About dialog are right the first time (decision C.3 #15)",
               "status": "todo"
             }
           ]
@@ -1359,7 +1617,15 @@
   "activity": [
     {
       "date": "2026-09-20",
-      "text": "Android physical-device run: the same Rust core + driver + TLS stack executed on an OPPO CPH2399 (Android 16, arm64) against Oracle 19c through adb reverse — 7/7 checks pass incl. TCPS with verification on. It is a native CLI binary over adb shell, not an APK: the packaged-app path and iOS device evidence remain open."
+      "text": "Owner approved the Phase 1 kickoff decisions as recommended (phase-1.md C.3 #1–#9). Toolchain installed and proven from Git Bash: Qt 6.8.3 msvc2022_64, CMake 4.4.3, Ninja 1.13.2, cbindgen 0.29.4 — hello-world Qt Quick app and QuickTest pass offscreen; no GPL-only Qt module installed. Project scripts are now bash-first."
+    },
+    {
+      "date": "2026-09-20",
+      "text": "Android physical-device run merged (PR #8): the Rust core + driver + TLS stack executed on an OPPO CPH2399 (Android 16, arm64) against Oracle 19c through adb reverse — 7/7 checks pass incl. TCPS with verification on. Native CLI over adb shell, not an APK: the packaged-app path and iOS device evidence remain open."
+    },
+    {
+      "date": "2026-09-20",
+      "text": "Phase 1 execution plan (docs/exec-plans/active/phase-1.md, milestones M1-M6) and ADR-0003 (Qt <-> Rust integration, Proposed, acceptance conditional on spike S15) drafted and landed, reflecting the owner's 2026-09-19 GO for Phase 1. TASKS.md P1 rewritten to the milestone structure plus an Owner decisions (Phase 1) group; phase-0.md and Task.html updated to record the GO, the carry-over work in progress on phase-0/driver-carryover and phase-0/android-device, and the owner's 2026-09-19 decision not to submit upstream issues F and G for now (tracked only). ARCHITECTURE.md §13 items 2, 3 and 10 point at ADR-0003 as a proposed (not accepted) resolution. M1 stays blocked on owner approval of the Qt/CMake/Ninja toolchain install."
     },
     {
       "date": "2026-09-19",
@@ -1379,7 +1645,7 @@
     },
     {
       "date": "2026-09-20",
-      "text": "Upstream issues #21–#25 filed on oracle/rust-oracledb (five of seven drafted issues, submitted by the owner's account; F and G await go-ahead)."
+      "text": "Upstream issues #21–#25 filed on oracle/rust-oracledb (five of seven drafted issues, submitted by the owner's account; the owner had already decided 2026-09-19 not to submit F and G for now, keeping the drafts for tracking only)."
     },
     {
       "date": "2026-09-19",

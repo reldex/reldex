@@ -1,0 +1,310 @@
+# Phase 1 Toolchain — Qt 6.8 LTS / CMake / Ninja / cbindgen / MSVC
+
+- **Date:** 2026-09-20
+- **Machine:** Windows 11 Pro 10.0.26200 (developer workstation)
+- **Primary shell for this project:** Git Bash (`env.sh`). PowerShell's `env.ps1` is
+  provided as an optional twin with the same effect.
+- **Scope:** open-source Qt 6.8 LTS (LGPLv3, dynamic linking only), CMake, Ninja,
+  cbindgen, and verification against the existing MSVC toolchain. No admin
+  elevation was used anywhere in this setup; nothing outside the paths listed
+  below was created or modified, and no machine-wide PATH/registry entries were
+  touched.
+
+## 1. Versions and install paths
+
+| Component | Version | Install path | Source |
+|---|---|---|---|
+| Qt | **6.8.3** (kit `win64_msvc2022_64`) | `C:\Qt\6.8.3\msvc2022_64` | download.qt.io via `aqtinstall`, official Qt OSS mirrors |
+| aqtinstall | 3.3.0 | user site-packages (`pip install --user`) | PyPI |
+| qtshadertools | bundled with the 6.8.3 install (module `qtshadertools`) | `C:\Qt\6.8.3\msvc2022_64` | download.qt.io |
+| CMake | 4.4.3 | `C:\Qt\Tools\CMake` | github.com/Kitware/CMake releases (official) |
+| Ninja | 1.13.2 | `C:\Qt\Tools\Ninja` | github.com/ninja-build/ninja releases (official) |
+| cbindgen | 0.29.4 | `%USERPROFILE%\.cargo\bin\cbindgen.exe` | crates.io via `cargo install` |
+| Rust toolchain | rustc 1.98.1 (48a229cea 2026-09-01), cargo 1.98.1 (797e8a9bc 2026-08-05), target `x86_64-pc-windows-msvc` (stable, pinned by the repo's `rust-toolchain.toml`) | pre-existing rustup install | rustup (pre-existing on this machine) |
+| MSVC toolset | 14.44.35207 (VC++ 2022) | `C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207` | pre-existing Visual Studio install (not modified) |
+| Visual Studio | Visual Studio Community 2022, version 17.14.36915.13 | `C:\Program Files\Microsoft Visual Studio\2022\Community` | pre-existing (not modified/installed by this task) |
+| Windows SDK (used by vcvars) | 10.0.26100.0 | (part of the existing VS install) | pre-existing |
+
+Python used to run `aqtinstall`: `C:\Python313\python.exe` (Python 3.13.11, pre-existing).
+
+## 2. Exact install commands (reproducible on a second machine / CI)
+
+```bash
+# 1. aqtinstall (per-user, no elevation)
+python -m pip install --user --upgrade aqtinstall
+
+# 2. Confirm the latest 6.8.x patch published to open-source users
+python -m aqt list-qt windows desktop --spec "6.8"        # -> 6.8.0 6.8.1 6.8.2 6.8.3
+python -m aqt list-qt windows desktop --arch 6.8.3        # confirms win64_msvc2022_64 exists
+python -m aqt list-qt windows desktop --modules 6.8.3 win64_msvc2022_64   # confirms qtshadertools is a separate module
+
+# 3. Install Qt 6.8.3, win64_msvc2022_64 kit, base + qtshadertools, into C:\Qt
+python -m aqt install-qt windows desktop 6.8.3 win64_msvc2022_64 -O C:\Qt -m qtshadertools
+
+# 4. CMake (portable zip, official Kitware GitHub release)
+curl -L -o cmake-4.4.3-windows-x86_64.zip \
+  https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-windows-x86_64.zip
+curl -L -o cmake-4.4.3-SHA-256.txt \
+  https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-SHA-256.txt
+sha256sum -c <(grep windows-x86_64.zip cmake-4.4.3-SHA-256.txt)   # verify
+# unzip so cmake.exe lands at C:\Qt\Tools\CMake\bin\cmake.exe (top-level
+# "cmake-4.4.3-windows-x86_64" folder from the zip renamed to "CMake")
+
+# 5. Ninja (portable zip, official ninja-build GitHub release)
+curl -L -o ninja-win.zip \
+  https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-win.zip
+# unzip into C:\Qt\Tools\Ninja  (ninja.exe directly inside; no official
+# published checksum file for this asset -- SHA-256 recorded below instead)
+
+# 6. cbindgen (crates.io)
+cargo install cbindgen --locked
+
+# 7. Verify MSVC toolchain (no install/modification)
+"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+# -> C:\Program Files\Microsoft Visual Studio\2022\Community
+```
+
+No step above required administrator elevation. `C:\Qt` was created directly by
+the current user (drive-root folder creation did not require elevation on this
+machine). Nothing under `C:\Windows`, the registry, or the machine PATH was
+touched; PATH changes are process-local only, via `env.sh` / `env.ps1` (section 5).
+
+## 3. Download checksums
+
+| File | SHA-256 | Verified against |
+|---|---|---|
+| `cmake-4.4.3-windows-x86_64.zip` | `4d52ebab7193a698651639ed80d8d04fd903358843572cf44c7fd234cb7c26ab` | matches Kitware's published `cmake-4.4.3-SHA-256.txt` |
+| `ninja-win.zip` | `07fc8261b42b20e71d1720b39068c2e14ffcee6396b76fb7a795fb460b78dc65` | computed locally; ninja-build does not publish a checksum file for this release asset |
+
+## 4. Module/tool inventory (proof of no GPL-only / forbidden modules)
+
+`C:\Qt\6.8.3\msvc2022_64\lib\cmake` contains CMake package directories for
+(non-exhaustive, required set only): `Qt6Core`, `Qt6Gui`, `Qt6Qml`, `Qt6Quick`,
+`Qt6QuickControls2`, `Qt6QuickTest`, `Qt6Test`, `Qt6Svg`, `Qt6ShaderTools`,
+`Qt6LinguistTools`, plus the usual supporting/private packages that Qt6 base +
+qtdeclarative + qtsvg + qttools + qtshadertools bring in (e.g. `Qt6Widgets`,
+`Qt6Network`, `Qt6Sql`, `Qt6Xml`, `Qt6Help`, `Qt6PrintSupport`, `Qt6Designer`,
+`Qt6QmlCompiler`, `Qt6QuickControls2*StyleImpl`, etc.) — all part of the base
+Qt6/qtdeclarative/qtsvg/qttools/qtshadertools install, not separate add-ons.
+
+**Confirmed present** (all required by the brief):
+- `Qt6Core`, `Qt6Gui`, `Qt6Qml`, `Qt6Quick`, `Qt6QuickControls2`, `Qt6QuickTest`, `Qt6Test`, `Qt6Svg`, `Qt6ShaderTools`, `Qt6LinguistTools` — CMake packages under `lib\cmake`.
+- `windeployqt6.exe`, `windeployqt.exe`, `qmlcachegen.exe`, `lupdate.exe`, `lrelease.exe`, `qmltestrunner.exe` — all present under `C:\Qt\6.8.3\msvc2022_64\bin`.
+
+**Confirmed absent** (explicitly forbidden add-ons — checked directly, none installed):
+`Qt6Charts`, `Qt6Graphs`, `Qt6DataVisualization`, `Qt6VirtualKeyboard`,
+`Qt6Quick3D`, `Qt6Quick3DPhysics`, `Qt6WebEngineCore`, `Qt6WaylandCompositor`,
+`Qt6Core5Compat` (qt5compat), `Qt6NetworkAuth` — none of these directories
+exist under `lib\cmake`. Only `qtbase`, `qtdeclarative`, `qtsvg`, `qttools`,
+`qttranslations` (all bundled in the Qt6 base install) plus the explicitly
+requested `qtshadertools` module, plus the small helper components
+`d3dcompiler_47` and `opengl32sw` (Qt's standard ANGLE/software-GL runtime
+helpers, not separate GPL modules), were installed.
+
+## 5. Licensing note
+
+Qt 6.8.3 was installed via the **open-source** aqtinstall/download.qt.io
+channel and is used under **LGPLv3**. Only dynamic linking against the Qt
+shared libraries is intended (the default with `qt_add_executable` /
+`find_package(Qt6 ...)` as configured here — no static Qt build was
+downloaded or built). No Qt Maintenance Tool account login was used or
+required; no GPL-only Qt module (e.g. qtvirtualkeyboard's GPL parts,
+qtwebengine) was installed.
+
+## 6. Entering the build environment
+
+**Git Bash is the primary, tested entry point for this project.**
+
+```bash
+source tools/dev-env/env.sh
+```
+
+`env.sh`:
+- Spawns a `cmd.exe` child that runs `vcvars64.bat` (found via `vswhere.exe`'s
+  reported VS install path) and captures its resulting environment.
+- Strips the trailing `\r` that `cmd`'s CRLF `set` output otherwise leaves on
+  every captured value (an untreated `\r` on `COMSPEC` corrupts the
+  `cmd.exe /C "..."` command line CMake/Ninja generate for linking, breaking
+  Ninja's lexer with a cryptic `rules.ninja:N: lexing error`).
+- Converts the captured Windows-style `PATH` entries to Unix form with
+  `cygpath -u` and **prepends** them to bash's existing `PATH` (never
+  overwrites it — overwriting breaks bash's own command resolution).
+- Only exports its own `QT_DIR` / `CMAKE_PREFIX_PATH` / Qt-bin-PATH entries
+  **after** the vcvars import step. This ordering matters: the vcvars-capture
+  child inherits bash's whole environment, and MSYS silently rewrites any
+  already-exported POSIX-style path (e.g. `/c/Qt/...`) to Windows form
+  (`C:/Qt/...`) the moment it crosses into that child process; `cmd`'s `set`
+  dump would then contain the mangled form, and importing it back would
+  clobber our own POSIX-style values. Setting our variables afterward avoids
+  this class of bug entirely.
+- Everything is process-local: no user/machine PATH, environment, or registry
+  change persists after the shell exits.
+
+`env.ps1` (optional twin, same effect, for PowerShell 5.1):
+
+```powershell
+. .\env.ps1
+```
+
+Equivalent process-local-only behavior (dot-source it so variables persist in
+your PowerShell session); also imports vcvars64 into the current process only
+and prepends Qt/CMake/Ninja to `PATH` for that process.
+
+## 7. Hello-world (Qt Quick) result
+
+Project: `hello-qt/` (CMake + `qt_add_executable` + `qt_add_qml_module`,
+`Main.qml` = a `Window` with `Text { text: "สวัสดี Reldex 🚀" }` and a 1s
+`Timer` that calls `Qt.quit()`).
+
+**From Git Bash (primary, tested path):**
+
+```bash
+source env.sh
+cd hello-qt
+cmake -S . -B build-bash -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="C:\Qt\6.8.3\msvc2022_64"
+cmake --build build-bash --config Release
+cd build-bash
+QT_QPA_PLATFORM=offscreen ./HelloReldexQt.exe
+echo "exit code: $?"        # -> 0
+```
+
+Result: **configure OK, build OK (19/19 targets), run OK, exit code 0.**
+
+**From PowerShell (optional twin, also verified):**
+
+```powershell
+. .\env.ps1
+Set-Location hello-qt
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="C:\Qt\6.8.3\msvc2022_64"
+cmake --build build --config Release
+Set-Location build
+$env:QT_QPA_PLATFORM = "offscreen"
+.\HelloReldexQt.exe
+# $LASTEXITCODE -> 0
+```
+
+Result: identical — configure OK, build OK, run OK, exit code 0.
+
+Both build trees (`hello-qt/build-bash` from Git Bash, `hello-qt/build` from
+PowerShell) were produced and run independently to prove the environment
+scripts are equivalent.
+
+## 8. QuickTest result
+
+Test: `hello-qt/tests/tst_basic.qml` (a trivial `TestCase` with two functions,
+`test_arithmetic` and `test_string`), run via `qmltestrunner.exe -input`,
+offscreen.
+
+```bash
+source env.sh
+qmltestrunner -input "$(pwd)/hello-qt/tests" -o "$(pwd)/qmltest_out.txt,txt"
+# QT_QPA_PLATFORM=offscreen (exported by env.sh's caller / test run)
+```
+
+Output:
+
+```
+********* Start testing of qmltestrunner *********
+Config: Using QtTest library 6.8.3, Qt 6.8.3 (x86_64-little_endian-llp64 shared (dynamic) release build; by MSVC 2022), windows 11
+PASS   : qmltestrunner::BasicToolchainSmokeTest::initTestCase()
+PASS   : qmltestrunner::BasicToolchainSmokeTest::test_arithmetic()
+PASS   : qmltestrunner::BasicToolchainSmokeTest::test_string()
+PASS   : qmltestrunner::BasicToolchainSmokeTest::cleanupTestCase()
+Totals: 4 passed, 0 failed, 0 skipped, 0 blacklisted, 4ms
+********* Finished testing of qmltestrunner *********
+```
+
+Exit code: **0**. Verified both from Git Bash and from PowerShell.
+
+## 9. Disk usage
+
+| Path | Size |
+|---|---|
+| `C:\Qt` (total) | ~2.2 GB (2.06 GiB by exact byte count) |
+| `C:\Qt\6.8.3` (the Qt kit) | ~2.0 GB |
+| `C:\Qt\Tools\CMake` | ~155 MB |
+| `C:\Qt\Tools\Ninja` | ~592 KB |
+
+Well within the ~5 GB disk budget approved for this task.
+
+## 10. Problems and workarounds
+
+1. **`vcvars64.bat` prints `'vswhere.exe' is not recognized`.** `vcvars64.bat`
+   shells out to bare `vswhere.exe` for extra SDK/toolset detection but does
+   not itself add the VS Installer directory to `PATH`. Harmless (the
+   environment still gets set correctly), but noisy and it leaves a stray
+   non-zero `$LASTEXITCODE`/exit status behind in PowerShell. **Workaround:**
+   both `env.ps1` and `env.sh` prepend
+   `C:\Program Files (x86)\Microsoft Visual Studio\Installer` to `PATH`
+   *before* invoking `vcvars64.bat` (process-local only), and `env.ps1`
+   explicitly resets `$LASTEXITCODE = 0` at the end so it doesn't leak into
+   the caller's shell.
+
+2. **`env.ps1`: PowerShell parse errors from an em dash character.** An early
+   draft used a Unicode em dash (—) in a comment/string; without a BOM,
+   PowerShell 5.1 read the UTF-8 bytes as the system ANSI code page and
+   mis-tokenized the file (quotes appeared to terminate early, cascading into
+   many unrelated parse errors). **Workaround:** replaced all em dashes with
+   plain ASCII hyphens in both `env.ps1` and `env.sh`; `Main.qml`'s Thai text
+   and emoji are written as `\uXXXX` / surrogate-pair escapes instead of
+   literal UTF-8 bytes for the same reason.
+
+3. **`env.sh` (first draft): quoting `cmd //c "call \"...\" && set"` directly
+   from Git Bash silently failed** (`vcvars64.bat` never actually ran; MSVC
+   env vars like `INCLUDE`/`LIB`/`VCToolsInstallDir` stayed empty, and `cl`
+   resolved to a stale entry already on the ambient `PATH` instead of the one
+   `vcvars64.bat` would have set). **Workaround:** generate a small temporary
+   `.bat` file (via `mktemp --suffix=.bat` + `cygpath -w`) that does
+   `call "vcvars64.bat" && set`, and invoke that file directly with
+   `cmd //c`, avoiding fragile nested-quote/`&&` escaping across the
+   Bash-to-cmd boundary.
+
+4. **`env.sh`: re-exporting cmd's captured `PATH` verbatim broke bash
+   itself** (`ls`, `cat`, `which`, etc. stopped resolving) because
+   Windows-style `PATH` (`C:\...;C:\...`) is not valid as bash's own `PATH`.
+   **Workaround:** split the captured `PATH` on `;`, convert each entry with
+   `cygpath -u`, and **prepend** (never overwrite) the result onto the
+   existing Unix-style `PATH`.
+
+5. **`env.sh`: a trailing `\r` from `cmd`'s CRLF `set` output corrupted
+   `COMSPEC`**, which CMake/Ninja embed verbatim into the generated
+   `CXX_EXECUTABLE_LINKER` rule (`cmd.exe /C "$PRE_LINK && ... && $POST_BUILD"`).
+   The stray `\r` landed *inside* the generated `rules.ninja` line (right
+   after `cmd.exe`), which Ninja's parser rejected as `rules.ninja:N: lexing
+   error`, only reproducible when configuring from Git Bash. **Workaround:**
+   strip a trailing `\r` (`${_value%$'\r'}`) from every captured key/value
+   pair before exporting.
+
+6. **`env.sh`: MSYS silently mangles already-exported POSIX paths when a
+   child Win32 process is spawned.** Originally `QT_DIR_UNIX` (and other
+   `QT_*` vars) were exported *before* the vcvars-capture step; because that
+   step spawns `cmd.exe` (a native Win32 process) which inherits bash's full
+   environment, MSYS rewrote `QT_DIR_UNIX`'s value from `/c/Qt/6.8.3/...` to
+   `C:/Qt/6.8.3/...` the moment it crossed into that child. `cmd`'s `set`
+   dump then contained the mangled value, and the import loop re-exported it
+   under the original name — silently overwriting our correct POSIX-style
+   value and breaking every later Unix-style path built from it (e.g. the
+   `HelloReldexQt.exe` run initially failed with a confusing
+   `error while loading shared libraries: api-ms-win-crt-locale-l1-1-0.dll`,
+   because `PATH` no longer actually contained `.../msvc2022_64/bin`).
+   **Workaround:** reordered `env.sh` so all of its own `QT_DIR` /
+   `CMAKE_PREFIX_PATH` / PATH-prepend exports happen *after* the vcvars
+   import step, so they don't exist yet (and can't be swept up and mangled)
+   when the `cmd.exe` child's environment is captured.
+
+7. **Bash tool call boundaries don't preserve shell state.** Each `Bash` tool
+   invocation is a fresh shell process; `source env.sh` in one call does not
+   persist to a later call. Not a bug in `env.sh` itself, but a reminder
+   (also called out at the top of `env.sh`/`env.ps1`) that sourcing and use
+   must happen in the same shell session/script.
+
+None of the above required elevation, changed machine-wide PATH/registry, or
+touched any file outside this scratch directory / `C:\Qt`.
+
+## 11. Where the pieces live in the repository
+
+- `tools/dev-env/env.sh` — primary (Git Bash) environment setup script: `source tools/dev-env/env.sh`.
+- `tools/dev-env/env.ps1` — optional PowerShell twin, dot-sourced from the repository root.
+- The hello-world Qt Quick project and QuickTest used for the proof above were throwaway scratch files and are
+  not kept; milestone task M1.5 adds the real `ui/` CMake project, which supersedes them.
