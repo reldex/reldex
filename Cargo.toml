@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/db-driver-api",
+    "crates/db-core",
+    "crates/drivers/mock",
+    "crates/drivers/oracle-thin",
+    "crates/reldex-core-poc",
+]
+
+# ---------------------------------------------------------------------------
+# Shared package metadata. Individual crates inherit these via
+# `field.workspace = true` in their own [package] table.
+# ---------------------------------------------------------------------------
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+publish = false
+version = "0.0.0"
+# No `license` field: licensing (Community/Pro) is intentionally undecided
+# (see TASKS.md "P0 — Repository bootstrap").
+
+# ---------------------------------------------------------------------------
+# Shared lint configuration. Individual crates opt in via
+# `[lints] workspace = true`.
+# ---------------------------------------------------------------------------
+[workspace.lints.rust]
+# FFI crate(s) will opt out of this once the FFI boundary is implemented
+# (docs/architecture/ARCHITECTURE.md §13 item 2).
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"
+print_stdout = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# `panic` is left at its default (unwinding); unwinding across the FFI
+# boundary is an open question for an ADR (docs/architecture/ARCHITECTURE.md
+# §13 item 2), not a decision to make in this skeleton.

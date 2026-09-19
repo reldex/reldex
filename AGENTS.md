@@ -73,6 +73,16 @@ Create an ADR under `docs/decisions/` when a decision:
 - changes result-storage architecture;
 - changes cross-platform support expectations.
 
+## Progress dashboard (`Task.html`)
+
+`Task.html` at the repository root is the human-facing dashboard for project progress, latest status, and the current plan. It is a single self-contained file (no build step, no network access) that the owner opens directly in a browser.
+
+- `TASKS.md` and the active plan under `docs/exec-plans/active/` remain the source of truth for task status; `Task.html` mirrors them and adds the status narrative (current focus, blockers/risks, next steps, decisions, recent activity).
+- Update `Task.html` **in the same change** whenever any of these change: a task status in `TASKS.md` or the active plan, an ADR is added or changes status, a phase gate or spike result is reached, a blocker appears or is resolved, or the plan changes.
+- Edit only the embedded data block (`<script type="application/json" id="project-data">`); do not restyle or restructure the page as part of routine updates. Always refresh `updatedAt` and prepend an entry to the activity log.
+- Report honestly: failed spikes, blocked work, and known limitations must be visible on the dashboard, never omitted.
+- A change that alters progress or plans but leaves `Task.html` stale is incomplete.
+
 ## Naming and branding
 
 - Product name: `Reldex`.

@@ -73,4 +73,5 @@ Use before declaring a substantial task complete. Source: `AGENTS.md`, `SKILL.md
 - [ ] `SPEC.md` updated when product behavior changed (if this task owns that file).
 - [ ] `docs/architecture/ARCHITECTURE.md` updated when architecture changed (if this task owns that file).
 - [ ] `TASKS.md` and the active exec plan updated when execution scope/status changed.
+- [ ] `Task.html` data block updated (`updatedAt`, statuses, activity) when progress or plans changed.
 - [ ] Any new production dependency documented with a reason.

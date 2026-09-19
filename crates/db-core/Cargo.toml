@@ -1,0 +1,19 @@
+[package]
+name = "reldex-db-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+reldex-db-driver-api = { path = "../db-driver-api" }
+
+[dev-dependencies]
+# Used only by tests/dependency_rules.rs to parse `cargo metadata` JSON.
+serde_json = "1"
+# Test-support driver (docs/architecture/ARCHITECTURE.md §4); see
+# tests/dependency_rules.rs for why this dev-only edge is allowed.
+reldex-driver-mock = { path = "../drivers/mock" }
