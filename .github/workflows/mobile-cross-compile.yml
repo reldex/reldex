@@ -1,0 +1,194 @@
+name: Mobile cross-compile (spike S6)
+
+# Spike S6 (docs/decisions/0001-database-driver-strategy.md, "Platform
+# viability" + the S6 spike-plan row): does the core + the Oracle thin driver
+# — including rustls's default `aws-lc-rs` crypto provider, which compiles
+# C/assembly via `aws-lc-sys` — build and *link* for
+# `aarch64-linux-android` and `aarch64-apple-ios`, on GitHub-hosted runners
+# (no local NDK/Xcode required)?
+#
+# This is a cross-compile check only. Per AGENTS.md / SPEC.md / the
+# `reldex-development` skill: cross-compiling is NOT mobile support. A green
+# run here proves nothing about a physical device — see
+# docs/exec-plans/active/phase-0-s6-mobile-cross-compile.md, "What this does
+# NOT prove".
+#
+# Scoped separately from ci.yml (which stays fast/hermetic and always runs)
+# because these jobs cross-compile the whole `aws-lc-sys` C/assembly build
+# for two extra targets, which is slow and, on macOS, expensive runner time.
+# Only triggered when the dependency graph or this workflow itself changes.
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/mobile-cross-compile.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The package set spike S6 asks for: the two vendor-neutral crates, the
+  # concrete Oracle thin driver (which pulls in `oracledb` -> `rustls` ->
+  # `aws-lc-rs` -> `aws-lc-sys`), the link-check probe crate (produces a real
+  # cdylib/staticlib so the *linker*, not just the compiler, is exercised),
+  # and the Phase 0 harness binary (a plain executable is meaningful on
+  # Android; cheap to also try on iOS in the same invocation).
+  S6_PACKAGES: >-
+    -p reldex-db-driver-api
+    -p reldex-db-core
+    -p reldex-driver-oracle-thin
+    -p reldex-mobile-link-check
+    -p reldex-core-poc
+  # Android API level targeted by the NDK toolchain. 26 (Android 8.0) is the
+  # oldest level with full 64-bit-only device support and comfortably above
+  # rustc's own minimum supported Android API; nothing in this dependency
+  # graph forced a different choice.
+  ANDROID_API_LEVEL: 26
+
+jobs:
+  android-arm64:
+    name: android-arm64 (S6)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mobile-android-arm64
+
+      - name: Print toolchain and NDK versions
+        run: |
+          rustc --version
+          cargo --version
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          echo "ANDROID_NDK_LATEST_HOME=$ANDROID_NDK_LATEST_HOME"
+          cat "$ANDROID_NDK_LATEST_HOME/source.properties"
+
+      - name: Install cargo-ndk
+        # `cargo install --locked` rather than `taiki-e/install-action`: that
+        # action only prebuilds binaries for a curated tool list and
+        # cargo-ndk's presence there is not guaranteed, whereas building it
+        # from crates.io is a small, reliable one-time cost on this
+        # ubuntu-latest job (the expensive runner is macos-latest, not this
+        # one).
+        run: cargo install cargo-ndk --locked
+
+      - name: Point ANDROID_NDK_HOME at the latest installed NDK
+        # cargo-ndk looks for ANDROID_NDK_HOME (then ANDROID_NDK_ROOT, then
+        # NDK_HOME). The runner image's default ANDROID_NDK_HOME can lag
+        # behind the newest NDK it also ships as ANDROID_NDK_LATEST_HOME;
+        # pin to the latter so the recorded NDK version is deliberate, not
+        # whatever happened to be default this month.
+        run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+
+      - name: cargo tree -- rustls provider (ring-swap question)
+        # Evidence for whether a provider swap away from `aws-lc-rs` is even
+        # possible from our side without forking: shows which crate's
+        # features pull `rustls` in, and with what feature set.
+        run: cargo tree -e features --target aarch64-linux-android -i rustls
+
+      - name: Build (release) for aarch64-linux-android
+        run: cargo ndk -t arm64-v8a -p "$ANDROID_API_LEVEL" build --release $S6_PACKAGES
+
+      - name: Record artifact sizes and file output
+        run: |
+          set -eu
+          OUT=target/aarch64-linux-android/release
+          STRIP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          echo "--- ls -l (unstripped) ---"
+          ls -l \
+            "$OUT"/libreldex_db_driver_api.rlib \
+            "$OUT"/libreldex_db_core.rlib \
+            "$OUT"/libreldex_driver_oracle_thin.rlib \
+            "$OUT"/libmobile_link_check.so \
+            "$OUT"/libmobile_link_check.a \
+            "$OUT"/reldex-core-poc
+          echo "--- file ---"
+          file "$OUT"/libmobile_link_check.so "$OUT"/reldex-core-poc
+          echo "--- stripped sizes (llvm-strip --strip-all, copy first) ---"
+          cp "$OUT"/libmobile_link_check.so /tmp/libmobile_link_check.stripped.so
+          cp "$OUT"/reldex-core-poc /tmp/reldex-core-poc.stripped
+          "$STRIP" --strip-all /tmp/libmobile_link_check.stripped.so /tmp/reldex-core-poc.stripped
+          ls -l /tmp/libmobile_link_check.stripped.so /tmp/reldex-core-poc.stripped
+
+  ios-arm64:
+    name: ios-arm64 (S6)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mobile-ios-arm64
+
+      - name: Print toolchain, Xcode and SDK versions
+        run: |
+          rustc --version
+          cargo --version
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphonesimulator --show-sdk-path
+
+      - name: cargo tree -- rustls provider (ring-swap question)
+        run: cargo tree -e features --target aarch64-apple-ios -i rustls
+
+      - name: Build (release) for aarch64-apple-ios (device)
+        run: cargo build --release --target aarch64-apple-ios $S6_PACKAGES
+
+      - name: Build (release) for aarch64-apple-ios-sim (simulator)
+        run: cargo build --release --target aarch64-apple-ios-sim $S6_PACKAGES
+
+      - name: Record artifact sizes and file output (device)
+        run: |
+          set -eu
+          OUT=target/aarch64-apple-ios/release
+          echo "--- ls -l (unstripped) ---"
+          ls -l \
+            "$OUT"/libreldex_db_driver_api.rlib \
+            "$OUT"/libreldex_db_core.rlib \
+            "$OUT"/libreldex_driver_oracle_thin.rlib \
+            "$OUT"/libmobile_link_check.a \
+            "$OUT"/libmobile_link_check.dylib \
+            "$OUT"/reldex-core-poc
+          echo "--- file ---"
+          file "$OUT"/libmobile_link_check.a "$OUT"/libmobile_link_check.dylib "$OUT"/reldex-core-poc
+          echo "--- stripped size (best-effort: strip on a .a strips its member objects) ---"
+          cp "$OUT"/libmobile_link_check.a /tmp/libmobile_link_check.device.stripped.a
+          strip -S /tmp/libmobile_link_check.device.stripped.a || echo "strip on .a failed/no-op, see log above"
+          ls -l /tmp/libmobile_link_check.device.stripped.a
+
+      - name: Record artifact sizes and file output (simulator)
+        run: |
+          set -eu
+          OUT=target/aarch64-apple-ios-sim/release
+          echo "--- ls -l (unstripped) ---"
+          ls -l \
+            "$OUT"/libreldex_db_driver_api.rlib \
+            "$OUT"/libreldex_db_core.rlib \
+            "$OUT"/libreldex_driver_oracle_thin.rlib \
+            "$OUT"/libmobile_link_check.a \
+            "$OUT"/libmobile_link_check.dylib \
+            "$OUT"/reldex-core-poc
+          echo "--- file ---"
+          file "$OUT"/libmobile_link_check.a "$OUT"/libmobile_link_check.dylib "$OUT"/reldex-core-poc
