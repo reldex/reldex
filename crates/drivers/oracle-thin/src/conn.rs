@@ -129,18 +129,51 @@ impl DatabaseDriver for OracleThinDriver {
         &self,
         params: &reldex_db_driver_api::ConnectionParams,
     ) -> DbResult<Box<dyn DatabaseConnection>> {
-        let config = build_config(params)?;
+        let Prepared {
+            config,
+            warnings,
+            names_certificate_parameters,
+        } = build_config(params)?;
         let allow_timestamp_with_time_zone = matches!(
             params.extensions().get(EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE),
             Some(ExtensionValue::Flag(true))
         );
-        let connection =
-            oracledb::connect(config).map_err(|error| crate::error::map_connect(&error))?;
+        let connection = oracledb::connect(config).map_err(|error| {
+            let mapped = crate::error::map_connect(&error);
+            // A descriptor that names Oracle's certificate parameters and then
+            // fails the *name* check needs to be told which name failed, or the
+            // obvious next move is to edit a parameter that does nothing.
+            if names_certificate_parameters {
+                crate::error::explain_name_verification(mapped)
+            } else {
+                mapped
+            }
+        })?;
         Ok(Box::new(OracleConnection::new(
             connection,
             allow_timestamp_with_time_zone,
+            warnings,
         )))
     }
+}
+
+/// An upstream configuration, plus whatever the driver noticed while building
+/// it and could not report any other way.
+///
+/// The warnings are connect-time findings — today, only what
+/// [`crate::descriptor`] read out of the descriptor — and the contract has
+/// nowhere to put them: [`DatabaseDriver::connect`] returns a connection or an
+/// error, and [`Warning`] travels on an [`ExecutionOutcome`]. They are therefore
+/// carried on the connection and attached to the first statement that succeeds;
+/// see [`OracleConnection::pending_warnings`].
+struct Prepared {
+    config: Config,
+    warnings: Vec<Warning>,
+    /// Whether the descriptor named either of Oracle's server-certificate
+    /// parameters. It changes nothing about the session; it changes what a
+    /// certificate **name** failure has to explain
+    /// ([`crate::error::explain_name_verification`]).
+    names_certificate_parameters: bool,
 }
 
 /// Installs a process-wide `rustls` crypto provider, but only if nothing has
@@ -169,7 +202,7 @@ pub fn install_default_crypto_provider() {
 }
 
 /// Builds the upstream configuration from vendor-neutral parameters.
-fn build_config(params: &reldex_db_driver_api::ConnectionParams) -> DbResult<Config> {
+fn build_config(params: &reldex_db_driver_api::ConnectionParams) -> DbResult<Prepared> {
     let tls = params.tls() == TlsMode::Required;
     if tls {
         install_default_crypto_provider();
@@ -236,6 +269,34 @@ fn build_config(params: &reldex_db_driver_api::ConnectionParams) -> DbResult<Con
         ));
     }
 
+    // Oracle's own server-certificate parameters, which this upstream version
+    // parses, forwards to the server and then never applies (U-14). The
+    // descriptor is read from two places because neither alone sees everything:
+    // the connect string as the caller wrote it, and the descriptor upstream
+    // rebuilt from it — which is the only source when the connect string was a
+    // `tnsnames.ora` alias and the parameters came out of a file. See
+    // [`crate::descriptor`] for what each is trusted to say.
+    //
+    // This runs before `oracledb::connect`, so a refusal costs no socket, and
+    // for a descriptor written out in full it applies whatever the protocol
+    // says: a pin the caller configured is unenforceable on a plaintext address
+    // too, and answering "that address is not TLS anyway" would be answering a
+    // question nobody asked. A `tnsnames.ora` alias is the exception, and only
+    // when its entry is plaintext — upstream strips the `SECURITY` segment out
+    // of a non-TCPS rendering, so neither source can see it. See
+    // [`crate::descriptor`], "The one shape this cannot see".
+    let certificate_request =
+        crate::descriptor::ServerCertificateRequest::scan_connect_string(&connect_string)
+            .merged_with(
+                crate::descriptor::ServerCertificateRequest::scan_upstream_descriptor(
+                    &config.get_connect_descriptor(),
+                ),
+            );
+    let warnings = certificate_request.guard(matches!(
+        params.extensions().get(EXT_ALLOW_UNENFORCED_SERVER_CERT_DN),
+        Some(ExtensionValue::Flag(true))
+    ))?;
+
     // The wallet directory is honoured whatever the mode says. A descriptor that
     // asks for TCPS gets TLS from upstream regardless of `TlsMode`, and a
     // connection that reaches a private CA only under `Required` would fail in a
@@ -298,7 +359,11 @@ fn build_config(params: &reldex_db_driver_api::ConnectionParams) -> DbResult<Con
     };
     config = config.set_stmtcachesize(cache_size);
 
-    Ok(config)
+    Ok(Prepared {
+        config,
+        warnings,
+        names_certificate_parameters: !certificate_request.is_empty(),
+    })
 }
 
 /// The characters an Easy Connect host or service name may contain.
@@ -425,16 +490,69 @@ pub const EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE: &str = "oracle.allow_timestamp_wit
 ///
 /// The server certificate is checked by `rustls`'s default verifier: chain,
 /// validity, `serverAuth` extended key usage, and the **name** — matched against
-/// `subjectAltName` only. A common name of `localhost` is invisible to it, and
-/// so is Oracle's `SSL_SERVER_DN_MATCH` / `SSL_SERVER_CERT_DN`: upstream parses
-/// both out of a descriptor and sends them to the server in the connect data,
-/// but its TLS layer never reads them. The name that is verified is whatever the
-/// descriptor's `HOST` says, so `HOST=127.0.0.1` requires an IP address in the
-/// SAN and `HOST=db.example.internal` requires that DNS name.
+/// `subjectAltName` only. A common name of `localhost` is invisible to it. The
+/// name that is verified is whatever the descriptor's `HOST` says, so
+/// `HOST=127.0.0.1` requires an IP address in the SAN and
+/// `HOST=db.example.internal` requires that DNS name.
 ///
 /// There is no way to disable verification, and this driver would not offer one
 /// if there were.
+///
+/// # Oracle's own two parameters, and what the driver does with them
+///
+/// `SSL_SERVER_DN_MATCH` and `SSL_SERVER_CERT_DN` are **inert** upstream:
+/// `oracledb` 26.0.0-beta.3 parses both out of a descriptor and writes them into
+/// the `SECURITY` segment it sends the server, and its TLS layer never reads
+/// either (upstream gap U-14). A driver that passed them through would leave a
+/// caller believing something was in force that is not, so this one reads them
+/// itself, before any socket is opened:
+///
+/// - **`SSL_SERVER_DN_MATCH` is accepted and reported.** Asking for matching to
+///   be *on* asks for nothing that is not already happening — the SAN host-name
+///   check above is unconditional, and stricter in practice than a
+///   distinguished-name match. Asking for it to be *off* cannot be honoured at
+///   all. Either way the session is at least as safe as the one configured, so
+///   it opens, with an [`ExecutionOutcome`]-borne warning saying which of the
+///   two happened.
+/// - **`SSL_SERVER_CERT_DN` is refused**, with [`ErrorKind::Configuration`],
+///   because it asks for the certificate's whole distinguished name to be
+///   **pinned** and nothing here pins it. Opening the session anyway would be a
+///   silent downgrade from the guarantee the profile asked for.
+///   [`EXT_ALLOW_UNENFORCED_SERVER_CERT_DN`] opts out of the refusal, and turns
+///   it into a warning that the pin was not applied.
+///
+/// Both are detected from the descriptor as the caller wrote it **and** from the
+/// descriptor upstream rebuilt — the second because a `tnsnames.ora` alias puts
+/// the parameters in a file this driver never sees the text of.
 pub const EXT_WALLET_DIR: &str = "oracle.wallet_dir";
+
+/// Extension key: open a session whose descriptor sets `SSL_SERVER_CERT_DN`,
+/// accepting that the distinguished name is **not** pinned.
+///
+/// Off by default, and the default is the point. `SSL_SERVER_CERT_DN` is the one
+/// Oracle TLS parameter that asks for something *stronger* than what this driver
+/// does — the server certificate's exact distinguished name, matched — and
+/// `oracledb` 26.0.0-beta.3 parses it, sends it to the server and never applies
+/// it (upstream gap U-14, spike S8). A connection profile imported from another
+/// Oracle tool may well carry it, so the failure mode is not hypothetical: the
+/// session would open, the pin would be absent, and nothing would say so.
+///
+/// Setting this to [`ExtensionValue::Flag(true)`] says the caller knows that and
+/// wants the session anyway — a connection that must be made today against a
+/// profile nobody can edit, or a test. Anything else, including
+/// `Flag(false)`, text `"true"` and an integer, leaves the refusal in place:
+/// this mirrors [`EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE`], and a malformed value
+/// resolving to the safe side is the only reading that cannot turn a typo into a
+/// weaker session.
+///
+/// What is still verified with the opt-in set is everything in
+/// [`EXT_WALLET_DIR`]'s "What is verified" — chain, validity, `serverAuth`
+/// extended key usage and the host name against `subjectAltName`. Only the DN
+/// pin is missing, and the connection reports that through a warning on its
+/// first successful statement.
+///
+/// [`ExtensionValue::Flag(true)`]: reldex_db_driver_api::ExtensionValue::Flag
+pub const EXT_ALLOW_UNENFORCED_SERVER_CERT_DN: &str = "oracle.allow_unenforced_server_cert_dn";
 
 /// Extension key: the password for an **encrypted private key** inside
 /// [`EXT_WALLET_DIR`]'s `ewallet.pem`.
@@ -537,10 +655,32 @@ pub(crate) struct OracleConnection {
     /// The deadline currently armed on the connection's socket, so a change can
     /// be reported rather than made silently.
     armed_deadline: Option<Duration>,
+    /// Non-fatal findings from **connect** time, waiting for somewhere to go.
+    ///
+    /// The contract has no connect-time warning channel: `connect` returns a
+    /// connection or a [`DbError`], and [`Warning`] rides on an
+    /// [`ExecutionOutcome`]. Adding one would mean changing
+    /// `db-driver-api`, which this driver does not get to do on its own
+    /// (contract gap C-6 in the spike results). So the narrowest existing
+    /// mechanism is used instead: the findings are attached to the **first
+    /// statement that succeeds** on this connection, alongside whatever that
+    /// statement produced, and `db-core` forwards them like any other warning.
+    ///
+    /// They stay pending until they are delivered, so a first statement that
+    /// fails does not consume them. The one case this does not cover is a
+    /// connection that never executes anything — `connect`, `ping`, `close` —
+    /// where the finding is lost; the refusal that matters most
+    /// ([`EXT_ALLOW_UNENFORCED_SERVER_CERT_DN`]) is an error rather than a
+    /// warning precisely so it does not depend on this path.
+    pending_warnings: Vec<Warning>,
 }
 
 impl OracleConnection {
-    fn new(inner: Connection, allow_timestamp_with_time_zone: bool) -> Self {
+    fn new(
+        inner: Connection,
+        allow_timestamp_with_time_zone: bool,
+        pending_warnings: Vec<Warning>,
+    ) -> Self {
         let open_result_sets = OpenResultSets::default();
         Self {
             id: ConnectionId::allocate(),
@@ -554,6 +694,7 @@ impl OracleConnection {
             allow_timestamp_with_time_zone,
             open_result_sets,
             armed_deadline: None,
+            pending_warnings,
         }
     }
 
@@ -1150,13 +1291,20 @@ impl DatabaseConnection for OracleConnection {
             (outcome, _) => outcome,
         };
 
-        let outcome = match (outcome, deadline_warning) {
-            (Ok(outcome), Some(warning)) => {
-                let mut warnings = outcome.warnings().to_vec();
-                warnings.push(warning);
+        // Two things the statement did not produce may still have to travel with
+        // it: a deadline change that re-bounded somebody else's open result set,
+        // and whatever `connect` found in the descriptor and had nowhere to put
+        // (see `pending_warnings`). The connect-time findings are **taken**, and
+        // only on success, so a first statement that fails leaves them waiting
+        // for the next one rather than swallowing them.
+        let outcome = match outcome {
+            Ok(outcome) if !self.pending_warnings.is_empty() || deadline_warning.is_some() => {
+                let mut warnings = std::mem::take(&mut self.pending_warnings);
+                warnings.extend(outcome.warnings().iter().cloned());
+                warnings.extend(deadline_warning);
                 Ok(outcome.with_warnings(warnings))
             }
-            (outcome, _) => outcome,
+            outcome => outcome,
         };
 
         if outcome.is_ok() {
@@ -1310,16 +1458,25 @@ mod tests {
         assert_eq!(OracleThinDriver::new().name(), "oracle-thin");
     }
 
+    /// `Config` is not `Debug`, so neither is [`Prepared`] and `expect` cannot
+    /// be used on it. The mirror image of [`refusal`].
+    fn prepared(parameters: &ConnectionParams) -> Prepared {
+        match build_config(parameters) {
+            Ok(prepared) => prepared,
+            Err(error) => panic!("these parameters should have been accepted: {error}"),
+        }
+    }
+
     #[test]
     fn a_host_port_endpoint_becomes_an_easy_connect_string() {
         // The Phase 0 database only answers to a service name; the SID
         // shorthand does not work on it (tools/oracle-test-db/README.md).
-        let config = build_config(&params(Endpoint::HostPort {
+        let config = prepared(&params(Endpoint::HostPort {
             host: "127.0.0.1".to_owned(),
             port: 1521,
             service: "RELDEX".to_owned(),
         }))
-        .expect("valid parameters");
+        .config;
         let descriptor = config.get_connect_descriptor();
         assert!(descriptor.contains("127.0.0.1"), "{descriptor}");
         assert!(descriptor.contains("1521"), "{descriptor}");
@@ -1330,8 +1487,7 @@ mod tests {
     fn a_full_descriptor_is_passed_through() {
         let descriptor = "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=127.0.0.1)(PORT=1521))\
                           (CONNECT_DATA=(SERVICE_NAME=RELDEX)))";
-        let config = build_config(&params(Endpoint::ConnectString(descriptor.to_owned())))
-            .expect("valid descriptor");
+        let config = prepared(&params(Endpoint::ConnectString(descriptor.to_owned()))).config;
         assert!(config.get_connect_descriptor().contains("RELDEX"));
     }
 
@@ -1345,7 +1501,7 @@ mod tests {
 
     #[test]
     fn requiring_tls_turns_a_host_port_endpoint_into_a_tcps_address() {
-        let config = build_config(
+        let config = prepared(
             &params(Endpoint::HostPort {
                 host: "localhost".to_owned(),
                 port: 2484,
@@ -1353,7 +1509,7 @@ mod tests {
             })
             .with_tls(TlsMode::Required),
         )
-        .expect("valid parameters");
+        .config;
         let descriptor = config.get_connect_descriptor().to_ascii_lowercase();
         assert!(descriptor.contains("(protocol=tcps)"), "{descriptor}");
         assert!(descriptor.contains("2484"), "{descriptor}");
@@ -1433,6 +1589,152 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::Configuration);
     }
 
+    /// A TCPS descriptor with an extra `SECURITY` parameter spliced in, or none.
+    fn tcps_descriptor(security: &str) -> String {
+        format!(
+            "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=localhost)(PORT=2484))\
+             (CONNECT_DATA=(SERVICE_NAME=RELDEX)){security})"
+        )
+    }
+
+    #[test]
+    fn a_descriptor_that_pins_a_certificate_distinguished_name_is_refused() {
+        // The dangerous direction, and the reason this guard exists: the
+        // profile asks for the server certificate's whole DN to be matched,
+        // upstream parses the parameter, forwards it and never applies it
+        // (U-14), and the session would open a guarantee short of what was
+        // configured with nothing saying so.
+        let error = refusal(
+            &params(Endpoint::ConnectString(tcps_descriptor(
+                "(SECURITY=(SSL_SERVER_CERT_DN=\"CN=localhost,O=Reldex\"))",
+            )))
+            .with_tls(TlsMode::Required),
+        );
+        assert_eq!(error.kind(), ErrorKind::Configuration);
+        assert!(error.message().contains("SSL_SERVER_CERT_DN"), "{error}");
+        assert!(error.message().contains("subjectAltName"), "{error}");
+        assert!(
+            error
+                .message()
+                .contains(EXT_ALLOW_UNENFORCED_SERVER_CERT_DN),
+            "the refusal must name the way out: {error}"
+        );
+
+        // A plaintext **descriptor written out in full** is refused too: a pin
+        // nothing applies is still a pin nothing applies, and "that address is
+        // not TLS anyway" answers a question the caller did not ask. (A
+        // plaintext `tnsnames.ora` *alias* is the one shape this cannot see;
+        // `descriptor::tests` pins that limitation.)
+        let error = refusal(&params(Endpoint::ConnectString(
+            "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=1521))\
+             (CONNECT_DATA=(SERVICE_NAME=RELDEX))(SECURITY=(SSL_SERVER_CERT_DN=CN=localhost)))"
+                .to_owned(),
+        )));
+        assert_eq!(error.kind(), ErrorKind::Configuration);
+    }
+
+    #[test]
+    fn only_an_explicit_flag_opts_out_of_the_distinguished_name_refusal() {
+        let descriptor = tcps_descriptor("(SECURITY=(SSL_SERVER_CERT_DN=CN=localhost))");
+        let with = |value: ExtensionValue| {
+            let mut extensions = Extensions::new();
+            extensions.set(EXT_ALLOW_UNENFORCED_SERVER_CERT_DN, value);
+            params(Endpoint::ConnectString(descriptor.clone()))
+                .with_tls(TlsMode::Required)
+                .with_extensions(extensions)
+        };
+
+        // Every shape but `Flag(true)` leaves the refusal standing, exactly as
+        // `EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE` does: a malformed opt-in must
+        // resolve to the safe side, or a typo quietly weakens a session.
+        for value in [
+            ExtensionValue::Flag(false),
+            ExtensionValue::Text("true".to_owned()),
+            ExtensionValue::Integer(1),
+        ] {
+            let error = refusal(&with(value.clone()));
+            assert_eq!(error.kind(), ErrorKind::Configuration, "{value:?}");
+        }
+
+        let warnings = prepared(&with(ExtensionValue::Flag(true))).warnings;
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].kind(), WarningKind::Informational);
+        assert!(
+            warnings[0].message().contains("without"),
+            "the session must be told the pin was not applied: {:?}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn a_descriptor_that_sets_dn_matching_is_accepted_and_reported() {
+        // Never a refusal: whichever way the parameter points, the session that
+        // opens verifies the host name against `subjectAltName`, which is at
+        // least as strong as what was asked for.
+        for (value, distinguishing) in [
+            ("ON", "does not use"),
+            ("yes", "does not use"),
+            ("true", "does not use"),
+            ("OFF", "cannot switch"),
+            ("no", "cannot switch"),
+            ("false", "cannot switch"),
+        ] {
+            let warnings = prepared(
+                &params(Endpoint::ConnectString(tcps_descriptor(&format!(
+                    "(SECURITY=(SSL_SERVER_DN_MATCH={value}))"
+                ))))
+                .with_tls(TlsMode::Required),
+            )
+            .warnings;
+            assert_eq!(warnings.len(), 1, "{value}: {warnings:?}");
+            assert_eq!(warnings[0].kind(), WarningKind::Informational, "{value}");
+            assert!(
+                warnings[0].message().contains(distinguishing),
+                "{value}: {:?}",
+                warnings[0]
+            );
+            assert!(warnings[0].message().contains("subjectAltName"), "{value}");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_endpoint_carries_no_connect_time_warnings() {
+        // The trap this guards against: upstream writes `(SSL_SERVER_DN_MATCH=ON)`
+        // into the `SECURITY` segment of **every** TCPS descriptor it rebuilds,
+        // because the flag defaults to true. Reading that back as a request
+        // would put a warning on every TLS session Reldex ever opens.
+        for parameters in [
+            params(Endpoint::ConnectString(tcps_descriptor(""))).with_tls(TlsMode::Required),
+            params(Endpoint::ConnectString(
+                "tcps://localhost:2484/RELDEX".to_owned(),
+            ))
+            .with_tls(TlsMode::Required),
+            params(Endpoint::ConnectString("127.0.0.1:1521/RELDEX".to_owned())),
+            params(Endpoint::HostPort {
+                host: "localhost".to_owned(),
+                port: 2484,
+                service: "RELDEX".to_owned(),
+            })
+            .with_tls(TlsMode::Required),
+        ] {
+            let prepared = prepared(&parameters);
+            assert!(
+                prepared
+                    .config
+                    .get_connect_descriptor()
+                    .to_ascii_lowercase()
+                    .contains("ssl_server_dn_match")
+                    || !prepared
+                        .config
+                        .get_connect_descriptor()
+                        .to_ascii_lowercase()
+                        .contains("(security="),
+                "this test is only meaningful while upstream still emits the default flag"
+            );
+            assert!(prepared.warnings.is_empty(), "{:?}", prepared.warnings);
+        }
+    }
+
     #[test]
     fn installing_the_crypto_provider_is_idempotent() {
         // Called twice on purpose: the second call must not panic, because
@@ -1464,7 +1766,7 @@ mod tests {
         // Whatever the driver renders from a connect string — the parsed
         // descriptor or the parse failure — the credential is not in it.
         let rendered = match build_config(&params(Endpoint::ConnectString("((((".to_owned()))) {
-            Ok(config) => config.get_connect_descriptor(),
+            Ok(prepared) => prepared.config.get_connect_descriptor(),
             Err(error) => error.to_string(),
         };
         assert!(!rendered.contains("not-a-real-password"), "{rendered}");

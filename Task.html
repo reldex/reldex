@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-20T22:15:00+07:00",
+  "updatedAt": "2026-09-20T23:55:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P0",
@@ -514,7 +514,7 @@
   "summary": "Phase 0 — Architecture Validation. Core stack proven against Oracle 19.3: vendor-neutral driver contract, db-core session layer, and a wrapper over Oracle's official oracledb crate (pinned beta). Spikes S1, S3, S5, S7, S8 (TCPS, with limits), S9, S10 (network loss/reconnect, two upstream gaps), S11 (NCLOB), S12 (developer features, one upstream blocker), S13 (privileged connections) and S14 (large result) all pass; S2 is partial (NUMBER bind restrictions); S4 cancel is an accepted limitation (owner decision 2026-09-20: pre-armed per-statement deadline + honest UI; SPEC §24.8 unmet until upstream ships a break API). S6 (mobile cross-compile) passed 2026-09-19 in CI (PR #3) — cross-compile and link only, physical-device validation still outstanding. Five of seven drafted upstream issues (A–E) were submitted 2026-09-20 (#21–#25); F and G await the owner's go-ahead.",
   "focus": [
     "Phase 0 exit assessment for the owner's go/no-go (phase-0.md)",
-    "Owner decisions outstanding: upstream issues F/G submission, C-5 connect_timeout approach, default deadline/EXPIRE_TIME guidance, CREATE TRIGGER rewrite, default fetch batch size, TCPS wording/SSL_SERVER_DN_MATCH guard"
+    "Owner decisions outstanding: upstream issues F/G submission, C-5 connect_timeout approach, default deadline/EXPIRE_TIME guidance, CREATE TRIGGER rewrite, default fetch batch size, TCPS wording/SSL_SERVER_DN_MATCH guard (implemented, PR open, awaiting confirmation), C-6 connect-time warnings"
   ],
   "blockers": [
     {
@@ -563,8 +563,8 @@
     },
     {
       "title": "TCPS is narrower than enterprise deployments expect",
-      "detail": "The oracledb beta supports one-way TLS 1.2 with PEM-supplied trust only: no mTLS combined with a private CA, no Oracle wallet files, no OS trust store, no revocation, SSL_SERVER_DN_MATCH silently ignored (U-12…U-14).",
-      "mitigation": "SPEC §8 states the supported configuration precisely; Issue E drafted for the owner to submit upstream."
+      "detail": "The oracledb beta supports one-way TLS 1.2 with PEM-supplied trust only: no mTLS combined with a private CA, no Oracle wallet files, no OS trust store, no revocation, SSL_SERVER_DN_MATCH / SSL_SERVER_CERT_DN not applied by upstream's TLS layer (U-12…U-14).",
+      "mitigation": "SPEC §8 states the supported configuration precisely; upstream issue oracle/rust-oracledb#25 submitted. A driver-side guard (refuse SSL_SERVER_CERT_DN unless explicitly allowed, warn on SSL_SERVER_DN_MATCH) is implemented and reviewed, open as an unmerged pull request pending owner confirmation."
     },
     {
       "title": "Black-holed connection hangs without a deadline; no keepalive upstream (U-15…U-17)",
@@ -580,9 +580,10 @@
   "nextSteps": [
     "Owner: approve submission of drafted upstream issues F and G (results file §6)",
     "Owner: provide an Android physical test device (+ local NDK) for physical-device validation; iOS needs a Mac + Apple Developer account + device",
-    "Owner: TCPS wording + SSL_SERVER_DN_MATCH guard decisions (results file §9 items 6–7)",
+    "Owner: confirm TCPS wording + the SSL_SERVER_DN_MATCH / SSL_SERVER_CERT_DN guard — implemented as proposed, open as an unmerged pull request (results file §9 items 6–7); merge = accept",
     "Owner: C-5 connect_timeout approach, default deadline/EXPIRE_TIME guidance, CREATE TRIGGER rewrite, default fetch batch size (results file §9 items 8–12)",
-    "Phase 0 go/no-go → Phase 1 (Qt Quick shell, thin C++/Rust FFI adapter)"
+    "Phase 0 go/no-go → Phase 1 (Qt Quick shell, thin C++/Rust FFI adapter)",
+    "Owner/lead: decide on the connect-time warning channel (contract gap C-6)"
   ],
   "decisions": [
     {
@@ -966,6 +967,16 @@
               "status": "todo"
             },
             {
+              "title": "Driver: TCPS descriptor guard (U-14) — refuse SSL_SERVER_CERT_DN unless explicitly allowed, warn on SSL_SERVER_DN_MATCH",
+              "status": "in_progress",
+              "note": "Implemented as the lead proposed and independently reviewed (3 must-fix applied); open as a pull request from phase-0/tcps-dn-guard, NOT merged — awaiting owner confirmation of results file §9 items 6–7."
+            },
+            {
+              "title": "Contract: connect-time warning channel (C-6)",
+              "status": "todo",
+              "note": "connect cannot return warnings; the driver attaches connect-time findings to the first successful statement. Proposal: one additive, vendor-neutral take_connect_warnings on DatabaseConnection (phase-0-spike-results.md §7 C-6)."
+            },
+            {
               "title": "S6 Android/iOS cross-compile check",
               "status": "done",
               "note": "Pass — kill criterion did not fire (PR #3: https://github.com/reldex/reldex/pull/3); physical-device validation still needed."
@@ -1320,6 +1331,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-20",
+      "text": "TCPS descriptor guard for upstream gap U-14 implemented on branch phase-0/tcps-dn-guard: SSL_SERVER_CERT_DN is refused before any network I/O unless explicitly allowed, SSL_SERVER_DN_MATCH produces a warning, name-mismatch errors explain which name is checked. Independent review found a real false negative (single-quoted / whitespace pins) — fixed, with an agreement test against upstream's own parser. New contract gap C-6 (no connect-time warning channel). Pull request left unmerged for the owner."
+    },
     {
       "date": "2026-09-20",
       "text": "Upstream issues #21–#25 filed on oracle/rust-oracledb (five of seven drafted issues, submitted by the owner's account; F and G await go-ahead)."

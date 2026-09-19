@@ -70,6 +70,8 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [x] Test DB: TCPS listener (S8) — `127.0.0.1:2484`, idempotent startup hook, wallet material untracked
 - [x] Test DB: container memory cap — 1.5 GiB SGA / 512 MiB PGA, `mem_limit: 4g` (~2.0 GiB resident)
 - [ ] Owner: decide how TCPS support is described to users and whether to refuse descriptors carrying `SSL_SERVER_DN_MATCH` (results file §9 items 6–7)
+- [~] Driver: TCPS descriptor guard (U-14) — refuse `SSL_SERVER_CERT_DN` unless explicitly allowed, warn on `SSL_SERVER_DN_MATCH` — implemented as the lead proposed and independently reviewed (3 must-fix applied); open as a pull request from `phase-0/tcps-dn-guard`, NOT merged — awaiting owner confirmation of results file §9 items 6–7.
+- [ ] Contract: connect-time warning channel (C-6) — `connect` cannot return warnings; the driver attaches connect-time findings to the first successful statement. Proposal: one additive, vendor-neutral `take_connect_warnings` on `DatabaseConnection` (`phase-0-spike-results.md` §7 C-6).
 - [x] S6 Android/iOS cross-compile check — pass, kill criterion did not fire (PR #3: https://github.com/reldex/reldex/pull/3); physical-device validation still needed
 - [ ] Driver: honour `connect_timeout` (C-5) — `ConnectionParams::connect_timeout` is accepted and ignored (`phase-0-spike-results.md` §7 C-5)
 - [ ] Owner decisions §9 items 8–12 (default deadline, `EXPIRE_TIME` recommendation, trigger DDL rewrite, default fetch batch size, C-5 approach)

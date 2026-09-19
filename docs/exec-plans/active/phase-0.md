@@ -149,7 +149,10 @@ For every mapping, document:
   with certificate and host-name verification on, confirmed server-side; trust comes from a
   user-supplied PEM. Not available upstream: mTLS with a private CA, Oracle wallet files, OS trust
   store, revocation, `SSL_SERVER_DN_MATCH` (U-12…U-14). `TlsMode::Required` refuses non-TCPS endpoints
-  rather than silently connecting in plaintext.
+  rather than silently connecting in plaintext, and (2026-09-19) a descriptor that sets
+  `SSL_SERVER_CERT_DN` is refused rather than connected with an unenforced pin, with
+  `oracle.allow_unenforced_server_cert_dn` as the opt-out; `SSL_SERVER_DN_MATCH` produces a warning.
+  Design proposed by the lead, **owner confirmation pending** (results file U-14 and §9 item 7).
 - [x] timeout behavior. Per spike S4's findings: a pre-armed deadline stops a long SQL statement
   about 0.5 s past the deadline with the session intact, but a fired deadline on a PL/SQL block the
   server will not interrupt promptly costs the connection entirely (upstream recovery defect U-6,
@@ -310,8 +313,10 @@ criterion's honest status is softened to make the table look more finished than 
 - Owner approval to submit drafted upstream **issues F and G** (results file §6) — U-15…U-17
   (timeouts/dead-link detection) and U-18 (`CREATE TRIGGER`).
 - **Owner decisions outstanding** (results file §9, full list): item 4 (relax the NUMBER-bind refusal
-  U-1 — recommendation: no), items 6–7 (how far TCPS is advertised to customers; whether to guard
-  against `SSL_SERVER_DN_MATCH` being silently ignored, U-14), item 8 (C-5 above), item 9 (whether
+  U-1 — recommendation: no), items 6–7 (how far TCPS is advertised to customers; the U-14 guard is
+  now **implemented as proposed** and needs the owner's confirmation rather than a decision from
+  scratch — it makes a profile carrying `SSL_SERVER_CERT_DN` stop connecting until it is edited or
+  the new extension is set), item 8 (C-5 above), item 9 (whether
   Reldex arms a default deadline on every call, and what the UI says about a silent link — U-6/U-17),
   item 10 (whether the Phase 0 test database, and Reldex's customer guidance, should set
   `SQLNET.EXPIRE_TIME`), item 11 (whether the editor should offer to rewrite `CREATE TRIGGER` DDL

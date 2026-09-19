@@ -27,12 +27,12 @@ use std::time::{Duration, Instant};
 
 use common::{
     PASSWORD, TCPS_CA_DIR, TCPS_DSN, TCPS_WRONG_CA_DIR, USER, exec, exec_quietly, measurement,
-    observation, optional, params, query, scalar, setting, tcps_params, tcps_params_bare,
-    tcps_params_with_ca, try_connect, unique,
+    observation, optional, params, params_at, query, scalar, setting, tcps_params,
+    tcps_params_bare, tcps_params_with_ca, try_connect, unique,
 };
 use reldex_db_driver_api::{
     ConnectionParams, Credentials, DatabaseDriver, DbError, Endpoint, ErrorKind, Secret,
-    SessionState, Statement, TlsMode, TransactionState,
+    SessionState, Statement, TlsMode, TransactionState, WarningKind,
 };
 use reldex_driver_oracle_thin::OracleThinDriver;
 
@@ -267,6 +267,160 @@ fn requiring_tls_over_a_plaintext_endpoint_is_refused_rather_than_downgraded() {
     // happens while the parameters are being turned into a configuration.
     assert_eq!(error.session_state(), SessionState::Usable);
     observation(format!("TCP endpoint + TlsMode::Required -> {error}"));
+}
+
+/// The configured TCPS target rewritten as a full descriptor, with an extra
+/// `SECURITY` segment spliced in.
+///
+/// `None` when the configured DSN is not the `tcps://host:port/service` shape
+/// these tests assume, so the caller can skip and say so rather than assert
+/// against a descriptor it built out of nothing.
+fn tcps_descriptor(security: &str) -> Option<String> {
+    let dsn = setting(TCPS_DSN);
+    let (host_port, service) = dsn.strip_prefix("tcps://")?.rsplit_once('/')?;
+    let (host, port) = host_port.rsplit_once(':')?;
+    Some(format!(
+        "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST={host})(PORT={port}))\
+         (CONNECT_DATA=(SERVICE_NAME={service})){security})"
+    ))
+}
+
+#[test]
+fn a_descriptor_that_pins_a_distinguished_name_is_refused_before_the_network_is_touched() {
+    // No TLS listener needed, and the port is deliberately one nothing answers
+    // on: a refusal that came from the network would be `Connection` (spike S1),
+    // so `Configuration` here is evidence that no socket was opened. U-14 means
+    // the parameter would otherwise be forwarded to the server and never
+    // applied, and the session would come back weaker than the profile asked
+    // for with nothing saying so.
+    let error = refusal(
+        &params_at(
+            "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=127.0.0.1)(PORT=1))\
+             (CONNECT_DATA=(SERVICE_NAME=RELDEX))\
+             (SECURITY=(SSL_SERVER_CERT_DN=\"CN=nobody,O=Reldex\")))",
+        )
+        .with_tls(TlsMode::Required),
+        "a descriptor pinning the server certificate's distinguished name",
+    );
+    assert_eq!(error.kind(), ErrorKind::Configuration, "{error}");
+    assert!(error.message().contains("SSL_SERVER_CERT_DN"), "{error}");
+    assert!(error.message().contains("subjectAltName"), "{error}");
+    assert_eq!(
+        error.session_state(),
+        SessionState::Usable,
+        "no session was opened, so there is nothing to validate"
+    );
+    assert!(!error.to_string().contains(&setting(PASSWORD)));
+    observation(format!("SSL_SERVER_CERT_DN -> {error}"));
+}
+
+#[test]
+fn a_descriptor_that_sets_dn_matching_opens_a_session_and_reports_the_parameter_as_inert() {
+    let Some(base) = tcps() else { return };
+    let Some(descriptor) = tcps_descriptor("(SECURITY=(SSL_SERVER_DN_MATCH=YES))") else {
+        observation(format!(
+            "SKIPPED: {TCPS_DSN} is not the tcps://host:port/service shape this test rewrites"
+        ));
+        return;
+    };
+    let params = ConnectionParams::new(
+        Endpoint::ConnectString(descriptor),
+        Credentials::UserPassword {
+            username: setting(USER),
+            password: Secret::new(setting(PASSWORD)),
+        },
+    )
+    .with_tls(TlsMode::Required)
+    .with_extensions(base.extensions().clone());
+
+    // Never a refusal: what the parameter asks for already happens, by a
+    // stricter mechanism.
+    let mut connection =
+        try_connect(&params).expect("SSL_SERVER_DN_MATCH must not stop a session opening");
+    // The finding reaches the caller on the first statement that succeeds — the
+    // contract has no connect-time warning channel (gap C-6 in the spike
+    // results), and this is the narrowest existing one.
+    let outcome = connection
+        .execute(&Statement::new("SELECT 1 FROM dual"))
+        .expect("an ordinary query over TCPS");
+    let warning = outcome
+        .warnings()
+        .iter()
+        .find(|warning| warning.message().contains("SSL_SERVER_DN_MATCH"))
+        .expect("the connect-time finding travels with the first statement");
+    assert_eq!(warning.kind(), WarningKind::Informational);
+    assert!(warning.message().contains("subjectAltName"), "{warning:?}");
+    observation(format!(
+        "SSL_SERVER_DN_MATCH=YES -> session opened; warning: {}",
+        warning.message()
+    ));
+    drop(outcome);
+
+    // And it is delivered once, not on every statement.
+    let second = connection
+        .execute(&Statement::new("SELECT 2 FROM dual"))
+        .expect("a second query");
+    assert!(
+        second.warnings().is_empty(),
+        "the connect-time finding was repeated: {:?}",
+        second.warnings()
+    );
+    drop(second);
+    connection.close().expect("close");
+}
+
+#[test]
+fn a_name_failure_under_those_parameters_says_which_name_was_actually_checked() {
+    let Some(base) = tcps() else { return };
+    // The same numeric-host mismatch as above — the listener's certificate has
+    // no IP address in its SAN — but this time the descriptor also sets
+    // `SSL_SERVER_DN_MATCH`. That is the configuration where the raw `rustls`
+    // text is most misleading: the obvious next move is to adjust the
+    // parameter, which does nothing at all (U-14).
+    let Some(descriptor) = tcps_descriptor("(SECURITY=(SSL_SERVER_DN_MATCH=YES))") else {
+        observation(format!(
+            "SKIPPED: {TCPS_DSN} is not the shape this test rewrites"
+        ));
+        return;
+    };
+    let numeric = descriptor.replace("(HOST=localhost)", "(HOST=127.0.0.1)");
+    if numeric == descriptor {
+        observation(format!(
+            "SKIPPED: {TCPS_DSN} does not name `localhost`, so there is no mismatch to make"
+        ));
+        return;
+    }
+    let params = ConnectionParams::new(
+        Endpoint::ConnectString(numeric),
+        Credentials::UserPassword {
+            username: setting(USER),
+            password: Secret::new(setting(PASSWORD)),
+        },
+    )
+    .with_tls(TlsMode::Required)
+    .with_extensions(base.extensions().clone());
+
+    let error = refusal(
+        &params,
+        "a host name outside the certificate's subjectAltName",
+    );
+    assert!(
+        error.message().contains("subjectAltName"),
+        "the failure should say which name was checked: {error}"
+    );
+    assert!(
+        error.message().contains("SSL_SERVER_CERT_DN"),
+        "and that the Oracle parameters do not influence it: {error}"
+    );
+    // Upstream's own text is still there, ahead of the explanation.
+    assert!(
+        error.message().contains("certificate not valid for name"),
+        "{error}"
+    );
+    assert!(!error.to_string().contains(&setting(PASSWORD)));
+    observation(format!(
+        "name mismatch under SSL_SERVER_DN_MATCH -> {error}"
+    ));
 }
 
 #[test]
