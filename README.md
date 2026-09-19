@@ -22,9 +22,10 @@ independently.
 **Known limitations, stated plainly:**
 
 - **No on-demand statement cancel.** Only a pre-armed deadline exists, and it can destroy the session
-  if the server does not interrupt promptly (spike S4 fails `SPEC.md` §10/§24.8's requirement).
-  [ADR-0001](docs/decisions/0001-database-driver-strategy.md) is re-opened; the cancellation path is
-  an owner decision.
+  if the server does not interrupt promptly (spike S4 fails `SPEC.md` §10/§24.8's requirement). The
+  owner decided on 2026-09-20 to accept this as a limitation — stay on `oracledb`, ship the pre-armed
+  deadline with an honest UI, and pursue upstream fixes — rather than change drivers; see
+  [ADR-0001](docs/decisions/0001-database-driver-strategy.md) "Owner decision (2026-09-20)".
 - **`TIMESTAMP WITH TIME ZONE` columns are refused** at describe time by default, because a
   named-region value aborts the process in the upstream driver; this is containment, not support.
 - **NUMBER bind restrictions**: certain decimal shapes (an odd count of leading zeros below 0.1, or a
@@ -34,12 +35,13 @@ independently.
 - **Mobile is unproven.** Android/iOS cross-compile has not been attempted (needs the NDK / a macOS
   host); no physical-device evidence exists for either platform.
 
-- [ADR-0001](docs/decisions/0001-database-driver-strategy.md) — **Accepted — S4 kill criterion FIRED
-  (2026-09-20); owner decision pending**: the primary database driver remains Oracle's official
-  `oracledb` crate (`oracle/rust-oracledb`); only the cancellation mechanism is in question.
+- [ADR-0001](docs/decisions/0001-database-driver-strategy.md) — **Accepted — owner decision
+  2026-09-20: stay on oracledb; pre-armed deadline + honest UI; upstream issues pending**: the primary
+  database driver remains Oracle's official `oracledb` crate (`oracle/rust-oracledb`); the owner
+  accepted the cancellation limitation rather than changing drivers.
 - [ADR-0002](docs/decisions/0002-driver-api-and-concurrency-model.md) (driver API and concurrency
-  model) — **Accepted (provisional — implemented; independently reviewed twice with must-fix findings
-  applied; amended after the Phase 0 spikes; owner review pending)**.
+  model) — **Accepted (owner confirmed 2026-09-20) — implemented; independently reviewed twice with
+  must-fix findings applied; amended after the Phase 0 spikes**.
 - A Cargo workspace with `crates/db-driver-api`, `crates/db-core` (session/worker-thread layer),
   `crates/drivers/mock`, `crates/drivers/oracle-thin` (wraps `oracledb`) and `crates/reldex-core-poc`
   all implemented, plus GitHub Actions CI (`cargo fmt`, `cargo clippy`, `cargo test` on
@@ -56,7 +58,7 @@ test DB); network-loss/reconnect behavior; Android/iOS validation.
 
 - **Core:** Rust.
 - **UI:** Qt Quick/QML with a thin C++ adapter over a stable Rust FFI boundary — planned, not started.
-- **Primary database driver:** Oracle's official [`oracledb`](https://github.com/oracle/rust-oracledb) crate (pure Rust, thin, blocking; no Instant Client/OCI required), pinned to an exact pre-GA beta version (`=26.0.0-beta.3`), per [ADR-0001](docs/decisions/0001-database-driver-strategy.md). It is encapsulated behind `db-driver-api` so it can be swapped if a kill criterion in the ADR's spike plan fires. The owner has not changed drivers; see the current limitations above.
+- **Primary database driver:** Oracle's official [`oracledb`](https://github.com/oracle/rust-oracledb) crate (pure Rust, thin, blocking; no Instant Client/OCI required), pinned to an exact pre-GA beta version (`=26.0.0-beta.3`), per [ADR-0001](docs/decisions/0001-database-driver-strategy.md). It is encapsulated behind `db-driver-api` so it can be swapped if a kill criterion in the ADR's spike plan fires. Spike S4's cancellation kill criterion fired, and on 2026-09-20 the owner decided to accept the limitation — ship the pre-armed deadline with an honest UI and pursue upstream fixes — rather than change drivers; see the current limitations above.
 - **Known gaps in the primary driver**, stated honestly: no on-demand statement-cancel API (Phase 0 falls back to a pre-armed deadline; four upstream issues are drafted, none submitted yet); it is pre-GA/beta software with at least one defect that can abort the whole process if an unhandled input reaches it; Native Network Encryption and 11G password verifiers are unsupported; Android/iOS viability is unproven and requires physical-device evidence before any mobile claim.
 - **Initial compatibility target:** Oracle Database 19c+.
 

@@ -28,7 +28,7 @@ Phase 0 is complete when:
 | 1 | **Done.** `db-driver-api` (ADR-0002) and `db-core`'s session/worker layer are implemented and independently reviewed (7 must-fix applied, commit `86f79d7`). |
 | 2 | **Done.** Spike S1 — pass: Easy Connect and a full TNS descriptor both authenticate; 119.5 ms median connect (10 sequential cycles). |
 | 3 | **Done.** Spike S3 — pass. |
-| 4 | **Not met.** Spike S4 fails for the requirement: only a pre-armed per-round-trip deadline exists, and it destroys the session whenever the server cannot answer promptly. `SPEC.md` §10/§24.8 is not satisfied by `oracledb` 26.0.0-beta.3. ADR-0001 is re-opened; owner decision pending. |
+| 4 | **Not met — accepted limitation (owner decision 2026-09-20).** Spike S4 fails for the requirement: only a pre-armed per-round-trip deadline exists, and it destroys the session whenever the server cannot answer promptly. `SPEC.md` §10/§24.8 is not satisfied by `oracledb` 26.0.0-beta.3. The owner reviewed ADR-0001's re-opening and decided to stay on `oracledb`, ship the pre-armed deadline with an honest UI, and pursue upstream fixes rather than change drivers — see ADR-0001 "Owner decision (2026-09-20)". This criterion remains **not met** for the Phase 0 go/no-go decision below; the decision was to accept the gap, not to close it. |
 | 5 | **Done, with documented limits.** Spikes S2 (conditional go — NUMBER-bind and TIMESTAMP WITH TIME ZONE restrictions contained by refusal, not silent corruption), S5 (pass) and S7 (pass) all ran against the live database. |
 | 6 | **Partial.** Windows x64 fully validated locally (build, connect, full spike matrix). Linux x64 and macOS ARM64 build in CI (fmt/clippy/test) but this branch has not yet gone through a PR/CI run, and neither has database access in CI. |
 | 7 | **Documented blocker, no evidence yet.** Spike S6 (cross-compile) has not run — it needs the Android NDK (owner approval to download) and a macOS host for iOS. No physical-device testing has been attempted for either platform. |
@@ -75,7 +75,7 @@ Proven by spike S3 against the live database, plus `db-core`'s own session-layer
 - [x] REF CURSOR. (spike S5, after contract fix C-1)
 - [x] Multiple concurrent sessions. (spike S9: 8 sessions, 400 inserts, 282.8 ms)
 - [x] Long-running query. (spike S4 drives a 3-way cartesian join over `ALL_OBJECTS` and a 20-second `DBMS_SESSION.SLEEP`; both execute — see below for the cancellation outcome)
-- [ ] Cancellation from another control path. **Ran 2026-09-19; fails for the requirement (ADR-0001 C1 / spike S4).** No mechanism stops a running statement and keeps the session in the general case: a pre-armed deadline (the only mechanism `oracledb` 26.0.0-beta.3 offers) stops a long SQL statement with the session intact, but destroys the connection for a PL/SQL block the server will not interrupt promptly (upstream recovery defect U-6); a privileged `ALTER SYSTEM CANCEL SQL` stops the statement server-side but the client is never notified (U-7); a minimal fork was assessed and is not recommended. `SPEC.md` §10/§24.8 is **not met**. Per ADR-0001's own rule, the ADR is re-opened and the cancellation path is an owner decision — see ADR-0001 "Spike outcome (2026-09-20)" and `phase-0-spike-results.md` §4.
+- [ ] Cancellation from another control path. **Ran 2026-09-19; fails for the requirement (ADR-0001 C1 / spike S4). Accepted limitation (owner decision 2026-09-20).** No mechanism stops a running statement and keeps the session in the general case: a pre-armed deadline (the only mechanism `oracledb` 26.0.0-beta.3 offers) stops a long SQL statement with the session intact, but destroys the connection for a PL/SQL block the server will not interrupt promptly (upstream recovery defect U-6); a privileged `ALTER SYSTEM CANCEL SQL` stops the statement server-side but the client is never notified (U-7); a minimal fork was assessed and is not recommended. `SPEC.md` §10/§24.8 is **not met** — the owner decided to stay on `oracledb`, ship the pre-armed deadline with an honest UI, and pursue the upstream fixes rather than change drivers; see ADR-0001 "Spike outcome (2026-09-20)" and "Owner decision (2026-09-20)", and `phase-0-spike-results.md` §4.
 
 ## Workstream D — Data types
 
@@ -223,6 +223,38 @@ Windows 11 Pro, `rustc 1.98.1` MSVC target). Full method notes are in
   TASKS.md).
 
 Do not make comparative performance claims without recording the method and environment.
+
+## Phase 0 exit assessment (draft)
+
+This restates the eight success criteria above as a single input for the owner's Phase 1 go/no-go
+decision. It is a draft assessment, not the decision itself — see the note at the end.
+
+| # | Criterion | Assessment | Evidence |
+| --- | --- | --- | --- |
+| 1 | Generic driver/session API exists | **Met** | `db-driver-api`/`db-core`, independently reviewed (commit `86f79d7`) |
+| 2 | Selected thin driver connects to the reference database | **Met** | Spike S1 — pass; `phase-0-spike-results.md` §3 |
+| 3 | Transaction behavior is correct | **Met** | Spike S3 — pass; `phase-0-spike-results.md` §3 |
+| 4 | Query cancellation is demonstrated | **Not met — accepted limitation (owner decision 2026-09-20)** | Spike S4; ADR-0001 "Spike outcome (2026-09-20)" and "Owner decision (2026-09-20)"; `phase-0-spike-results.md` §4 |
+| 5 | Required datatypes/PL-SQL behaviors are integration-tested | **Partially met** | Spikes S2 (conditional go), S5 (pass), S7 (pass); NCLOB not directly tested — `phase-0-spike-results.md` §3 |
+| 6 | Desktop platform viability is established | **Partially met** | Windows x64 fully validated locally; Linux x64 and macOS ARM64 build/fmt/clippy/test green on CI (PR #1) but no database connect exercised in CI — see `README.md` "Current status" |
+| 7 | Android/iOS direct-connect feasibility: physical-device evidence or a documented blocker | **Not met, documented blocker** | Spike S6 not run — needs Android NDK (owner approval to download) and a macOS host for iOS; no physical-device evidence for either platform |
+| 8 | No full desktop UI required to prove these results | **Met** | `reldex-core-poc` is a CLI harness; no Qt/QML UI exists |
+
+**What remains before a Phase 1 go decision:**
+
+- TCPS (spike S8) — pending a TCPS listener on the test database (tracked in `TASKS.md`; a concurrent
+  workstream owns this).
+- Android/iOS cross-compile (spike S6) — pending Android NDK approval and a macOS host; criterion 7
+  needs either physical-device evidence or to remain a clearly documented blocker, not silence.
+- Network-loss/reconnect behavior — not evidenced at all in Phase 0 (Workstream F).
+- NCLOB — not directly spiked (CLOB/BLOB streaming and NVARCHAR2/Thai character fidelity were each
+  tested separately; no NCLOB-specific spike ran).
+- EXPLAIN PLAN / DBMS_XPLAN — not run (Workstream E).
+- Metadata/dictionary access as a capability in its own right — only incidental evidence so far
+  (`USER_ERRORS`, `V$SESSION`, each exercised only for another test's own purpose).
+
+This is a draft assessment for the owner's use, not a go/no-go decision — per "Deliverables" below,
+that decision is the owner's to make.
 
 ## Deliverables
 

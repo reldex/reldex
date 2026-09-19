@@ -1,13 +1,12 @@
 # 0002 — Driver API and Concurrency Model
 
-**Status:** Accepted (provisional — implemented; independent API review completed 2026-09-19 and its
-must-fix findings applied, see "Amendments after API review"; amended after the ADR-0001
-Phase 0 spikes, see "Amendments after the Phase 0 spikes"; amended again after the independent
-review of the `db-core` session layer, see "Amendments after the db-core session review"; owner
-review pending)
+**Status:** Accepted (owner confirmed 2026-09-20) — implemented; independent API review completed
+2026-09-19 and its must-fix findings applied, see "Amendments after API review"; amended after the
+ADR-0001 Phase 0 spikes, see "Amendments after the Phase 0 spikes"; amended again after the
+independent review of the `db-core` session layer, see "Amendments after the db-core session review"
 **Date:** 2026-09-19
 **Amended:** 2026-09-19 (API review), 2026-09-19 (Phase 0 spikes), 2026-09-19 (db-core session
-review)
+review), 2026-09-20 (owner confirmation)
 
 ## Context
 
@@ -377,7 +376,8 @@ are `#[non_exhaustive]`, so either can arrive without a breaking change.
 ## Lead decisions (2026-09-19)
 
 During implementation the implementer raised five open questions. The lead decided each below under
-the owner's delegation; all five are open to owner review.
+the owner's delegation. **Confirmed by the owner on 2026-09-20** (owner reviewed the lead's summary
+and answered "as you recommended" to all five).
 
 1. **No auto-commit toggle in the V1 contract (D4).** Accepted.
 2. **`TIMESTAMP WITH TIME ZONE` named regions (D5).** Accepted as a documented limitation — normalized

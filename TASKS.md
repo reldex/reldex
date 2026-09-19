@@ -38,7 +38,7 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [~] Add connection/profile model (driver-level connection params done; user-facing profile model pending)
 - [x] Add session abstraction (`db-core` `DatabaseSession` implemented and hardened; see above)
 - [x] Add transaction abstraction (`db-core` conservative tracking, incl. locking queries, implemented and proven by spike S3)
-- [x] Add cancellation abstraction (contract implemented; driver-level mechanism evaluated in spike S4 and **fails for the requirement** — only a pre-armed per-round-trip deadline exists, no on-demand cancel; ADR-0001 re-opened, owner decision pending)
+- [x] Add cancellation abstraction (contract implemented; driver-level mechanism evaluated in spike S4 and **fails for the requirement** — only a pre-armed per-round-trip deadline exists, no on-demand cancel; owner decision 2026-09-20: accepted as a limitation, see ADR-0001 "Owner decision" section)
 
 ### Functional POC
 - [x] Connect/disconnect/ping (spike S1 — pass)
@@ -50,7 +50,7 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [x] COMMIT/ROLLBACK/SAVEPOINT (spike S3 — pass)
 - [x] CLOB/NCLOB/BLOB (spike S7 — pass; 100 MB CLOB and BLOB streamed, +4.7 MB working set)
 - [x] DBMS_OUTPUT (spike S5 — pass, including Thai text)
-- [!] Long-running query cancellation — **fails for the requirement** (spike S4: no mechanism stops a statement and keeps the session in the general case; see ADR-0001 "Spike outcome" section and `phase-0-spike-results.md` §4)
+- [!] Long-running query cancellation — accepted limitation (owner decision 2026-09-20): pre-armed deadline only; blocked on upstream cancel API (see ADR-0001 "Spike outcome" and "Owner decision" sections and `phase-0-spike-results.md` §4)
 - [ ] TCPS (spike S8 — not run; the Phase 0 test DB has no TCPS listener)
 - [ ] Network-loss behavior (not directly spiked; only recovery-path failure modes seen incidentally during S4, recorded as U-6/U-7)
 - [x] Concurrent independent sessions (spike S9 — pass; 8 sessions, 400 inserts, 283 ms)
@@ -62,8 +62,9 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [ ] Android ARM64 physical device (spike S6 not run — needs the Android NDK; owner approval to download)
 - [ ] iOS/iPadOS ARM64 physical device (not started)
 
-- [ ] Owner: decide cancellation path (ADR-0001 re-opened)
-- [ ] Owner: submit the four drafted upstream issues (`docs/exec-plans/active/phase-0-spike-results.md` §6)
+- [x] Owner: decide cancellation path (ADR-0001 re-opened) [decision 2026-09-20: stay on `oracledb`; ship the pre-armed per-statement deadline with an honest UI; pursue upstream fixes via the four drafted issues — see ADR-0001 "Owner decision (2026-09-20)"]
+- [ ] Owner: submit the four drafted upstream issues (`docs/exec-plans/active/phase-0-spike-results.md` §6, Issue B first)
+- [ ] Track upstream `oracle/rust-oracledb` releases; re-run the integration suite and the ignored abort-repro tests on each new beta
 - [ ] Third-party notices file before any binary distribution (dependency licences — 63 third-party crates in the oracle-thin graph, all permissive but attribution is required; see `phase-0-spike-results.md` §1)
 - [ ] Test DB: TCPS listener (S8)
 - [ ] Test DB: container memory cap
@@ -84,6 +85,7 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [ ] PL/SQL execution
 - [ ] Bind-variable dialog
 - [ ] Cancel
+- [ ] UI (P1): statement time-limit control + explicit "Cancel unavailable with current driver" messaging (SPEC §10 interim note)
 - [ ] Commit/Rollback
 - [ ] Result Store
 - [ ] Virtualized Result Grid

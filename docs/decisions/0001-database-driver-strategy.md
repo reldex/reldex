@@ -1,6 +1,6 @@
 # 0001 — Database Driver Strategy
 
-**Status:** Accepted — S4 kill criterion FIRED (2026-09-20); owner decision pending
+**Status:** Accepted — owner decision 2026-09-20: stay on oracledb; pre-armed deadline + honest UI; upstream issues pending
 **Date:** 2026-09-19
 **Amended:** 2026-09-19 — **C1 revised and spike S4 widened.** The ADR-0002 API review re-read
 `oracledb`'s source and established that `set_call_timeout` locks the same `Arc<Mutex<Client>>` that
@@ -12,6 +12,8 @@ running statement and keeps the session in the general case. Per this ADR's own 
 criterion in the spike plan fires, this ADR is re-opened rather than silently worked around"), it is
 now re-opened for the owner. See "Spike outcome (2026-09-20)" below. The owner has not changed
 drivers — `oracledb` remains the chosen driver — only the cancellation mechanism is undecided.
+**Amended:** 2026-09-20 — **Owner decision recorded; ADR re-closed.** See "Owner decision
+(2026-09-20)" below.
 **Decided by:** project owner, 2026-09-19 — the primary driver is Oracle's official
 [`oracle/rust-oracledb`](https://github.com/oracle/rust-oracledb) (crate `oracledb`). If a kill
 criterion in the spike plan fires, this ADR is re-opened rather than silently worked around.
@@ -64,6 +66,38 @@ offer is in question. Adopting a different driver is alternative 3 above, not a 
 The other kill criteria did not fire: S1, S3, S5, S7 and S9 pass outright; S2's NUMBER and
 `TIMESTAMP WITH TIME ZONE` findings were upstream defects contained by refusal (see U-1, U-2, U-3 in
 the results file), not silent precision loss or corruption, so S2 is a **conditional go**, not a kill.
+
+## Owner decision (2026-09-20)
+
+The project owner reviewed the lead's summary of the spike outcome above and, in chat on
+2026-09-20, answered "as you recommended" to the open items this ADR was re-opened for:
+
+1. **Stay on `oracledb`.** The 2026-09-19 driver decision stands; the rejected alternatives under
+   "Alternatives considered" are not reopened and no fork is pursued.
+2. **Ship with the pre-armed per-statement deadline (`CancelKind::PreArmedDeadline`) and an honest
+   UI.** The product must state plainly that on-demand Cancel is unavailable with the current driver.
+   `SPEC.md` §10 carries this as an interim note, and §24.8 stays an **unmet target** — marked "not
+   yet met — blocked on upstream driver (ADR-0001)" rather than redefined as satisfied.
+3. **Pursue the upstream fixes via the four drafted issues** (`phase-0-spike-results.md` §6), Issue B
+   (the silent NUMBER-bind corruption, U-1) first. Submission itself is a separate, still-open action
+   (`TASKS.md` — the lead is confirming with the owner who posts them).
+
+Spike S4's kill criterion fired, and the owner's decision is to **accept the limitation rather than
+change drivers**: the gap is real, but none of the rejected alternatives (a different driver, an
+embedded non-Rust thin driver, ODPI-C + Instant Client, or a from-scratch Rust driver) is judged worth
+its own cost for this gap alone, and the upstream maintainer has been responsive to prior reports.
+
+This ADR is **re-closed** as `Accepted` with this decision recorded. It would be **re-opened again**
+if:
+
+- upstream declines to add a cancel/break API (Issue A) after a reasonable review period, or
+- a data-corruption defect surfaces with no wrapper-side guard — i.e. a value upstream mis-handles
+  silently that Reldex cannot detect and refuse the way U-1/U-2 are refused today, or
+- a new kill criterion fires in a still-outstanding spike (S6, S8).
+
+Everything in "Spike outcome (2026-09-20)" above remains the technical record of what was found; this
+section records only what the owner decided to do about it. The "undecided"/"re-opened for the owner"
+language above describes the state as of 2026-09-20 before this decision; it is now decided.
 
 ## Context
 

@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-20T15:30:00+07:00",
+  "updatedAt": "2026-09-20T18:45:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P0",
@@ -511,27 +511,26 @@
     "goal": "Prove the Rust core, thin database connectivity, cancellation, transaction behavior, and mobile feasibility before substantial UI investment.",
     "exitGate": "Desktop POC passes. Android/iOS feasibility is documented from physical-device tests."
   },
-  "summary": "Phase 0 spikes ran against the live Oracle 19.3 test database on 2026-09-19: S1, S3, S5, S7 and S9 pass; S2 is a conditional go (character data and reads are exact, but two upstream NUMBER-bind defects and a TIMESTAMP WITH TIME ZONE abort are contained by refusal, not fixed). S4 (on-demand statement cancellation) fails for the requirement: only a pre-armed per-round-trip deadline exists, and it can destroy the session. Per ADR-0001's own rule the ADR is re-opened and the cancellation path is now an owner decision. Four upstream issues are fully drafted but nothing has been submitted yet. db-core and the oracle-thin wrapper both shipped and passed independent review (7 and 4 must-fix findings respectively, both applied). Workspace is fmt/clippy clean; cargo test --workspace is 267 passed, 0 failed, 1 ignored (DB-free).",
+  "summary": "Phase 0 spikes ran against the live Oracle 19.3 test database on 2026-09-19: S1, S3, S5, S7 and S9 pass; S2 is a conditional go (character data and reads are exact, but two upstream NUMBER-bind defects and a TIMESTAMP WITH TIME ZONE abort are contained by refusal, not fixed). S4 (on-demand statement cancellation) fails for the requirement: only a pre-armed per-round-trip deadline exists, and it can destroy the session. On 2026-09-20 the owner reviewed the lead's summary and decided: stay on oracledb, ship the pre-armed deadline with an honest UI, and pursue the upstream fixes via the four drafted issues (Issue B first); ADR-0002's five lead decisions were confirmed the same day, and SPEC.md was amended for the five spike-evidence proposals. db-core and the oracle-thin wrapper both shipped and passed independent review (7 and 4 must-fix findings respectively, both applied). Workspace is fmt/clippy clean; cargo test --workspace is 267 passed, 0 failed, 1 ignored (DB-free).",
   "focus": [
-    "Docs synced to the Phase 0 spike evidence (this change): ADR-0001 re-opened, TASKS.md/phase-0.md/README/ARCHITECTURE.md updated",
-    "Preparing a PR so CI can run on Windows, Linux and macOS before merge",
-    "Awaiting the owner's cancellation-path decision (ADR-0001) and submission of the four drafted upstream issues"
+    "Test DB: TCPS listener for spike S8, and a container memory cap (tools/oracle-test-db)",
+    "Reldex-owned driver contract tests to detect behaviour changes on oracledb upgrades",
+    "Phase 0 exit assessment (docs/exec-plans/active/phase-0.md) ahead of the owner's Phase 1 go/no-go"
   ],
   "blockers": [
     {
-      "title": "On-demand statement cancel is not possible with the oracledb beta",
-      "detail": "Spike S4 evaluated four candidates in order (pre-armed deadline, privileged ALTER SYSTEM CANCEL SQL, upstream public API, minimal fork) and none delivers a cancel that stops a running statement on demand while keeping the session usable in the general case. A pre-armed deadline stops a long SQL statement with the session intact but costs the connection entirely for a PL/SQL block the server will not interrupt promptly. SPEC.md §10/§24.8 cannot be met with oracledb 26.0.0-beta.3. Per ADR-0001's own rule, the ADR is re-opened.",
-      "severity": "blocked",
-      "since": "2026-09-19"
-    },
-    {
-      "title": "Owner action required: submit the four drafted upstream issues",
-      "detail": "Four issues are fully drafted in docs/exec-plans/active/phase-0-spike-results.md §6 — a public break/interrupt API, the NUMBER-bind data-corruption defect (U-1), the two process-abort defects (U-2/U-3), and the recovery/cancel-observation defects (U-6/U-7). Nothing has been posted to oracle/rust-oracledb yet.",
+      "title": "Owner action: submit four upstream issues (results file §6)",
+      "detail": "Four issues are fully drafted in docs/exec-plans/active/phase-0-spike-results.md §6 — a public break/interrupt API, the NUMBER-bind data-corruption defect (U-1, submit first per the owner's priority), the two process-abort defects (U-2/U-3), and the recovery/cancel-observation defects (U-6/U-7). Nothing has been posted to oracle/rust-oracledb yet; the lead is confirming with the owner who posts them.",
       "severity": "blocked",
       "since": "2026-09-19"
     }
   ],
   "risks": [
+    {
+      "title": "On-demand Cancel unavailable — accepted limitation (owner decision 2026-09-20)",
+      "detail": "The owner decided on 2026-09-20 to stay on oracledb and ship the pre-armed per-statement deadline with an honest UI rather than change drivers. SPEC.md §24.8 remains an unmet Definition-of-Done target until upstream ships a break/cancel API (ADR-0001 'Owner decision (2026-09-20)').",
+      "mitigation": "SPEC.md §10 carries an explicit interim note: the UI must state plainly that on-demand Cancel is unavailable with the current driver and must never present the time-limit control as Cancel. The four drafted upstream issues are pending submission (see blockers)."
+    },
     {
       "title": "TIMESTAMP WITH TIME ZONE columns are refused, not rendered",
       "detail": "A named-region TIMESTAMP WITH TIME ZONE value aborts the process upstream (U-3). The driver refuses any TIMESTAMP WITH TIME ZONE column at describe time, before any value is decoded, so a query touching one loses that column entirely.",
@@ -559,25 +558,24 @@
     }
   ],
   "nextSteps": [
-    "Merge after review",
-    "Owner: decide the cancellation path (ADR-0001 re-opened)",
-    "Owner: submit the four drafted upstream issues (phase-0-spike-results.md §6)",
-    "Add a TCPS listener to the test database and run spike S8",
+    "Owner: submit the four drafted upstream issues (phase-0-spike-results.md §6, Issue B first)",
     "Run spike S6 (Android/iOS cross-compile) once NDK access is approved",
-    "Phase 0 go/no-go decision for Phase 1"
+    "Add a TCPS listener to the test database and run spike S8",
+    "Close remaining Phase 0 evidence gaps: network-loss/reconnect, NCLOB, EXPLAIN PLAN/DBMS_XPLAN, metadata dictionary access",
+    "Phase 0 exit assessment → owner go/no-go decision for Phase 1"
   ],
   "decisions": [
     {
       "id": "ADR-0001",
       "title": "Database driver strategy — primary driver is Oracle's oracledb (rust-oracledb)",
-      "status": "Accepted — S4 kill criterion FIRED (2026-09-20); owner decision pending",
+      "status": "Accepted — owner decision 2026-09-20: stay on oracledb; pre-armed deadline + honest UI; upstream issues pending",
       "date": "2026-09-19",
       "link": "docs/decisions/0001-database-driver-strategy.md"
     },
     {
       "id": "ADR-0002",
       "title": "Driver API and concurrency model — blocking object-safe contract, per-session worker thread in db-core",
-      "status": "Accepted (provisional — implemented; independently reviewed twice (API review, db-core session review) with must-fix findings applied; amended after the Phase 0 spikes; owner review pending)",
+      "status": "Accepted (owner confirmed 2026-09-20) — implemented; independently reviewed twice (API review, db-core session review), must-fix findings applied; amended after the Phase 0 spikes",
       "date": "2026-09-19",
       "link": "docs/decisions/0002-driver-api-and-concurrency-model.md"
     }
@@ -613,7 +611,7 @@
       "box": "2 d",
       "killCriterion": "No mechanism achieves cancel within ~2 s and leaves the session usable — even via set_call_timeout",
       "status": "blocked",
-      "result": "Fail for the requirement. No mechanism stops a running statement and keeps the session in the general case. Only a pre-armed per-round-trip deadline exists (CancelKind::PreArmedDeadline): it stops a long SQL statement about 0.5 s past the deadline with the session intact, but costs the connection entirely for a PL/SQL block the server will not interrupt promptly (upstream's recovery path re-reads with the expired timeout still armed, U-6). A privileged ALTER SYSTEM CANCEL SQL stops the statement server-side in about half a second, but the client is never notified and hangs until its own deadline (U-7). oracledb has the interrupt marker internally but exposes no public break API, and its single round-trip mutex means one cannot be added from outside (arming a deadline mid-call blocked 4.8 s of a 5.3 s statement). A minimal fork is technically possible but not recommended (TLS complicates it, and U-6/U-7 would still need fixing). SPEC.md §10/§24.8 cannot be met with oracledb 26.0.0-beta.3. ADR-0001 is re-opened; owner decision pending."
+      "result": "Fail for the requirement. No mechanism stops a running statement and keeps the session in the general case. Only a pre-armed per-round-trip deadline exists (CancelKind::PreArmedDeadline): it stops a long SQL statement about 0.5 s past the deadline with the session intact, but costs the connection entirely for a PL/SQL block the server will not interrupt promptly (upstream's recovery path re-reads with the expired timeout still armed, U-6). A privileged ALTER SYSTEM CANCEL SQL stops the statement server-side in about half a second, but the client is never notified and hangs until its own deadline (U-7). oracledb has the interrupt marker internally but exposes no public break API, and its single round-trip mutex means one cannot be added from outside (arming a deadline mid-call blocked 4.8 s of a 5.3 s statement). A minimal fork is technically possible but not recommended (TLS complicates it, and U-6/U-7 would still need fixing). SPEC.md §10/§24.8 cannot be met with oracledb 26.0.0-beta.3. ADR-0001 is re-opened; owner decision pending. Owner decision (2026-09-20): accepted as a limitation — ship with the pre-armed deadline and an honest UI; pursue the upstream fixes via the four drafted issues (results file §6, Issue B first)."
     },
     {
       "id": "S5",
@@ -763,7 +761,7 @@
             {
               "title": "Add cancellation abstraction",
               "status": "done",
-              "note": "Contract implemented and revised after API review: Arc<dyn CancelHandle>, CancelKind::{Native,PreArmedDeadline,Unsupported}, CancelOutcome, SessionState (ADR-0002 D2 + amendments). Driver-level cancel evaluated in spike S4 and fails for the requirement — no on-demand cancel exists with oracledb 26.0.0-beta.3; ADR-0001 re-opened, owner decision pending."
+              "note": "Contract implemented and revised after API review: Arc<dyn CancelHandle>, CancelKind::{Native,PreArmedDeadline,Unsupported}, CancelOutcome, SessionState (ADR-0002 D2 + amendments). Driver-level cancel evaluated in spike S4 and fails for the requirement — no on-demand cancel exists with oracledb 26.0.0-beta.3. Owner decision 2026-09-20: accepted as a limitation — see ADR-0001 'Owner decision' section."
             }
           ]
         },
@@ -818,7 +816,7 @@
             {
               "title": "Long-running query cancellation",
               "status": "blocked",
-              "note": "Fails for the requirement (spike S4): no mechanism stops a statement and keeps the session in the general case. See ADR-0001 'Spike outcome' section."
+              "note": "Accepted limitation (owner decision 2026-09-20): pre-armed deadline only; blocked on upstream cancel API. See ADR-0001 'Spike outcome' and 'Owner decision' sections."
             },
             {
               "title": "TCPS",
@@ -872,10 +870,15 @@
           "tasks": [
             {
               "title": "Owner: decide cancellation path (ADR-0001 re-opened)",
+              "status": "done",
+              "note": "Decision 2026-09-20: stay on oracledb; ship the pre-armed per-statement deadline with an honest UI; pursue upstream fixes via the four drafted issues. See ADR-0001 'Owner decision (2026-09-20)'."
+            },
+            {
+              "title": "Owner: submit the four drafted upstream issues (phase-0-spike-results.md §6, Issue B first)",
               "status": "todo"
             },
             {
-              "title": "Owner: submit the four drafted upstream issues (phase-0-spike-results.md §6)",
+              "title": "Track upstream oracle/rust-oracledb releases; re-run the integration suite and the ignored abort-repro tests on each new beta",
               "status": "todo"
             },
             {
@@ -958,6 +961,10 @@
             },
             {
               "title": "Cancel",
+              "status": "todo"
+            },
+            {
+              "title": "UI (P1): statement time-limit control + explicit \"Cancel unavailable with current driver\" messaging (SPEC §10 interim note)",
               "status": "todo"
             },
             {
@@ -1226,6 +1233,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-20",
+      "text": "Owner decisions recorded: stay on oracledb with the pre-armed deadline + honest UI (ADR-0001); ADR-0002's five lead decisions confirmed by the owner; SPEC.md amended for the five spike-evidence proposals (cancellation wording keeps on-demand Cancel as the target with an interim note, §8 driver-matrix note, §24.14 PL/SQL scoping, §22 third-party notices, TSTZ/JSON caveats); spec-change-proposals.md marked APPLIED and moved to docs/exec-plans/completed/."
+    },
     {
       "date": "2026-09-20",
       "text": "PR #1 opened; CI green on Windows, Linux and macOS (Apple Silicon) — first build evidence for Linux x64 and macOS ARM64. Merged to main."

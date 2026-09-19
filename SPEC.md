@@ -1,6 +1,6 @@
 # Reldex — Product & Technical Specification
 
-**Status:** Initial architecture specification  
+**Status:** Initial architecture specification — amended 2026-09-20 after Phase 0 spikes (owner-approved)  
 **Product:** Reldex  
 **Category:** High-performance cross-platform database development environment  
 **Primary platform:** Desktop  
@@ -152,6 +152,13 @@ Mobile direct-connect must not be advertised until real-device testing succeeds.
 
 ### Driver test matrix
 
+Validated against Oracle's official `oracledb` crate v26.0.0-beta.3 (ADR-0001), with exceptions
+recorded in `docs/exec-plans/active/phase-0.md` (Workstreams C–G) and
+`docs/exec-plans/active/phase-0-spike-results.md`: cancellation does not meet §10/§24.8 (see the
+interim note under §10); TCPS, network loss, reconnect, and EXPLAIN PLAN/DBMS_XPLAN were not run in
+Phase 0; privileged connections and metadata/dictionary access have only incidental evidence; NCLOB
+was not directly tested.
+
 Connectivity:
 - host/port
 - service name
@@ -186,6 +193,12 @@ Types:
 - RAW
 - CLOB/NCLOB/BLOB
 - JSON where applicable
+
+Type caveats (Phase 0, `oracledb` 26.0.0-beta.3): a named-region `TIMESTAMP WITH TIME ZONE` value is
+refused at describe time — containment, not support, see the §10 interim note; a genuine `JSON`
+column type (21c+), `XMLType`, `VECTOR`, object types and `BFILE` are refused at describe time for
+the same driver-version reason. Oracle 19c's own JSON-via-VARCHAR2/CLOB/BLOB is unaffected. Evidence:
+`phase-0-spike-results.md` §3 and §5 (U-3).
 
 Transactions:
 - COMMIT
@@ -239,7 +252,15 @@ Default:
 Auto-commit = OFF
 ```
 
-Every worksheet must expose Execute, Cancel, Commit, and Rollback.
+Every worksheet must expose Execute, Cancel, Commit, and Rollback. On-demand Cancel remains the
+product requirement — Reldex competes on correct cancellation.
+
+> **Interim limitation (owner decision, 2026-09-20).** With the current primary driver version
+> (`oracledb` 26.0.0-beta.3, [ADR-0001](docs/decisions/0001-database-driver-strategy.md)), on-demand
+> Cancel is not available: no mechanism stops a running statement and keeps the session usable in the
+> general case. Until the driver exposes a break/cancel mechanism, Reldex offers a per-statement time
+> limit set before execution instead. The UI must never present this limit as Cancel, and must tell
+> the user plainly that on-demand Cancel is unavailable with the current driver. See §24.8.
 
 Closing a worksheet with an active transaction must ask the user to Commit, Rollback, or Cancel closing. Never silently commit.
 
@@ -488,6 +509,13 @@ Candidates:
 
 Entitlements must use a centralized feature service rather than scattered `is_pro` checks.
 
+### Third-party notices
+
+Any distributed build — Community or Pro — must ship a generated third-party notices file (e.g. via
+`cargo about`) covering the full transitive dependency graph, not just direct dependencies, before
+first binary distribution. The oracle-thin driver alone carries 55 third-party crates at run time (63
+including build-only crates), all permissively licensed but requiring attribution.
+
 ## 23. Non-goals for V1
 
 Do not delay V1 for:
@@ -513,13 +541,13 @@ A developer can:
 5. execute SQL and PL/SQL;
 6. use bind variables;
 7. browse large results without freezing the UI;
-8. cancel running statements;
+8. cancel running statements — **not yet met — blocked on upstream driver (ADR-0001)** (see the §10 interim note);
 9. commit and roll back explicitly;
 10. use DBMS_OUTPUT;
 11. browse database objects;
 12. inspect tables;
 13. open and compile PL/SQL source;
-14. view compile errors;
+14. view compile errors — token-level error-position highlighting is scoped to PL/SQL compilation errors; ordinary SQL errors report the native ORA-nnnnn code and message without a character position (upstream limitation, see ADR-0002 "Notes for driver implementers");
 15. run explain plan;
 16. save and restore non-transactional workspace state;
 17. continue interacting with the application while other sessions execute.

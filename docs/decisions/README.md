@@ -24,5 +24,5 @@ Per `AGENTS.md`, create an ADR when a decision:
 
 | ADR | Title | Status | Date |
 | --- | --- | --- | --- |
-| [0001](0001-database-driver-strategy.md) | Database driver strategy — primary driver is Oracle's `oracledb` (rust-oracledb) | Accepted — S4 kill criterion FIRED (2026-09-20); owner decision pending | 2026-09-19 |
-| [0002](0002-driver-api-and-concurrency-model.md) | Driver API and concurrency model — blocking object-safe contract, per-session worker thread in `db-core` | Accepted (provisional — implemented; independently reviewed twice (API review, db-core session review), must-fix findings applied; amended after the Phase 0 spikes; owner review pending) | 2026-09-19 |
+| [0001](0001-database-driver-strategy.md) | Database driver strategy — primary driver is Oracle's `oracledb` (rust-oracledb) | Accepted — owner decision 2026-09-20: stay on oracledb; pre-armed deadline + honest UI; upstream issues pending | 2026-09-19 |
+| [0002](0002-driver-api-and-concurrency-model.md) | Driver API and concurrency model — blocking object-safe contract, per-session worker thread in `db-core` | Accepted (owner confirmed 2026-09-20) — implemented; independently reviewed twice (API review, db-core session review), must-fix findings applied; amended after the Phase 0 spikes | 2026-09-19 |
