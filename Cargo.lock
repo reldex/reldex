@@ -655,6 +655,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "reldex-mobile-link-check"
+version = "0.0.0"
+dependencies = [
+ "reldex-db-core",
+ "reldex-driver-oracle-thin",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
