@@ -180,6 +180,21 @@ Connectivity:
 - username/password
 - privileged connections where supported
 
+**Connect timeout (owner decision 2026-09-19).** The Oracle driver must honour a caller-set
+connect timeout (`ConnectionParams::connect_timeout`; see `phase-0-spike-results.md` §7 C-5 and
+U-15) itself, by running the upstream connect on a helper thread and giving up once the limit
+passes — an abandoned attempt is left to finish or fail on its own, and no session is ever adopted
+after the limit. Default **15 seconds**; user-configurable per connection profile (§17), including
+"no limit". This is driver-specific behavior; the core connection contract is unchanged.
+
+**Trigger DDL auto-rewrite (owner decision 2026-09-19).** For a `CREATE TRIGGER` body containing
+`:NEW`/`:OLD` (U-18), the Oracle driver automatically rewrites the DDL into
+`BEGIN EXECUTE IMMEDIATE q'[…]'; END;` (choosing a quote delimiter that cannot collide with the
+body). This rewrite is **on by default**, is always reported to the user as a warning on the
+outcome with the statement actually sent available for inspection, and can be turned **off** per
+connection, in which case the existing explanatory refusal (§8 above) is returned instead. This is
+driver-specific (vendor) behavior; the core DDL-execution path stays vendor-neutral.
+
 SQL:
 - SELECT
 - INSERT
@@ -273,6 +288,16 @@ product requirement — Reldex competes on correct cancellation.
 > limit set before execution instead. The UI must never present this limit as Cancel, and must tell
 > the user plainly that on-demand Cancel is unavailable with the current driver. See §24.8.
 
+**Per-statement time limit defaults and configuration (owner decision 2026-09-19).** Reldex arms
+a default per-statement time limit on worksheet statements; the initial default is **600 seconds**,
+to be revisited with real usage in Phase 1. It must be user-configurable at three levels —
+application default, connection profile, and per worksheet/statement — including "no limit". When
+the user selects "no limit", the UI must plainly explain the consequence: a hung statement can then
+only be abandoned by closing the session. This does not change the constraints in the interim note
+above: the limit must never be presented as Cancel, the UI states before running that a limit
+applies, and when the limit fires the session may be lost (see `phase-0-spike-results.md` U-6) and
+the UI must say so honestly.
+
 Closing a worksheet with an active transaction must ask the user to Commit, Rollback, or Cancel closing. Never silently commit.
 
 ## 11. UI architecture
@@ -328,6 +353,13 @@ The result store should support:
 - efficient random access
 
 Apache Arrow may be used internally where benchmarks show a benefit. UI APIs must not depend directly on Arrow.
+
+**Fetch batch size (owner decision 2026-09-19).** No default fetch batch size is fixed yet:
+`phase-0-spike-results.md` S14 found throughput is **not** monotonic in batch size (10,000
+rows/batch measured 3.5× slower than the best of 100 and 1,000, with the longest wait for the
+first row), so the shipped default will be set from a Phase 1 benchmark across row shapes and a
+real network. Until then the driver's current default is used. Fetch batch size must be a user
+setting — an application default and a per-connection-profile override — within a bounded range.
 
 ## 13. Result grid
 

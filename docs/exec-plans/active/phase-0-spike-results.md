@@ -2316,6 +2316,14 @@ own. Their verdicts against `SPEC.md` §8's operations list:
    recommendation is to implement it, because a desktop client must be able to
    bound a connect, but it changes `connect()`'s threading for every caller and
    is therefore not a change to make without the owner.
+
+   **Owner decision (2026-09-19):** option 3, as recommended. The driver will
+   honour `ConnectionParams::connect_timeout` itself by running the upstream
+   connect on a helper thread and giving up once the limit passes — the
+   abandoned attempt is left to finish or fail on its own, and no session is
+   ever adopted after the limit. Default **15 seconds**; user-configurable per
+   connection profile, including "no limit". Status: approved, implementation
+   pending.
 9. **Whether Reldex should arm a default deadline on every call, and what to
    tell the user about a silent link.** S10 measured the shape of the problem:
    with no deadline a black-holed link never returns (U-17); with one, the
@@ -2325,18 +2333,46 @@ own. Their verdicts against `SPEC.md` §8's operations list:
    UI, or no default and a user-visible cancel that cannot actually stop the
    call. Both need the UI to exist, so the decision can wait — but it must not
    be made by accident.
+
+    **Owner decision (2026-09-19):** Reldex arms a default per-statement time
+    limit on worksheet statements. Initial default **600 seconds**, to be
+    revisited with real usage in Phase 1. User-configurable at three levels —
+    application default, connection profile, and per worksheet/statement —
+    including "no limit", which the UI must accompany with a plain explanation
+    of the consequence (a hung statement can then only be abandoned by closing
+    the session). The constraints already stated in `SPEC.md` §10 are
+    unchanged: the limit must never be presented as Cancel, the UI states
+    before running that a limit applies, and when the limit fires the session
+    may be lost (U-6) and the UI says so honestly.
 10. **Whether the Phase 0 test database should set `SQLNET.EXPIRE_TIME`, and
     whether Reldex should tell customers to.** It is unset today, which is why
     S10 measured a dead client holding a row lock for the full 20 s budget. This
     is a database-configuration recommendation Reldex may need to document
     (server-side dead connection detection is the only thing that protects other
     users from a Reldex client that vanished), not something the driver can fix.
+
+    **Owner decision (2026-09-19):** documentation recommendation only. Reldex
+    cannot enforce or detect `SQLNET.EXPIRE_TIME`; user-facing docs and
+    connection troubleshooting material recommend DBAs set it (e.g. 10
+    minutes) server-side so locks held by dead clients are released. The
+    Phase 0 test database stays unset, because S10's measurements depend on
+    that; a note in the test-DB documentation is tracked as a follow-up task
+    rather than made here.
 11. **`CREATE TRIGGER` (U-18).** The driver now explains the failure and names
     the `EXECUTE IMMEDIATE q'[…]'` workaround, but it does **not** apply the
     workaround itself, because that silently changes a DDL statement into a
     PL/SQL block and moves any error position — which `SPEC.md` §24.14 cares
     about. Whether Reldex's editor should offer to rewrite the statement (with
     the rewrite visible to the user) is a product decision. Issue G is drafted.
+
+    **Owner decision (2026-09-19):** the database driver (vendor-specific
+    code, not core) rewrites such DDL automatically into
+    `BEGIN EXECUTE IMMEDIATE q'[…]'; END;` (choosing a quote delimiter that
+    cannot collide with the body), **on by default**, always tells the user it
+    did so — a warning on the outcome, with the statement actually sent
+    available for inspection — and can be turned **off** by the user
+    (connection-level setting), in which case the existing explanatory
+    refusal is returned. Status: approved, implementation pending.
 12. **Which fetch batch size Reldex should default to.** S14 found throughput is
     **not** monotonic in the batch size — 10 000 rows per fetch was 3.5× slower
     than the best of 100 and 1 000, and cost up to 1.1 s before the first row
@@ -2345,3 +2381,20 @@ own. Their verdicts against `SPEC.md` §8's operations list:
     is enough to forbid assuming "bigger is faster", not enough to pick a
     number. A short follow-up measurement across row shapes and a real network
     should precede the choice.
+
+    **Owner decision (2026-09-19):** no number is chosen now. The default will
+    be set from a benchmark during Phase 1 UI work; until then the driver's
+    current default stays. It must be a user setting (application default and
+    per connection profile) within a bounded range.
+
+13. **New: connect-time warning channel (contract gap C-6).** Approved in
+    principle: add one additive, vendor-neutral, defaulted method to the
+    driver contract (a `take_connect_warnings`-style method on
+    `DatabaseConnection`) and have `db-core` collect it once after connect,
+    recorded as an amendment to ADR-0002 when implemented. C-6 itself is
+    documented in full on another, still-unmerged branch — pull request #5,
+    the TCPS descriptor guard — and is not otherwise written up in this
+    results file; the detailed write-up arrives with that pull request, and
+    implementation is sequenced after it lands. **Owner decision
+    (2026-09-19):** approved in principle, as above; implementation is
+    sequenced after pull request #5.

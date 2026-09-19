@@ -71,8 +71,12 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [x] Test DB: container memory cap — 1.5 GiB SGA / 512 MiB PGA, `mem_limit: 4g` (~2.0 GiB resident)
 - [ ] Owner: decide how TCPS support is described to users and whether to refuse descriptors carrying `SSL_SERVER_DN_MATCH` (results file §9 items 6–7)
 - [x] S6 Android/iOS cross-compile check — pass, kill criterion did not fire (PR #3: https://github.com/reldex/reldex/pull/3); physical-device validation still needed
-- [ ] Driver: honour `connect_timeout` (C-5) — `ConnectionParams::connect_timeout` is accepted and ignored (`phase-0-spike-results.md` §7 C-5)
-- [ ] Owner decisions §9 items 8–12 (default deadline, `EXPIRE_TIME` recommendation, trigger DDL rewrite, default fetch batch size, C-5 approach)
+- [ ] Driver: honour `connect_timeout` (C-5) — `ConnectionParams::connect_timeout` is accepted and ignored (`phase-0-spike-results.md` §7 C-5); approved 2026-09-19: helper thread, default 15 s, user-configurable per connection profile including "no limit"
+- [x] Owner decisions §9 items 8–12 — decided 2026-09-19: default per-statement deadline 600 s (three-level setting), `EXPIRE_TIME` documentation-only recommendation, trigger DDL auto-rewrite with an off switch, default fetch batch size deferred to a Phase 1 benchmark, C-5 helper-thread approach — every one made user-configurable per the owner's requirement (`phase-0-spike-results.md` §9)
+- [ ] Driver: `CREATE TRIGGER` auto-rewrite for `:NEW`/`:OLD` (U-18) — rewrite to `BEGIN EXECUTE IMMEDIATE q'[…]'; END;` on by default, always reported to the user as a warning with the statement actually sent available for inspection, off switch at connection level (approved 2026-09-19, `phase-0-spike-results.md` §9 item 11)
+- [ ] Contract: connect-time warning channel (C-6) — additive `take_connect_warnings`-style method on `DatabaseConnection`, collected once by `db-core` after connect; approved in principle 2026-09-19, sequenced after pull request #5 (TCPS descriptor guard); record as an ADR-0002 amendment when implemented
+- [ ] Docs: recommend `SQLNET.EXPIRE_TIME` (e.g. 10 minutes) in user-facing connection troubleshooting docs (owner decision 2026-09-19, `phase-0-spike-results.md` §9 item 10)
+- [ ] Docs: note in `tools/oracle-test-db/README.md` that `SQLNET.EXPIRE_TIME` is left unset on the Phase 0 test database on purpose, so S10's measurements remain valid (follow-up; not edited in this change)
 - [ ] Android physical-device harness (needs a test device from the owner + local NDK)
 
 ## P1 — Desktop MVP
@@ -91,8 +95,10 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [ ] Bind-variable dialog
 - [ ] Cancel
 - [ ] UI (P1): statement time-limit control + explicit "Cancel unavailable with current driver" messaging (SPEC §10 interim note)
+- [ ] Default per-statement time limit (600 s) as a three-level setting — application default, connection profile, per worksheet/statement — including a "no limit" option with an explicit UI warning about the consequence (owner decision 2026-09-19, SPEC §10)
 - [ ] Commit/Rollback
 - [ ] Result Store
+- [ ] Fetch batch size as a user setting (application default + per connection profile, bounded range), informed by a Phase 1 benchmark to pick the shipped default (owner decision 2026-09-19, SPEC §12; `phase-0-spike-results.md` S14)
 - [ ] Virtualized Result Grid
 - [ ] Query History
 - [ ] DBMS_OUTPUT panel
