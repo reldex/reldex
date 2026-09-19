@@ -155,8 +155,11 @@ Mobile direct-connect must not be advertised until real-device testing succeeds.
 Validated against Oracle's official `oracledb` crate v26.0.0-beta.3 (ADR-0001), with exceptions
 recorded in `docs/exec-plans/active/phase-0.md` (Workstreams C–G) and
 `docs/exec-plans/active/phase-0-spike-results.md`: cancellation does not meet §10/§24.8 (see the
-interim note under §10); TCPS, network loss, reconnect, and EXPLAIN PLAN/DBMS_XPLAN were not run in
-Phase 0; privileged connections and metadata/dictionary access have only incidental evidence; NCLOB
+interim note under §10); TCPS is validated only as one-way TLS 1.2 with an AEAD suite, trusting a
+PEM the user supplies — mutual TLS combined with a private CA, reading an existing Oracle wallet
+(`ewallet.p12`/`cwallet.sso`), OS trust stores and certificate revocation are not available with this
+driver version (spike S8, U-12…U-14); network loss, reconnect, and EXPLAIN PLAN/DBMS_XPLAN were not
+run in Phase 0; privileged connections and metadata/dictionary access have only incidental evidence; NCLOB
 was not directly tested.
 
 Connectivity:

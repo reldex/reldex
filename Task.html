@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-20T18:45:00+07:00",
+  "updatedAt": "2026-09-20T19:30:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P0",
@@ -511,15 +511,14 @@
     "goal": "Prove the Rust core, thin database connectivity, cancellation, transaction behavior, and mobile feasibility before substantial UI investment.",
     "exitGate": "Desktop POC passes. Android/iOS feasibility is documented from physical-device tests."
   },
-  "summary": "Phase 0 spikes ran against the live Oracle 19.3 test database on 2026-09-19: S1, S3, S5, S7 and S9 pass; S2 is a conditional go (character data and reads are exact, but two upstream NUMBER-bind defects and a TIMESTAMP WITH TIME ZONE abort are contained by refusal, not fixed). S4 (on-demand statement cancellation) fails for the requirement: only a pre-armed per-round-trip deadline exists, and it can destroy the session. On 2026-09-20 the owner reviewed the lead's summary and decided: stay on oracledb, ship the pre-armed deadline with an honest UI, and pursue the upstream fixes via the four drafted issues (Issue B first); ADR-0002's five lead decisions were confirmed the same day, and SPEC.md was amended for the five spike-evidence proposals. db-core and the oracle-thin wrapper both shipped and passed independent review (7 and 4 must-fix findings respectively, both applied). Workspace is fmt/clippy clean; cargo test --workspace is 267 passed, 0 failed, 1 ignored (DB-free).",
+  "summary": "Phase 0 — Architecture Validation. Core stack proven against Oracle 19.3: vendor-neutral driver contract, db-core session layer, and a wrapper over Oracle's official oracledb crate (pinned beta). Spikes S1, S3, S5, S7, S8 (TCPS, with limits) and S9 pass; S2 partial (NUMBER bind restrictions); S4 cancel is an accepted limitation (owner decision 2026-09-20: pre-armed per-statement deadline + honest UI; SPEC §24.8 unmet until upstream ships a break API). S6 (mobile cross-compile) not run.",
   "focus": [
-    "Test DB: TCPS listener for spike S8, and a container memory cap (tools/oracle-test-db)",
-    "Reldex-owned driver contract tests to detect behaviour changes on oracledb upgrades",
-    "Phase 0 exit assessment (docs/exec-plans/active/phase-0.md) ahead of the owner's Phase 1 go/no-go"
+    "Phase 0 exit assessment for the owner's go/no-go",
+    "Remaining evidence gaps: network-loss/reconnect, NCLOB, EXPLAIN PLAN/DBMS_XPLAN, metadata access"
   ],
   "blockers": [
     {
-      "title": "Owner action: submit four upstream issues (results file §6)",
+      "title": "Owner action: submit the drafted upstream issues (results file §6, issues A–E)",
       "detail": "Four issues are fully drafted in docs/exec-plans/active/phase-0-spike-results.md §6 — a public break/interrupt API, the NUMBER-bind data-corruption defect (U-1, submit first per the owner's priority), the two process-abort defects (U-2/U-3), and the recovery/cancel-observation defects (U-6/U-7). Nothing has been posted to oracle/rust-oracledb yet; the lead is confirming with the owner who posts them.",
       "severity": "blocked",
       "since": "2026-09-19"
@@ -555,14 +554,19 @@
       "title": "Local test database has coverage limitations",
       "detail": "tools/oracle-test-db/ uses the community image doctorkirk/oracle-19c:19.3 — 19.3 base release with no Release Updates, Single-Instance Non-CDB (most real 19c sites run CDB/PDB), unmaintained since 2021-03, amd64 only, and TCPS is not configured out of the box (spike S8 not run). The container also currently auto-sizes memory to roughly 40% of host-visible RAM rather than a container-bounded value.",
       "mitigation": "Treat spike results as Phase 0 driver-level evidence, not full production-topology coverage. Follow-ups are tracked in TASKS.md: add a wallet-based TCPS listener before running S8, and add an explicit container memory cap."
+    },
+    {
+      "title": "TCPS is narrower than enterprise deployments expect",
+      "detail": "The oracledb beta supports one-way TLS 1.2 with PEM-supplied trust only: no mTLS combined with a private CA, no Oracle wallet files, no OS trust store, no revocation, SSL_SERVER_DN_MATCH silently ignored (U-12…U-14).",
+      "mitigation": "SPEC §8 states the supported configuration precisely; Issue E drafted for the owner to submit upstream."
     }
   ],
   "nextSteps": [
-    "Owner: submit the four drafted upstream issues (phase-0-spike-results.md §6, Issue B first)",
-    "Run spike S6 (Android/iOS cross-compile) once NDK access is approved",
-    "Add a TCPS listener to the test database and run spike S8",
-    "Close remaining Phase 0 evidence gaps: network-loss/reconnect, NCLOB, EXPLAIN PLAN/DBMS_XPLAN, metadata dictionary access",
-    "Phase 0 exit assessment → owner go/no-go decision for Phase 1"
+    "Owner: submit upstream issues A–E (or authorise the lead to post them)",
+    "Owner: approve Android NDK download for spike S6 (mobile cross-compile)",
+    "Close remaining Phase 0 evidence gaps (network-loss/reconnect, NCLOB, EXPLAIN PLAN/DBMS_XPLAN, metadata dictionary access)",
+    "Owner: TCPS wording + SSL_SERVER_DN_MATCH guard decisions (results file §9 items 6–7)",
+    "Phase 0 go/no-go → Phase 1 (Qt Quick shell, thin C++/Rust FFI adapter)"
   ],
   "decisions": [
     {
@@ -642,8 +646,8 @@
       "title": "TCPS against a TLS-enabled listener",
       "box": "1 d",
       "killCriterion": "TCPS cannot be established without Instant Client",
-      "status": "blocked",
-      "result": "Not run. The Phase 0 Docker test database (doctorkirk/oracle-19c:19.3) has no TCPS listener configured; the driver reports tls=false and refuses TlsMode::Required rather than silently connecting in plaintext. Adding a wallet-based TCPS listener to the test DB is a tracked follow-up."
+      "status": "done",
+      "result": "Pass with limits (2026-09-20). Pure-Rust TCPS session, certificate + host-name verification on, TLS 1.2 ECDHE-RSA-AES256-GCM-SHA384, confirmed server-side (NETWORK_PROTOCOL = tcps); TLS handshake ≈ 39 ms. Trust only via a user-supplied PEM; no mTLS with a private CA (U-13), no ewallet.p12 / OS trust store (U-12), SSL_SERVER_DN_MATCH ignored upstream (U-14), no revocation. Kill criterion did not fire."
     },
     {
       "id": "S9",
@@ -820,8 +824,8 @@
             },
             {
               "title": "TCPS",
-              "status": "todo",
-              "note": "Spike S8 not run — the Phase 0 test DB has no TCPS listener."
+              "status": "done",
+              "note": "Spike S8 pass with limits (2026-09-20): one-way TLS 1.2, verification on, PEM-supplied trust; no mTLS + private CA, no Oracle wallet files, no revocation (upstream U-12…U-14)."
             },
             {
               "title": "Network-loss behavior",
@@ -888,10 +892,16 @@
             },
             {
               "title": "Test DB: TCPS listener (S8)",
-              "status": "todo"
+              "status": "done",
+              "note": "127.0.0.1:2484, idempotent startup hook, wallet material untracked."
             },
             {
               "title": "Test DB: container memory cap",
+              "status": "done",
+              "note": "1.5 GiB SGA / 512 MiB PGA, mem_limit 4g (~2.0 GiB resident)."
+            },
+            {
+              "title": "Owner: decide how TCPS support is described to users and whether to refuse descriptors carrying SSL_SERVER_DN_MATCH (results file §9 items 6–7)",
               "status": "todo"
             },
             {
@@ -1233,6 +1243,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-20",
+      "text": "Spike S8 (TCPS) passed with limits; test DB gained a TCPS listener (127.0.0.1:2484) and a memory cap (~2 GiB); upstream gaps U-12…U-14 recorded, Issue E drafted."
+    },
     {
       "date": "2026-09-20",
       "text": "Owner decisions recorded: stay on oracledb with the pre-armed deadline + honest UI (ADR-0001); ADR-0002's five lead decisions confirmed by the owner; SPEC.md amended for the five spike-evidence proposals (cancellation wording keeps on-demand Cancel as the target with an interim note, §8 driver-matrix note, §24.14 PL/SQL scoping, §22 third-party notices, TSTZ/JSON caveats); spec-change-proposals.md marked APPLIED and moved to docs/exec-plans/completed/."

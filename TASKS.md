@@ -51,7 +51,7 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [x] CLOB/NCLOB/BLOB (spike S7 — pass; 100 MB CLOB and BLOB streamed, +4.7 MB working set)
 - [x] DBMS_OUTPUT (spike S5 — pass, including Thai text)
 - [!] Long-running query cancellation — accepted limitation (owner decision 2026-09-20): pre-armed deadline only; blocked on upstream cancel API (see ADR-0001 "Spike outcome" and "Owner decision" sections and `phase-0-spike-results.md` §4)
-- [ ] TCPS (spike S8 — not run; the Phase 0 test DB has no TCPS listener)
+- [x] TCPS (spike S8 — pass with limits, 2026-09-20: one-way TLS 1.2, verification on, PEM-supplied trust; no mTLS + private CA, no Oracle wallet files, no revocation — upstream U-12…U-14)
 - [ ] Network-loss behavior (not directly spiked; only recovery-path failure modes seen incidentally during S4, recorded as U-6/U-7)
 - [x] Concurrent independent sessions (spike S9 — pass; 8 sessions, 400 inserts, 283 ms)
 
@@ -66,8 +66,9 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [ ] Owner: submit the four drafted upstream issues (`docs/exec-plans/active/phase-0-spike-results.md` §6, Issue B first)
 - [ ] Track upstream `oracle/rust-oracledb` releases; re-run the integration suite and the ignored abort-repro tests on each new beta
 - [ ] Third-party notices file before any binary distribution (dependency licences — 63 third-party crates in the oracle-thin graph, all permissive but attribution is required; see `phase-0-spike-results.md` §1)
-- [ ] Test DB: TCPS listener (S8)
-- [ ] Test DB: container memory cap
+- [x] Test DB: TCPS listener (S8) — `127.0.0.1:2484`, idempotent startup hook, wallet material untracked
+- [x] Test DB: container memory cap — 1.5 GiB SGA / 512 MiB PGA, `mem_limit: 4g` (~2.0 GiB resident)
+- [ ] Owner: decide how TCPS support is described to users and whether to refuse descriptors carrying `SSL_SERVER_DN_MATCH` (results file §9 items 6–7)
 - [ ] S6 Android/iOS cross-compile check (needs NDK / macOS)
 
 ## P1 — Desktop MVP

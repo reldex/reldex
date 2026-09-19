@@ -49,8 +49,7 @@ independently.
 - A local Oracle 19c Docker test database under [`tools/oracle-test-db/`](tools/oracle-test-db/),
   verified (AL32UTF8, Thai round-trip, Non-CDB).
 
-**Not started yet:** the Qt Quick/QML UI; driver-upgrade contract tests; TCPS (no listener on the
-test DB); network-loss/reconnect behavior; Android/iOS validation.
+**Not started yet:** the Qt Quick/QML UI; driver-upgrade contract tests; network-loss/reconnect behavior; Android/iOS validation.
 
 [`Task.html`](Task.html) (open it in a browser) is the live, human-facing progress dashboard: current focus, blockers/risks, spike results, and recent activity. [`TASKS.md`](TASKS.md) and the active plan under [`docs/exec-plans/active/phase-0.md`](docs/exec-plans/active/phase-0.md) remain the source of truth for task status; `Task.html` mirrors them.
 

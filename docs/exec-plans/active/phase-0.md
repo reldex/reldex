@@ -136,9 +136,11 @@ For every mapping, document:
 - [x] service name. (spike S1: `127.0.0.1:1521/RELDEX`)
 - [x] connect descriptor. (spike S1: full TNS descriptor with `CONNECT_DATA=(SID=RELDEX)`)
 - [x] TCP. (every Phase 0 connection is plaintext TCP; the test DB has no TLS listener)
-- [ ] TCPS. **Not run** (spike S8) — the Phase 0 test database has no TCPS listener configured; the
-  driver reports `tls = false` and refuses `TlsMode::Required` rather than silently connecting in
-  plaintext.
+- [x] TCPS. **Pass with limits** (spike S8, 2026-09-20) — one-way TLS 1.2 (`ECDHE-RSA-AES256-GCM-SHA384`)
+  with certificate and host-name verification on, confirmed server-side; trust comes from a
+  user-supplied PEM. Not available upstream: mTLS with a private CA, Oracle wallet files, OS trust
+  store, revocation, `SSL_SERVER_DN_MATCH` (U-12…U-14). `TlsMode::Required` refuses non-TCPS endpoints
+  rather than silently connecting in plaintext.
 - [x] timeout behavior. Per spike S4's findings: a pre-armed deadline stops a long SQL statement
   about 0.5 s past the deadline with the session intact, but a fired deadline on a PL/SQL block the
   server will not interrupt promptly costs the connection entirely (upstream recovery defect U-6,
@@ -242,8 +244,8 @@ decision. It is a draft assessment, not the decision itself — see the note at 
 
 **What remains before a Phase 1 go decision:**
 
-- TCPS (spike S8) — pending a TCPS listener on the test database (tracked in `TASKS.md`; a concurrent
-  workstream owns this).
+- TCPS (spike S8) — done 2026-09-20, pass with limits (see Workstream F); the remaining TCPS questions
+  are owner decisions (results file §9 items 6–7).
 - Android/iOS cross-compile (spike S6) — pending Android NDK approval and a macOS host; criterion 7
   needs either physical-device evidence or to remain a clearly documented blocker, not silence.
 - Network-loss/reconnect behavior — not evidenced at all in Phase 0 (Workstream F).

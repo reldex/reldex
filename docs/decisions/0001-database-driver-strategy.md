@@ -37,7 +37,8 @@ what follows is the verdict summary only — read that file for the numbers behi
 | S5 PL/SQL | **Pass** (REF CURSOR included, after contract fix C-1) |
 | S7 LOB streaming | **Pass** |
 | S9 concurrency | **Pass** |
-| S6, S8 | **Not run** — S6 (Android/iOS cross-compile) needs the Android NDK, which needs owner approval to download; S8 (TCPS) needs a TCPS listener the Phase 0 test database does not have |
+| S8 | **Pass with limits** (2026-09-20): pure-Rust TCPS session with certificate and host-name verification on, TLS 1.2 `ECDHE-RSA-AES256-GCM-SHA384`, confirmed server-side (`NETWORK_PROTOCOL = tcps`); trust via a user-supplied PEM only — no mTLS combined with a private CA (U-13), no `ewallet.p12`/OS trust store (U-12), `SSL_SERVER_DN_MATCH` ignored upstream (U-14), no revocation — kill criterion did NOT fire |
+| S6 | **Not run** — Android/iOS cross-compile needs the Android NDK (owner approval to download) and a macOS host |
 
 **S4 is the spike this ADR's decision rests on, and its kill criterion fired.** A pre-armed
 per-round-trip deadline (`CancelKind::PreArmedDeadline`) is the only mechanism that works at all, and
@@ -93,7 +94,7 @@ if:
 - upstream declines to add a cancel/break API (Issue A) after a reasonable review period, or
 - a data-corruption defect surfaces with no wrapper-side guard — i.e. a value upstream mis-handles
   silently that Reldex cannot detect and refuse the way U-1/U-2 are refused today, or
-- a new kill criterion fires in a still-outstanding spike (S6, S8).
+- a new kill criterion fires in the still-outstanding spike S6 (S8 has since passed with limits).
 
 Everything in "Spike outcome (2026-09-20)" above remains the technical record of what was found; this
 section records only what the owner decided to do about it. The "undecided"/"re-opened for the owner"
@@ -452,7 +453,7 @@ Coverage limitations to remember when reading spike results:
 - **19.3 base release, no Release Updates.** Real sites run 19.2x; some fixed bugs will be present.
 - **Non-CDB.** No PDB, no service-per-PDB behaviour — which is what most real 19c sites run. Any
   connect-string or service-name conclusion from this image is not the full story.
-- **TCPS not configured out of the box** — S8 needs listener work, or a different image.
+- **TCPS not configured out of the box** — resolved 2026-09-20: `tools/oracle-test-db/startup/` adds a TCPS listener on `127.0.0.1:2484` (test CA, orapki-built wallet) and S8 has been run.
 - **Community-built and unmaintained** (last updated 2021-03); amd64 only.
 
 Optional later additions, not required for Phase 0: the official
