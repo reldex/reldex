@@ -124,6 +124,32 @@ Everything in "Spike outcome (2026-09-20)" above remains the technical record of
 section records only what the owner decided to do about it. The "undecided"/"re-opened for the owner"
 language above describes the state as of 2026-09-20 before this decision; it is now decided.
 
+### Addendum — owner decisions on results file §9 items 8–12 (2026-09-19)
+
+Separately from the cancellation decision above, on 2026-09-19 the owner answered items 8–12 of
+`phase-0-spike-results.md` §9 ("What the owner has to decide"), accepting the lead's recommendation
+for each with one added product requirement: every one of these behaviours must be
+user-configurable. Full evidence and wording are in `phase-0-spike-results.md` §9 and in `SPEC.md`;
+summarized here, one line each:
+
+- **Item 8 (`connect_timeout`, C-5/U-15):** implement on a helper thread, default 15 s,
+  user-configurable per connection profile including "no limit". Implementation pending.
+- **Item 9 (default per-statement time limit):** default 600 s, configurable at three levels
+  (application default, connection profile, per worksheet/statement), including "no limit" with an
+  explicit UI warning about the consequence. The existing `SPEC.md` §10 interim-limitation
+  constraints are unchanged.
+- **Item 10 (`SQLNET.EXPIRE_TIME`):** documentation recommendation only — Reldex cannot enforce or
+  detect it; the Phase 0 test database stays unset so S10's measurements remain valid.
+- **Item 11 (`CREATE TRIGGER` U-18):** the driver auto-rewrites the DDL to
+  `EXECUTE IMMEDIATE`, on by default, always reported to the user, with a per-connection off switch.
+  Implementation pending.
+- **Item 12 (default fetch batch size):** not chosen now; deferred to a Phase 1 benchmark (S14 found
+  throughput is not monotonic in batch size). Must be a user setting (application default + per
+  connection profile) within a bounded range.
+
+This addendum does not change this ADR's `Accepted` status, and it does not alter the cancellation
+decision recorded above; it records separate, narrower owner decisions from the same results file.
+
 ## Context
 
 `ARCHITECTURE.md` §13 open question 1 asks which pure/thin driver backs `drivers/oracle/thin`.
