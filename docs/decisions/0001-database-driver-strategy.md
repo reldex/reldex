@@ -1,17 +1,69 @@
 # 0001 — Database Driver Strategy
 
-**Status:** Accepted (conditional on Phase 0 spikes S1–S5)
+**Status:** Accepted — S4 kill criterion FIRED (2026-09-20); owner decision pending
 **Date:** 2026-09-19
 **Amended:** 2026-09-19 — **C1 revised and spike S4 widened.** The ADR-0002 API review re-read
 `oracledb`'s source and established that `set_call_timeout` locks the same `Arc<Mutex<Client>>` that
 `execute` holds for the whole round trip. The "cancel = short call timeout on demand" fallback this
 ADR originally recommended therefore does not exist. See C1 and the S4 row.
+**Amended:** 2026-09-20 — **Spike outcome recorded; ADR re-opened.** Spikes S1–S5, S7 and S9 ran
+against the live Phase 0 test database on 2026-09-19. S4's kill criterion fired: no mechanism stops a
+running statement and keeps the session in the general case. Per this ADR's own rule ("If a kill
+criterion in the spike plan fires, this ADR is re-opened rather than silently worked around"), it is
+now re-opened for the owner. See "Spike outcome (2026-09-20)" below. The owner has not changed
+drivers — `oracledb` remains the chosen driver — only the cancellation mechanism is undecided.
 **Decided by:** project owner, 2026-09-19 — the primary driver is Oracle's official
 [`oracle/rust-oracledb`](https://github.com/oracle/rust-oracledb) (crate `oracledb`). If a kill
 criterion in the spike plan fires, this ADR is re-opened rather than silently worked around.
 
 All external facts below were checked on **2026-09-19**. Claims that could not be verified from a
 primary source are labelled **Unverified**.
+
+## Spike outcome (2026-09-20)
+
+Spikes S1–S5, S7 and S9 ran against the live Phase 0 test database (Oracle 19.3 EE, container
+`reldex-oracle19c`) on **2026-09-19**. Full detail, measurements and evidence are in
+[`docs/exec-plans/active/phase-0-spike-results.md`](../exec-plans/active/phase-0-spike-results.md);
+what follows is the verdict summary only — read that file for the numbers behind each line.
+
+| Spike | Verdict |
+| --- | --- |
+| S1 connect / auth | **Pass** |
+| S2 type fidelity | **Partial** — reads exact to 40 digits and byte-exact Thai/non-BMP text; NUMBER binds unsafe for two upstream shapes (U-1, U-2), refused rather than corrupted; `TIMESTAMP WITH TIME ZONE` refused at describe time (U-3 containment) |
+| S3 session / transaction | **Pass** |
+| S4 cancellation | **Fail for the requirement** — no mechanism stops a running statement and keeps the session in the general case |
+| S5 PL/SQL | **Pass** (REF CURSOR included, after contract fix C-1) |
+| S7 LOB streaming | **Pass** |
+| S9 concurrency | **Pass** |
+| S6, S8 | **Not run** — S6 (Android/iOS cross-compile) needs the Android NDK, which needs owner approval to download; S8 (TCPS) needs a TCPS listener the Phase 0 test database does not have |
+
+**S4 is the spike this ADR's decision rests on, and its kill criterion fired.** A pre-armed
+per-round-trip deadline (`CancelKind::PreArmedDeadline`) is the only mechanism that works at all, and
+it costs the session whenever the server cannot answer the interrupt promptly (a PL/SQL block, in
+particular). `SPEC.md` §10/§24.8 "Cancel" is **not met** by `oracledb` 26.0.0-beta.3 — not by this
+wrapper, not with the privileged `ALTER SYSTEM CANCEL SQL` extra, and not by a small fork of the
+upstream crate (assessed, not built; see the results file §4 candidate 4). Per this ADR's own rule,
+**it is re-opened for the owner.**
+
+**Options, exactly as the results file §9 frames them:**
+
+1. **Ship with a pre-armed deadline and an honest UI, and submit the upstream issues.** The driver
+   reports `CancelKind::PreArmedDeadline` and the UI says plainly that a running statement can only be
+   stopped by a limit set before it starts. **Recommended by the spike author and the lead.**
+2. **Wait for upstream.** The four drafted issues (results file §6) include a public break/interrupt
+   API request; its lead time is weeks to months, and nothing has been submitted yet — that is a
+   separate owner action regardless of which option is chosen.
+3. **Re-open this ADR's rejected alternatives** (embedding a non-Rust thin driver, ODPI-C + Instant
+   Client, writing a Rust driver from scratch) — see "Alternatives considered" above. Each was
+   rejected for reasons independent of cancellation and those reasons still hold.
+
+**The lead did not change drivers.** The owner explicitly chose `oracledb` (see "Decided by" above),
+and nothing in the S4 result changes that choice — only the cancellation mechanism the product can
+offer is in question. Adopting a different driver is alternative 3 above, not a decision made here.
+
+The other kill criteria did not fire: S1, S3, S5, S7 and S9 pass outright; S2's NUMBER and
+`TIMESTAMP WITH TIME ZONE` findings were upstream defects contained by refusal (see U-1, U-2, U-3 in
+the results file), not silent precision loss or corruption, so S2 is a **conditional go**, not a kill.
 
 ## Context
 

@@ -8,21 +8,47 @@ Reldex is an independent project and is not affiliated with, endorsed by, or spo
 
 ## Current status
 
-**Phase 0 — Architecture Validation.** The project is proving the Rust core, thin database connectivity, cancellation, transaction behavior, and mobile feasibility before any significant UI investment (`ROADMAP.md`).
+**Phase 0 — Architecture Validation.** Spikes S1–S5, S7 and S9 ran against a live Oracle Database
+19.3 (Docker) on 2026-09-19; full evidence is in
+[`docs/exec-plans/active/phase-0-spike-results.md`](docs/exec-plans/active/phase-0-spike-results.md).
 
-What exists today:
+**What works against a real Oracle 19c today:** connect via Easy Connect or a full TNS descriptor;
+SELECT/DML/DDL; PL/SQL blocks, procedures, functions and packages with IN/OUT/IN OUT binds and
+DBMS_OUTPUT; REF CURSOR fetched to exhaustion; COMMIT/ROLLBACK/SAVEPOINT with auto-commit off and no
+session-state leakage; CLOB/BLOB streamed in bounded memory (100 MB for +4.7 MB working set); NUMBER
+and character data (including Thai and non-BMP text) read back exact; 8 concurrent sessions running
+independently.
 
-- Product/architecture documentation (`SPEC.md`, `docs/architecture/ARCHITECTURE.md`, `ROADMAP.md`, `TASKS.md`, the active Phase 0 plan).
-- [ADR-0001](docs/decisions/0001-database-driver-strategy.md) — **Accepted, conditional on spikes S1–S5**: the primary database driver is Oracle's official `oracledb` crate (`oracle/rust-oracledb`).
-- A Cargo workspace skeleton (`crates/db-driver-api`, `crates/db-core`, `crates/drivers/mock`, `crates/drivers/oracle-thin`, `crates/reldex-core-poc`) and GitHub Actions CI (`cargo fmt`, `cargo clippy`, `cargo test` on Windows/Linux/macOS).
-- A local Oracle 19c Docker test database under [`tools/oracle-test-db/`](tools/oracle-test-db/), verified (AL32UTF8, Thai round-trip, Non-CDB).
-- [ADR-0002](docs/decisions/0002-driver-api-and-concurrency-model.md) (driver API and concurrency model) — **Accepted (provisional — implemented; independent API review in progress; owner review pending)**. The `db-driver-api` contract is implemented: 5 traits, ~45 types, zero production dependencies, 68 unit + 6 doc tests, fmt/clippy/test green.
+**Known limitations, stated plainly:**
 
-What does not exist yet:
+- **No on-demand statement cancel.** Only a pre-armed deadline exists, and it can destroy the session
+  if the server does not interrupt promptly (spike S4 fails `SPEC.md` §10/§24.8's requirement).
+  [ADR-0001](docs/decisions/0001-database-driver-strategy.md) is re-opened; the cancellation path is
+  an owner decision.
+- **`TIMESTAMP WITH TIME ZONE` columns are refused** at describe time by default, because a
+  named-region value aborts the process in the upstream driver; this is containment, not support.
+- **NUMBER bind restrictions**: certain decimal shapes (an odd count of leading zeros below 0.1, or a
+  40-digit value at specific decimal-point positions) are refused on bind rather than corrupted or
+  crashed.
+- **Native Network Encryption and 11G password verifiers are unsupported** by the primary driver.
+- **Mobile is unproven.** Android/iOS cross-compile has not been attempted (needs the NDK / a macOS
+  host); no physical-device evidence exists for either platform.
 
-- No UI (Qt Quick/QML has not been started).
-- No database driver implementation — `db-driver-api` now has the vendor-neutral trait contract and normalized `DbError` (ADR-0002), but `db-core`'s session/transaction implementation, the mock driver, and the `oracledb` wrapper in `crates/drivers/oracle-thin` are all still to do.
-- No mobile validation — Android/iOS direct-connect feasibility has not been tested on physical devices.
+- [ADR-0001](docs/decisions/0001-database-driver-strategy.md) — **Accepted — S4 kill criterion FIRED
+  (2026-09-20); owner decision pending**: the primary database driver remains Oracle's official
+  `oracledb` crate (`oracle/rust-oracledb`); only the cancellation mechanism is in question.
+- [ADR-0002](docs/decisions/0002-driver-api-and-concurrency-model.md) (driver API and concurrency
+  model) — **Accepted (provisional — implemented; independently reviewed twice with must-fix findings
+  applied; amended after the Phase 0 spikes; owner review pending)**.
+- A Cargo workspace with `crates/db-driver-api`, `crates/db-core` (session/worker-thread layer),
+  `crates/drivers/mock`, `crates/drivers/oracle-thin` (wraps `oracledb`) and `crates/reldex-core-poc`
+  all implemented, plus GitHub Actions CI (`cargo fmt`, `cargo clippy`, `cargo test` on
+  Windows/Linux/macOS — this branch has not yet gone through a PR/CI run).
+- A local Oracle 19c Docker test database under [`tools/oracle-test-db/`](tools/oracle-test-db/),
+  verified (AL32UTF8, Thai round-trip, Non-CDB).
+
+**Not started yet:** the Qt Quick/QML UI; driver-upgrade contract tests; TCPS (no listener on the
+test DB); network-loss/reconnect behavior; Android/iOS validation.
 
 [`Task.html`](Task.html) (open it in a browser) is the live, human-facing progress dashboard: current focus, blockers/risks, spike results, and recent activity. [`TASKS.md`](TASKS.md) and the active plan under [`docs/exec-plans/active/phase-0.md`](docs/exec-plans/active/phase-0.md) remain the source of truth for task status; `Task.html` mirrors them.
 
@@ -30,9 +56,22 @@ What does not exist yet:
 
 - **Core:** Rust.
 - **UI:** Qt Quick/QML with a thin C++ adapter over a stable Rust FFI boundary — planned, not started.
-- **Primary database driver:** Oracle's official [`oracledb`](https://github.com/oracle/rust-oracledb) crate (pure Rust, thin, blocking; no Instant Client/OCI required), pinned to an exact pre-GA beta version, per [ADR-0001](docs/decisions/0001-database-driver-strategy.md). It is encapsulated behind `db-driver-api` so it can be swapped if a kill criterion in the ADR's spike plan fires.
-- **Known gaps in the primary driver**, stated honestly: no public statement-cancel API yet (Phase 0 may fall back to call-timeout semantics while an upstream request is pending); it is pre-GA/beta software; Native Network Encryption and 11G password verifiers are unsupported; Android/iOS viability is unproven and requires physical-device evidence before any mobile claim.
+- **Primary database driver:** Oracle's official [`oracledb`](https://github.com/oracle/rust-oracledb) crate (pure Rust, thin, blocking; no Instant Client/OCI required), pinned to an exact pre-GA beta version (`=26.0.0-beta.3`), per [ADR-0001](docs/decisions/0001-database-driver-strategy.md). It is encapsulated behind `db-driver-api` so it can be swapped if a kill criterion in the ADR's spike plan fires. The owner has not changed drivers; see the current limitations above.
+- **Known gaps in the primary driver**, stated honestly: no on-demand statement-cancel API (Phase 0 falls back to a pre-armed deadline; four upstream issues are drafted, none submitted yet); it is pre-GA/beta software with at least one defect that can abort the whole process if an unhandled input reaches it; Native Network Encryption and 11G password verifiers are unsupported; Android/iOS viability is unproven and requires physical-device evidence before any mobile claim.
 - **Initial compatibility target:** Oracle Database 19c+.
+
+## Running the integration suite
+
+`cargo test --workspace` runs unit tests only and never touches a database. The database-backed
+integration suite is opt-in (`--features oracle-it`) and requires the local Oracle 19c test database —
+see [`tools/oracle-test-db/README.md`](tools/oracle-test-db/README.md) for setup and connection
+details. Run the cancellation spike single-threaded; it includes long cartesian joins, a
+`KILL SESSION` and a 20-second PL/SQL sleep whose outcome is load-dependent under parallel execution:
+
+```sh
+tools/oracle-test-db/run-it.ps1 s4_cancel -- --test-threads=1
+tools/oracle-test-db/run-it.sh  s4_cancel -- --test-threads=1
+```
 
 ## Product principles
 
@@ -52,9 +91,9 @@ What does not exist yet:
 ```text
 crates/
   db-driver-api/          vendor-neutral driver contract + DbError (implemented, ADR-0002)
-  db-core/                sessions, transactions, query, results, metadata, workspace (skeleton)
-  drivers/mock/            test-support/mock driver for core tests (skeleton)
-  drivers/oracle-thin/     thin driver wrapping Oracle's `oracledb` crate, ADR-0001 (skeleton)
+  db-core/                sessions, transactions, query, results, metadata, workspace (implemented)
+  drivers/mock/            test-support/mock driver for core tests (implemented)
+  drivers/oracle-thin/     thin driver wrapping Oracle's `oracledb` crate, ADR-0001 (implemented; spikes S1-S5, S7, S9 run)
   reldex-core-poc/         Phase 0 validation harness binary (no full UI)
 docs/
   architecture/            architecture source of truth (ARCHITECTURE.md)

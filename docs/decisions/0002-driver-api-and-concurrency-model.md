@@ -408,6 +408,21 @@ table from the user. Added `ColumnData::Unsupported(TextColumn)`, `ColumnKind::U
 still in `native_type_name`. Deliberately a *separate* variant from `Text`, so nothing downstream can
 treat the rendering as character data, edit it, or parse it back.
 
+**Carve-out found by the Phase 0 spikes (2026-09-20): not every unrepresentable type gets a text
+rendering.** M1's `ColumnData::Unsupported` path assumes the driver can produce *some* text for the
+value — that is true for `INTERVAL DAY TO SECOND`, `INTERVAL YEAR TO MONTH`, `ROWID` and
+`TIMESTAMP WITH LOCAL TIME ZONE`, which the oracle-thin wrapper renders exactly this way (spike S2).
+It is not true for `XMLType`, `JSON`, `VECTOR`, object types and `BFILE` on `oracledb`
+26.0.0-beta.3: upstream's own row decoder (`DbValue::from_response`) has no branch for them at all, so
+there is no value to render — the **fetch itself would fail**, not just the typed conversion. Failing
+from `fetch_batch` would still kill a result set after earlier batches had already reached the caller,
+so the wrapper refuses the column **at describe time**, before the first batch is requested: the
+session stays `Usable`, and the column is simply absent rather than shown as `Unsupported` text. This
+is a *third* outcome alongside M1's "rendered as text" and an ordinary `DbError`, not a special case
+of either, and a driver implementer should not expect `ColumnData::Unsupported` to be reachable for
+every type a server can send. See `docs/exec-plans/active/phase-0-spike-results.md` §3 (S2) for the
+evidence.
+
 **M2 — `DbError::new` no longer defaults `session_state` to `Usable`.** The initial value is derived
 from `kind` (`SessionState::initial_for`): `NetworkLost` → `Lost`;
 `Connection`/`Timeout`/`Cancelled`/`DriverInternal` → `NeedsValidation`; others `Usable`. A driver

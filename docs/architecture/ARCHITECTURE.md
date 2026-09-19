@@ -124,6 +124,15 @@ Rules:
   another session's state (Phase 0 Workstream B).
 - A reconnect creates a *new* database session and is surfaced as such.
 
+`db-core`'s `DatabaseSession` implements this rather than leaving it to the FFI/UI layer. `close`
+takes a `CloseDisposition` and decides whether a transaction is open on the session's own worker
+thread, after every command queued ahead of the close has run; a commit or rollback that fails inside
+`close` leaves the session open rather than discard a transaction the user asked to keep (never a
+silent commit — [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) K4). A session's
+lifecycle adds `Lost` (unrecoverable, terminal, no reconnect) and `Closed` (closed on purpose) states
+on top of the driver contract's own `SessionState`, so a closed or dead session is never mistaken for
+one still usable (ADR-0002 K8).
+
 ## 6. Concurrency and threading
 
 - No database or network I/O on the UI thread, ever (`SPEC.md` §11, §19).
@@ -140,6 +149,15 @@ D1/D2, `db-core` runs one dedicated worker thread per session (no async runtime 
 and cancellation from another control path goes through a separate, cloneable `Arc<dyn CancelHandle>`
 obtained before a call blocks — never through the worker thread itself. The driver-level cancellation
 mechanism and its latency per platform remain open (§13 item 5).
+
+Only plain data crosses a worker-thread boundary in practice, not just in intent: before a fetched
+batch leaves its owning thread, `db-core` takes any live LOB locator out of it and parks it behind a
+core-owned, opaque `LobHandle` scoped to the session that issued it — a handle from one session is
+rejected on another rather than mistaken for a stale one (ADR-0002 K1, K8). Dropping a session never
+hangs the caller: `Drop` requests a cancel, asks the worker to abandon and release everything, waits
+at most a bounded timeout, then detaches the worker thread, which still releases the connection and
+its resources whenever the blocked call eventually returns (ADR-0002 K5). Explicit `close` remains the
+only path that can commit; `Drop` only abandons.
 
 ## 7. FFI and Qt adapter boundary
 
@@ -207,8 +225,10 @@ reconnect (`SPEC.md` §25; `phase-0.md` Workstream G). Emulator/simulator result
 
 ## 11. Planned repository layout (provisional)
 
-Only crates the current documents name. Layout is provisional until an ADR records it (Phase 0
-Workstream A landed empty, skeleton-only crates at the paths below; see §13 item 10).
+Only crates the current documents name. Layout is provisional until an ADR records it. Phase 0
+Workstream A landed the crates below as skeletons first; `db-driver-api`, `db-core` (session/worker
+layer) and `drivers/oracle-thin` (the `oracledb` wrapper) are now implemented and independently
+reviewed against the Phase 0 test database — see §13 item 10 for the still-open layout question.
 
 ```text
 crates/db-driver-api/          vendor-neutral driver contract + DbError
@@ -254,19 +274,31 @@ Until then, no code should assume an answer.
    TCPS, and Android/iOS viability.
 2. **FFI mechanism.** Which Rust/C++ interop approach provides a stable, typed, small boundary, and
    how is ABI/version compatibility guaranteed?
-3. **Threading and callbacks across FFI — constrained, still open.** [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md)
-   D1 fixes one input: each session's calls run on that session's dedicated worker thread, so
-   completion must be marshalled off that thread to the Qt thread either way (e.g. a queue the
-   adapter drains via a `QEvent`/queued signal). The concrete mechanism, and the thread-affinity and
-   reentrancy rules, are not yet decided.
+3. **Threading and callbacks across FFI — core side settled; FFI event delivery still open.**
+   [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) D1/D2 are now implemented in
+   `db-core`, not just decided: one dedicated worker thread per session drains a FIFO command queue,
+   and every call returns a `Completion` the caller polls or waits on. That settles the core side —
+   each session's calls run on that session's owning worker thread, and only plain `RowBatch` data
+   (never a driver handle) crosses to another thread. What remains open for Phase 1 is the FFI half:
+   the concrete mechanism that marshals a worker thread's completion to the Qt thread (e.g. a queue
+   the C++ adapter drains via a `QEvent`/queued signal, per ADR-0002's "Deferred" section), plus the
+   thread-affinity and reentrancy rules the adapter must enforce. Nothing here depends on which
+   cancellation mechanism ADR-0001 lands on.
 4. **Async runtime vs. threads — RESOLVED by [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) D1.**
    No async runtime below the FFI line; `db-core` uses one dedicated worker thread per session, owning
    `Box<dyn DatabaseConnection>` for that session's lifetime.
 5. **Cancellation mechanism — contract RESOLVED by [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) D2;
-   driver-level mechanism still open.** The contract is a separate `Arc<dyn CancelHandle>`,
-   `CancelKind::{Native, PreArmedDeadline, Unsupported}`, and `SessionState::{Usable, NeedsValidation, Lost}`
-   reported on every `DbError`. Which mechanism the primary driver actually offers, and the
-   cancellation latency achievable per platform, remain open (ADR-0001 C1, spike S4).
+   driver-level mechanism FAILED spike S4 — open, owner decision pending.** The contract is a
+   separate `Arc<dyn CancelHandle>`, `CancelKind::{Native, PreArmedDeadline, Unsupported}`, and
+   `SessionState::{Usable, NeedsValidation, Lost}` reported on every `DbError`; that part is settled
+   and implemented. Spike S4 (run 2026-09-19 against a live Oracle 19.3 database; see
+   `docs/exec-plans/active/phase-0-spike-results.md` §4) found that `oracledb` 26.0.0-beta.3 offers
+   only `CancelKind::PreArmedDeadline` — a deadline armed before a call starts, which stops a SQL
+   statement with the session intact but destroys the connection for a PL/SQL block the server will
+   not interrupt promptly. No mechanism it evaluated (pre-armed deadline, a privileged
+   `ALTER SYSTEM CANCEL SQL`, a minimal fork) delivers an on-demand cancel that keeps the session
+   usable in the general case. `SPEC.md` §10/§24.8 "Cancel" is therefore **not met**, ADR-0001's kill
+   criterion fired, and the ADR is re-opened for the owner (ADR-0001 "Spike outcome (2026-09-20)").
 6. **Result store representation.** What is the in-memory row/batch layout, bounded-memory policy,
    and spill/eviction behavior? Does Arrow earn its place by benchmark (deferred to Phase 3)?
 7. **Error model shape — RESOLVED by [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) D3.**

@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-19T23:30:00+07:00",
+  "updatedAt": "2026-09-20T14:30:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P0",
@@ -511,58 +511,74 @@
     "goal": "Prove the Rust core, thin database connectivity, cancellation, transaction behavior, and mobile feasibility before substantial UI investment.",
     "exitGate": "Desktop POC passes. Android/iOS feasibility is documented from physical-device tests."
   },
-  "summary": "Phase 0 — Architecture Validation. Workspace, CI, the local Oracle 19c Docker test DB and the vendor-neutral driver contract (db-driver-api, ADR-0002) are in place; the contract passed an independent review after a must-fix round (93 unit + 8 doc tests). Primary driver is Oracle's official oracledb crate (ADR-0001, conditional on spikes S1–S5). Biggest open risk: on-demand statement cancel is not available in the oracledb beta (spike S4).",
+  "summary": "Phase 0 spikes ran against the live Oracle 19.3 test database on 2026-09-19: S1, S3, S5, S7 and S9 pass; S2 is a conditional go (character data and reads are exact, but two upstream NUMBER-bind defects and a TIMESTAMP WITH TIME ZONE abort are contained by refusal, not fixed). S4 (on-demand statement cancellation) fails for the requirement: only a pre-armed per-round-trip deadline exists, and it can destroy the session. Per ADR-0001's own rule the ADR is re-opened and the cancellation path is now an owner decision. Four upstream issues are fully drafted but nothing has been submitted yet. db-core and the oracle-thin wrapper both shipped and passed independent review (7 and 4 must-fix findings respectively, both applied). Workspace is fmt/clippy clean; cargo test --workspace is 267 passed, 0 failed, 1 ignored (DB-free).",
   "focus": [
-    "Mock driver + db-core session/transaction layer (worker thread per session)",
-    "oracledb wrapper in crates/drivers/oracle-thin + spikes S1–S5 against the Docker test DB"
+    "Docs synced to the Phase 0 spike evidence (this change): ADR-0001 re-opened, TASKS.md/phase-0.md/README/ARCHITECTURE.md updated",
+    "Preparing a PR so CI can run on Windows, Linux and macOS before merge",
+    "Awaiting the owner's cancellation-path decision (ADR-0001) and submission of the four drafted upstream issues"
   ],
-  "blockers": [],
+  "blockers": [
+    {
+      "title": "On-demand statement cancel is not possible with the oracledb beta",
+      "detail": "Spike S4 evaluated four candidates in order (pre-armed deadline, privileged ALTER SYSTEM CANCEL SQL, upstream public API, minimal fork) and none delivers a cancel that stops a running statement on demand while keeping the session usable in the general case. A pre-armed deadline stops a long SQL statement with the session intact but costs the connection entirely for a PL/SQL block the server will not interrupt promptly. SPEC.md §10/§24.8 cannot be met with oracledb 26.0.0-beta.3. Per ADR-0001's own rule, the ADR is re-opened.",
+      "severity": "blocked",
+      "since": "2026-09-19"
+    },
+    {
+      "title": "Owner action required: submit the four drafted upstream issues",
+      "detail": "Four issues are fully drafted in docs/exec-plans/active/phase-0-spike-results.md §6 — a public break/interrupt API, the NUMBER-bind data-corruption defect (U-1), the two process-abort defects (U-2/U-3), and the recovery/cancel-observation defects (U-6/U-7). Nothing has been posted to oracle/rust-oracledb yet.",
+      "severity": "blocked",
+      "since": "2026-09-19"
+    }
+  ],
   "risks": [
     {
-      "title": "Statement cancel may be impossible with the current oracledb beta",
-      "detail": "Independent API review verified from source that set_call_timeout blocks on the same lock as execute(); on-demand cancel cannot be built on it. Only a pre-armed per-call deadline is available today.",
-      "mitigation": "Spike S4 evaluates four candidates; the driver contract reports CancelKind honestly (PreArmedDeadline vs Native) so the UI can never pretend; upstream cancel-API request drafted for the owner to submit."
+      "title": "TIMESTAMP WITH TIME ZONE columns are refused, not rendered",
+      "detail": "A named-region TIMESTAMP WITH TIME ZONE value aborts the process upstream (U-3). The driver refuses any TIMESTAMP WITH TIME ZONE column at describe time, before any value is decoded, so a query touching one loses that column entirely.",
+      "mitigation": "Documented product limitation until upstream fixes the todo!() in oracledb's timestamp decoder. TO_CHAR(c, '... TZR') remains available as a text escape; Reldex must not enable the oracle.allow_timestamp_with_time_zone opt-in by default."
     },
     {
-      "title": "No public statement-cancel API in the primary driver",
-      "detail": "oracledb (oracle/rust-oracledb) exposes no public cancel/break/interrupt function; execute() holds the connection's mutex for the call duration, so a second thread cannot interleave a break today (ADR-0001 Conflict C1).",
-      "mitigation": "Spike S4 evaluates set_call_timeout as a coarse stand-in; an upstream enhancement request is being drafted; ADR-0001 is re-opened if S4's kill criterion fires."
+      "title": "NUMBER bind restrictions (U-1, U-2)",
+      "detail": "Binding a decimal below 0.1 with an odd count of leading zeros after the point would silently store a value ten times too large upstream (U-1); a 40-digit value at an odd, positive decimal-point index, or magnitude >= 1E40, would abort the process (U-2). The driver refuses both shapes with ErrorKind::Unsupported instead of binding them.",
+      "mitigation": "The refusal predicate is checked complete over the whole digit-count x decimal-point-index space, not just by example. Reading such values back is unaffected and exact to 126 digits; only binding certain shapes is restricted."
     },
     {
-      "title": "Primary driver is pre-GA beta",
-      "detail": "oracledb is roughly two months old (first release 2026-08-06); its short issue history already includes two transaction/session-correctness bugs, both fixed within days (ADR-0001 Conflict C2).",
-      "mitigation": "Pin an exact version, keep it strictly behind db-driver-api, and add Reldex-owned contract tests so an upgrade that changes behaviour is caught in CI."
+      "title": "A driver panic aborts the whole process (U-4), and no wrapper can contain it",
+      "detail": "oracledb 26.0.0-beta.3's StatementHolder::drop unwraps a possibly-poisoned mutex, so any panic during a round trip panics again while unwinding and aborts the process (STATUS_STACK_BUFFER_OVERRUN on Windows). catch_unwind cannot help.",
+      "mitigation": "The driver refuses every input shape known to panic upstream (the TSTZ and NUMBER cases above) before it reaches the crate. An unidentified panicking input would still abort the process, which is why the version stays pinned exactly."
     },
     {
-      "title": "Mobile (Android/iOS) viability is unproven",
-      "detail": "Oracle names no tested target platforms for oracledb; Android/iOS are almost certainly untested upstream (ADR-0001 Conflict C3).",
-      "mitigation": "Spike S6 cross-compiles to aarch64-linux-android and aarch64-apple-ios; SPEC.md §25 requires physical-device evidence before any mobile direct-connect claim, regardless of build success."
+      "title": "Mobile (Android/iOS) viability is still unproven",
+      "detail": "Spike S6 (cross-compile to aarch64-linux-android / aarch64-apple-ios) has not been run. It needs the Android NDK, which needs owner approval to download, and an iOS build needs a macOS host.",
+      "mitigation": "SPEC.md §25 requires physical-device evidence before any mobile direct-connect claim regardless of build success; tracked as a standalone P0 follow-up task."
     },
     {
       "title": "Local test database has coverage limitations",
-      "detail": "tools/oracle-test-db/ uses the community image doctorkirk/oracle-19c:19.3 — 19.3 base release with no Release Updates, Single-Instance Non-CDB (most real 19c sites run CDB/PDB), unmaintained since 2021-03, amd64 only, and TCPS is not configured out of the box. Verification also found the container needs an explicit AL32UTF8 client charset (NLS_LANG) or multi-byte UTF-8 (including Thai) is corrupted on the wire — a real finding for Reldex's own driver, not just a test-harness quirk.",
-      "mitigation": "Treat spike results as Phase 0 driver-level evidence, not full production-topology coverage; every driver/client must declare AL32UTF8 explicitly; a CDB/PDB-capable official image is a documented optional later addition, not required for Phase 0. Follow-ups tracked for tools/oracle-test-db/: add a TCPS listener (wallet-based) before spike S8, and add a container memory cap (mem_limit / deploy.resources.limits.memory) plus an explicit SGA/PGA resize, since dbca currently auto-sizes to roughly 40% of host-visible memory (~12 GiB observed) rather than a container-bounded value."
+      "detail": "tools/oracle-test-db/ uses the community image doctorkirk/oracle-19c:19.3 — 19.3 base release with no Release Updates, Single-Instance Non-CDB (most real 19c sites run CDB/PDB), unmaintained since 2021-03, amd64 only, and TCPS is not configured out of the box (spike S8 not run). The container also currently auto-sizes memory to roughly 40% of host-visible RAM rather than a container-bounded value.",
+      "mitigation": "Treat spike results as Phase 0 driver-level evidence, not full production-topology coverage. Follow-ups are tracked in TASKS.md: add a wallet-based TCPS listener before running S8, and add an explicit container memory cap."
     }
   ],
   "nextSteps": [
-    "Finish mock driver + db-core session layer with tests",
-    "Wrap oracledb (pinned exact beta) and run spikes S1–S5; record results honestly in ADR-0001",
-    "Code review of both, open PR, CI on Windows/Linux/macOS, merge",
-    "Owner: review ADR-0002 lead decisions and submit the upstream cancel-API request",
-    "Follow-ups: TCPS listener for the test DB (S8), container memory cap, Android cross-compile check (S6, needs NDK)"
+    "Open a PR for this branch and get CI green on Windows, Linux and macOS",
+    "Merge after review",
+    "Owner: decide the cancellation path (ADR-0001 re-opened)",
+    "Owner: submit the four drafted upstream issues (phase-0-spike-results.md §6)",
+    "Add a TCPS listener to the test database and run spike S8",
+    "Run spike S6 (Android/iOS cross-compile) once NDK access is approved",
+    "Phase 0 go/no-go decision for Phase 1"
   ],
   "decisions": [
     {
       "id": "ADR-0001",
       "title": "Database driver strategy — primary driver is Oracle's oracledb (rust-oracledb)",
-      "status": "Accepted (conditional on spikes S1–S5)",
+      "status": "Accepted — S4 kill criterion FIRED (2026-09-20); owner decision pending",
       "date": "2026-09-19",
       "link": "docs/decisions/0001-database-driver-strategy.md"
     },
     {
       "id": "ADR-0002",
       "title": "Driver API and concurrency model — blocking object-safe contract, per-session worker thread in db-core",
-      "status": "Accepted (provisional — implemented; independent API review in progress; owner review pending)",
+      "status": "Accepted (provisional — implemented; independently reviewed twice (API review, db-core session review) with must-fix findings applied; amended after the Phase 0 spikes; owner review pending)",
       "date": "2026-09-19",
       "link": "docs/decisions/0002-driver-api-and-concurrency-model.md"
     }
@@ -573,72 +589,72 @@
       "title": "Connect + authenticate to 19c: Easy Connect, service name, full descriptor",
       "box": "0.5 d",
       "killCriterion": "Cannot authenticate against a stock 19c account after verifier workaround",
-      "status": "todo",
-      "result": ""
+      "status": "done",
+      "result": "Pass. Easy Connect (service name) and full TNS descriptor both authenticate; wrong password → Authentication error; unreachable port → Connection error; ping and close-then-use both behave correctly. Connect latency: 119.5 ms median (10 sequential cycles, 118.6-123.7 ms range); ping: 769 microseconds median."
     },
     {
       "id": "S2",
       "title": "SELECT fidelity: NUMBER precision at 38 digits, DATE, TIMESTAMP, TIMESTAMP TZ, NVARCHAR2/NCLOB with Thai text, RAW",
       "box": "1 d",
       "killCriterion": "Silent precision loss in NUMBER, or Thai/NCHAR corruption",
-      "status": "todo",
-      "result": "Not yet run against the driver. Pre-spike finding from raw sqlplus testing of the test-DB harness: Thai text was corrupted (U+FFFD) until the client set NLS_LANG=AMERICAN_AMERICA.AL32UTF8 — S2 must prove the Thai/NCHAR round-trip through the oracledb driver itself, not just sqlplus."
+      "status": "done",
+      "result": "Partial — three critical upstream defects, all contained by refusal rather than corruption. Character data (Thai, non-BMP, mixed) is byte-exact with no NLS_LANG set; NUMBER reads are exact to 40 digits. Binding a NUMBER is unsafe for two shapes: an odd count of leading zeros below 0.1 would silently store it ten times too large (U-1), and a 40-digit value at an odd/positive decimal-point index or magnitude >=1E40 aborts the process (U-2) — both are refused (ErrorKind::Unsupported) rather than bound. TIMESTAMP WITH TIME ZONE aborts the process for named-region values (U-3); the driver refuses the column at describe time, before any value is decoded, so the crash is contained but the type stays unreadable by default. XMLTYPE, JSON, VECTOR, object types and BFILE are refused at describe time too (upstream cannot decode them at all)."
     },
     {
       "id": "S3",
       "title": "Session/transaction correctness: auto-commit OFF, uncommitted state across statements, SAVEPOINT + ROLLBACK TO via SQL, second session cannot see uncommitted data",
       "box": "1 d",
       "killCriterion": "SAVEPOINT unusable, or session state leaks between connections",
-      "status": "todo",
-      "result": ""
+      "status": "done",
+      "result": "Pass. Auto-commit is off by default and proven against a second session; uncommitted state survives multiple statements; SAVEPOINT + ROLLBACK TO works; DDL's implicit commit is reported (StatementKind::Ddl, committed_implicitly() == true), not hidden; NLS/temp-table/package state does not leak between sessions; closing over an open transaction rolls back rather than commits."
     },
     {
       "id": "S4",
       "title": "Cancel a long-running statement from another control path; measure latency (re-scoped after API review)",
       "box": "2 d",
       "killCriterion": "No mechanism achieves cancel within ~2 s and leaves the session usable — even via set_call_timeout",
-      "status": "todo",
-      "result": "Not run yet. Review finding: oracledb's set_call_timeout locks the same mutex execute() holds, so a call timeout is only a pre-armed deadline. Candidates in order: (1) pre-armed deadline, (2) privileged control session ALTER SYSTEM CANCEL SQL, (3) upstream public cancel API, (4) minimal fork/patch writing the break marker outside the mutex. If only (1) works, SPEC 10/24.8 Cancel is NOT met and ADR-0001 is re-opened with the owner."
+      "status": "blocked",
+      "result": "Fail for the requirement. No mechanism stops a running statement and keeps the session in the general case. Only a pre-armed per-round-trip deadline exists (CancelKind::PreArmedDeadline): it stops a long SQL statement about 0.5 s past the deadline with the session intact, but costs the connection entirely for a PL/SQL block the server will not interrupt promptly (upstream's recovery path re-reads with the expired timeout still armed, U-6). A privileged ALTER SYSTEM CANCEL SQL stops the statement server-side in about half a second, but the client is never notified and hangs until its own deadline (U-7). oracledb has the interrupt marker internally but exposes no public break API, and its single round-trip mutex means one cannot be added from outside (arming a deadline mid-call blocked 4.8 s of a 5.3 s statement). A minimal fork is technically possible but not recommended (TLS complicates it, and U-6/U-7 would still need fixing). SPEC.md §10/§24.8 cannot be met with oracledb 26.0.0-beta.3. ADR-0001 is re-opened; owner decision pending."
     },
     {
       "id": "S5",
       "title": "REF CURSOR + IN/OUT/IN OUT binds + DBMS_OUTPUT",
       "box": "1 d",
       "killCriterion": "REF CURSOR or OUT binds unusable",
-      "status": "todo",
-      "result": ""
+      "status": "done",
+      "result": "Pass. Anonymous blocks, CALL, stored procedures/functions/packages, OUT/IN OUT binds, DBMS_OUTPUT (including Thai), PL/SQL compile-error detection and error position all work. REF CURSOR OUT bind is fetched to exhaustion with the parent connection usable throughout, after the additive contract fix C-1 (ADR-0002 amendment P1)."
     },
     {
       "id": "S6",
-      "title": "Cross-compile checks: cargo build --target aarch64-linux-android and aarch64-apple-ios",
+      "title": "Cross-compile checks: cargo build —target aarch64-linux-android and aarch64-apple-ios",
       "box": "0.5 d",
       "killCriterion": "Either target fails to build and no provider swap fixes it",
-      "status": "todo",
-      "result": ""
+      "status": "blocked",
+      "result": "Not run. Needs the Android NDK (aarch64-linux-android target) and, for iOS, a macOS host — both unavailable in this workstream's environment. Owner approval is needed to download the NDK."
     },
     {
       "id": "S7",
-      "title": "CLOB/BLOB streaming ≥100 MB with bounded RSS; confirm issue #18 impact",
+      "title": "CLOB/BLOB streaming >=100 MB with bounded R§; confirm issue #18 impact",
       "box": "1 d",
       "killCriterion": "Memory grows with LOB size, or non-ASCII CLOBs unreadable",
-      "status": "todo",
-      "result": ""
+      "status": "done",
+      "result": "Pass. 100 MB CLOB and 100 MB BLOB streamed through LobStream::read_chunk with a 64 KiB caller buffer; process working set grew only 4.7 MB across 200 MB streamed. CLOB: 104,857,600 bytes / 4,801 chunks / 18.2 s. BLOB: 104,857,600 bytes / 1,600 chunks / 3.2 s."
     },
     {
       "id": "S8",
       "title": "TCPS against a TLS-enabled listener",
       "box": "1 d",
       "killCriterion": "TCPS cannot be established without Instant Client",
-      "status": "todo",
-      "result": ""
+      "status": "blocked",
+      "result": "Not run. The Phase 0 Docker test database (doctorkirk/oracle-19c:19.3) has no TCPS listener configured; the driver reports tls=false and refuses TlsMode::Required rather than silently connecting in plaintext. Adding a wallet-based TCPS listener to the test DB is a tracked follow-up."
     },
     {
       "id": "S9",
       "title": "Network-loss detection and reconnect semantics; N concurrent sessions under load",
       "box": "1 d",
       "killCriterion": "Lost sessions are hidden rather than surfaced",
-      "status": "todo",
-      "result": ""
+      "status": "done",
+      "result": "Pass (concurrency half only — see the Functional POC 'Network-loss behavior' task for the untested half). 8 concurrent sessions, 400 inserts (50 per thread) plus commit and read-back, 282.8 ms wall clock; every thread saw exactly its own 50 rows."
     }
   ],
   "phases": [
@@ -704,17 +720,17 @@
             {
               "title": "Create db-driver-api",
               "status": "done",
-              "note": "Implemented per ADR-0002: 5 traits (DatabaseDriver, DatabaseConnection, CancelHandle, Cursor, LobStream), ~45 types, zero production dependencies, 68 unit + 6 doc tests, fmt/clippy/test green. Independent API review in progress; owner review pending."
+              "note": "Implemented per ADR-0002: 5 traits (DatabaseDriver, DatabaseConnection, CancelHandle, Cursor, LobStream), ~45 types, zero production dependencies. Independently reviewed; must-fix findings applied."
             },
             {
               "title": "Create db-core",
-              "status": "in_progress",
-              "note": "Skeleton crate at crates/db-core; depends only on db-driver-api. Session/worker-thread implementation against the now-implemented contract not started."
+              "status": "done",
+              "note": "Session layer implemented: worker-thread-per-session, FIFO command queue, out-of-band cancel, conservative transaction tracking incl. locking queries, CloseDisposition (never a silent commit), terminal Lost/Closed lifecycle, core-owned ResultId/LobHandle (LOB handles never cross threads), bounded Drop, SessionLimits, panic containment. Independently reviewed, 7 must-fix applied, commit 86f79d7."
             },
             {
               "title": "Create initial database driver implementation — wrap Oracle's official oracledb crate (oracle/rust-oracledb, pinned exact version) in crates/drivers/oracle-thin",
-              "status": "todo",
-              "note": "Per ADR-0001. Skeleton crate exists at crates/drivers/oracle-thin; wrapper not started."
+              "status": "done",
+              "note": "Per ADR-0001, pinned to =26.0.0-beta.3. Independently reviewed, 4 must-fix applied (NUMBER-guard false negative, U-3 re-execution gap, statement classification, LOB error mapping), commit db38c14."
             },
             {
               "title": "Add driver contract tests that detect behaviour changes on oracledb upgrades",
@@ -722,7 +738,8 @@
             },
             {
               "title": "(S4 critical path) Draft upstream request to oracle/rust-oracledb for a public statement-cancel/break API — plus accessors for OracleNumber digits and the transaction-in-progress flag (owner to submit)",
-              "status": "todo"
+              "status": "done",
+              "note": "Four issues drafted in full: docs/exec-plans/active/phase-0-spike-results.md §6 (public break API; NUMBER-bind data corruption; the two process aborts; the recovery/cancel-observation defects). Nothing has been submitted yet — see the separate owner task."
             },
             {
               "title": "Add normalized DbError",
@@ -736,18 +753,18 @@
             },
             {
               "title": "Add session abstraction",
-              "status": "in_progress",
-              "note": "Contract only: DatabaseConnection trait implemented in db-driver-api (ADR-0002); db-core's DatabaseSession (worker thread, cancel handle, transaction tracking) not yet implemented."
+              "status": "done",
+              "note": "db-core's DatabaseSession (worker thread, cancel handle, transaction tracking, Lost/Closed lifecycle) implemented and hardened; see 'Create db-core' above."
             },
             {
               "title": "Add transaction abstraction",
-              "status": "in_progress",
-              "note": "Contract only: commit/rollback/savepoint/transaction_state on DatabaseConnection implemented in db-driver-api (ADR-0002 D4); db-core implementation pending."
+              "status": "done",
+              "note": "db-core's conservative transaction tracking, including locking queries (SELECT ... FOR UPDATE, LOCK TABLE), implemented and proven by spike S3."
             },
             {
               "title": "Add cancellation abstraction",
               "status": "done",
-              "note": "Contract implemented and revised after API review: Arc<dyn CancelHandle>, CancelKind::{Native,PreArmedDeadline,Unsupported}, CancelOutcome, SessionState (ADR-0002 D2 + amendments). Driver-level cancel pending spike S4 — the call-timeout fallback was disproved as an on-demand cancel."
+              "note": "Contract implemented and revised after API review: Arc<dyn CancelHandle>, CancelKind::{Native,PreArmedDeadline,Unsupported}, CancelOutcome, SessionState (ADR-0002 D2 + amendments). Driver-level cancel evaluated in spike S4 and fails for the requirement — no on-demand cancel exists with oracledb 26.0.0-beta.3; ADR-0001 re-opened, owner decision pending."
             }
           ]
         },
@@ -756,55 +773,68 @@
           "tasks": [
             {
               "title": "Connect/disconnect/ping",
-              "status": "todo"
+              "status": "done",
+              "note": "Spike S1 — pass."
             },
             {
               "title": "SELECT",
-              "status": "todo"
+              "status": "done",
+              "note": "Spikes S2/S3/S5 — pass."
             },
             {
               "title": "DML",
-              "status": "todo"
+              "status": "done",
+              "note": "Spike S3 — pass."
             },
             {
               "title": "PL/SQL anonymous block",
-              "status": "todo"
+              "status": "done",
+              "note": "Spike S5 — pass."
             },
             {
               "title": "IN/OUT/IN OUT binds",
-              "status": "todo"
+              "status": "done",
+              "note": "Spike S5 — pass."
             },
             {
               "title": "REF CURSOR",
-              "status": "todo"
+              "status": "done",
+              "note": "Spike S5 — pass, after contract fix C-1."
             },
             {
               "title": "COMMIT/ROLLBACK/SAVEPOINT",
-              "status": "todo"
+              "status": "done",
+              "note": "Spike S3 — pass."
             },
             {
               "title": "CLOB/NCLOB/BLOB",
-              "status": "todo"
+              "status": "done",
+              "note": "Spike S7 — pass; 100 MB CLOB and BLOB streamed, +4.7 MB working set."
             },
             {
               "title": "DBMS_OUTPUT",
-              "status": "todo"
+              "status": "done",
+              "note": "Spike S5 — pass, including Thai text."
             },
             {
               "title": "Long-running query cancellation",
-              "status": "todo"
+              "status": "blocked",
+              "note": "Fails for the requirement (spike S4): no mechanism stops a statement and keeps the session in the general case. See ADR-0001 'Spike outcome' section."
             },
             {
               "title": "TCPS",
-              "status": "todo"
+              "status": "todo",
+              "note": "Spike S8 not run — the Phase 0 test DB has no TCPS listener."
             },
             {
               "title": "Network-loss behavior",
-              "status": "todo"
+              "status": "todo",
+              "note": "Not directly spiked; only recovery-path failure modes seen incidentally during S4 (U-6, U-7)."
             },
             {
               "title": "Concurrent independent sessions",
-              "status": "todo"
+              "status": "done",
+              "note": "Spike S9 — pass; 8 sessions, 400 inserts, 282.8 ms."
             }
           ]
         },
@@ -813,22 +843,57 @@
           "tasks": [
             {
               "title": "Windows x64",
-              "status": "todo"
+              "status": "done",
+              "note": "Build, connect and the full spike matrix all run locally, 2026-09-19."
             },
             {
               "title": "Linux x64",
-              "status": "todo"
+              "status": "todo",
+              "note": "CI configured for build + unit tests only, no DB; not yet run for this branch — pending PR/CI."
             },
             {
               "title": "macOS ARM64",
-              "status": "todo"
+              "status": "todo",
+              "note": "CI configured for build + unit tests only, no DB; not yet run for this branch — pending PR/CI."
             },
             {
               "title": "Android ARM64 physical device",
-              "status": "todo"
+              "status": "todo",
+              "note": "Spike S6 not run — needs the Android NDK; owner approval to download."
             },
             {
               "title": "iOS/iPadOS ARM64 physical device",
+              "status": "todo",
+              "note": "Not started."
+            }
+          ]
+        },
+        {
+          "title": "Follow-ups / owner actions",
+          "tasks": [
+            {
+              "title": "Owner: decide cancellation path (ADR-0001 re-opened)",
+              "status": "todo"
+            },
+            {
+              "title": "Owner: submit the four drafted upstream issues (phase-0-spike-results.md §6)",
+              "status": "todo"
+            },
+            {
+              "title": "Third-party notices file before any binary distribution",
+              "status": "todo",
+              "note": "63 third-party crates in the oracle-thin dependency graph, all permissive but attribution is required."
+            },
+            {
+              "title": "Test DB: TCPS listener (S8)",
+              "status": "todo"
+            },
+            {
+              "title": "Test DB: container memory cap",
+              "status": "todo"
+            },
+            {
+              "title": "S6 Android/iOS cross-compile check (needs NDK / macOS)",
               "status": "todo"
             }
           ]
@@ -850,6 +915,11 @@
             {
               "title": "Thin C++ ↔ Rust FFI adapter",
               "status": "todo"
+            },
+            {
+              "title": "Non-blocking open_session + per-session completion/event queue for the Qt adapter",
+              "status": "todo",
+              "note": "Deferred by ADR-0002 amendment."
             },
             {
               "title": "Connection Manager",
@@ -1158,6 +1228,30 @@
   ],
   "activity": [
     {
+      "date": "2026-09-20",
+      "text": "Docs synced to the Phase 0 spike evidence: ADR-0001 status set to 'Accepted — S4 kill criterion FIRED; owner decision pending' with a Spike outcome section; ADR-0002 gets a JSON/XMLTYPE/VECTOR/OBJECT/BFILE describe-time-refusal carve-out; ARCHITECTURE.md, phase-0.md, TASKS.md, README.md and this dashboard updated to match; spec-change-proposals.md added for the owner."
+    },
+    {
+      "date": "2026-09-19",
+      "text": "Independent review of the oracle-thin wrapper (4 must-fix): fixed a false-negative NUMBER guard, a re-execution gap in the U-3 TSTZ containment, mis-routed parenthesised/WITH/commented queries, and LOB read failures mis-reported as DataConversion with the session marked Usable. Commit db38c14."
+    },
+    {
+      "date": "2026-09-19",
+      "text": "Independent review of the db-core session layer (7 must-fix): only-plain-data-crosses-threads enforced for LOB handles, close() lifecycle and CloseDisposition corrected, the cancel-race window documented, panic containment and the Closed session lifecycle added, handles made session-scoped. Commit 86f79d7."
+    },
+    {
+      "date": "2026-09-19",
+      "text": "REF CURSOR made ownable via OutValues::take_named/take_positional (contract fix C-1, ADR-0002 amendment P1); TIMESTAMP WITH TIME ZONE named-region abort (U-3) contained by refusing the column at describe time. Commit 9be926d."
+    },
+    {
+      "date": "2026-09-19",
+      "text": "oracledb (=26.0.0-beta.3) wrapped in crates/drivers/oracle-thin; spikes S1-S5, S7, S9 run against the live Oracle 19.3 test DB — all pass except S2 (partial, upstream NUMBER/TSTZ defects contained) and S4 (fails for the requirement — no on-demand cancel). Commit 4a0cd9a."
+    },
+    {
+      "date": "2026-09-19",
+      "text": "Mock driver and db-core session layer built: worker-thread-per-session, FIFO command queue, conservative transaction tracking. Commit 3c7bcac."
+    },
+    {
       "date": "2026-09-19",
       "text": "Independent API review of db-driver-api: 7 must-fix + should-fix items applied; cancel contract re-scoped to PreArmedDeadline/Native; NUMBER widened to 40 digits; S4 re-scoped."
     },
@@ -1199,7 +1293,6 @@
     }
   ]
 }
-
 </script>
 
 <div id="error-banner" role="alert" hidden></div>

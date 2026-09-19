@@ -22,49 +22,58 @@ This file is the human-readable current task board. Detailed active execution pl
 
 ## P0 — Architecture validation
 
-See `docs/exec-plans/active/phase-0.md`.
+See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the statuses below,
+`docs/exec-plans/active/phase-0-spike-results.md` (run 2026-09-19).
 
 - [x] Local Oracle 19c Docker test database (tools/oracle-test-db)
 
 ### Driver/core
 - [x] Create Rust workspace
 - [x] Create `db-driver-api`
-- [~] Create `db-core`
-- [ ] Create initial database driver implementation — wrap Oracle's official `oracledb` crate (`oracle/rust-oracledb`, pinned exact version) in `crates/drivers/oracle-thin` (ADR-0001)
+- [x] Create `db-core` (session layer implemented: worker-thread-per-session, FIFO queue, out-of-band cancel, conservative transaction tracking incl. locking queries, `CloseDisposition`, terminal `Lost`/`Closed` lifecycle, core-owned `ResultId`/`LobHandle`, bounded `Drop`, `SessionLimits`, panic containment; independently reviewed, 7 must-fix applied, commit `86f79d7`)
+- [x] Create initial database driver implementation — wrap Oracle's official `oracledb` crate (`oracle/rust-oracledb`, pinned exact version `=26.0.0-beta.3`) in `crates/drivers/oracle-thin` (ADR-0001); independently reviewed, 4 must-fix applied, commit `db38c14`
 - [ ] Add driver contract tests that detect behaviour changes on `oracledb` upgrades
-- [ ] **(S4 critical path)** Draft upstream request to `oracle/rust-oracledb` for a public statement-cancel/break API — plus accessors for `OracleNumber` digits and the connection's transaction-in-progress flag (owner to submit)
+- [x] **(S4 critical path)** Draft upstream request to `oracle/rust-oracledb` for a public statement-cancel/break API — plus accessors for `OracleNumber` digits and the connection's transaction-in-progress flag (four issues drafted in full: `docs/exec-plans/active/phase-0-spike-results.md` §6 — nothing has been submitted; see the separate owner task below)
 - [x] Add normalized `DbError`
 - [~] Add connection/profile model (driver-level connection params done; user-facing profile model pending)
-- [~] Add session abstraction (contract in db-driver-api; db-core implementation pending)
-- [~] Add transaction abstraction (contract in db-driver-api; db-core implementation pending)
-- [x] Add cancellation abstraction (contract; driver-level cancel pending spike S4 — call-timeout fallback disproved as on-demand cancel, it is a pre-armed deadline only)
+- [x] Add session abstraction (`db-core` `DatabaseSession` implemented and hardened; see above)
+- [x] Add transaction abstraction (`db-core` conservative tracking, incl. locking queries, implemented and proven by spike S3)
+- [x] Add cancellation abstraction (contract implemented; driver-level mechanism evaluated in spike S4 and **fails for the requirement** — only a pre-armed per-round-trip deadline exists, no on-demand cancel; ADR-0001 re-opened, owner decision pending)
 
 ### Functional POC
-- [ ] Connect/disconnect/ping
-- [ ] SELECT
-- [ ] DML
-- [ ] PL/SQL anonymous block
-- [ ] IN/OUT/IN OUT binds
-- [ ] REF CURSOR
-- [ ] COMMIT/ROLLBACK/SAVEPOINT
-- [ ] CLOB/NCLOB/BLOB
-- [ ] DBMS_OUTPUT
-- [ ] Long-running query cancellation
-- [ ] TCPS
-- [ ] Network-loss behavior
-- [ ] Concurrent independent sessions
+- [x] Connect/disconnect/ping (spike S1 — pass)
+- [x] SELECT (spikes S2/S3/S5 — pass)
+- [x] DML (spike S3 — pass)
+- [x] PL/SQL anonymous block (spike S5 — pass)
+- [x] IN/OUT/IN OUT binds (spike S5 — pass)
+- [x] REF CURSOR (spike S5 — pass, after contract fix C-1)
+- [x] COMMIT/ROLLBACK/SAVEPOINT (spike S3 — pass)
+- [x] CLOB/NCLOB/BLOB (spike S7 — pass; 100 MB CLOB and BLOB streamed, +4.7 MB working set)
+- [x] DBMS_OUTPUT (spike S5 — pass, including Thai text)
+- [!] Long-running query cancellation — **fails for the requirement** (spike S4: no mechanism stops a statement and keeps the session in the general case; see ADR-0001 "Spike outcome" section and `phase-0-spike-results.md` §4)
+- [ ] TCPS (spike S8 — not run; the Phase 0 test DB has no TCPS listener)
+- [ ] Network-loss behavior (not directly spiked; only recovery-path failure modes seen incidentally during S4, recorded as U-6/U-7)
+- [x] Concurrent independent sessions (spike S9 — pass; 8 sessions, 400 inserts, 283 ms)
 
 ### Platform validation
-- [ ] Windows x64
-- [ ] Linux x64
-- [ ] macOS ARM64
-- [ ] Android ARM64 physical device
-- [ ] iOS/iPadOS ARM64 physical device
+- [x] Windows x64 (build, connect, and the full spike matrix all run locally, 2026-09-19)
+- [ ] Linux x64 (CI configured for build + unit tests only, no DB; not yet run for this branch — pending PR/CI)
+- [ ] macOS ARM64 (CI configured for build + unit tests only, no DB; not yet run for this branch — pending PR/CI)
+- [ ] Android ARM64 physical device (spike S6 not run — needs the Android NDK; owner approval to download)
+- [ ] iOS/iPadOS ARM64 physical device (not started)
+
+- [ ] Owner: decide cancellation path (ADR-0001 re-opened)
+- [ ] Owner: submit the four drafted upstream issues (`docs/exec-plans/active/phase-0-spike-results.md` §6)
+- [ ] Third-party notices file before any binary distribution (dependency licences — 63 third-party crates in the oracle-thin graph, all permissive but attribution is required; see `phase-0-spike-results.md` §1)
+- [ ] Test DB: TCPS listener (S8)
+- [ ] Test DB: container memory cap
+- [ ] S6 Android/iOS cross-compile check (needs NDK / macOS)
 
 ## P1 — Desktop MVP
 
 - [ ] Qt Quick application shell
 - [ ] Thin C++ ↔ Rust FFI adapter
+- [ ] Non-blocking `open_session` + per-session completion/event queue for the Qt adapter (deferred by ADR-0002 amendment)
 - [ ] Connection Manager
 - [ ] Workspace shell
 - [ ] SQL Worksheet
