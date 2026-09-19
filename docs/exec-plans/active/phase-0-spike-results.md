@@ -579,6 +579,11 @@ SAN. For Reldex that is the right default and is left as it is; it does mean a
 customer whose server certificate carries only a CN, or who reaches the database
 by an address the certificate does not name, cannot connect at all.
 
+Since 2026-09-19 the driver no longer passes those two parameters through in
+silence: `SSL_SERVER_CERT_DN` is **refused** before any socket is opened and
+`SSL_SERVER_DN_MATCH` produces a warning. See the U-14 entry in §5 for the
+design and for what the owner still has to confirm.
+
 There is also no "insecure, no-verify" mode anywhere in the crate, so the
 separation the task allowed for — using one to tell "handshake works" apart from
 "trust works" — was neither possible nor needed: the `s_client` run had already
@@ -617,6 +622,12 @@ the TCPS DSN to use a name; see `tools/oracle-test-db/README.md`.)
 - `oracle.wallet_dir` (text) and `oracle.wallet_password` (secret) are the two
   new extension keys. The password must be an `ExtensionValue::Secret`; `Text`
   is refused, so it cannot reach a log through an ordinary `{:?}`.
+- **(2026-09-19)** a descriptor that sets `SSL_SERVER_CERT_DN` is **refused**
+  before any socket is opened, because this driver cannot pin a distinguished
+  name and would otherwise open a weaker session than the profile configured;
+  `oracle.allow_unenforced_server_cert_dn` is the third extension key and opts
+  out of that refusal. `SSL_SERVER_DN_MATCH` is accepted either way round and
+  reported through a warning. See the U-14 entry in §5.
 - A TLS failure now carries the `rustls` reason. Upstream's `Display` appends
   its cause, and this driver's error mapping used to replace the whole string
   with "the network stream failed" — so every TLS failure read identically and
@@ -631,7 +642,7 @@ the TCPS DSN to use a name; see `tools/oracle-test-db/README.md`.)
 |---|---|
 | **Mutual TLS (client certificates)** | Untested, and not combinable with a private CA: one `ewallet.pem` is read as a client certificate **or** as a set of roots, never both (U-13). The test listener runs `SSL_CLIENT_AUTHENTICATION = FALSE`. |
 | **Oracle wallets** | Not read at all. `cwallet.sso`, `ewallet.p12`, `MY_WALLET_DIRECTORY` in a descriptor: none of them reach the TLS layer. A customer with an existing wallet must export a PEM (U-12). |
-| **`SSL_SERVER_DN_MATCH` / `SSL_SERVER_CERT_DN`** | Parsed and sent to the server, never used by the client (U-14). |
+| **`SSL_SERVER_DN_MATCH` / `SSL_SERVER_CERT_DN`** | Parsed and sent to the server, never used by the client (U-14). Since 2026-09-19 the driver refuses `SSL_SERVER_CERT_DN` and warns about `SSL_SERVER_DN_MATCH` rather than forwarding either silently; neither is *implemented*, and DN matching remains impossible. |
 | **TLS 1.3, and anything but the two GCM suites** | 19.3 has no TLS 1.3. A listener hardened to TLS 1.0/1.1 or to CBC suites cannot talk to this driver. |
 | **Certificate revocation** | No CRL or OCSP anywhere in the crate. An expired certificate is caught; a revoked one is not. |
 | **Native Network Encryption** | Still absent upstream (ADR-0001, §5 table), and unrelated to TCPS. |
@@ -1509,6 +1520,97 @@ reported rather than worked around, but silently ignoring a security parameter
 is worse than rejecting it: a caller that believes it turned verification off
 should be told it did not. Drafted as part of **Issue E**.
 
+#### Reldex-side guard — **implemented as proposed, pending owner confirmation**
+
+2026-09-19. The two parameters are not alike, and the guard treats them
+differently for that reason:
+
+- **`SSL_SERVER_CERT_DN` is refused** (`ErrorKind::Configuration`, before any
+  socket is opened), because it asks for something *stronger* than what this
+  driver does — the server certificate's whole distinguished name, pinned — and
+  nothing applies it. Opening the session anyway is the silent downgrade the
+  paragraph above calls worse than a rejection. The new extension key
+  `oracle.allow_unenforced_server_cert_dn` opts out, as an
+  `ExtensionValue::Flag(true)` and nothing else (a malformed value leaves the
+  refusal standing, exactly as `oracle.allow_timestamp_with_time_zone` does),
+  and turns the refusal into a warning that the pin was not applied.
+- **`SSL_SERVER_DN_MATCH` is never refused**, whichever way it points. Asking
+  for matching *on* asks for nothing that is not already happening; asking for
+  it *off* cannot be honoured. Either way the session that opens is at least as
+  safe as the one configured, so it opens, with a warning saying which of the
+  two happened.
+- **A certificate name failure under either parameter** gets one extra sentence
+  saying that the name checked is the descriptor's `HOST` against
+  `subjectAltName`, not the DN — otherwise the obvious next move is to edit a
+  parameter that does nothing. The `rustls` failure is recognized by markers
+  **rendered by the linked `rustls` itself** rather than transcribed, and a unit
+  test fails loudly if a future version stops producing something usable;
+  `oracledb` keeps the underlying error private and exposes it only through
+  `Display`, so text is the only available signal.
+
+Detection reads the descriptor twice, because neither source sees everything:
+the connect string as the caller wrote it (a deliberately dumb case-insensitive
+substring scan — quote-aware cleverness is what loses a real occurrence to an
+unbalanced quote, and a false positive costs an edit while a false negative
+costs the guarantee), and the descriptor `get_connect_descriptor` rebuilt, which
+is the only source when the connect string was a `tnsnames.ora` alias. The
+second is read by different rules: upstream writes `(SSL_SERVER_DN_MATCH=ON)`
+into **every** TCPS descriptor because the flag defaults to true, so its
+presence there means nothing — its absence from an emitted `(SECURITY=…)`
+segment is what means the caller switched it off.
+
+Reading a *value* is where this first went wrong, and the correction is worth
+recording because it is the whole failure mode in miniature. The scanner must
+agree with upstream about "empty", and upstream means `Node::has_value` —
+`!value.is_empty()` on the value **as stored**. `parse_descriptor_value` honours
+only `"` as a delimiter and does **not** trim a quoted value; a bare value it
+does trim. A first version treated `'` as a quote as well and trimmed both, so
+`(SSL_SERVER_CERT_DN=''CN=db,O=Acme'')`, `(SSL_SERVER_CERT_DN='')`,
+`(SSL_SERVER_CERT_DN=" ")` and a quoted tab all read as empty here while
+upstream kept and forwarded the pin — the first of them opening a session with
+no refusal and no warning, which is exactly the silent downgrade the guard
+exists to stop. Found in review, fixed, and pinned by
+`the_guard_never_sees_less_than_upstream_keeps`, which asserts against
+`oracledb` itself (`Config::set_connect_string` + `get_connect_descriptor`)
+rather than against a second reading of its source, and refuses to pass
+vacuously. The rule the module now states: wherever the guard's notion of
+"present" can disagree with upstream's, it must err towards **present**.
+
+**Known limitation — a plaintext `tnsnames.ora` alias is not covered.**
+`build_description_segment` emits the `SECURITY` segment only when an address
+says TCPS, so an alias whose entry is `(PROTOCOL=TCP)` plus
+`(SECURITY=(SSL_SERVER_CERT_DN=…))` is rendered with the segment stripped, and
+the connect string is only the alias name — neither source sees it (the same
+applies to `SSL_SERVER_DN_MATCH=OFF` on a TCP alias). A descriptor written out
+in full is covered whatever its protocol; only the alias indirection hides it.
+Left open rather than worked around: closing it would mean parsing
+`tnsnames.ora` in this driver, a second divergent implementation of exactly the
+thing whose divergence the paragraph above is about, and the entry is plaintext
+so there is no TLS session whose guarantee could be weaker than advertised.
+`a_tcps_alias_is_seen_through_upstream_and_a_plaintext_alias_is_not` asserts
+both the alias path working and the limitation, so a future upstream that
+renders the segment unconditionally turns it into a failing test.
+
+Upstream's Easy Connect parser has no query-parameter arm at all
+(`connect_string_parser.rs`: protocol, hosts, service name, server type,
+instance name, and trailing text silently discarded), so
+`tcps://host:2484/SVC?ssl_server_dn_match=no` never reaches upstream as a
+parameter. The scan covers that form anyway, which is the conservative
+direction: the caller is told the setting does nothing instead of believing it
+works. Its value terminates at `&` and `;` as well as at a parenthesis — without
+that, `?ssl_server_dn_match=on&retry_count=3` read as the value
+`on&retry_count=3`, which is not `on`, and a user who had switched matching
+**on** was told it could not be switched off. The two parameters use different
+terminator sets on purpose: `SSL_SERVER_CERT_DN` keeps the narrower one, because
+every extra terminator can only shorten a value and the one thing that must
+never happen to a pin is being shortened to nothing.
+
+Code: `crates/drivers/oracle-thin/src/descriptor.rs`, wired in `conn.rs`'s
+`build_config`; diagnostics in `error.rs`. Warnings reach the caller on the
+first statement that succeeds — see contract gap **C-6** in §7, which is what
+this implementation had to work around. **This is the design the lead proposed;
+the owner has not confirmed it** (§9 item 7).
+
 ### U-15 — **A connect cannot be bounded in time at all**
 
 `client/mod.rs:616` opens the socket with a bare `TcpStream::connect(sock_addr)`
@@ -2150,6 +2252,84 @@ is bounded by the user's own retries — but it is the owner's call, and it shou
 be made alongside the upstream request (Issue F), which would remove the need
 for it entirely.
 
+### C-6 — there is no connect-time warning channel — **open, worked around**
+
+Found while implementing the U-14 guard (2026-09-19).
+`DatabaseDriver::connect` returns `DbResult<Box<dyn DatabaseConnection>>`: a
+connection or an error, with nothing in between. `Warning` — the contract's own
+type for "non-fatal, worth showing" — travels only on an `ExecutionOutcome`. So
+a driver that notices something while opening a session can refuse the session
+or stay silent, and there is no third answer.
+
+That was adequate while every connect-time finding was fatal. The U-14 guard
+makes it inadequate: `SSL_SERVER_CERT_DN` is a refusal, but `SSL_SERVER_DN_MATCH`
+is deliberately **not** one — the session that opens verifies the server more
+strictly than the parameter asked for — and the caller still has to be told the
+parameter did nothing, or a profile imported from another Oracle tool goes on
+believing it configured something.
+
+*Worked around, not redesigned.* The driver holds the findings on the
+connection (`OracleConnection::pending_warnings`) and attaches them to the
+**first statement that succeeds**, which reaches the user through the existing
+path end to end: `ExecutionOutcome::warnings` → `worker.rs` →
+`db-core::ExecuteOutcome::warnings`. Nothing in `db-driver-api` changed, and no
+Oracle vocabulary entered it.
+
+#### Evidence
+
+Run 2026-09-19 on the machine in §1, `pwsh tools/oracle-test-db/run-it.ps1
+s8_tcps --nocapture` against `reldex-oracle19c`: **12 passed, 0 failed**, 44.8 s.
+The test is
+`a_descriptor_that_sets_dn_matching_opens_a_session_and_reports_the_parameter_as_inert`.
+It rewrites the configured TCPS DSN as a full descriptor with
+`(SECURITY=(SSL_SERVER_DN_MATCH=YES))`, opens the session, runs
+`SELECT 1 FROM dual`, and finds the finding on that outcome:
+
+```text
+OBSERVATION SSL_SERVER_DN_MATCH=YES -> session opened; warning: this connection's
+endpoint sets SSL_SERVER_DN_MATCH, which this driver does not use: the Oracle crate
+it wraps sends the parameter to the server and its TLS layer never reads it
+(upstream gap U-14). The server's identity is verified regardless — the host name
+from the descriptor's HOST is matched against the certificate's subjectAltName on
+every TCPS session, which is stricter than a distinguished-name match rather than
+weaker — so the parameter asks for nothing that is not already happening
+```
+
+It then runs `SELECT 2 FROM dual` and asserts that outcome's warnings are
+**empty**, so the finding is delivered once rather than on every statement. The
+same run covers the other half: the descriptor pinning a DN is refused with
+`ErrorKind::Configuration` against a port nothing listens on
+(`a_descriptor_that_pins_a_distinguished_name_is_refused_before_the_network_is_touched`)
+— a refusal that had come from the network would have been
+`ErrorKind::Connection`, which is what spike S1 measures for a closed port.
+
+Its one hole, stated rather than hidden: a connection that is opened, pinged and
+closed without ever executing a statement never delivers the finding. That is
+why the case that actually weakens a session — the unenforceable DN pin — is an
+**error** and not a warning: it does not depend on this path at all.
+
+*Minimal proposal, if the owner wants the gap closed properly.* One additive,
+vendor-neutral method with a default body, so no existing driver breaks:
+
+```rust
+pub trait DatabaseConnection: Send {
+    /// Non-fatal messages produced while this connection was being opened.
+    ///
+    /// Taken rather than borrowed, so each is reported once. The default is
+    /// empty, for a driver with nothing to say.
+    fn take_connect_warnings(&mut self) -> Vec<Warning> {
+        Vec::new()
+    }
+}
+```
+
+`db-core` would call it once in `worker.rs` where `driver.connect(params)`
+returns, and carry the result out of `SessionManager::open_session` beside the
+`ConnectionId` — roughly ten lines in the contract and twenty in the core. It
+removes the "first statement" coupling entirely. Not done here: `db-driver-api`
+is frozen, and C-1 is the precedent that an additive change to it needs the
+lead's approval rather than a driver author's judgement.
+
 ---
 
 ## 8. Secret handling
@@ -2316,13 +2496,25 @@ own. Their verdicts against `SPEC.md` §8's operations list:
    configuration precisely in `SPEC.md` §8 rather than to say "TCPS supported",
    and to treat U-12's `ewallet.p12` support as the upstream request that most
    affects real deployments. `SPEC.md` is not owned by this task.
-7. **Whether `SSL_SERVER_DN_MATCH` being silently ignored (U-14) needs a
-   Reldex-side guard.** A connection profile imported from another tool may
-   carry it; upstream accepts and ignores it, so the session verifies the name
-   anyway and fails where the user expected it to succeed. This driver could
-   refuse a descriptor containing it, with a message saying why. Not done:
-   `Endpoint::ConnectString` is deliberately opaque, and one more special case
-   in it needs the owner's call.
+   **Updated 2026-09-19:** the scope statement now has one more clause to make,
+   because of item 7's guard — a descriptor carrying `SSL_SERVER_CERT_DN` is
+   **refused** rather than connected, so "TCPS supported" would be wrong in a
+   second direction as well.
+7. ~~**Whether `SSL_SERVER_DN_MATCH` being silently ignored (U-14) needs a
+   Reldex-side guard.**~~ **Implemented as proposed by the lead, pending owner
+   confirmation** (2026-09-19). The answer turned out to depend on *which*
+   parameter: `SSL_SERVER_CERT_DN` asks for a guarantee nothing delivers and is
+   now **refused** before any socket is opened, with
+   `oracle.allow_unenforced_server_cert_dn` as the opt-out;
+   `SSL_SERVER_DN_MATCH` is **never refused**, because the session that opens is
+   at least as safe as the one it asked for, and is reported through a warning
+   instead. A certificate name failure under either parameter now says which
+   name was actually checked. See the U-14 entry in §5 for the mechanism and the
+   limits, and **C-6** in §7 for the contract gap the warning path had to work
+   around. The owner still has to confirm this is the behaviour they want,
+   because it makes an imported connection profile that carries
+   `SSL_SERVER_CERT_DN` stop connecting until it is edited or the extension is
+   set.
 8. **What to do about `connect_timeout` (C-5, U-15).** The contract offers it,
    the driver ignores it, and nothing else can bound a connect — 22.0 s against
    an unroutable address, unbounded against a black hole. Three options are set
@@ -2330,6 +2522,14 @@ own. Their verdicts against `SPEC.md` §8's operations list:
    recommendation is to implement it, because a desktop client must be able to
    bound a connect, but it changes `connect()`'s threading for every caller and
    is therefore not a change to make without the owner.
+
+   **Owner decision (2026-09-19):** option 3, as recommended. The driver will
+   honour `ConnectionParams::connect_timeout` itself by running the upstream
+   connect on a helper thread and giving up once the limit passes — the
+   abandoned attempt is left to finish or fail on its own, and no session is
+   ever adopted after the limit. Default **15 seconds**; user-configurable per
+   connection profile, including "no limit". Status: approved, implementation
+   pending.
 9. **Whether Reldex should arm a default deadline on every call, and what to
    tell the user about a silent link.** S10 measured the shape of the problem:
    with no deadline a black-holed link never returns (U-17); with one, the
@@ -2339,18 +2539,46 @@ own. Their verdicts against `SPEC.md` §8's operations list:
    UI, or no default and a user-visible cancel that cannot actually stop the
    call. Both need the UI to exist, so the decision can wait — but it must not
    be made by accident.
+
+    **Owner decision (2026-09-19):** Reldex arms a default per-statement time
+    limit on worksheet statements. Initial default **600 seconds**, to be
+    revisited with real usage in Phase 1. User-configurable at three levels —
+    application default, connection profile, and per worksheet/statement —
+    including "no limit", which the UI must accompany with a plain explanation
+    of the consequence (a hung statement can then only be abandoned by closing
+    the session). The constraints already stated in `SPEC.md` §10 are
+    unchanged: the limit must never be presented as Cancel, the UI states
+    before running that a limit applies, and when the limit fires the session
+    may be lost (U-6) and the UI says so honestly.
 10. **Whether the Phase 0 test database should set `SQLNET.EXPIRE_TIME`, and
     whether Reldex should tell customers to.** It is unset today, which is why
     S10 measured a dead client holding a row lock for the full 20 s budget. This
     is a database-configuration recommendation Reldex may need to document
     (server-side dead connection detection is the only thing that protects other
     users from a Reldex client that vanished), not something the driver can fix.
+
+    **Owner decision (2026-09-19):** documentation recommendation only. Reldex
+    cannot enforce or detect `SQLNET.EXPIRE_TIME`; user-facing docs and
+    connection troubleshooting material recommend DBAs set it (e.g. 10
+    minutes) server-side so locks held by dead clients are released. The
+    Phase 0 test database stays unset, because S10's measurements depend on
+    that; a note in the test-DB documentation is tracked as a follow-up task
+    rather than made here.
 11. **`CREATE TRIGGER` (U-18).** The driver now explains the failure and names
     the `EXECUTE IMMEDIATE q'[…]'` workaround, but it does **not** apply the
     workaround itself, because that silently changes a DDL statement into a
     PL/SQL block and moves any error position — which `SPEC.md` §24.14 cares
     about. Whether Reldex's editor should offer to rewrite the statement (with
     the rewrite visible to the user) is a product decision. Issue G is drafted.
+
+    **Owner decision (2026-09-19):** the database driver (vendor-specific
+    code, not core) rewrites such DDL automatically into
+    `BEGIN EXECUTE IMMEDIATE q'[…]'; END;` (choosing a quote delimiter that
+    cannot collide with the body), **on by default**, always tells the user it
+    did so — a warning on the outcome, with the statement actually sent
+    available for inspection — and can be turned **off** by the user
+    (connection-level setting), in which case the existing explanatory
+    refusal is returned. Status: approved, implementation pending.
 12. **Which fetch batch size Reldex should default to.** S14 found throughput is
     **not** monotonic in the batch size — 10 000 rows per fetch was 3.5× slower
     than the best of 100 and 1 000, and cost up to 1.1 s before the first row
@@ -2359,3 +2587,20 @@ own. Their verdicts against `SPEC.md` §8's operations list:
     is enough to forbid assuming "bigger is faster", not enough to pick a
     number. A short follow-up measurement across row shapes and a real network
     should precede the choice.
+
+    **Owner decision (2026-09-19):** no number is chosen now. The default will
+    be set from a benchmark during Phase 1 UI work; until then the driver's
+    current default stays. It must be a user setting (application default and
+    per connection profile) within a bounded range.
+
+13. **New: connect-time warning channel (contract gap C-6).** Approved in
+    principle: add one additive, vendor-neutral, defaulted method to the
+    driver contract (a `take_connect_warnings`-style method on
+    `DatabaseConnection`) and have `db-core` collect it once after connect,
+    recorded as an amendment to ADR-0002 when implemented. C-6 itself is
+    documented in full on another, still-unmerged branch — pull request #5,
+    the TCPS descriptor guard — and is not otherwise written up in this
+    results file; the detailed write-up arrives with that pull request, and
+    implementation is sequenced after it lands. **Owner decision
+    (2026-09-19):** approved in principle, as above; implementation is
+    sequenced after pull request #5.

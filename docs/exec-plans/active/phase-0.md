@@ -149,7 +149,10 @@ For every mapping, document:
   with certificate and host-name verification on, confirmed server-side; trust comes from a
   user-supplied PEM. Not available upstream: mTLS with a private CA, Oracle wallet files, OS trust
   store, revocation, `SSL_SERVER_DN_MATCH` (U-12…U-14). `TlsMode::Required` refuses non-TCPS endpoints
-  rather than silently connecting in plaintext.
+  rather than silently connecting in plaintext, and (2026-09-19) a descriptor that sets
+  `SSL_SERVER_CERT_DN` is refused rather than connected with an unenforced pin, with
+  `oracle.allow_unenforced_server_cert_dn` as the opt-out; `SSL_SERVER_DN_MATCH` produces a warning.
+  Design proposed by the lead, **owner confirmation pending** (results file U-14 and §9 item 7).
 - [x] timeout behavior. Per spike S4's findings: a pre-armed deadline stops a long SQL statement
   about 0.5 s past the deadline with the session intact, but a fired deadline on a PL/SQL block the
   server will not interrupt promptly costs the connection entirely (upstream recovery defect U-6,
@@ -304,25 +307,38 @@ criterion's honest status is softened to make the table look more finished than 
   a physical iPhone/iPad.
 - TCPS (spike S8) — done 2026-09-20, pass with limits (see Workstream F); the remaining TCPS questions
   are owner decisions (results file §9 items 6–7).
-- Driver fix or owner-approved workaround for **C-5** (`ConnectionParams::connect_timeout` accepted
-  and ignored) — three options are set out in the results file §7 C-5; recommendation is to implement
-  it on a helper thread, but it changes `connect()`'s threading for every caller and needs the owner.
+- Driver fix for **C-5** (`ConnectionParams::connect_timeout` accepted and ignored) — **approved
+  2026-09-19**: implement on a helper thread, default 15 s, user-configurable per connection
+  profile including "no limit" (results file §9 item 8, ADR-0001 2026-09-19 addendum).
+  **Implementation pending.**
 - Owner approval to submit drafted upstream **issues F and G** (results file §6) — U-15…U-17
-  (timeouts/dead-link detection) and U-18 (`CREATE TRIGGER`).
+  (timeouts/dead-link detection) and U-18 (`CREATE TRIGGER`). **Still outstanding.**
 - **Watching for the fixes.** Each upstream defect that can be observed from a test now has a
   canary asserting it is *still there*
   (`crates/drivers/oracle-thin/tests/canary_upstream_{offline,live}.rs`), so a fix arrives as a
   failing test that names the guard it makes removable; a version tripwire fails as soon as the pin
   moves. See `oracledb-upgrade-checklist.md` for the per-U-number map and the manual checks.
-- **Owner decisions outstanding** (results file §9, full list): item 4 (relax the NUMBER-bind refusal
-  U-1 — recommendation: no), items 6–7 (how far TCPS is advertised to customers; whether to guard
-  against `SSL_SERVER_DN_MATCH` being silently ignored, U-14), item 8 (C-5 above), item 9 (whether
-  Reldex arms a default deadline on every call, and what the UI says about a silent link — U-6/U-17),
-  item 10 (whether the Phase 0 test database, and Reldex's customer guidance, should set
-  `SQLNET.EXPIRE_TIME`), item 11 (whether the editor should offer to rewrite `CREATE TRIGGER` DDL
-  through the `EXECUTE IMMEDIATE` workaround, U-18), item 12 (default fetch batch size — S14 found
-  throughput is not monotonic in batch size, which rules out assuming "bigger is faster" but is not
-  enough evidence to pick a number).
+- **Owner decisions from results file §9 — updated 2026-09-19.** Items 8–12 are now decided (see
+  `phase-0-spike-results.md` §9 and ADR-0001's 2026-09-19 addendum), each made user-configurable per
+  the owner's requirement: item 8 (`connect_timeout`, C-5) — helper thread, default 15 s,
+  **implementation pending**; item 9 (default per-statement time limit) — default 600 s,
+  configurable at three levels (application default, connection profile, per worksheet/statement)
+  including "no limit" with an explicit UI warning, `SPEC.md` §10 constraints unchanged; item 10
+  (`SQLNET.EXPIRE_TIME`) — documentation recommendation only, Phase 0 test database stays unset;
+  item 11 (`CREATE TRIGGER` U-18) — driver auto-rewrites via `EXECUTE IMMEDIATE` by default, always
+  reported to the user, off switch at connection level, **implementation pending**; item 12
+  (default fetch batch size) — deferred to a Phase 1 benchmark (S14 found throughput is not
+  monotonic in batch size), must be a user setting. A new **item 13** (connect-time warning
+  channel, contract gap C-6) is approved in principle: one additive
+  `take_connect_warnings`-style method on `DatabaseConnection`, collected once by `db-core` after
+  connect, recorded as an ADR-0002 amendment when implemented; its detailed write-up arrives with
+  pull request #5 (the TCPS descriptor guard), and implementation is sequenced after that PR.
+  **Still outstanding and undecided:** item 4 (relax the NUMBER-bind refusal U-1 — recommendation:
+  no).
+  **Items 6–7 confirmed by the owner 2026-09-19** by accepting pull request #5: TCPS is described
+  exactly as `SPEC.md` §8 states it, and the driver guards U-14 — a descriptor carrying
+  `SSL_SERVER_CERT_DN` is refused unless `oracle.allow_unenforced_server_cert_dn` is set,
+  `SSL_SERVER_DN_MATCH` is accepted with a warning (results file §9 items 6–7, U-14, C-6).
 
 This is a draft assessment for the owner's use, not a go/no-go decision — per "Deliverables" below,
 that decision is the owner's to make.

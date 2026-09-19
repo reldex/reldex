@@ -72,10 +72,23 @@
 //! store when it holds no private key. What is **not** available is the rest of
 //! Oracle's TLS configuration surface — `SSL_SERVER_DN_MATCH` and
 //! `SSL_SERVER_CERT_DN` are parsed from a descriptor and sent to the server, but
-//! upstream's TLS layer never reads them; there is no mutual-TLS *and* private-CA
-//! combination, because one `ewallet.pem` is read as one or the other; and
-//! `orapki`'s own wallet files are not read at all. See [`EXT_WALLET_DIR`] and
-//! upstream gaps U-12 to U-14 in the spike results.
+//! upstream's TLS layer never reads them (U-14); there is no mutual-TLS *and*
+//! private-CA combination, because one `ewallet.pem` is read as one or the
+//! other; and `orapki`'s own wallet files are not read at all. See
+//! [`EXT_WALLET_DIR`] and upstream gaps U-12 to U-14 in the spike results.
+//!
+//! Because U-14 is a parameter being *ignored* rather than a feature being
+//! absent, the two are not treated alike. A descriptor that sets
+//! `SSL_SERVER_CERT_DN` asks for something this driver cannot deliver — the
+//! server certificate's distinguished name pinned — so
+//! [`connect`](reldex_db_driver_api::DatabaseDriver::connect) **refuses it**
+//! before any socket is opened, rather than handing back a session with a
+//! weaker guarantee than the profile configured;
+//! [`EXT_ALLOW_UNENFORCED_SERVER_CERT_DN`] opts out of the refusal for a caller
+//! who accepts that. A descriptor that sets `SSL_SERVER_DN_MATCH` is always
+//! accepted, because host-name verification against `subjectAltName` is on
+//! unconditionally and cannot be turned off, and is reported through a warning
+//! so a profile that expected either answer is not left guessing.
 //!
 //! **The `rustls` crypto provider.** `rustls` resolves its default provider from
 //! the compiled-in features, which works while exactly one is enabled — today,
@@ -249,11 +262,13 @@ mod binds;
 mod classify;
 mod conn;
 mod cursor;
+mod descriptor;
 mod error;
 mod lob;
 mod value;
 
 pub use conn::{
-    EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE, EXT_STATEMENT_CACHE_SIZE, EXT_WALLET_DIR,
-    EXT_WALLET_PASSWORD, OracleThinDriver, install_default_crypto_provider,
+    EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE, EXT_ALLOW_UNENFORCED_SERVER_CERT_DN,
+    EXT_STATEMENT_CACHE_SIZE, EXT_WALLET_DIR, EXT_WALLET_PASSWORD, OracleThinDriver,
+    install_default_crypto_provider,
 };
