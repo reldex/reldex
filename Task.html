@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-20T23:55:00+07:00",
+  "updatedAt": "2026-09-19T23:59:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P0",
@@ -513,8 +513,8 @@
   },
   "summary": "Phase 0 — Architecture Validation. Core stack proven against Oracle 19.3: vendor-neutral driver contract, db-core session layer, and a wrapper over Oracle's official oracledb crate (pinned beta). Spikes S1, S3, S5, S7, S8 (TCPS, with limits), S9, S10 (network loss/reconnect, two upstream gaps), S11 (NCLOB), S12 (developer features, one upstream blocker), S13 (privileged connections) and S14 (large result) all pass; S2 is partial (NUMBER bind restrictions); S4 cancel is an accepted limitation (owner decision 2026-09-20: pre-armed per-statement deadline + honest UI; SPEC §24.8 unmet until upstream ships a break API). S6 (mobile cross-compile) passed 2026-09-19 in CI (PR #3) — cross-compile and link only, physical-device validation still outstanding. Five of seven drafted upstream issues (A–E) were submitted 2026-09-20 (#21–#25); F and G await the owner's go-ahead.",
   "focus": [
-    "Phase 0 exit assessment for the owner's go/no-go (phase-0.md)",
-    "Owner decisions outstanding: upstream issues F/G submission, C-5 connect_timeout approach, default deadline/EXPIRE_TIME guidance, CREATE TRIGGER rewrite, default fetch batch size, TCPS wording/SSL_SERVER_DN_MATCH guard (implemented, PR open, awaiting confirmation), C-6 connect-time warnings"
+    "Phase 0 closed: owner gave the go for Phase 1 on 2026-09-19",
+    "Carry-over driver work: connect_timeout (C-5), CREATE TRIGGER auto-rewrite (U-18), connect-time warning channel (C-6)"
   ],
   "blockers": [
     {
@@ -569,21 +569,19 @@
     {
       "title": "Black-holed connection hangs without a deadline; no keepalive upstream (U-15…U-17)",
       "detail": "Spike S10: a connect cannot be bounded at all (ConnectionParams::connect_timeout is accepted and ignored, C-5) — 22.0 s against an unroutable address, still outstanding after 30 s against a black hole. A black-holed link with no deadline armed never returns; the only deadline that ends it destroys the session (U-6). No TCP keepalive exists upstream and SQLNET.EXPIRE_TIME is parsed and never acted on, so a dead client's row lock blocked a second session for the full 20 s measured.",
-      "mitigation": "Documented as U-15…U-17 and drafted as upstream Issue F (awaiting the owner's go-ahead to submit). C-5 (connect_timeout) has three options recorded in phase-0-spike-results.md §7; owner decision pending (results file §9 items 8–10)."
+      "mitigation": "Documented as U-15…U-17 and drafted as upstream Issue F (awaiting the owner's go-ahead to submit). C-5 (connect_timeout) approved 2026-09-19: helper thread, default 15 s, user-configurable, implementation pending. Default per-statement time limit approved 2026-09-19: 600 s, a three-level user setting including \"no limit\" with an explicit UI warning (results file §9 items 8–9). SQLNET.EXPIRE_TIME server-side recommendation approved as documentation only (item 10); Reldex cannot enforce it."
     },
     {
       "title": "Trigger DDL with :NEW/:OLD cannot be executed directly (U-18) — workaround documented",
       "detail": "oracledb's SQL parser scans every statement, DDL included, for :name and treats each hit as a bind placeholder, so CREATE TRIGGER … BEGIN :NEW.col := …; END; fails with a missing-bind-values error.",
-      "mitigation": "The driver reports ErrorKind::Unsupported naming the cause and the workaround: submit the DDL inside BEGIN EXECUTE IMMEDIATE q'[…]'; END;, which the parser skips (proven in spike S12). Drafted as upstream Issue G (awaiting the owner's go-ahead). Whether Reldex's editor should offer to auto-rewrite the statement is owner decision item 11 (results file §9)."
+      "mitigation": "The driver reports ErrorKind::Unsupported naming the cause and the workaround: submit the DDL inside BEGIN EXECUTE IMMEDIATE q'[…]'; END;, which the parser skips (proven in spike S12). Drafted as upstream Issue G (awaiting the owner's go-ahead). Auto-rewrite approved 2026-09-19 (results file §9 item 11): the driver rewrites the DDL to BEGIN EXECUTE IMMEDIATE q'[…]'; END; by default, always reports the rewrite to the user with the sent statement available for inspection, and can be turned off per connection."
     }
   ],
   "nextSteps": [
     "Owner: approve submission of drafted upstream issues F and G (results file §6)",
     "Owner: provide an Android physical test device (+ local NDK) for physical-device validation; iOS needs a Mac + Apple Developer account + device",
-    "Owner: confirm TCPS wording + the SSL_SERVER_DN_MATCH / SSL_SERVER_CERT_DN guard — implemented as proposed, open as an unmerged pull request (results file §9 items 6–7); merge = accept",
-    "Owner: C-5 connect_timeout approach, default deadline/EXPIRE_TIME guidance, CREATE TRIGGER rewrite, default fetch batch size (results file §9 items 8–12)",
-    "Phase 0 go/no-go → Phase 1 (Qt Quick shell, thin C++/Rust FFI adapter)",
-    "Owner/lead: decide on the connect-time warning channel (contract gap C-6)"
+    "Implement approved 2026-09-19 decisions: connect_timeout (C-5) helper thread with a 15 s default, CREATE TRIGGER auto-rewrite (U-18) with an off switch, and the connect-time warning channel (C-6, sequenced after pull request #5)",
+    "Phase 0 go/no-go → Phase 1 (Qt Quick shell, thin C++/Rust FFI adapter)"
   ],
   "decisions": [
     {
@@ -599,6 +597,13 @@
       "status": "Accepted (owner confirmed 2026-09-20) — implemented; independently reviewed twice (API review, db-core session review), must-fix findings applied; amended after the Phase 0 spikes",
       "date": "2026-09-19",
       "link": "docs/decisions/0002-driver-api-and-concurrency-model.md"
+    },
+    {
+      "id": "OWNER-2026-09-19",
+      "title": "Owner decisions — results file §9 items 8–12 (connect_timeout, per-statement time limit, EXPIRE_TIME, trigger DDL rewrite, fetch batch size) plus item 13 (connect-time warning channel, C-6)",
+      "status": "Decided 2026-09-19, accepting the lead's recommendation for each with one added requirement: every behaviour must be user-configurable. Implementation pending for items 8, 11 and 13; items 9–10 are default/documentation only; item 12 deferred to a Phase 1 benchmark.",
+      "date": "2026-09-19",
+      "link": "docs/exec-plans/active/phase-0-spike-results.md"
     }
   ],
   "spikes": [
@@ -964,17 +969,13 @@
             },
             {
               "title": "Owner: decide how TCPS support is described to users and whether to refuse descriptors carrying SSL_SERVER_DN_MATCH (results file §9 items 6–7)",
-              "status": "todo"
+              "status": "done",
+              "note": "Confirmed by the owner 2026-09-19 (pull request #5 accepted): TCPS described as SPEC §8 states it; the driver guards U-14."
             },
             {
               "title": "Driver: TCPS descriptor guard (U-14) — refuse SSL_SERVER_CERT_DN unless explicitly allowed, warn on SSL_SERVER_DN_MATCH",
-              "status": "in_progress",
-              "note": "Implemented as the lead proposed and independently reviewed (3 must-fix applied); open as a pull request from phase-0/tcps-dn-guard, NOT merged — awaiting owner confirmation of results file §9 items 6–7."
-            },
-            {
-              "title": "Contract: connect-time warning channel (C-6)",
-              "status": "todo",
-              "note": "connect cannot return warnings; the driver attaches connect-time findings to the first successful statement. Proposal: one additive, vendor-neutral take_connect_warnings on DatabaseConnection (phase-0-spike-results.md §7 C-6)."
+              "status": "done",
+              "note": "Implemented, independently reviewed (3 must-fix applied), confirmed by the owner and merged 2026-09-19 (pull request #5)."
             },
             {
               "title": "S6 Android/iOS cross-compile check",
@@ -984,12 +985,32 @@
             {
               "title": "Driver: honour connect_timeout (C-5)",
               "status": "todo",
-              "note": "ConnectionParams::connect_timeout is accepted and ignored (phase-0-spike-results.md §7 C-5)."
+              "note": "ConnectionParams::connect_timeout is accepted and ignored (phase-0-spike-results.md §7 C-5); approved 2026-09-19: helper thread, default 15 s, user-configurable per connection profile including \"no limit\"."
             },
             {
               "title": "Owner decisions §9 items 8–12",
+              "status": "done",
+              "note": "Decided 2026-09-19: default per-statement deadline 600 s (three-level setting), EXPIRE_TIME documentation-only recommendation, trigger DDL auto-rewrite with an off switch, default fetch batch size deferred to a Phase 1 benchmark, C-5 helper-thread approach — every one made user-configurable per the owner's requirement (phase-0-spike-results.md §9)."
+            },
+            {
+              "title": "Driver: CREATE TRIGGER auto-rewrite for :NEW/:OLD (U-18)",
               "status": "todo",
-              "note": "Default deadline, EXPIRE_TIME recommendation, trigger DDL rewrite, default fetch batch size, C-5 approach."
+              "note": "Rewrite to BEGIN EXECUTE IMMEDIATE q'[…]'; END; on by default, always reported to the user as a warning with the statement actually sent available for inspection, off switch at connection level (approved 2026-09-19, phase-0-spike-results.md §9 item 11)."
+            },
+            {
+              "title": "Contract: connect-time warning channel (C-6)",
+              "status": "todo",
+              "note": "Additive take_connect_warnings-style method on DatabaseConnection, collected once by db-core after connect; approved in principle 2026-09-19, sequenced after pull request #5 (TCPS descriptor guard); record as an ADR-0002 amendment when implemented."
+            },
+            {
+              "title": "Docs: recommend SQLNET.EXPIRE_TIME in user-facing connection troubleshooting docs",
+              "status": "todo",
+              "note": "Owner decision 2026-09-19, phase-0-spike-results.md §9 item 10 (e.g. 10 minutes)."
+            },
+            {
+              "title": "Docs: note in tools/oracle-test-db/README.md that SQLNET.EXPIRE_TIME is left unset on purpose",
+              "status": "todo",
+              "note": "Follow-up so S10's measurements remain valid; not edited in this change."
             },
             {
               "title": "Android physical-device harness",
@@ -1066,12 +1087,22 @@
               "status": "todo"
             },
             {
+              "title": "Default per-statement time limit (600 s) as a three-level setting",
+              "status": "todo",
+              "note": "Application default, connection profile, per worksheet/statement; including a \"no limit\" option with an explicit UI warning about the consequence (owner decision 2026-09-19, SPEC §10)."
+            },
+            {
               "title": "Commit/Rollback",
               "status": "todo"
             },
             {
               "title": "Result Store",
               "status": "todo"
+            },
+            {
+              "title": "Fetch batch size as a user setting",
+              "status": "todo",
+              "note": "Application default + per connection profile, bounded range, informed by a Phase 1 benchmark to pick the shipped default (owner decision 2026-09-19, SPEC §12; phase-0-spike-results.md S14)."
             },
             {
               "title": "Virtualized Result Grid",
@@ -1331,6 +1362,14 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-19",
+      "text": "Owner confirmed results file §9 items 6–7 by accepting pull request #5 (TCPS descriptor guard, U-14) and gave the go for Phase 1. Upstream issues F and G stay drafted and unsubmitted by owner decision — kept for tracking only."
+    },
+    {
+      "date": "2026-09-19",
+      "text": "Owner decided results file §9 items 8–12 (connect_timeout default 15 s, per-statement time limit default 600 s, EXPIRE_TIME documentation recommendation, CREATE TRIGGER auto-rewrite with an off switch, fetch batch size deferred to a Phase 1 benchmark) plus item 13 (connect-time warning channel, C-6, approved in principle) — each made user-configurable per the owner's requirement. See phase-0-spike-results.md §9 and ADR-0001's 2026-09-19 addendum."
+    },
     {
       "date": "2026-09-20",
       "text": "TCPS descriptor guard for upstream gap U-14 implemented on branch phase-0/tcps-dn-guard: SSL_SERVER_CERT_DN is refused before any network I/O unless explicitly allowed, SSL_SERVER_DN_MATCH produces a warning, name-mismatch errors explain which name is checked. Independent review found a real false negative (single-quoted / whitespace pins) — fixed, with an agreement test against upstream's own parser. New contract gap C-6 (no connect-time warning channel). Pull request left unmerged for the owner."
