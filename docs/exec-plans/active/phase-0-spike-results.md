@@ -1218,7 +1218,11 @@ beside it (`error.rs`), not an oversight.
 > `IDENTIFIED BY "<value>"`, and `.env.example` shipped defaults that worked
 > against the image. Both were throwaway values for a container bound to
 > `127.0.0.1`, and neither is used anywhere else — but they were tracked, so
-> **they remain in git history** and history was not rewritten. What changed:
+> **they remain in git history** and history was not rewritten. On 2026-09-20,
+> before this branch was first pushed, the lead **rotated** the SYS/SYSTEM and
+> `RELDEX_TEST` passwords on the running container to random values stored only
+> in the untracked `.env` (S1 re-run green with the new values), so the strings
+> in history no longer open anything. What changed:
 >
 > - the `.sql` hook is gone, replaced by `init/01_create_test_user.sh`, which
 >   takes `RELDEX_TEST_USER` / `RELDEX_TEST_PWD` from the **container's
