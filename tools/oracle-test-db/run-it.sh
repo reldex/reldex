@@ -58,6 +58,25 @@ RELDEX_TEST_ORACLE_SYSTEM_USER='SYSTEM'
 RELDEX_TEST_ORACLE_SYSTEM_PASSWORD="$oracle_pwd"
 export RELDEX_TEST_ORACLE_SYSTEM_USER RELDEX_TEST_ORACLE_SYSTEM_PASSWORD
 
+# Spike S8 (TCPS). Set only when the TLS listener has been enabled and the
+# CA certificate exported (`startup/10_enable_tcps.sh`, then the export step in
+# README.md, "TCPS"); the S8 tests skip themselves and say so otherwise.
+#
+# `localhost`, not `127.0.0.1`: the listener's certificate carries the DNS name
+# and no IP address, and the client verifies whatever the descriptor's HOST
+# says. That is not a quirk of this setup — it is what S8 found, and
+# `s8_tcps.rs` has a test that depends on the numeric form failing.
+if [ -f "$here/wallet/ewallet.pem" ]; then
+    RELDEX_TEST_ORACLE_TCPS_DSN='tcps://localhost:2484/RELDEX'
+    RELDEX_TEST_ORACLE_TCPS_CA_DIR="$here/wallet"
+    export RELDEX_TEST_ORACLE_TCPS_DSN RELDEX_TEST_ORACLE_TCPS_CA_DIR
+    if [ -f "$here/wallet-untrusted/ewallet.pem" ]; then
+        RELDEX_TEST_ORACLE_TCPS_WRONG_CA_DIR="$here/wallet-untrusted"
+        export RELDEX_TEST_ORACLE_TCPS_WRONG_CA_DIR
+    fi
+    echo "tcps:     $RELDEX_TEST_ORACLE_TCPS_DSN (CA from $RELDEX_TEST_ORACLE_TCPS_CA_DIR)"
+fi
+
 echo "database: $RELDEX_TEST_ORACLE_USER@$RELDEX_TEST_ORACLE_DSN"
 
 cd "$repo"

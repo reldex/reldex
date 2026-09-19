@@ -288,8 +288,9 @@ Until then, no code should assume an answer.
    No async runtime below the FFI line; `db-core` uses one dedicated worker thread per session, owning
    `Box<dyn DatabaseConnection>` for that session's lifetime.
 5. **Cancellation mechanism — contract RESOLVED by [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) D2;
-   driver-level mechanism FAILED spike S4 — open, owner decision pending.** The contract is a
-   separate `Arc<dyn CancelHandle>`, `CancelKind::{Native, PreArmedDeadline, Unsupported}`, and
+   driver-level mechanism FAILED spike S4 — accepted limitation per owner decision, pending
+   upstream.** The contract is a separate `Arc<dyn CancelHandle>`,
+   `CancelKind::{Native, PreArmedDeadline, Unsupported}`, and
    `SessionState::{Usable, NeedsValidation, Lost}` reported on every `DbError`; that part is settled
    and implemented. Spike S4 (run 2026-09-19 against a live Oracle 19.3 database; see
    `docs/exec-plans/active/phase-0-spike-results.md` §4) found that `oracledb` 26.0.0-beta.3 offers
@@ -297,8 +298,10 @@ Until then, no code should assume an answer.
    statement with the session intact but destroys the connection for a PL/SQL block the server will
    not interrupt promptly. No mechanism it evaluated (pre-armed deadline, a privileged
    `ALTER SYSTEM CANCEL SQL`, a minimal fork) delivers an on-demand cancel that keeps the session
-   usable in the general case. `SPEC.md` §10/§24.8 "Cancel" is therefore **not met**, ADR-0001's kill
-   criterion fired, and the ADR is re-opened for the owner (ADR-0001 "Spike outcome (2026-09-20)").
+   usable in the general case. `SPEC.md` §10/§24.8 "Cancel" is therefore **not met**; ADR-0001's kill
+   criterion fired and the ADR re-opened, and on 2026-09-20 the owner decided to accept the limitation
+   — stay on `oracledb`, ship the pre-armed deadline with an honest UI, and pursue upstream fixes —
+   rather than change drivers (ADR-0001 "Owner decision (2026-09-20)").
 6. **Result store representation.** What is the in-memory row/batch layout, bounded-memory policy,
    and spill/eviction behavior? Does Arrow earn its place by benchmark (deferred to Phase 3)?
 7. **Error model shape — RESOLVED by [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) D3.**

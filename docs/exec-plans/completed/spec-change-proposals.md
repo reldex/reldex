@@ -1,10 +1,14 @@
 # Proposed `SPEC.md` changes — for the owner
 
+**Status: APPLIED to SPEC.md on 2026-09-20 with owner approval.** See "How each proposal was
+applied (2026-09-20)" near the end of this file for what changed and where. The proposals below are
+kept as written, as the record of what was proposed and why; they are historical from this point on.
+
 **`SPEC.md` is the owner's document and is not edited here or anywhere else in this change.** This
 file lists edits the Phase 0 spike evidence suggests, with rationale and evidence links, for the
 owner to accept, amend or reject. Section numbers below are `SPEC.md`'s current numbering as of this
 writing; all evidence is from
-[`docs/exec-plans/active/phase-0-spike-results.md`](phase-0-spike-results.md) (spikes run
+[`docs/exec-plans/active/phase-0-spike-results.md`](../active/phase-0-spike-results.md) (spikes run
 2026-09-19 against a live Oracle 19.3 database) unless noted otherwise.
 
 ## 1. §8 — driver test matrix limitations of the current upstream beta
@@ -130,6 +134,28 @@ linking to the spike results, so a future reader of §8 does not read "TIMESTAMP
 `XMLTYPE`/JSON/VECTOR/object types/BFILE) and §5, U-3;
 [ADR-0002](../../decisions/0002-driver-api-and-concurrency-model.md) amendment M1 and its Phase 0
 carve-out.
+
+## How each proposal was applied (2026-09-20)
+
+1. **§8 matrix limitations.** Applied as proposed: `SPEC.md` §8's "Driver test matrix" now opens with
+   a note that it is validated against `oracledb` 26.0.0-beta.3 with named exceptions (cancellation,
+   TCPS, network loss/reconnect, EXPLAIN PLAN/DBMS_XPLAN, privileged connections and metadata access),
+   pointing to `phase-0.md` and `phase-0-spike-results.md`.
+2. **§10/§24.8 cancellation wording.** Applied **option 2** as the owner directed (not option 1):
+   §10 and §24.8 remain the target requirement — on-demand Cancel stays what Reldex ships for — with
+   a clearly-marked interim note under §10 stating that on-demand Cancel is unavailable with the
+   current driver, that Reldex offers a per-statement time limit instead, that the UI must never call
+   the limit "Cancel", and must say so plainly. §24.8 item 8 is marked "not yet met — blocked on
+   upstream driver (ADR-0001)".
+3. **§24.14 highlighting scope.** Applied as proposed: Definition-of-Done item 14 now scopes
+   token-level error-position highlighting to PL/SQL compilation errors; ordinary SQL errors report
+   the native `ORA-nnnnn` code and message without a character position.
+4. **§22 third-party notices.** Applied as proposed: a new "Third-party notices" subsection requires
+   a generated notices file (e.g. `cargo about`) covering the full transitive dependency graph before
+   first binary distribution.
+5. **TIMESTAMP WITH TIME ZONE / JSON caveats.** Applied as proposed: a "Type caveats" paragraph was
+   added after §8's type list naming both cases (TSTZ named-region refusal; JSON/XMLType/VECTOR/object
+   types/BFILE refusal) and linking to the spike evidence.
 
 ## Summary table
 

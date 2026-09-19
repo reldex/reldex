@@ -131,6 +131,170 @@ docker exec -it -e NLS_LANG=AMERICAN_AMERICA.AL32UTF8 reldex-oracle19c \
   bash -c 'sqlplus "$RELDEX_TEST_USER/$RELDEX_TEST_PWD@//localhost:1521/RELDEX"'
 ```
 
+## TCPS (TLS) listener — ADR-0001 spike S8
+
+A second endpoint, `127.0.0.1:2484`, speaks TCPS. It is set up by
+`startup/10_enable_tcps.sh`, which `compose.yaml` mounts into the image's
+`/opt/oracle/scripts/startup` hook — the hook the image runs on **every**
+start, unlike `setup`, which runs once after the database is created. The
+script is idempotent and safe to run by hand against a live container:
+
+```bash
+docker exec reldex-oracle19c bash /opt/oracle/scripts/startup/10_enable_tcps.sh
+```
+
+It creates, inside the **persisted volume** at
+`/opt/oracle/oradata/dbconfig/RELDEX/wallet`:
+
+| File | What it is |
+|---|---|
+| `cwallet.sso`, `ewallet.p12` | the auto-login Oracle wallet the listener opens at start-up |
+| `ca.pem` | the test CA's certificate — **public**, and the one the client needs |
+| `other-ca.pem` | an unrelated CA that signed nothing, for the negative test |
+| `ca.key`, `server.key` | private keys; mode 600, inside the volume, never on the host |
+| `.wallet-password` | a random wallet password generated at setup time, mode 600 |
+
+Nothing there is a secret worth protecting — it belongs to a listener bound to
+`127.0.0.1` on one developer machine — but it is generated randomly and kept out
+of git all the same. `.gitignore` already covers `wallet/`, `*.pem`, `*.key`,
+`*.p12`, `cwallet.sso` and `ewallet.p12`.
+
+It also rewrites `listener.ora` and `sqlnet.ora`. Those are symlinks from
+`$ORACLE_HOME/network/admin` into the same persisted directory, so the
+configuration survives a container re-creation; re-creating the container is
+therefore safe, and `docker compose up -d` brings TCPS back by itself.
+
+### Getting the CA certificate to the client
+
+`oracledb`'s rustls client reads exactly one file: **`ewallet.pem`** in the
+directory it is given. It is **not** an Oracle wallet — it is a PEM bundle, and
+when it contains no private key every certificate in it is added to the trusted
+roots. So the client-side "wallet" here is a directory holding a copy of
+`ca.pem` named `ewallet.pem`:
+
+```bash
+mkdir -p tools/oracle-test-db/wallet tools/oracle-test-db/wallet-untrusted
+docker exec reldex-oracle19c bash -lc \
+  'cat /opt/oracle/oradata/dbconfig/RELDEX/wallet/ca.pem' \
+  > tools/oracle-test-db/wallet/ewallet.pem
+docker exec reldex-oracle19c bash -lc \
+  'cat /opt/oracle/oradata/dbconfig/RELDEX/wallet/other-ca.pem' \
+  > tools/oracle-test-db/wallet-untrusted/ewallet.pem
+```
+
+`run-it.ps1` / `run-it.sh` look for those two files and, when they are there,
+export `RELDEX_TEST_ORACLE_TCPS_DSN`, `RELDEX_TEST_ORACLE_TCPS_CA_DIR` and
+`RELDEX_TEST_ORACLE_TCPS_WRONG_CA_DIR`. Without them the S8 tests skip
+themselves and say why.
+
+### `localhost`, not `127.0.0.1`
+
+The server certificate carries `subjectAltName = DNS:localhost,
+DNS:reldex-oracle19c` and **no IP address**, so the connect string has to be
+`tcps://localhost:2484/RELDEX`. rustls ignores the common name entirely and
+matches only the SAN, against whatever the descriptor's `HOST` says — there is
+no `SSL_SERVER_DN_MATCH=OFF` in this client to fall back on. The numeric form
+therefore fails with `certificate not valid for name "127.0.0.1"`, which is
+exactly what `s8_tcps.rs`'s host-name test asserts.
+
+Two consequences worth knowing:
+
+- Adding `IP:127.0.0.1` to `RELDEX_TCPS_SANS` (an environment variable the
+  script honours) would make the numeric form work — and would break that test
+  on purpose. Change both together.
+- Resolving `localhost` costs about **2 seconds per connect** on this Windows
+  host, roughly twenty times a whole plaintext connect. That is name resolution,
+  not TLS: the same 2 s appears on a plain `localhost:1521/RELDEX`. The S8
+  latency test measures TCP and TCPS against the *same* host name so the TLS
+  figure is not contaminated by it.
+
+### Verifying the server side without the driver
+
+```bash
+# negotiated protocol and cipher, chain verified against the test CA
+docker exec reldex-oracle19c bash -lc \
+  'echo | openssl s_client -connect localhost:2484 \
+     -CAfile /opt/oracle/oradata/dbconfig/RELDEX/wallet/ca.pem 2>&1 \
+   | grep -E "Protocol  :|Cipher    :|Verify return"'
+# ->     Protocol  : TLSv1.2
+#        Cipher    : ECDHE-RSA-AES256-GCM-SHA384
+#        Verify return code: 0 (ok)
+
+# the endpoint is registered and the service is on it
+docker exec reldex-oracle19c lsnrctl status
+```
+
+### Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| `TNS-12560 / TNS-00540: SSL protocol adapter failure` in `listener.log`, while `openssl verify` is happy | The wallet is not an `orapki` wallet. 19.3 will **not** serve a PKCS#12 produced by `openssl pkcs12 -export`, however valid it is. The script generates the key pair inside the wallet with `orapki wallet add` and imports only the signed certificate; do not "simplify" that back. |
+| The same failure with both certificates named `CN=placeholder` | OpenSSL 1.0.2 (this image) ignores `-subj` when the config file names a `distinguished_name` section under `prompt = no`. The script uses one config file per certificate instead. |
+| `lsnrctl reload` reports success but the endpoint summary has no TCPS line | `reload` does not open a listening endpoint that was not there before. The script falls back to `lsnrctl stop` + `start`, which does. |
+| `openssl s_client -tls1_1` still completes a handshake | `SSL_VERSION` / `SSL_CIPHER_SUITES` were set in `sqlnet.ora` only. The **listener** reads its own from `listener.ora`; the script writes both. |
+| `invalid peer certificate: UnknownIssuer` from the driver | The client's `ewallet.pem` is missing, empty, or the wrong CA. Re-export it as above. |
+| `The listener supports no services` | PMON has not re-registered yet. Wait a few seconds, or `ALTER SYSTEM REGISTER;` as SYSDBA. |
+
+The listener's own log is at
+`/opt/oracle/diag/tnslsnr/<hostname>/listener/trace/listener.log`.
+
+## Memory footprint
+
+`dbca` sized this instance from **host** memory when it was created, which on a
+39 GiB machine meant `sga_target` 11.75 GiB and `pga_aggregate_target` 3.92 GiB
+— about 15.7 GiB of configured memory for a test database that never needs it.
+The pages are committed lazily, so `docker stats` showed far less at rest, but
+nothing bounded it.
+
+It is now capped from both sides, **without re-creating the database**:
+
+| | Before | After |
+|---|---|---|
+| `sga_target` / `sga_max_size` | 11.75 GiB | **1536 MB** |
+| `pga_aggregate_target` | 3.92 GiB | **512 MB** |
+| `pga_aggregate_limit` | 7.83 GiB | **2048 MB** (its minimum) |
+| `processes` | 1280 | **300** |
+| Container ceiling | none | **`mem_limit: 4g`** |
+| `docker stats` at rest | 693.5 MiB / 39.17 GiB (1.73%) | **1.83 GiB / 4 GiB (45.9%)** |
+
+The "after" number is larger than the "before" one because it was taken after a
+full integration run had touched the SGA, not because the instance grew: the
+figure that changed is the 15.7 GiB it was entitled to ask for.
+
+`pga_aggregate_limit` has a hard floor of **2048 MB** and must also be at least
+`3 MB × processes`, which is why `processes` came down to 300 — at 1280 the floor
+would have been 3.75 GiB. Setting it to 1536 MB is what made the instance refuse
+to start with `ORA-00093` on the first attempt.
+
+A pfile of the previous settings is kept **on the volume** at
+`/opt/oracle/oradata/dbconfig/RELDEX/pfileRELDEX.ora.before-memcap`. To go back:
+
+```bash
+docker exec reldex-oracle19c bash -lc \
+  'sqlplus -S -L / as sysdba <<EOF
+CREATE SPFILE FROM PFILE=''/opt/oracle/oradata/dbconfig/RELDEX/pfileRELDEX.ora.before-memcap'';
+EOF'
+# then raise or remove mem_limit in compose.yaml and `docker compose up -d`
+```
+
+If the instance ever refuses to start after a parameter change, the container
+exits and `sqlplus` inside it is unreachable. Repair the spfile from a throwaway
+container on the same volume:
+
+```bash
+docker run --rm -v reldex-oracle19c-data:/opt/oracle/oradata \
+  --entrypoint bash doctorkirk/oracle-19c:19.3 -lc '
+    export ORACLE_SID=RELDEX
+    S=/opt/oracle/oradata/dbconfig/RELDEX/spfileRELDEX.ora
+    $ORACLE_HOME/bin/sqlplus -S -L / as sysdba <<EOF
+CREATE PFILE=''/tmp/p.ora'' FROM SPFILE=''$S'';
+EOF
+    # edit /tmp/p.ora, then:
+    $ORACLE_HOME/bin/sqlplus -S -L / as sysdba <<EOF
+CREATE SPFILE=''$S'' FROM PFILE=''/tmp/p.ora'';
+EOF'
+```
+
 ## Stop / start / reset
 
 ```bash
@@ -175,13 +339,13 @@ See **Limitations** for a follow-up.
   below).
 - **amd64 only.** No native Apple Silicon / ARM64 image; on ARM hosts this
   runs under emulation (slow, not represented in the numbers above).
-- **TCPS/TLS is not configured.** The listener above is plaintext TCP only.
-  Adding a TCPS listener (wallet-based) is a follow-up task, tracked
-  informally here — see "Suggested follow-ups" below.
-- **Memory sizing is host-scaled, not container-bounded** (see above) —
-  consider adding `mem_limit`/`deploy.resources.limits.memory` to
-  `compose.yaml` plus an explicit SGA/PGA resize if running on a
-  memory-constrained host.
+- ~~**TCPS/TLS is not configured.**~~ **Done** — see "TCPS (TLS) listener"
+  above. What remains untested is **mutual** TLS: the listener runs with
+  `SSL_CLIENT_AUTHENTICATION = FALSE`, because `oracledb` cannot both trust a
+  private CA and present a client certificate (one `ewallet.pem` is read as one
+  or the other).
+- ~~**Memory sizing is host-scaled, not container-bounded.**~~ **Done** — see
+  "Memory footprint" above.
 - **Local testing only.** Never expose this container's port beyond
   `127.0.0.1`, never reuse its dev password anywhere real, and never point
   it at anything other than disposable test data.
@@ -211,3 +375,11 @@ logging in with an Oracle Single Sign-On (SSO) account at
 - `init/01_create_test_user.sh` — idempotent `RELDEX_TEST` user/grants, with
   the password taken from the container environment. Auto-run by the image's
   setup hook on first start, and re-runnable by hand at any time.
+- `startup/10_enable_tcps.sh` — idempotent TCPS wallet + listener setup, run by
+  the image's **startup** hook on every container start. See "TCPS (TLS)
+  listener" above.
+- `wallet/`, `wallet-untrusted/` — untracked, created by the export step in
+  "Getting the CA certificate to the client". Each holds an `ewallet.pem` that
+  the driver reads as a set of trusted roots.
+- `run-it.ps1`, `run-it.sh` — load `.env` and run the opt-in integration tests
+  with the connection settings in the environment.

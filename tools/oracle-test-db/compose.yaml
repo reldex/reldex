@@ -30,12 +30,28 @@ services:
       # visible to whoever changes either side.
       RELDEX_TEST_PWD: ${RELDEX_TEST_PWD}
       RELDEX_TEST_USER: ${RELDEX_TEST_USER:-RELDEX_TEST}
+    # The instance sized itself from host RAM when it was created (SGA 11.75 GiB,
+    # PGA 3.9 GiB on a 39 GiB machine), which is absurd for a test container. The
+    # spfile now asks for SGA 1536M / PGA 512M with `processes = 300`, and this
+    # is the hard ceiling around it; see README.md, "Memory footprint" for the
+    # measured before/after and for how to restore the old values.
+    mem_limit: 4g
     ports:
       # Bind to loopback only - never expose the listener beyond this host.
       - "127.0.0.1:1521:1521"
+      # TCPS (TLS), added for ADR-0001 spike S8 by `startup/10_enable_tcps.sh`.
+      # Same rule: loopback only. The certificate in the container's wallet is
+      # valid for `localhost` and for the container name, and for nothing else.
+      - "127.0.0.1:2484:2484"
     volumes:
       - reldex-oracle19c-data:/opt/oracle/oradata
       - ./init:/opt/oracle/scripts/setup:ro
+      # Run on **every** start (the `setup` hook above runs once, after the
+      # database is created). `10_enable_tcps.sh` is idempotent: it regenerates
+      # the wallet only when it is missing or expiring, and rewrites
+      # `listener.ora`/`sqlnet.ora`, which are symlinks into the persisted
+      # volume, so a re-created container comes back with TCPS already on.
+      - ./startup:/opt/oracle/scripts/startup:ro
     healthcheck:
       test: ["CMD", "/opt/oracle/checkDBStatus.sh"]
       interval: 60s
