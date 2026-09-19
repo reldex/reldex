@@ -496,13 +496,14 @@
   Percentages and progress bars are computed from task statuses by the script below; never
   hand-type a percentage anywhere in this file.
 -->
-<script type="application/json" id="project-data">{
+<script type="application/json" id="project-data">
+{
   "project": {
     "name": "Reldex",
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-20T07:00:00+07:00",
+  "updatedAt": "2026-09-20T08:30:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -516,26 +517,7 @@
     "M1 blocked on owner approval to install Qt 6.8 LTS + CMake + Ninja (phase-1.md C.3 #1) — nothing downstream of M1 starts first",
     "Phase 0 carry-over continues in parallel: connect_timeout/C-5, CREATE TRIGGER rewrite/U-18, connect-warning channel/C-6 on phase-0/driver-carryover; Android physical-device validation on phase-0/android-device"
   ],
-  "blockers": [
-    {
-      "title": "Owner action: approve the Qt/CMake/Ninja toolchain install (phase-1.md §C.0, C.3 #1)",
-      "detail": "Qt 6.8 LTS (kit msvc2022_64, modules qtbase/qtdeclarative/qtshadertools/qtsvg/qttools, no Qt Creator) plus CMake >=3.24 and Ninja need to be installed on the dev machine (~2 GB download, ~5 GB on disk). Nothing in M1 — and therefore nothing in Phase 1 — starts without this.",
-      "severity": "blocked",
-      "since": "2026-09-20"
-    },
-    {
-      "title": "Owner action: decide the Qt licence position (phase-1.md C.3 #2, #3)",
-      "detail": "Recommendation is LGPLv3-compliant dynamic linking, no GPL-only Qt modules, and a pinned exact Qt version with upgrades treated as a reviewed change. A commercial Qt licence is flagged as a future decision point (iOS distribution or a static-linked closed-source Pro build), not spent now.",
-      "severity": "blocked",
-      "since": "2026-09-20"
-    },
-    {
-      "title": "Owner action: app identifier and branding (phase-1.md C.3 #5)",
-      "detail": "Needs a reverse-DNS id, executable name, display name, installer publisher string and a placeholder icon before packaging work (M6.6) can proceed correctly. Recommendation: com.reldex.reldex / Reldex.exe / \"Reldex\", with no vendor trademark in any of them.",
-      "severity": "blocked",
-      "since": "2026-09-20"
-    }
-  ],
+  "blockers": [],
   "risks": [
     {
       "title": "On-demand Cancel unavailable — accepted limitation (owner decision 2026-09-20)",
@@ -609,12 +591,19 @@
     }
   ],
   "nextSteps": [
-    "Owner: approve the toolchain install so M1 can start (phase-1.md §C.0, C.3 #1)",
+    "Spike S15 (M1.3–M1.8): crates/ffi, C++ adapter, 1M-row virtualized table; measure kill criteria K1–K7, then accept or re-open ADR-0003",
     "Owner: decide the remaining open items in phase-1.md §C.3 (#2-#11, #15) — licence position, branding, secrets storage, local store format, telemetry, code signing, Community/Pro licensing",
     "Once approved: install Qt/CMake/Ninja/cbindgen, then start M1.3-M1.9 (crates/ffi skeleton, CMake+Corrosion+Qt skeleton, ResultTableModel, spike S15) to accept or re-open ADR-0003",
     "Continue Phase 0 carry-over: land phase-0/driver-carryover (C-5, U-18, C-6) and phase-0/android-device (Android physical-device validation); iOS device evidence still needed"
   ],
   "decisions": [
+    {
+      "id": "OWNER-2026-09-20",
+      "title": "Phase 1 kickoff decisions approved as recommended (phase-1.md C.3 #1–#9)",
+      "status": "Accepted — owner decision 2026-09-20: stay on oracledb; pre-armed deadline + honest UI; upstream issues pending — upstream issues #21–#25 filed 2026-09-20",
+      "date": "2026-09-20",
+      "link": "Toolchain install (Qt 6.8 LTS msvc2022_64 + CMake + Ninja + cbindgen, no Qt Creator); LGPLv3 dynamic linking with GPL-only Qt modules banned; pinned Qt version; the Phase 1 defer list; app identity com.reldex.reldex / Reldex.exe / Reldex; unsigned Windows builds in Phase 1; Windows Credential Manager with no plaintext fallback; one SQLite store; no telemetry. Also: Git Bash is the project's primary script shell, and the lead may proceed through later phases without a separate go/no-go, reporting each exit gate honestly. Still open: fetch-batch default (after the M5.6 benchmark), the no-Cancel wording (at M4.6), Community/Pro licensing."
+    },
     {
       "id": "ADR-0001",
       "title": "Database driver strategy — primary driver is Oracle's oracledb (rust-oracledb)",
@@ -983,7 +972,7 @@
             {
               "title": "Android ARM64 physical device",
               "status": "in_progress",
-              "note": "Cross-compile + link proven in CI — spike S6, PR #3. Device provided by the owner 2026-09-19 (OPPO CPH2399, NDK 28.2 installed); physical-device validation in progress on branch phase-0/android-device, not finished."
+              "note": "Native-binary evidence on a physical phone, 2026-09-20 (OPPO CPH2399, Android 16, arm64-v8a): connect/ping, exact typed data incl. Thai + emoji, transaction, 100k-row fetch (+0.6 MB RSS), TCPS with verification on, deadline path — 7/7 pass (docs/exec-plans/active/phase-0-android-device.md). Still open: the packaged-app path (APK, app sandbox, real Wi-Fi/cellular) — SPEC §25 stays unmet until then."
             },
             {
               "title": "iOS/iPadOS ARM64 physical device",
@@ -1079,8 +1068,8 @@
             },
             {
               "title": "Android physical-device harness",
-              "status": "in_progress",
-              "note": "Device and NDK provided by the owner 2026-09-19; harness build and validation in progress on branch phase-0/android-device."
+              "status": "done",
+              "note": "tools/android-device/run-on-device.sh (bash-first; .ps1 twin): cross-builds with the local NDK (no cargo-ndk/cmake needed on Windows), pushes, adb reverse, runs 7 checks, redacted transcript."
             }
           ]
         }
@@ -1095,8 +1084,8 @@
           "title": "M1 — De-risk: toolchain, ADR-0003, and a real virtualized table",
           "tasks": [
             {
-              "title": "M1.1 Owner approval + toolchain install (Qt, CMake, Ninja, cbindgen) (owner + sonnet) — blocked on owner decision (phase-1.md C.3 #1)",
-              "status": "blocked"
+              "title": "M1.1 Owner approval + toolchain install (Qt, CMake, Ninja, cbindgen) (owner + sonnet) — approved and installed 2026-09-20: Qt 6.8.3 msvc2022_64, CMake 4.4.3, Ninja 1.13.2, cbindgen 0.29.4; no GPL-only module present (docs/exec-plans/active/phase-1-toolchain.md, tools/dev-env/env.sh)",
+              "status": "done"
             },
             {
               "title": "M1.2 ★ Draft ADR-0003: Qt ↔ Rust integration (opus, review mandatory) — docs/decisions/0003-qt-rust-integration.md (Proposed)",
@@ -1333,40 +1322,40 @@
           "title": "Owner decisions (Phase 1)",
           "tasks": [
             {
-              "title": "Owner: install Qt and the build tools per phase-1.md §C.0 — M1.1 is blocked on this (decision C.3 #1)",
-              "status": "todo"
+              "title": "Owner: install Qt and the build tools per phase-1.md §C.0 — approved 2026-09-20, without Qt Creator (decision C.3 #1)",
+              "status": "done"
             },
             {
-              "title": "Owner: licence position — LGPLv3-compliant dynamic linking, ban GPL-only Qt modules, commercial licence deferred (decision C.3 #2)",
-              "status": "todo"
+              "title": "Owner: licence position — LGPLv3-compliant dynamic linking, ban GPL-only Qt modules, commercial licence deferred (decision C.3 #2) — approved 2026-09-20 as recommended",
+              "status": "done"
             },
             {
-              "title": "Owner: Qt version policy — pin one exact Qt version, treat an upgrade as a reviewed change (decision C.3 #3)",
-              "status": "todo"
+              "title": "Owner: Qt version policy — pin one exact Qt version, treat an upgrade as a reviewed change (decision C.3 #3) — approved 2026-09-20 as recommended",
+              "status": "done"
             },
             {
-              "title": "Owner: approve the Phase 1 defer list (decision C.3 #4)",
-              "status": "todo"
+              "title": "Owner: approve the Phase 1 defer list (decision C.3 #4) — approved 2026-09-20 as recommended",
+              "status": "done"
             },
             {
-              "title": "Owner: app identifier and branding — reverse-DNS id, executable/display name, installer publisher string, placeholder icon (decision C.3 #5)",
-              "status": "todo"
+              "title": "Owner: app identifier and branding — reverse-DNS id, executable/display name, installer publisher string, placeholder icon (decision C.3 #5) — approved 2026-09-20 as recommended",
+              "status": "done"
             },
             {
-              "title": "Owner: code signing for Windows — ship Phase 1 unsigned? (decision C.3 #6)",
-              "status": "todo"
+              "title": "Owner: code signing for Windows — ship Phase 1 unsigned? (decision C.3 #6) — approved 2026-09-20 as recommended",
+              "status": "done"
             },
             {
-              "title": "Owner: secrets storage approach — Windows Credential Manager for Phase 1, no plaintext fallback ever (decision C.3 #7)",
-              "status": "todo"
+              "title": "Owner: secrets storage approach — Windows Credential Manager for Phase 1, no plaintext fallback ever (decision C.3 #7) — approved 2026-09-20 as recommended",
+              "status": "done"
             },
             {
-              "title": "Owner: local store format — one SQLite file for profiles/settings/history/workspace (decision C.3 #8)",
-              "status": "todo"
+              "title": "Owner: local store format — one SQLite file for profiles/settings/history/workspace (decision C.3 #8) — approved 2026-09-20 as recommended",
+              "status": "done"
             },
             {
-              "title": "Owner: telemetry and logging policy — no telemetry, local rotating log, opt-in SQL-text debug logging (decision C.3 #9)",
-              "status": "todo"
+              "title": "Owner: telemetry and logging policy — no telemetry, local rotating log, opt-in SQL-text debug logging (decision C.3 #9) — approved 2026-09-20 as recommended",
+              "status": "done"
             },
             {
               "title": "Owner: fetch-batch default sign-off once the M5.6 benchmark produces a number (decision C.3 #10)",
@@ -1626,6 +1615,14 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-20",
+      "text": "Owner approved the Phase 1 kickoff decisions as recommended (phase-1.md C.3 #1–#9). Toolchain installed and proven from Git Bash: Qt 6.8.3 msvc2022_64, CMake 4.4.3, Ninja 1.13.2, cbindgen 0.29.4 — hello-world Qt Quick app and QuickTest pass offscreen; no GPL-only Qt module installed. Project scripts are now bash-first."
+    },
+    {
+      "date": "2026-09-20",
+      "text": "Android physical-device run merged (PR #8): the Rust core + driver + TLS stack executed on an OPPO CPH2399 (Android 16, arm64) against Oracle 19c through adb reverse — 7/7 checks pass incl. TCPS with verification on. Native CLI over adb shell, not an APK: the packaged-app path and iOS device evidence remain open."
+    },
     {
       "date": "2026-09-20",
       "text": "Phase 1 execution plan (docs/exec-plans/active/phase-1.md, milestones M1-M6) and ADR-0003 (Qt <-> Rust integration, Proposed, acceptance conditional on spike S15) drafted and landed, reflecting the owner's 2026-09-19 GO for Phase 1. TASKS.md P1 rewritten to the milestone structure plus an Owner decisions (Phase 1) group; phase-0.md and Task.html updated to record the GO, the carry-over work in progress on phase-0/driver-carryover and phase-0/android-device, and the owner's 2026-09-19 decision not to submit upstream issues F and G for now (tracked only). ARCHITECTURE.md §13 items 2, 3 and 10 point at ADR-0003 as a proposed (not accepted) resolution. M1 stays blocked on owner approval of the Qt/CMake/Ninja toolchain install."

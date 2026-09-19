@@ -39,7 +39,7 @@ Phase 0 is complete when:
 | 4 | **Not met — accepted limitation (owner decision 2026-09-20).** Spike S4 fails for the requirement: only a pre-armed per-round-trip deadline exists, and it destroys the session whenever the server cannot answer promptly. `SPEC.md` §10/§24.8 is not satisfied by `oracledb` 26.0.0-beta.3. The owner reviewed ADR-0001's re-opening and decided to stay on `oracledb`, ship the pre-armed deadline with an honest UI, and pursue upstream fixes rather than change drivers — see ADR-0001 "Owner decision (2026-09-20)". This criterion remains **not met** for the Phase 0 go/no-go decision below; the decision was to accept the gap, not to close it. |
 | 5 | **Done, with documented limits.** Spikes S2 (conditional go — NUMBER-bind and TIMESTAMP WITH TIME ZONE restrictions contained by refusal, not silent corruption), S5 (pass), S7 (pass) and S11 (NCLOB — pass) all ran against the live database. |
 | 6 | **Partial.** Windows x64 fully validated locally (build, connect, full spike matrix). Linux x64 and macOS ARM64 build in CI (fmt/clippy/test) but this branch has not yet gone through a PR/CI run, and neither has database access in CI. |
-| 7 | **Cross-compile proven; physical-device evidence still outstanding.** Spike S6 passed 2026-09-19 (PR #3): `aarch64-linux-android`, `aarch64-apple-ios` and `aarch64-apple-ios-sim` all compile and link in CI with no local NDK/Xcode needed (`phase-0-s6-mobile-cross-compile.md`). The owner provided an Android arm64 phone (OPPO CPH2399) on 2026-09-19 with NDK 28.2 already installed, and a physical-device validation run is in progress on branch `phase-0/android-device` (not finished; no results to cite yet). No physical-device testing has been attempted for iOS; the blocker there is still that no Mac + Apple Developer account + device has been provided. |
+| 7 | **Android has physical-device evidence; iOS does not.** Spike S6 passed 2026-09-19 (PR #3): all three mobile targets compile and link in CI (`phase-0-s6-mobile-cross-compile.md`). On 2026-09-20 the core plus driver then **ran on a physical arm64 phone** (OPPO CPH2399, Android 16) against the live Oracle 19c test database over USB `adb reverse` — connect, ping, typed data, transaction, 100k-row fetch, TCPS with verification on, and the deadline path, 7/7 (`phase-0-android-device.md`). That is a native CLI binary over `adb shell`, **not** an APK, and not a real network. No iOS device has run anything. |
 | 8 | **Done.** `reldex-core-poc` is a ping/query/exec CLI harness; no Qt/QML UI exists. |
 
 ## Driver decision
@@ -206,15 +206,33 @@ Known unsupported configurations of the primary driver (ADR-0001): Native Networ
   links (`cargo-ndk`, API 26) on an ordinary GitHub-hosted runner with no local NDK; `.so` 2,676,128 B
   unstripped / 2,285,896 B stripped. Cross-compile evidence only, not device evidence — see
   [`phase-0-s6-mobile-cross-compile.md`](phase-0-s6-mobile-cross-compile.md).
-- [ ] Package minimal native harness.
-- [ ] Connect over TCP.
-- [ ] Connect over TCPS.
-- [ ] SQL/PLSQL.
-- [ ] transaction.
-- [ ] cancellation.
-- [ ] LOB.
-- [ ] background/resume.
-- [ ] reconnect/lost-session behavior.
+  Additionally proven 2026-09-20: the same cross-compile needs **no `cargo-ndk`, `cmake`, NASM or
+  `bindgen`** on a **Windows** host either — three cargo environment variables pointing at the NDK's
+  clang/`llvm-ar` are enough.
+- [x] Package minimal native harness. **Pass (2026-09-20).** `reldex-device-check`
+  (`crates/reldex-core-poc/src/bin/`), cross-compiled for `aarch64-linux-android` (API 26),
+  `adb push`ed and run over `adb shell`. **Native CLI binary, not an APK** — see
+  [`phase-0-android-device.md`](phase-0-android-device.md).
+- [x] Connect over TCP. **Pass (2026-09-20).** OPPO CPH2399, Android 16, arm64-v8a; connect 282 ms,
+  ping 3–8 ms, over USB `adb reverse` to the loopback-bound test database.
+- [x] Connect over TCPS. **Pass (2026-09-20).** Certificate **and** host-name verification on;
+  confirmed by the server's own `sys_context('USERENV','NETWORK_PROTOCOL')` = `tcps`.
+- [x] SQL. **Pass (2026-09-20).** Typed round trips (39-digit NUMBER, DATE, TIMESTAMP(6), Thai and
+  non-BMP text through VARCHAR2 and NVARCHAR2, each cross-checked against the server's own
+  `TO_CHAR`/`LENGTHB`/`LENGTH`) and a 100 000-row batched fetch at ~15 k rows/s with peak RSS under
+  6.2 MB. **PL/SQL was not run on-device.**
+- [x] transaction. **Pass (2026-09-20).** Auto-commit off; insert → rollback → gone;
+  insert → commit → present.
+- [ ] cancellation. **Partial.** The pre-armed **deadline** path passed on-device (`Timeout`,
+  `NeedsValidation`, session really recovers). On-demand cancel is an accepted Phase 0 limitation
+  (criterion 4) and was not exercised on the device.
+- [ ] LOB. Not attempted on-device.
+- [ ] background/resume. Not attempted; the process ran in the foreground for seconds, with "stay
+  awake" on. Doze/App Standby untested.
+- [ ] reconnect/lost-session behavior. Not attempted on-device.
+- [ ] **Packaged-app path** (new): Rust core as `cdylib`/`staticlib` behind JNI/Qt, an APK with
+  `INTERNET` permission and a network-security config, and a real Wi-Fi/cellular route. None of this
+  is covered by the native-binary run.
 
 ### iOS/iPadOS ARM64 physical device
 - [x] Cross-compile. **Pass (spike S6, 2026-09-19, PR #3).** `aarch64-apple-ios` and
@@ -301,18 +319,21 @@ table look more finished than the evidence supports.
 | 4 | Query cancellation is demonstrated | **Not met — accepted limitation (owner decision 2026-09-20)** | Spike S4; ADR-0001 "Spike outcome (2026-09-20)" and "Owner decision (2026-09-20)"; `phase-0-spike-results.md` §4 |
 | 5 | Required datatypes/PL-SQL behaviors are integration-tested | **Met, with limits** | Spikes S2 (conditional go — NUMBER-bind and TIMESTAMP WITH TIME ZONE restrictions), S5 (pass), S7 (pass), S11 (NCLOB — pass), S12 (developer features — pass, but `CREATE TRIGGER … :NEW` is impossible, U-18) — `phase-0-spike-results.md` §3, §5 |
 | 6 | Desktop platform viability is established | **Met, with limits** | Windows x64 fully validated locally; Linux x64 and macOS ARM64 build/fmt/clippy/test green on CI (PR #1) but no database connect exercised in CI — see `README.md` "Current status" |
-| 7 | Android/iOS direct-connect feasibility: physical-device evidence or a documented blocker | **Met, with limits — stated honestly.** Cross-compile and link are proven; no physical-device evidence exists yet; the blocker is documented, not silent | Spike S6 — pass 2026-09-19, PR #3, `aarch64-linux-android`/`aarch64-apple-ios`/`aarch64-apple-ios-sim` all compile and link in CI with no local NDK/Xcode (`phase-0-s6-mobile-cross-compile.md`). **What is still missing:** no device has run any of connect/SQL/transaction/cancel/LOB/TCPS/background-resume. An Android arm64 phone (OPPO CPH2399) was provided by the owner on 2026-09-19 (NDK 28.2 installed) and validation is **in progress on branch `phase-0/android-device`** (not finished, no results yet); iOS still needs a Mac + Apple Developer account + device, not yet provided — see that file's "Next step toward physical-device validation" |
+| 7 | Android/iOS direct-connect feasibility: physical-device evidence or a documented blocker | **Met, with limits — stated honestly.** Android now has real device evidence; iOS still has none and its blocker is documented, not silent | Spike S6 — pass 2026-09-19, PR #3, all three mobile targets compile and link in CI (`phase-0-s6-mobile-cross-compile.md`). **Android device run — pass 2026-09-20**, 7/7 on an OPPO CPH2399 (Android 16, arm64-v8a) against the live database over USB `adb reverse`: connect+ping, NUMBER/DATE/TIMESTAMP/Thai/non-BMP fidelity, rollback+commit, 100 000 rows at ~15 k rows/s with peak RSS under 6.2 MB, TCPS confirmed by the server's `USERENV.NETWORK_PROTOCOL`, and a deadline that returns `Timeout` with a session that really does recover (`phase-0-android-device.md`). **What is still missing:** it is a native CLI binary over `adb shell`, not an APK (no Qt, no JNI, no permission model, `shell` SELinux context) and the transport is USB loopback, not Wi-Fi/cellular; on-device LOB, PL/SQL, cancellation-beyond-deadline, reconnect and background/resume were not run; and **no physical iOS device has been provided** (iOS additionally needs a Mac + Apple Developer account) |
 | 8 | No full desktop UI required to prove these results | **Met** | `reldex-core-poc` is a CLI harness; no Qt/QML UI exists |
 
 **Carried into Phase 1 as Phase 0 tail work (owner gave the GO 2026-09-19):**
 
-- **Android physical-device validation** — the owner provided a physical Android device (arm64,
-  OPPO CPH2399, API 26+) on 2026-09-19; NDK 28.2 is already installed. Validation is **in progress on
-  branch `phase-0/android-device`** (not finished; no results to cite yet;
-  `phase-0-s6-mobile-cross-compile.md` "Next step").
-- **iOS physical-device validation** — still outstanding. Needs a Mac with Xcode (CI already confirms
-  the toolchain), an Apple Developer account (a free personal-team identity suffices for a 7-day local
-  debug build), and a physical iPhone/iPad; none of these has been provided yet.
+- **Android physical-device validation** — **done 2026-09-20 for the native-binary path**
+  (`phase-0-android-device.md`): 7/7 on an OPPO CPH2399 (Android 16, arm64-v8a) over USB
+  `adb reverse`, repeatable via `tools/android-device/run-on-device.sh`. What remains is the
+  **packaged-app path**: the Rust core as a `cdylib`/`staticlib` loaded by the Qt/JNI app, an APK
+  with `INTERNET` permission and a network-security config, a real Wi-Fi/cellular route to a
+  reachable database, and background/resume under Doze — see that file's "What remains for the
+  packaged-app path".
+- **iOS physical-device validation** — needs a Mac with Xcode (CI already confirms the toolchain), an
+  Apple Developer account (a free personal-team identity suffices for a 7-day local debug build), and
+  a physical iPhone/iPad.
 - TCPS (spike S8) — done 2026-09-20, pass with limits (see Workstream F); the remaining TCPS questions
   are owner decisions (results file §9 items 6–7), confirmed 2026-09-19 (see below).
 - Driver fix for **C-5** (`ConnectionParams::connect_timeout` accepted and ignored) — **approved

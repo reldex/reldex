@@ -59,7 +59,7 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [x] Windows x64 (build, connect, and the full spike matrix all run locally, 2026-09-19)
 - [~] Linux x64 (build + fmt + clippy -D warnings + `cargo test --workspace` green on CI `ubuntu-latest`, PR #1, 2026-09-20 — https://github.com/reldex/reldex/actions/runs/35419377082; no database connect yet)
 - [~] macOS ARM64 (build + fmt + clippy -D warnings + `cargo test --workspace` green on CI `macos-latest` (Apple Silicon), PR #1, 2026-09-20 — https://github.com/reldex/reldex/actions/runs/35419377082; no database connect yet)
-- [~] Android ARM64 physical device (cross-compile + link proven in CI — spike S6, PR #3; device provided by the owner 2026-09-19 (OPPO CPH2399, NDK 28.2 installed); physical-device validation in progress on branch `phase-0/android-device`, not finished)
+- [~] Android ARM64 physical device — native-binary evidence on a physical phone, 2026-09-20 (OPPO CPH2399, Android 16, arm64-v8a): connect/ping, exact typed data incl. Thai + emoji, transaction, 100k-row fetch (+0.6 MB RSS), TCPS with verification on, deadline path — 7/7 pass (`docs/exec-plans/active/phase-0-android-device.md`). Still open: the packaged-app path (APK, app sandbox, real Wi-Fi/cellular network) — SPEC §25 stays unmet until then
 - [ ] iOS/iPadOS ARM64 physical device (cross-compile + link proven in CI — spike S6, PR #3; physical-device evidence still needed, needs a Mac + Apple Developer account + device)
 
 - [x] Owner: decide cancellation path (ADR-0001 re-opened) [decision 2026-09-20: stay on `oracledb`; ship the pre-armed per-statement deadline with an honest UI; pursue upstream fixes via the four drafted issues — see ADR-0001 "Owner decision (2026-09-20)"]
@@ -79,7 +79,7 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [~] Contract: connect-time warning channel (C-6) — additive `take_connect_warnings`-style method on `DatabaseConnection`, collected once by `db-core` after connect; approved in principle 2026-09-19, detailed write-up in `phase-0-spike-results.md` §7 C-6; sequenced after pull request #5 (TCPS descriptor guard, merged); record as an ADR-0002 amendment when implemented; in progress on branch `phase-0/driver-carryover`, not yet merged — Phase 1 M2.3 consumes the result
 - [ ] Docs: recommend `SQLNET.EXPIRE_TIME` (e.g. 10 minutes) in user-facing connection troubleshooting docs (owner decision 2026-09-19, `phase-0-spike-results.md` §9 item 10)
 - [ ] Docs: note in `tools/oracle-test-db/README.md` that `SQLNET.EXPIRE_TIME` is left unset on the Phase 0 test database on purpose, so S10's measurements remain valid (follow-up; not edited in this change)
-- [~] Android physical-device harness (device and NDK provided 2026-09-19; harness build and validation in progress on branch `phase-0/android-device`)
+- [x] Android physical-device harness — `tools/android-device/run-on-device.sh` (bash-first; `.ps1` twin): cross-builds with the local NDK (no cargo-ndk/cmake needed on Windows), pushes, `adb reverse`, runs 7 checks, redacted transcript
 
 ## P1 — Desktop MVP
 
@@ -88,7 +88,7 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 
 ### M1 — De-risk: toolchain, ADR-0003, and a real virtualized table
 
-- [!] M1.1 Owner approval + toolchain install (Qt, CMake, Ninja, cbindgen) (owner + sonnet) — blocked on owner decision (phase-1.md C.3 #1)
+- [x] M1.1 Owner approval + toolchain install (Qt, CMake, Ninja, cbindgen) (owner + sonnet) — approved and installed 2026-09-20: Qt 6.8.3 msvc2022_64, CMake 4.4.3, Ninja 1.13.2, cbindgen 0.29.4; no GPL-only module present (`docs/exec-plans/active/phase-1-toolchain.md`, `tools/dev-env/env.sh`)
 - [x] M1.2 ★ Draft ADR-0003: Qt ↔ Rust integration (opus, review mandatory) — `docs/decisions/0003-qt-rust-integration.md` (Proposed)
 - [ ] M1.3 ★ `crates/ffi` skeleton: hub, session open/execute/fetch, batch views, errors, waker (opus, review mandatory)
 - [ ] M1.4 C smoke harness (`ui/tests/ffi_smoke`), no Qt, mock driver, ASan on Linux (sonnet)
@@ -158,15 +158,15 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 
 ### Owner decisions (Phase 1)
 
-- [ ] Owner: install Qt and the build tools per `phase-1.md` §C.0 — M1.1 is blocked on this (decision C.3 #1)
-- [ ] Owner: licence position — LGPLv3-compliant dynamic linking, ban GPL-only Qt modules, commercial licence deferred (decision C.3 #2)
-- [ ] Owner: Qt version policy — pin one exact Qt version, treat an upgrade as a reviewed change (decision C.3 #3)
-- [ ] Owner: approve the Phase 1 defer list (decision C.3 #4)
-- [ ] Owner: app identifier and branding — reverse-DNS id, executable/display name, installer publisher string, placeholder icon (decision C.3 #5)
-- [ ] Owner: code signing for Windows — ship Phase 1 unsigned? (decision C.3 #6)
-- [ ] Owner: secrets storage approach — Windows Credential Manager for Phase 1, no plaintext fallback ever (decision C.3 #7)
-- [ ] Owner: local store format — one SQLite file for profiles/settings/history/workspace (decision C.3 #8)
-- [ ] Owner: telemetry and logging policy — no telemetry, local rotating log, opt-in SQL-text debug logging (decision C.3 #9)
+- [x] Owner: install Qt and the build tools per `phase-1.md` §C.0 — approved 2026-09-20, without Qt Creator (decision C.3 #1)
+- [x] Owner: licence position — LGPLv3-compliant dynamic linking, ban GPL-only Qt modules, commercial licence deferred (decision C.3 #2) — approved 2026-09-20 as recommended
+- [x] Owner: Qt version policy — pin one exact Qt version, treat an upgrade as a reviewed change (decision C.3 #3) — approved 2026-09-20 as recommended
+- [x] Owner: approve the Phase 1 defer list (decision C.3 #4) — approved 2026-09-20 as recommended
+- [x] Owner: app identifier and branding — reverse-DNS id, executable/display name, installer publisher string, placeholder icon (decision C.3 #5) — approved 2026-09-20 as recommended
+- [x] Owner: code signing for Windows — ship Phase 1 unsigned? (decision C.3 #6) — approved 2026-09-20 as recommended
+- [x] Owner: secrets storage approach — Windows Credential Manager for Phase 1, no plaintext fallback ever (decision C.3 #7) — approved 2026-09-20 as recommended
+- [x] Owner: local store format — one SQLite file for profiles/settings/history/workspace (decision C.3 #8) — approved 2026-09-20 as recommended
+- [x] Owner: telemetry and logging policy — no telemetry, local rotating log, opt-in SQL-text debug logging (decision C.3 #9) — approved 2026-09-20 as recommended
 - [ ] Owner: fetch-batch default sign-off once the M5.6 benchmark produces a number (decision C.3 #10)
 - [ ] Owner: wording sign-off for the no-Cancel UX and "no limit" strings, M4.6 (decision C.3 #11)
 - [x] Owner: Phase-0 leftovers (C-5, U-18, C-6) carried into Phase 1 M2 — confirmed 2026-09-19; in progress on `phase-0/driver-carryover` (decision C.3 #12)

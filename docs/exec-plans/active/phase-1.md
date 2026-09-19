@@ -1,6 +1,6 @@
 # Execution Plan — Phase 1 Desktop MVP
 
-**Status:** Active — M1 blocked on owner approval of the toolchain install (§C.0, owner decision C.3 #1)
+**Status:** Active — toolchain install approved by the owner 2026-09-20 and in progress (M1.1); spike S15 next
 **Date:** 2026-09-20
 **Depends on:** [ADR-0001](../../decisions/0001-database-driver-strategy.md) (database driver strategy),
 [ADR-0002](../../decisions/0002-driver-api-and-concurrency-model.md) (driver API and concurrency model),
@@ -10,9 +10,8 @@ conditional on spike S15), and [`phase-0.md`](phase-0.md) (Phase 0 exit assessme
 
 **Purpose.** This is the Phase 1 (Desktop MVP) execution plan produced immediately after the Phase 1 GO:
 the core (`db-core`) changes needed before/with the UI (§B), the milestone plan M1–M6 with owner/inputs/
-outputs/dependencies/acceptance criteria per task (§C), and the risk register (§D). Neither ADR-0003 nor
-any of the owner decisions listed in §C.3 has been accepted yet, except where §C.3 explicitly records a
-decision already made. Status per task uses the same legend as `TASKS.md`: `[x]` done, `[~]` in progress,
+outputs/dependencies/acceptance criteria per task (§C), and the risk register (§D). ADR-0003 is not accepted yet (it waits for spike S15). The owner decisions in §C.3 carry their
+current status: #1–#9 were approved as recommended on 2026-09-20; #10, #11 and #15 are still open. Status per task uses the same legend as `TASKS.md`: `[x]` done, `[~]` in progress,
 `[ ]` todo, `[!]` blocked.
 
 ---
@@ -403,23 +402,23 @@ Six milestones. M1 is the de-risking gate and nothing downstream starts until it
 ## C.3 — Owner decisions required (numbered; recommendation for each; current status per the 2026-09-20 facts)
 
 1. **Install Qt and the build tools per §C.0?** — *Recommend yes*, Qt 6.8 LTS `msvc2022_64`, modules `qtbase`/`qtdeclarative`/`qtshadertools`/`qtsvg`/`qttools` only, **without Qt Creator**, plus CMake and Ninja. ~2 GB download, ~5 GB on disk. Nothing starts without this.
-   **Status:** Open — not yet decided. M1.1 is blocked on this.
+   **Status:** Approved 2026-09-20 as recommended (no Qt Creator). Install in progress (M1.1).
 2. **Licence position.** — *Recommend*: ship Community under **LGPLv3-compliant dynamic linking**, ban GPL-only Qt modules, and treat a commercial Qt licence as a decision deferred to the first of (a) iOS distribution, (b) a closed-source Pro build that needs static linking. Budget implication to be aware of now, not to spend now.
-   **Status:** Open — not yet decided.
+   **Status:** Approved 2026-09-20 as recommended.
 3. **Qt version policy.** — *Recommend* pinning one exact Qt version in `phase-1-toolchain.md` and treating an upgrade as a reviewed change (same discipline as the `oracledb` pin). Note that LTS patch releases move to commercial-only after the open-source window; the pinned version must be one we can still legally obtain.
-   **Status:** Open — not yet decided.
+   **Status:** Approved 2026-09-20 as recommended.
 4. **Approve the defer list (§C.1).** — *Recommend yes as written.* The sharpest cuts: Explain Plan and export move to P2 even though `SPEC.md` §24 lists them, because §24 is the **V1** Definition of Done, not the MVP. If you want either in Phase 1, say which milestone loses a task to pay for it.
-   **Status:** Open — not yet decided.
+   **Status:** Approved 2026-09-20 as recommended.
 5. **App identifier and branding.** — Needs: reverse-DNS id, executable name, display name, installer publisher string, and a placeholder icon. *Recommend* `com.reldex.reldex` / `Reldex.exe` / "Reldex", with `AGENTS.md`'s rule enforced by an automated check that no vendor trademark appears in any of them. Vendor names remain allowed in driver and compatibility text.
-   **Status:** Open — not yet decided.
+   **Status:** Approved 2026-09-20 as recommended.
 6. **Code signing for Windows.** — *Recommend* shipping Phase 1 **unsigned** (internal/early users see a SmartScreen warning) and buying a certificate only before public distribution. Signing an unsigned-today build later is cheap; buying early is not.
-   **Status:** Open — not yet decided.
+   **Status:** Approved 2026-09-20 as recommended.
 7. **Secrets storage.** — *Recommend* Windows Credential Manager via the `windows` crate (MIT/Apache-2.0) for Phase 1, with the `keyring` crate evaluated for macOS/Linux in P2. Rejected for now: `keyring` on Windows-only, because its Linux path drags in zbus/D-Bus we do not need yet. **No plaintext fallback ever** — if no store is available, Reldex prompts every time.
-   **Status:** Open — not yet decided.
+   **Status:** Approved 2026-09-20 as recommended.
 8. **Local store format.** — *Recommend* one SQLite file (rusqlite, bundled SQLite) for profiles, settings, history, workspace: atomic, no half-written config, and it is needed for history regardless. Trade-off accepted: settings are not hand-editable; an export/import to TOML can come later if support needs it.
-   **Status:** Open — not yet decided.
+   **Status:** Approved 2026-09-20 as recommended.
 9. **Telemetry and logging.** — *Recommend* no telemetry at all in Phase 1; local rotating log file, default level `info`, SQL text logged only at `debug` behind an explicit opt-in, secrets redacted by construction and asserted by test.
-   **Status:** Open — not yet decided.
+   **Status:** Approved 2026-09-20 as recommended.
 10. **Fetch-batch default (M5.6).** — *Recommend* the owner signs off the number the benchmark produces rather than pre-committing one. S14 showed 10,000 rows/batch was ~3.5× *slower* than the best of 100 and 1,000, so intuition is actively wrong here.
     **Status:** Open — not yet decided (deferred to the M5.6 benchmark by design).
 11. **Wording sign-off for the no-Cancel UX and "no limit" (M4.6).** — *Recommend* the owner reads and approves the exact strings, because this is the product's honesty commitment in user-visible form. Proposed: Cancel is absent, not disabled; the run bar shows "Time limit 10 min (from profile)"; "no limit" reads *"A statement with no limit can only be ended by disconnecting this worksheet, which loses its transaction."*
@@ -429,7 +428,7 @@ Six milestones. M1 is the de-risking gate and nothing downstream starts until it
 13. **Upstream issues F and G** (U-15…U-18) — still awaiting your go-ahead from Phase 0. *Recommend* submitting; F in particular is the connect-timeout gap M2.1 works around locally.
     **Status:** Resolved — the owner decided on 2026-09-19 **not** to submit F and G for now; the drafts are kept for tracking only (results file §6). This is a decision, not a pending recommendation.
 14. **Mobile test hardware.** — Not needed for Phase 1, but *recommend* acquiring an Android arm64 device (API 26+) during Phase 1 so P4 is not gated on procurement. iOS additionally needs a Mac and an Apple Developer account.
-    **Status:** Partially resolved — the owner provided an Android arm64 phone (OPPO CPH2399) on 2026-09-19; NDK 28.2 is already installed and a physical-device validation run is in progress on branch `phase-0/android-device` (not finished; no results to cite yet). This validation is Phase-0 scope, not Phase 1. iOS still needs a Mac + Apple Developer account + device — not yet provided.
+    **Status:** Resolved for Android — the owner provided an Android arm64 phone (OPPO CPH2399) on 2026-09-19 and the native-binary device run passed 7/7 on 2026-09-20 (`phase-0-android-device.md`); previously reported as in progress on branch `phase-0/android-device` (not finished; no results to cite yet). This validation is Phase-0 scope, not Phase 1. iOS still needs a Mac + Apple Developer account + device — not yet provided.
 15. **Community/Pro licensing decision** (open since P0). — Blocks first distribution, not Phase 1 development. *Recommend* deciding before M6.6 so the notices file and About dialog are right the first time.
     **Status:** Open — not yet decided.
 
