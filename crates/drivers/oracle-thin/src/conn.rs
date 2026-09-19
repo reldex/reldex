@@ -1142,6 +1142,13 @@ impl DatabaseConnection for OracleConnection {
         } else {
             self.execute_non_query(statement, kind, &owned, name_refs.as_deref())
         };
+        // A caller who supplied no binds can still be told that a bind value is
+        // missing, because upstream's parser found a `:name` in the statement
+        // text. `CREATE TRIGGER … :NEW.x := …` is the case that matters.
+        let outcome = match (outcome, statement.binds().is_empty()) {
+            (Err(error), true) => Err(crate::error::explain_parsed_placeholders(error)),
+            (outcome, _) => outcome,
+        };
 
         let outcome = match (outcome, deadline_warning) {
             (Ok(outcome), Some(warning)) => {

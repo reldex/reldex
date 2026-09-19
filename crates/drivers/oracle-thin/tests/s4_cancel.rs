@@ -185,7 +185,25 @@ fn a_deadline_stops_a_long_sql_statement_and_reports_the_session_honestly() {
 }
 
 #[test]
-fn a_deadline_on_a_plsql_sleep_destroys_the_session() {
+fn a_deadline_on_a_plsql_sleep_usually_destroys_the_session() {
+    // This is the case that breaks, and **how often** it breaks is not fixed.
+    // The server will not answer the interrupt marker until the sleep is over,
+    // so upstream's `recover_from_error` — which reads the reset reply from the
+    // same socket with the same timeout still armed — usually times out as
+    // well, `unrecoverable_error` closes the transport, and the caller loses
+    // the session instead of getting a timeout. Sometimes the recovery lands
+    // inside the remaining window and the session survives.
+    //
+    // This test used to assert `NetworkLost` outright. That assertion was
+    // **flaky**, which is worse than either outcome: measured on 2026-09-19,
+    // three runs of this test on its own gave `NetworkLost` three times, while
+    // two runs of the whole file serially gave `NetworkLost` once and `Timeout`
+    // once — the earlier tests in the file leave the container busy enough to
+    // flip it. The results file's claim that "serial runs are stable" was true
+    // for the rest of the file and not for this test. A re-run is not evidence,
+    // so what is asserted here is the invariant that must hold **either way**:
+    // the call comes back, it is classified as one of the two honest kinds, and
+    // the session state it reports matches what the session actually does.
     let mut connection = connect();
     let deadline = Duration::from_secs(2);
 
@@ -202,25 +220,39 @@ fn a_deadline_on_a_plsql_sleep_destroys_the_session() {
         elapsed < Duration::from_secs(20),
         "the sleep ran to completion"
     );
-    // This is the case that breaks. The server will not answer the interrupt
-    // marker until the sleep is over, so upstream's `recover_from_error` —
-    // which reads the reset reply from the same socket **with the same timeout
-    // still armed** — times out as well, `unrecoverable_error` closes the
-    // transport, and the caller loses the session instead of getting a timeout.
-    assert_eq!(
-        error.kind(),
-        ErrorKind::NetworkLost,
-        "upstream behaviour changed for the uninterruptible case; the spike's \
-         conclusion and the driver's capabilities should be revisited: {error}"
+    assert!(
+        elapsed >= deadline,
+        "the call returned before its own deadline"
     );
-    assert_eq!(error.session_state(), SessionState::Lost);
-    let after = still_usable(connection.as_mut())
-        .err()
-        .unwrap_or_else(|| panic!("the session unexpectedly survived"));
-    observation(format!(
-        "the session did NOT survive the PL/SQL deadline: {}",
-        describe(&after)
-    ));
+
+    match error.kind() {
+        ErrorKind::NetworkLost => {
+            assert_eq!(error.session_state(), SessionState::Lost);
+            let after = still_usable(connection.as_mut())
+                .expect_err("a session reported Lost must not still work");
+            observation(format!(
+                "UPSTREAM GAP U-6, usual outcome: the session did NOT survive the PL/SQL \
+                 deadline: {}",
+                describe(&after)
+            ));
+        }
+        ErrorKind::Timeout => {
+            assert_eq!(error.session_state(), SessionState::NeedsValidation);
+            still_usable(connection.as_mut()).unwrap_or_else(|error| {
+                panic!(
+                    "the driver reported Timeout, which promises a recoverable session, \
+                     but the session did not survive: {}",
+                    describe(&error)
+                )
+            });
+            observation(
+                "UPSTREAM GAP U-6, the less common outcome: recovery landed inside the \
+                 remaining window and the session survived its own deadline. Load \
+                 decides which of the two a user gets, which is the whole problem",
+            );
+        }
+        other => panic!("a fired deadline must be Timeout or NetworkLost, not {other:?}: {error}"),
+    }
     let _ = connection.close();
 }
 

@@ -58,6 +58,14 @@ RELDEX_TEST_ORACLE_SYSTEM_USER='SYSTEM'
 RELDEX_TEST_ORACLE_SYSTEM_PASSWORD="$oracle_pwd"
 export RELDEX_TEST_ORACLE_SYSTEM_USER RELDEX_TEST_ORACLE_SYSTEM_PASSWORD
 
+# Opt-in extra, used only by spike S13 (`AS SYSDBA` over the listener, which
+# this image authenticates against its password file). Same password as above;
+# a separate pair of variables so the role is explicit at the call site and a
+# checkout that does not want a SYSDBA test can unset just these two.
+RELDEX_TEST_ORACLE_SYSDBA_USER='SYS'
+RELDEX_TEST_ORACLE_SYSDBA_PASSWORD="$oracle_pwd"
+export RELDEX_TEST_ORACLE_SYSDBA_USER RELDEX_TEST_ORACLE_SYSDBA_PASSWORD
+
 # Spike S8 (TCPS). Set only when the TLS listener has been enabled and the
 # CA certificate exported (`startup/10_enable_tcps.sh`, then the export step in
 # README.md, "TCPS"); the S8 tests skip themselves and say so otherwise.

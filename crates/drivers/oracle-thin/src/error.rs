@@ -142,8 +142,26 @@ pub(crate) fn map(error: &oracledb::Error) -> DbError {
 /// phase has to supply the distinction the upstream error does not carry.
 /// Measured in spike S1: connecting to a closed port reports
 /// `StreamOperation`, which [`map`] alone would call a lost session.
+///
+/// A socket-level timeout needs the same correction for a different reason.
+/// `oracledb` turns **every** `TimedOut`/`WouldBlock` `io::Error` into
+/// `CallTimeoutExceeded` (`src/error.rs:131`, cause discarded), so the TCP
+/// handshake giving up after the operating system's own patience — 22.0 s
+/// against an unroutable address, spike S10 — arrived here indistinguishable
+/// from a fired call deadline. Reporting that as [`ErrorKind::Timeout`] told
+/// the user a deadline they never set had expired, and attached a session state
+/// to a session that was never created.
 pub(crate) fn map_connect(error: &oracledb::Error) -> DbError {
     let mapped = map(error);
+    if mapped.kind() == ErrorKind::Timeout {
+        return DbError::new(
+            ErrorKind::Connection,
+            "the database could not be reached: the connection attempt timed out in the \
+             network layer. This driver cannot bound that wait — neither it nor \
+             `oracledb` applies a connect timeout — so the delay is the operating \
+             system's, not a deadline Reldex asked for",
+        );
+    }
     if mapped.kind() != ErrorKind::NetworkLost {
         return mapped;
     }
@@ -155,6 +173,44 @@ pub(crate) fn map_connect(error: &oracledb::Error) -> DbError {
         rebuilt = rebuilt.with_native(NativeError::new(native.code(), native.message()));
     }
     rebuilt
+}
+
+/// Replaces upstream's bind-count complaint with the reason a caller who
+/// supplied **no** binds can still trigger it.
+///
+/// `oracledb`'s SQL parser scans the whole statement text for `:name` and turns
+/// every hit into a bind placeholder, DDL included
+/// (`src/statement/sql_parser.rs`: `determine_statement_type` sets `is_ddl` and
+/// the scan carries on regardless). So `CREATE TRIGGER … :NEW.col := …` — which
+/// every Oracle IDE has to be able to run, and which SQL\*Plus accepts — comes
+/// back as "1 positional bind values are required but 0 were provided": a
+/// message that blames the caller for a placeholder they did not write.
+///
+/// The failure cannot be prevented from here; upstream offers no way to turn
+/// the scan off. What it can do is say what happened and what works instead.
+/// Spike S12 found it on `CREATE TRIGGER`.
+pub(crate) fn explain_parsed_placeholders(error: DbError) -> DbError {
+    if error.kind() != ErrorKind::Configuration
+        || !error
+            .message()
+            .contains("positional bind values are required but 0 were provided")
+    {
+        return error;
+    }
+    DbError::new(
+        ErrorKind::Unsupported,
+        format!(
+            "this statement declares no bind values, but the Oracle crate's SQL parser \
+             treated a `:name` in its text as a bind placeholder and then required a \
+             value for it. `:NEW` and `:OLD` in a trigger body are the usual cause: the \
+             parser applies the same scan to DDL as to DML and offers no way to turn it \
+             off. Submitting the same text inside a PL/SQL block works, because a quoted \
+             string is skipped: BEGIN EXECUTE IMMEDIATE q'[<the DDL>]'; END;. Upstream \
+             reported: {}",
+            error.message()
+        ),
+    )
+    .with_session_state(SessionState::Usable)
 }
 
 /// Converts a failure raised by `Lob::read` while streaming a large object.
@@ -615,6 +671,35 @@ mod tests {
                 .unwrap_or_default()
                 .contains("ข้อมูล")
         );
+    }
+
+    #[test]
+    fn a_connect_that_times_out_in_the_socket_is_not_reported_as_a_call_timeout() {
+        // `oracledb`'s `impl From<std::io::Error>` turns **any** `TimedOut` or
+        // `WouldBlock` I/O error into `ErrorKind::CallTimeoutExceeded` and
+        // discards the cause (`src/error.rs:131`). During `connect` there is no
+        // statement and no armed deadline, so passing that through told the
+        // user "the call timeout armed for this statement expired" about a
+        // connection that was never established, and left the session
+        // `NeedsValidation` — a session state for a session that does not
+        // exist. Spike S10 found it against 192.0.2.1 (22.0 s, RFC 5737
+        // TEST-NET-1).
+        let upstream = oracledb::Error::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        let mapped = map_connect(&upstream);
+        assert_eq!(mapped.kind(), ErrorKind::Connection);
+        assert_eq!(mapped.session_state(), SessionState::NeedsValidation);
+        assert!(
+            mapped.message().contains("could not be reached"),
+            "the message should describe a connect failure, not a fired deadline: {}",
+            mapped.message()
+        );
+
+        // The same upstream kind on an established connection still means what
+        // it says: a deadline the caller armed really did fire.
+        let on_a_session = map(&oracledb::Error::from(std::io::Error::from(
+            std::io::ErrorKind::TimedOut,
+        )));
+        assert_eq!(on_a_session.kind(), ErrorKind::Timeout);
     }
 
     #[test]
