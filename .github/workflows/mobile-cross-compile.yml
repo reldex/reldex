@@ -102,7 +102,12 @@ jobs:
         run: cargo tree -e features --target aarch64-linux-android -i rustls
 
       - name: Build (release) for aarch64-linux-android
-        run: cargo ndk -t arm64-v8a -p "$ANDROID_API_LEVEL" build --release $S6_PACKAGES
+        # `-P` (uppercase), not `-p`: cargo-ndk's own platform/API-level flag
+        # is `-P`/`--platform`; lowercase `-p` is not one of its flags at all,
+        # so it falls through to the forwarded cargo args and cargo reads it
+        # as `--package 26`, failing with "unknown package: 26" (found by
+        # running the first version of this workflow).
+        run: cargo ndk -t arm64-v8a -P "$ANDROID_API_LEVEL" build --release $S6_PACKAGES
 
       - name: Record artifact sizes and file output
         run: |
@@ -128,6 +133,20 @@ jobs:
   ios-arm64:
     name: ios-arm64 (S6)
     runs-on: macos-latest
+    env:
+      # Without this, rustc links against its own old default minimum
+      # (`arm64-apple-ios10.0.0` in the invocation actually observed), while
+      # `aws-lc-sys`'s C/assembly objects are compiled by this runner's
+      # installed Xcode against its current SDK (26.5) with no minimum of
+      # their own. The SDK's `libSystem` stub only exposes `___chkstk_darwin`
+      # (a stack-probe helper some of that assembly calls) to targets whose
+      # minimum is new enough, so linking against the 10.0 minimum fails with
+      # "Undefined symbols ... ___chkstk_darwin" (found by running the first
+      # version of this workflow) even though the symbol exists in the SDK.
+      # 15.0 is an arbitrary, comfortably-modern floor picked only to clear
+      # that availability gate for this build/link probe; it is not a
+      # decision about Reldex's real minimum supported iOS version.
+      IPHONEOS_DEPLOYMENT_TARGET: "15.0"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
