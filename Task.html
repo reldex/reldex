@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-19T23:59:00+07:00",
+  "updatedAt": "2026-09-19T23:20:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P0",
@@ -797,7 +797,8 @@
             },
             {
               "title": "Add driver contract tests that detect behaviour changes on oracledb upgrades",
-              "status": "todo"
+              "status": "done",
+              "note": "Upstream canary suite: one canary per observable upstream defect (offline ones run in CI, live ones opt-in), process-abort defects U-2/U-3/U-4 run in a child process, version tripwire on the oracledb pin. Procedure: docs/exec-plans/active/oracledb-upgrade-checklist.md."
             },
             {
               "title": "(S4 critical path) Draft upstream request to oracle/rust-oracledb for a public statement-cancel/break API — plus accessors for OracleNumber digits and the transaction-in-progress flag (owner to submit)",
@@ -1362,6 +1363,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-19",
+      "text": "Upstream canary suite added: each observable oracledb defect has a test asserting it is still present, so an upstream fix shows up as a failing test naming the guard that can be removed; a tripwire fails when the pinned version moves. While writing it, the U-12 catalogue entry was corrected (MY_WALLET_DIRECTORY is not parsed at all upstream)."
+    },
     {
       "date": "2026-09-19",
       "text": "Owner confirmed results file §9 items 6–7 by accepting pull request #5 (TCPS descriptor guard, U-14) and gave the go for Phase 1. Upstream issues F and G stay drafted and unsubmitted by owner decision — kept for tracking only."

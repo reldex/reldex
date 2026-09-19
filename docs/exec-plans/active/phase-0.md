@@ -313,6 +313,11 @@ criterion's honest status is softened to make the table look more finished than 
   **Implementation pending.**
 - Owner approval to submit drafted upstream **issues F and G** (results file §6) — U-15…U-17
   (timeouts/dead-link detection) and U-18 (`CREATE TRIGGER`). **Still outstanding.**
+- **Watching for the fixes.** Each upstream defect that can be observed from a test now has a
+  canary asserting it is *still there*
+  (`crates/drivers/oracle-thin/tests/canary_upstream_{offline,live}.rs`), so a fix arrives as a
+  failing test that names the guard it makes removable; a version tripwire fails as soon as the pin
+  moves. See `oracledb-upgrade-checklist.md` for the per-U-number map and the manual checks.
 - **Owner decisions from results file §9 — updated 2026-09-19.** Items 8–12 are now decided (see
   `phase-0-spike-results.md` §9 and ADR-0001's 2026-09-19 addendum), each made user-configurable per
   the owner's requirement: item 8 (`connect_timeout`, C-5) — helper thread, default 15 s,

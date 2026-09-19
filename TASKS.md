@@ -32,7 +32,7 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [x] Create `db-driver-api`
 - [x] Create `db-core` (session layer implemented: worker-thread-per-session, FIFO queue, out-of-band cancel, conservative transaction tracking incl. locking queries, `CloseDisposition`, terminal `Lost`/`Closed` lifecycle, core-owned `ResultId`/`LobHandle`, bounded `Drop`, `SessionLimits`, panic containment; independently reviewed, 7 must-fix applied, commit `86f79d7`)
 - [x] Create initial database driver implementation — wrap Oracle's official `oracledb` crate (`oracle/rust-oracledb`, pinned exact version `=26.0.0-beta.3`) in `crates/drivers/oracle-thin` (ADR-0001); independently reviewed, 4 must-fix applied, commit `db38c14`
-- [ ] Add driver contract tests that detect behaviour changes on `oracledb` upgrades
+- [x] Add driver contract tests that detect behaviour changes on `oracledb` upgrades — upstream canary suite (`crates/drivers/oracle-thin/tests/canary_upstream_{offline,live}.rs`): one canary per observable upstream defect, process-abort defects run in a child process, version tripwire on the pin; procedure in `docs/exec-plans/active/oracledb-upgrade-checklist.md`
 - [x] **(S4 critical path)** Draft upstream request to `oracle/rust-oracledb` for a public statement-cancel/break API — plus accessors for `OracleNumber` digits and the connection's transaction-in-progress flag (seven issues drafted in full: `docs/exec-plans/active/phase-0-spike-results.md` §6 — A–E submitted 2026-09-20 (#21–#25), F and G await owner go-ahead; see the separate owner task below)
 - [x] Add normalized `DbError`
 - [~] Add connection/profile model (driver-level connection params done; user-facing profile model pending)

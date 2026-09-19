@@ -1464,12 +1464,26 @@ is everything around it:
   `ewallet.p12` — what `orapki` actually produces, and what every Oracle
   administrator has — are not read. Neither is the operating system trust store,
   nor `SSL_CERT_FILE`, nor `SSL_CERT_DIR`.
-- A descriptor's `MY_WALLET_DIRECTORY` **is** parsed
-  (`config/connect_options.rs:508`, into `ConnectOptions::wallet_location`) and
-  is then only echoed back into the `SECURITY` segment sent to the server: the
-  TLS layer reads `Config::wallet_location`, a different field. A connect string
-  that names a wallet directory therefore looks as though it configured
-  something and did not.
+- A descriptor's wallet directory never reaches the TLS layer. **Corrected
+  2026-09-19** while writing the U-12 canary; the first version of this bullet
+  said `MY_WALLET_DIRECTORY` is parsed, and that is wrong in a way that makes
+  the gap wider, not narrower:
+  - the only arm `process_security_nodes` has
+    (`config/connect_options.rs:508`) is keyed on **`wallet_location`**, so the
+    descriptor key it accepts is `WALLET_LOCATION`;
+  - **`MY_WALLET_DIRECTORY`** — the spelling `orapki`, `tnsnames.ora` and every
+    other Oracle client use — has no arm at all and is dropped in silence;
+  - `build_description_segment` writes the field back out as
+    `MY_WALLET_DIRECTORY` (`:392-393`), so a descriptor does not even
+    round-trip through this crate's own parser;
+  - and either way it lands in `Description::wallet_location`, while the TLS
+    layer reads `Config::wallet_location` — a different field, set only by
+    `Config::set_wallet_location`.
+
+  A connect string that names a wallet directory therefore looks as though it
+  configured something and did not. *Evidence:*
+  `u12_a_wallet_directory_named_in_a_descriptor_still_never_reaches_the_tls_layer`
+  in `canary_upstream_offline.rs`.
 
 No workaround is needed and none was invented; the request is documentation plus
 `ewallet.p12`/system-store support. Drafted as **Issue E**.
