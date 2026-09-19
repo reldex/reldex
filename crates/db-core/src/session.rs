@@ -489,6 +489,9 @@ pub struct DatabaseSession {
     shared: Arc<SessionShared>,
     cancel_handle: Arc<dyn reldex_db_driver_api::CancelHandle>,
     cancel_kind: CancelKind,
+    /// Collected once, on the worker thread, right after `connect` returned.
+    /// Fixed for the session's lifetime, so this needs no lock.
+    connect_warnings: Vec<Warning>,
 }
 
 impl DatabaseSession {
@@ -510,6 +513,26 @@ impl DatabaseSession {
     #[must_use]
     pub fn cancel_kind(&self) -> CancelKind {
         self.cancel_kind
+    }
+
+    /// Non-fatal findings the driver produced while **opening** this session.
+    ///
+    /// Collected once on the worker thread immediately after
+    /// [`reldex_db_driver_api::DatabaseDriver::connect`] returned
+    /// ([`reldex_db_driver_api::DatabaseConnection::take_connect_warnings`]),
+    /// so a session that is opened, pinged and closed without ever running a
+    /// statement still reports them. Typically a transport or profile parameter
+    /// the driver cannot honour but that does not make the session any less
+    /// safe than it was asked to be; anything that *does* is a failed `connect`
+    /// instead.
+    ///
+    /// Constant for the session's lifetime, so it is borrowed rather than
+    /// taken: reading it late — after the UI has a window to show it in — must
+    /// not be the same as losing it. Never mixed into
+    /// [`ExecuteOutcome::warnings`], which belongs to one statement.
+    #[must_use]
+    pub fn connect_warnings(&self) -> &[Warning] {
+        &self.connect_warnings
     }
 
     /// Requests that the currently running statement, if any, stop.
@@ -872,6 +895,11 @@ impl SessionManager {
     /// (`SPEC.md` §11/§19). Making the *wait* asynchronous too is Phase 1 FFI
     /// work (ADR-0002, amendments after the db-core review).
     ///
+    /// Anything non-fatal the driver noticed while opening the connection is
+    /// collected once on that worker thread and reported through
+    /// [`DatabaseSession::connect_warnings`]; callers that show connection
+    /// diagnostics should read it as soon as this returns.
+    ///
     /// # Errors
     ///
     /// Whatever [`DatabaseDriver::connect`] returned, or a
@@ -892,6 +920,7 @@ impl SessionManager {
             shared: handle.shared,
             cancel_handle: handle.cancel_handle,
             cancel_kind: handle.cancel_kind,
+            connect_warnings: handle.connect_warnings,
         })
     }
 }

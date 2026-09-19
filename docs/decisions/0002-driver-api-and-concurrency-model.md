@@ -3,10 +3,12 @@
 **Status:** Accepted (owner confirmed 2026-09-20) — implemented; independent API review completed
 2026-09-19 and its must-fix findings applied, see "Amendments after API review"; amended after the
 ADR-0001 Phase 0 spikes, see "Amendments after the Phase 0 spikes"; amended again after the
-independent review of the `db-core` session layer, see "Amendments after the db-core session review"
+independent review of the `db-core` session layer, see "Amendments after the db-core session review";
+amended again by the owner's connect-time-warning decision, see "Amendment: the connect-time warning
+channel"
 **Date:** 2026-09-19
 **Amended:** 2026-09-19 (API review), 2026-09-19 (Phase 0 spikes), 2026-09-19 (db-core session
-review), 2026-09-20 (owner confirmation)
+review), 2026-09-20 (owner confirmation), 2026-09-20 (connect-time warning channel, C-6)
 
 ## Context
 
@@ -804,6 +806,86 @@ Recorded so the design stays unblocked:
   `Completion::wait_timeout` consume the completion and hand it back on `Err`, which is what makes
   them non-lossy: the reply exists exactly once and is not `Clone`, so a method that could both
   return it and leave a `Completion` behind would have to fabricate something for the second caller.
+
+## Amendment: the connect-time warning channel (2026-09-20, contract gap C-6)
+
+Owner decision (`phase-0-spike-results.md` §9 item 13, approved 2026-09-19; sequenced after pull
+request #5, which has landed). Numbering: `W`.
+
+### W1 — `DatabaseConnection::take_connect_warnings`
+
+`DatabaseDriver::connect` returns `DbResult<Box<dyn DatabaseConnection>>`: a connection or an error,
+with nothing in between. `Warning` — this contract's own type for "non-fatal, worth showing" —
+travelled only on an `ExecutionOutcome`. So a driver that noticed something while *opening* a
+session had exactly two answers, and for one real case both were wrong. The U-14 guard is that case:
+`SSL_SERVER_CERT_DN` is a refusal, because the session would be weaker than the profile configured,
+but `SSL_SERVER_DN_MATCH` deliberately is **not** — the session that opens verifies the server more
+strictly than the parameter asked for — and the caller still has to be told the parameter did
+nothing, or an imported profile goes on believing it configured something.
+
+The oracle-thin driver worked around it by holding the findings on the connection and attaching them
+to the **first statement that succeeded**. That reached the user through the existing path, but it
+coupled a connect-time fact to an unrelated statement's outcome and lost it entirely for a session
+that is opened, pinged and closed without executing anything.
+
+One additive, vendor-neutral, defaulted method closes it:
+
+```rust
+pub trait DatabaseConnection: Send {
+    /// Non-fatal findings produced while this connection was being opened.
+    fn take_connect_warnings(&mut self) -> Vec<Warning> {
+        Vec::new()
+    }
+}
+```
+
+- **Defaulted**, so a driver with nothing to say needs no change, and **object-safe**, so
+  `Box<dyn DatabaseConnection>` is unaffected — the two properties that make this additive rather
+  than a contract break.
+- **Taken, not borrowed**, so each finding is reported once and the connection keeps nothing.
+- Cheap and non-blocking: it reports what `connect` already discovered and must not issue a round
+  trip.
+- The dividing line is stated on the method: anything that makes the session *worse* than the caller
+  asked for stays an error from `connect`. This channel is for "you configured something that did
+  nothing", never for "your session is less safe than you think". That is what keeps the U-14 split
+  — refuse the pin, report the match — a principle rather than a judgement call.
+
+No Oracle vocabulary enters the crate, and `db-driver-api` still has zero production dependencies.
+
+### W2 — `db-core` collects once, and reports it with the session
+
+`worker.rs` calls it exactly once, on the session's worker thread, immediately after
+`driver.connect` returns and before the session is reported ready — the only moment at which
+"somebody asks" is defined. The findings travel out with the successful open and are reported by
+`DatabaseSession::connect_warnings() -> &[Warning]`.
+
+Three alternatives were considered and rejected:
+
+- **Widening `SessionManager::open_session`'s return type** to a tuple. It would make every caller
+  that does not care about warnings destructure one, for a fact that belongs to the session it just
+  opened.
+- **An event queue.** The per-session outbound completion/event queue is real and is named in
+  "Deferred, and deliberately not built now"; it is Phase 1 FFI work, and inventing a one-message
+  version of it here would prejudge its shape.
+- **Mixing them into the first `ExecuteOutcome::warnings`.** That is the mechanism being replaced.
+
+`connect_warnings` **borrows** rather than takes, which is deliberately the opposite of the driver
+method. The driver must hand its findings over once, because keeping them is what caused the
+duplicate-delivery problem; the core's copy is fixed for the session's lifetime, so reading it late —
+after the UI has a window to show it in — must not be the same as losing it. It is never mixed into
+`ExecuteOutcome::warnings`, which belongs to one statement.
+
+A driver that panics inside `take_connect_warnings` is contained like any other driver call (K6): the
+connection is *torn*, so it is dropped rather than closed, and the session does not open.
+
+*Evidence:* `a_driver_with_nothing_to_say_about_connecting_needs_no_code_at_all` in
+`db-driver-api`'s `session.rs` (a stub connection that implements only the required methods);
+`connect_warnings_are_taken_once_and_default_to_none` in `crates/drivers/mock/tests/contract.rs`;
+`crates/db-core/tests/connect_warnings.rs` (reaches the owner with no statement run, is not mixed
+into a statement's warnings, and is empty for a driver with nothing to say); and live against the
+TCPS listener, `a_descriptor_that_sets_dn_matching_opens_a_session_and_reports_the_parameter_as_inert`
+and `a_connect_time_finding_survives_a_session_that_never_executes_a_statement` in
+`crates/drivers/oracle-thin/tests/s8_tcps.rs` — 13 passed, 0 failed, 49.1 s.
 
 ## Notes for driver implementers
 

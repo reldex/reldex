@@ -337,36 +337,76 @@ fn a_descriptor_that_sets_dn_matching_opens_a_session_and_reports_the_parameter_
     // stricter mechanism.
     let mut connection =
         try_connect(&params).expect("SSL_SERVER_DN_MATCH must not stop a session opening");
-    // The finding reaches the caller on the first statement that succeeds — the
-    // contract has no connect-time warning channel (gap C-6 in the spike
-    // results), and this is the narrowest existing one.
-    let outcome = connection
-        .execute(&Statement::new("SELECT 1 FROM dual"))
-        .expect("an ordinary query over TCPS");
-    let warning = outcome
-        .warnings()
+    // The finding reaches the caller through the contract's connect-time
+    // channel (`take_connect_warnings`, ADR-0002's C-6 amendment), before any
+    // statement has run — which is the half the interim mechanism could not
+    // cover, because it rode on the first statement that succeeded.
+    let connect_warnings = connection.take_connect_warnings();
+    let warning = connect_warnings
         .iter()
         .find(|warning| warning.message().contains("SSL_SERVER_DN_MATCH"))
-        .expect("the connect-time finding travels with the first statement");
+        .expect("the connect-time finding is reported by the connection itself");
     assert_eq!(warning.kind(), WarningKind::Informational);
     assert!(warning.message().contains("subjectAltName"), "{warning:?}");
     observation(format!(
-        "SSL_SERVER_DN_MATCH=YES -> session opened; warning: {}",
+        "SSL_SERVER_DN_MATCH=YES -> session opened; connect warning: {}",
         warning.message()
     ));
-    drop(outcome);
-
-    // And it is delivered once, not on every statement.
-    let second = connection
-        .execute(&Statement::new("SELECT 2 FROM dual"))
-        .expect("a second query");
     assert!(
-        second.warnings().is_empty(),
-        "the connect-time finding was repeated: {:?}",
-        second.warnings()
+        connection.take_connect_warnings().is_empty(),
+        "connect findings are taken, not borrowed: the second call must report nothing"
     );
-    drop(second);
+
+    // And it never appears on a statement, which is what the replaced
+    // mechanism did.
+    let outcome = connection
+        .execute(&Statement::new("SELECT 1 FROM dual"))
+        .expect("an ordinary query over TCPS");
+    assert!(
+        outcome.warnings().is_empty(),
+        "a connect-time finding must not travel with a statement any more: {:?}",
+        outcome.warnings()
+    );
+    drop(outcome);
     connection.close().expect("close");
+}
+
+#[test]
+fn a_connect_time_finding_survives_a_session_that_never_executes_a_statement() {
+    // The hole the interim mechanism could not close, now covered: open, ping,
+    // close, and the finding still reaches the caller.
+    let Some(base) = tcps() else { return };
+    let Some(descriptor) = tcps_descriptor("(SECURITY=(SSL_SERVER_DN_MATCH=YES))") else {
+        observation(format!(
+            "SKIPPED: {TCPS_DSN} is not the tcps://host:port/service shape this test rewrites"
+        ));
+        return;
+    };
+    let params = ConnectionParams::new(
+        Endpoint::ConnectString(descriptor),
+        Credentials::UserPassword {
+            username: setting(USER),
+            password: Secret::new(setting(PASSWORD)),
+        },
+    )
+    .with_tls(TlsMode::Required)
+    .with_extensions(base.extensions().clone());
+
+    let mut connection = try_connect(&params).expect("the session must open");
+    let warnings = connection.take_connect_warnings();
+    connection.ping().expect("ping");
+    connection.close().expect("close");
+
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.message().contains("SSL_SERVER_DN_MATCH")),
+        "no statement ran, and the finding still has to arrive: {warnings:?}"
+    );
+    observation(
+        "a connection that is opened, pinged and closed reports its connect-time finding — \
+         the case the pre-C-6 mechanism lost entirely",
+    );
 }
 
 #[test]

@@ -138,34 +138,51 @@ impl DatabaseDriver for OracleThinDriver {
             params.extensions().get(EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE),
             Some(ExtensionValue::Flag(true))
         );
-        let connection = oracledb::connect(config).map_err(|error| {
-            let mapped = crate::error::map_connect(&error);
-            // A descriptor that names Oracle's certificate parameters and then
-            // fails the *name* check needs to be told which name failed, or the
-            // obvious next move is to edit a parameter that does nothing.
+        // A descriptor that names Oracle's certificate parameters and then
+        // fails the *name* check needs to be told which name failed, or the
+        // obvious next move is to edit a parameter that does nothing. This
+        // closure runs wherever the connect runs, which — once a limit
+        // applies — is a helper thread, so it must own everything it needs.
+        let map_error = move |error: &oracledb::Error| {
+            let mapped = crate::error::map_connect(error);
             if names_certificate_parameters {
                 crate::error::explain_name_verification(mapped)
             } else {
                 mapped
             }
-        })?;
+        };
+        // `oracledb` cannot bound a connect (U-15), so the bound is this
+        // driver's: the blocking connect runs on a helper thread and the wait
+        // ends at the limit, leaving an attempt that outlives it to dispose of
+        // its own session (contract gap C-5, owner decision 2026-09-19).
+        let connection = match crate::connect_timeout::limit(params) {
+            Some(limit) => crate::connect_timeout::connect_within(config, limit, map_error)?,
+            None => oracledb::connect(config).map_err(|error| map_error(&error))?,
+        };
+        // On unless the caller explicitly says otherwise; see
+        // [`EXT_REWRITE_TRIGGER_DDL`].
+        let rewrite_trigger_ddl = !matches!(
+            params.extensions().get(EXT_REWRITE_TRIGGER_DDL),
+            Some(ExtensionValue::Flag(false))
+        );
         Ok(Box::new(OracleConnection::new(
             connection,
             allow_timestamp_with_time_zone,
+            rewrite_trigger_ddl,
             warnings,
         )))
     }
 }
 
 /// An upstream configuration, plus whatever the driver noticed while building
-/// it and could not report any other way.
+/// it.
 ///
 /// The warnings are connect-time findings — today, only what
-/// [`crate::descriptor`] read out of the descriptor — and the contract has
-/// nowhere to put them: [`DatabaseDriver::connect`] returns a connection or an
-/// error, and [`Warning`] travels on an [`ExecutionOutcome`]. They are therefore
-/// carried on the connection and attached to the first statement that succeeds;
-/// see [`OracleConnection::pending_warnings`].
+/// [`crate::descriptor`] read out of the descriptor — and they leave the driver
+/// through
+/// [`DatabaseConnection::take_connect_warnings`], the contract's own
+/// connect-time channel (ADR-0002, C-6 amendment); see
+/// [`OracleConnection::connect_warnings`].
 struct Prepared {
     config: Config,
     warnings: Vec<Warning>,
@@ -563,6 +580,26 @@ pub const EXT_ALLOW_UNENFORCED_SERVER_CERT_DN: &str = "oracle.allow_unenforced_s
 /// rendering of the parameters cannot print it.
 pub const EXT_WALLET_PASSWORD: &str = "oracle.wallet_password";
 
+/// Extension key: whether `CREATE … TRIGGER` DDL is rewritten so it can run at
+/// all. **On by default** (owner decision 2026-09-19, `SPEC.md` §8).
+///
+/// `oracledb` 26.0.0-beta.3 reads `:NEW`, `:OLD` — any `:name` — inside a
+/// trigger body as a bind placeholder and then demands a value for it, so the
+/// plain `CREATE TRIGGER` every other Oracle client accepts cannot be executed
+/// (upstream gap U-18). This driver therefore submits such a statement inside
+/// `BEGIN EXECUTE IMMEDIATE q'…'; END;`, where a quoted string is invisible to
+/// that parser, and puts a [`Warning`] on the outcome saying so and carrying
+/// the exact text sent. See [`crate::rewrite`].
+///
+/// `ExtensionValue::Flag(false)` turns it off, and the statement is then
+/// refused with the explanatory error [`crate::error::explain_parsed_placeholders`]
+/// produces. Every other shape — including a malformed value — leaves the
+/// rewrite **on**, because here "on" is the working configuration rather than
+/// the risky one: this is the opposite default to
+/// [`EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE`], and for the same reason, which is
+/// that a typo must not silently change what the driver can do.
+pub const EXT_REWRITE_TRIGGER_DDL: &str = "oracle.rewrite_trigger_ddl";
+
 /// The cancel handle for a connection.
 ///
 /// This driver is [`CancelKind::PreArmedDeadline`], so `request_cancel` sends
@@ -651,35 +688,31 @@ pub(crate) struct OracleConnection {
     transaction: TransactionState,
     /// See [`EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE`].
     allow_timestamp_with_time_zone: bool,
+    /// See [`EXT_REWRITE_TRIGGER_DDL`].
+    rewrite_trigger_ddl: bool,
     open_result_sets: OpenResultSets,
     /// The deadline currently armed on the connection's socket, so a change can
     /// be reported rather than made silently.
     armed_deadline: Option<Duration>,
-    /// Non-fatal findings from **connect** time, waiting for somewhere to go.
+    /// Non-fatal findings from **connect** time — today, only what
+    /// [`crate::descriptor`] read out of the descriptor.
     ///
-    /// The contract has no connect-time warning channel: `connect` returns a
-    /// connection or a [`DbError`], and [`Warning`] rides on an
-    /// [`ExecutionOutcome`]. Adding one would mean changing
-    /// `db-driver-api`, which this driver does not get to do on its own
-    /// (contract gap C-6 in the spike results). So the narrowest existing
-    /// mechanism is used instead: the findings are attached to the **first
-    /// statement that succeeds** on this connection, alongside whatever that
-    /// statement produced, and `db-core` forwards them like any other warning.
-    ///
-    /// They stay pending until they are delivered, so a first statement that
-    /// fails does not consume them. The one case this does not cover is a
-    /// connection that never executes anything — `connect`, `ping`, `close` —
-    /// where the finding is lost; the refusal that matters most
-    /// ([`EXT_ALLOW_UNENFORCED_SERVER_CERT_DN`]) is an error rather than a
-    /// warning precisely so it does not depend on this path.
-    pending_warnings: Vec<Warning>,
+    /// They leave through [`DatabaseConnection::take_connect_warnings`], which
+    /// `db-core` calls once, on the session's worker thread, as soon as
+    /// `connect` returns (ADR-0002's C-6 amendment). Taken there and not kept,
+    /// so they are reported once and — unlike the interim mechanism this
+    /// replaced, which rode on the first statement that succeeded — they reach
+    /// the caller even for a session that is opened, pinged and closed without
+    /// ever executing anything.
+    connect_warnings: Vec<Warning>,
 }
 
 impl OracleConnection {
     fn new(
         inner: Connection,
         allow_timestamp_with_time_zone: bool,
-        pending_warnings: Vec<Warning>,
+        rewrite_trigger_ddl: bool,
+        connect_warnings: Vec<Warning>,
     ) -> Self {
         let open_result_sets = OpenResultSets::default();
         Self {
@@ -692,9 +725,10 @@ impl OracleConnection {
             // claims to know.
             transaction: TransactionState::Inactive,
             allow_timestamp_with_time_zone,
+            rewrite_trigger_ddl,
             open_result_sets,
             armed_deadline: None,
-            pending_warnings,
+            connect_warnings,
         }
     }
 
@@ -876,9 +910,14 @@ impl OracleConnection {
             .with_warnings(self.warnings()))
     }
 
+    /// `sql` is what actually goes to the server, which is the caller's text
+    /// unless [`crate::rewrite`] had to replace it (U-18). Everything else —
+    /// the reported [`StatementKind`], the binds, the deadline — still comes
+    /// from `statement`, because that is what the user submitted.
     fn execute_non_query(
         &mut self,
         statement: &Statement,
+        sql: &str,
         kind: StatementKind,
         owned: &[OwnedBind],
         names: Option<&[&str]>,
@@ -886,7 +925,7 @@ impl OracleConnection {
         let refs: Vec<&dyn ToDbValue> = owned.iter().map(OwnedBind::as_dyn).collect();
         let mut prepared = self
             .inner
-            .statement(statement.sql())
+            .statement(sql)
             .map_err(|error| crate::error::map(&error))?;
         prepared.exclude_from_cache();
         prepared.fetch_lobs();
@@ -1231,6 +1270,39 @@ fn deadline_change_warning(
     ))
 }
 
+/// Makes a rewritten statement end the way the statement the caller wrote
+/// would have, which takes more than sending different text.
+///
+/// Two differences have to be undone. Plain DDL that compiles with errors
+/// *succeeds* and reports a warning; the same DDL inside `EXECUTE IMMEDIATE`
+/// raises ORA-24344 as a PL/SQL exception instead. The object is created
+/// either way, so reporting a failure would tell the caller nothing was — see
+/// [`crate::error::compiled_with_errors`]. And the wrapper block reports one
+/// row "affected", an artefact of `EXECUTE IMMEDIATE` that the DDL itself did
+/// not do, so the count is dropped. Nothing else is lost with it: a rewritten
+/// statement is always trigger DDL, which has neither a cursor nor output
+/// binds.
+///
+/// The warning that says the text was rewritten comes first, because it
+/// explains everything after it.
+fn finish_rewritten(
+    kind: StatementKind,
+    rewrite: &crate::rewrite::Rewrite,
+    outcome: DbResult<ExecutionOutcome>,
+) -> DbResult<ExecutionOutcome> {
+    let mut warnings = vec![rewrite.warning()];
+    match outcome {
+        Err(error) if crate::error::is_compiled_with_errors(&error) => {
+            warnings.push(crate::error::compiled_with_errors(&error));
+        }
+        Err(error) => return Err(error),
+        Ok(outcome) => warnings.extend(outcome.warnings().iter().cloned()),
+    }
+    Ok(ExecutionOutcome::new()
+        .with_statement_kind(kind)
+        .with_warnings(warnings))
+}
+
 impl DatabaseConnection for OracleConnection {
     fn id(&self) -> ConnectionId {
         self.id
@@ -1242,6 +1314,10 @@ impl DatabaseConnection for OracleConnection {
 
     fn cancel_handle(&self) -> Arc<dyn CancelHandle> {
         self.cancel.clone()
+    }
+
+    fn take_connect_warnings(&mut self) -> Vec<Warning> {
+        std::mem::take(&mut self.connect_warnings)
     }
 
     fn execute(&mut self, statement: &Statement) -> DbResult<ExecutionOutcome> {
@@ -1271,6 +1347,21 @@ impl DatabaseConnection for OracleConnection {
             .as_ref()
             .map(|names| names.iter().map(String::as_str).collect());
 
+        // `CREATE … TRIGGER` whose body upstream would misread as carrying bind
+        // placeholders is submitted inside `EXECUTE IMMEDIATE` instead, because
+        // otherwise it cannot be executed at all (U-18). Only when the caller
+        // declared **no** binds: a statement with real binds is one upstream's
+        // scan is right about, and rewriting it would move the caller's own
+        // placeholders inside a string literal.
+        let rewrite = if self.rewrite_trigger_ddl && statement.binds().is_empty() {
+            crate::rewrite::plan(statement.sql())?
+        } else {
+            None
+        };
+        let sql = rewrite
+            .as_ref()
+            .map_or_else(|| statement.sql(), crate::rewrite::Rewrite::text);
+
         let deadline_warning = deadline_change_warning(
             self.open_result_sets.count(),
             self.armed_deadline,
@@ -1281,26 +1372,33 @@ impl DatabaseConnection for OracleConnection {
         let outcome = if returns_rows {
             self.execute_query(statement, &owned, name_refs.as_deref())
         } else {
-            self.execute_non_query(statement, kind, &owned, name_refs.as_deref())
+            self.execute_non_query(statement, sql, kind, &owned, name_refs.as_deref())
         };
         // A caller who supplied no binds can still be told that a bind value is
         // missing, because upstream's parser found a `:name` in the statement
-        // text. `CREATE TRIGGER … :NEW.x := …` is the case that matters.
+        // text. `CREATE TRIGGER … :NEW.x := …` is the case that matters, and it
+        // only reaches here when the rewrite above is switched off.
         let outcome = match (outcome, statement.binds().is_empty()) {
             (Err(error), true) => Err(crate::error::explain_parsed_placeholders(error)),
             (outcome, _) => outcome,
         };
 
-        // Two things the statement did not produce may still have to travel with
-        // it: a deadline change that re-bounded somebody else's open result set,
-        // and whatever `connect` found in the descriptor and had nowhere to put
-        // (see `pending_warnings`). The connect-time findings are **taken**, and
-        // only on success, so a first statement that fails leaves them waiting
-        // for the next one rather than swallowing them.
+        // A rewritten statement must end the way the one the user wrote would
+        // have, which takes more than sending different text; see
+        // [`finish_rewritten`].
+        let outcome = match (&rewrite, outcome) {
+            (Some(rewrite), outcome) => finish_rewritten(kind, rewrite, outcome),
+            (None, outcome) => outcome,
+        };
+
+        // One thing the statement did not produce may still have to travel with
+        // it: a deadline change that re-bounded somebody else's open result set.
+        // Connect-time findings do **not** ride here any more — they go through
+        // `take_connect_warnings`, so they are delivered whether or not a
+        // statement ever runs, and never twice.
         let outcome = match outcome {
-            Ok(outcome) if !self.pending_warnings.is_empty() || deadline_warning.is_some() => {
-                let mut warnings = std::mem::take(&mut self.pending_warnings);
-                warnings.extend(outcome.warnings().iter().cloned());
+            Ok(outcome) if deadline_warning.is_some() => {
+                let mut warnings = outcome.warnings().to_vec();
                 warnings.extend(deadline_warning);
                 Ok(outcome.with_warnings(warnings))
             }

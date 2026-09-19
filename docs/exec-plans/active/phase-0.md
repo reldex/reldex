@@ -158,9 +158,10 @@ For every mapping, document:
   server will not interrupt promptly costs the connection entirely (upstream recovery defect U-6,
   load-dependent by construction — see `phase-0-spike-results.md` U-6). This is timeout behavior, not
   cancellation; see Workstream C for why it does not satisfy `SPEC.md` §24.8. **Extended by spike S10:**
-  a connect cannot be bounded at all — `ConnectionParams::connect_timeout()` is accepted and ignored
-  by the driver (contract gap C-5) — and a black-holed link with no deadline armed never returns
-  (U-15, U-17).
+  a connect could not be bounded at all — `ConnectionParams::connect_timeout()` was accepted and
+  ignored by the driver (contract gap C-5) — and a black-holed link with no deadline armed never
+  returns (U-15, U-17). **C-5 fixed 2026-09-20**: the driver bounds the connect itself (default
+  15 s); U-15 and U-17 are unchanged upstream.
 - [x] network-loss behavior. **Pass, with two upstream gaps (spike S10).** A dead socket (hard drop)
   is detected in 54 µs–568 µs and reported `NetworkLost`/`Lost`; loss mid-statement, mid-fetch and
   mid-LOB-stream all report and retire the handle cleanly; an in-doubt commit is surfaced as unknown,
@@ -258,7 +259,8 @@ Windows 11 Pro, `rustc 1.98.1` MSVC target). Full method notes are in
   observable on-demand cancel in the general case — see Workstream C. **Connect-time deadlines
   (spike S10):** a connect to a discarded address (`192.0.2.1`) returned after 22.0 s — the operating
   system's own SYN budget, nothing the driver chose — and a connect into a black hole was still
-  outstanding after 30 s even with `ConnectionParams::with_connect_timeout(2 s)` set (U-15/C-5); a
+  outstanding after 30 s even with `ConnectionParams::with_connect_timeout(2 s)` set (U-15/C-5) —
+  both **2.0 s** after the C-5 fix, re-measured with a short explicit limit; a
   black-holed `ping` with no deadline had not returned after 30 s, while the same call with a 3 s
   deadline returned after 6.0 s and destroyed the session (U-6/U-17).
 - **Concurrency** — 8 concurrent sessions, 400 inserts (50 per thread) plus commit and read-back,
@@ -310,7 +312,10 @@ criterion's honest status is softened to make the table look more finished than 
 - Driver fix for **C-5** (`ConnectionParams::connect_timeout` accepted and ignored) — **approved
   2026-09-19**: implement on a helper thread, default 15 s, user-configurable per connection
   profile including "no limit" (results file §9 item 8, ADR-0001 2026-09-19 addendum).
-  **Implementation pending.**
+  **Done 2026-09-20**: `connect_timeout.rs`; "no limit" is the driver extension
+  `oracle.connect_timeout_unbounded`, because `Option<Duration>` cannot carry the third state.
+  The upstream defect is untouched — an abandoned attempt cannot be interrupted, only left to
+  finish, so it costs one thread until it does.
 - Owner approval to submit drafted upstream **issues F and G** (results file §6) — U-15…U-17
   (timeouts/dead-link detection) and U-18 (`CREATE TRIGGER`). **Still outstanding.**
 - **Watching for the fixes.** Each upstream defect that can be observed from a test now has a
@@ -321,18 +326,22 @@ criterion's honest status is softened to make the table look more finished than 
 - **Owner decisions from results file §9 — updated 2026-09-19.** Items 8–12 are now decided (see
   `phase-0-spike-results.md` §9 and ADR-0001's 2026-09-19 addendum), each made user-configurable per
   the owner's requirement: item 8 (`connect_timeout`, C-5) — helper thread, default 15 s,
-  **implementation pending**; item 9 (default per-statement time limit) — default 600 s,
+  **done 2026-09-20**; item 9 (default per-statement time limit) — default 600 s,
   configurable at three levels (application default, connection profile, per worksheet/statement)
   including "no limit" with an explicit UI warning, `SPEC.md` §10 constraints unchanged; item 10
   (`SQLNET.EXPIRE_TIME`) — documentation recommendation only, Phase 0 test database stays unset;
   item 11 (`CREATE TRIGGER` U-18) — driver auto-rewrites via `EXECUTE IMMEDIATE` by default, always
-  reported to the user, off switch at connection level, **implementation pending**; item 12
+  reported to the user, off switch at connection level, **done 2026-09-20**
+  (`oracle.rewrite_trigger_ddl`; two residual limits — a 32767-byte PL/SQL literal and a syntax
+  error's position referring to the wrapper); item 12
   (default fetch batch size) — deferred to a Phase 1 benchmark (S14 found throughput is not
   monotonic in batch size), must be a user setting. A new **item 13** (connect-time warning
   channel, contract gap C-6) is approved in principle: one additive
   `take_connect_warnings`-style method on `DatabaseConnection`, collected once by `db-core` after
   connect, recorded as an ADR-0002 amendment when implemented; its detailed write-up arrives with
-  pull request #5 (the TCPS descriptor guard), and implementation is sequenced after that PR.
+  pull request #5 (the TCPS descriptor guard), and implementation is sequenced after that PR —
+  **done 2026-09-20** (ADR-0002 amendment W1/W2; the driver's interim "first statement" mechanism
+  is gone).
   **Still outstanding and undecided:** item 4 (relax the NUMBER-bind refusal U-1 — recommendation:
   no).
   **Items 6–7 confirmed by the owner 2026-09-19** by accepting pull request #5: TCPS is described

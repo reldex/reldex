@@ -8,7 +8,7 @@ use std::time::Instant;
 use reldex_db_driver_api::{
     CancelHandle, CancelKind, CancelOutcome, Capabilities, ConnectionId, DatabaseConnection,
     DatabaseDriver, DbError, DbResult, ErrorKind, ExecutionOutcome, LobLocator, OutValues,
-    SavepointName, SessionState, Statement, StatementKind, TransactionState, Value,
+    SavepointName, SessionState, Statement, StatementKind, TransactionState, Value, Warning,
 };
 
 use crate::cursor::{MockCursor, MockLobStream};
@@ -182,6 +182,10 @@ pub struct MockConnection {
     armed_deadline: Arc<Mutex<Option<Instant>>>,
     latched_cancel: Arc<AtomicBool>,
     cancel_handle: Arc<MockCancelHandle>,
+    /// Findings this connection reports once, through
+    /// [`DatabaseConnection::take_connect_warnings`]; see
+    /// [`Scenario::set_connect_warnings`].
+    connect_warnings: Vec<Warning>,
 }
 
 impl MockConnection {
@@ -208,6 +212,7 @@ impl MockConnection {
         } else {
             TransactionState::Unknown
         };
+        let connect_warnings = scenario.connect_warnings();
         Self {
             id,
             scenario,
@@ -220,6 +225,7 @@ impl MockConnection {
             armed_deadline,
             latched_cancel,
             cancel_handle,
+            connect_warnings,
         }
     }
 
@@ -444,6 +450,13 @@ impl DatabaseConnection for MockConnection {
 
     fn cancel_handle(&self) -> Arc<dyn CancelHandle> {
         Arc::clone(&self.cancel_handle) as Arc<dyn CancelHandle>
+    }
+
+    fn take_connect_warnings(&mut self) -> Vec<Warning> {
+        // Taken, not cloned: the contract reports each finding once, and a mock
+        // that handed the same warning out twice would let a bug in the core's
+        // "collect exactly once" go unnoticed.
+        std::mem::take(&mut self.connect_warnings)
     }
 
     fn execute(&mut self, statement: &Statement) -> DbResult<ExecutionOutcome> {

@@ -465,7 +465,7 @@ produced these behaviour changes. Each has a test; most need no database.
 | A LOB locator allocates its staging buffer on first read | A batch of unopened locators used to allocate one buffer each | `a_batch_of_unread_lob_locators_costs_almost_nothing` |
 | Dropping a connection marks it closed, so handles that outlive it report instead of touching a dead socket | `close()` did this; `drop` did not | `a_handle_outliving_a_dropped_connection_reports_too` |
 | A socket-level timeout during **connect** is `ErrorKind::Connection`, not `Timeout` | Upstream turns every `TimedOut` I/O error into `CallTimeoutExceeded` (U-16), so a 22-second TCP connect failure was reported as "the call timeout armed for this statement expired" — about a session that never existed, with a session state attached to it | `a_connect_that_times_out_in_the_socket_is_not_reported_as_a_call_timeout` (no database), `a_connect_to_an_unroutable_address_measures_the_operating_systems_patience` (live) |
-| A missing bind value for a statement that declared **no** binds is `ErrorKind::Unsupported` with the cause and the workaround | Upstream's parser reads `:NEW` in a trigger body as a placeholder (U-18); passing its message on blamed the caller for something they did not write, and left them with nothing to do about it | `a_trigger_body_that_mentions_new_is_refused_with_the_reason` |
+| A missing bind value for a statement that declared **no** binds is `ErrorKind::Unsupported` with the cause and the workaround | Upstream's parser reads `:NEW` in a trigger body as a placeholder (U-18); passing its message on blamed the caller for something they did not write, and left them with nothing to do about it. Since 2026-09-20 the driver applies the workaround itself (§5 U-18), so this refusal is what `oracle.rewrite_trigger_ddl = false` restores | `a_trigger_body_that_mentions_new_is_refused_with_the_reason_when_the_rewrite_is_off` |
 
 ### S6 — mobile cross-compile — **Pass**
 
@@ -762,20 +762,25 @@ dead session was gone (`TO_CHAR` reverted to the instance default `19-SEP-26`).
 
 #### Connect-time behaviour
 
-| Endpoint | Asked for | Measured |
-|---|---|---|
-| `192.0.2.1:1521` (RFC 5737, discarded) | nothing | **22.0 s**, the operating system's own SYN budget |
-| proxy that accepts and forwards nothing | `with_connect_timeout(2 s)` | **still outstanding after 30 s** |
+| Endpoint | Asked for | Measured (original) | Measured (after the C-5 fix) |
+|---|---|---|---|
+| `192.0.2.1:1521` (RFC 5737, discarded) | nothing / `with_connect_timeout(2 s)` | **22.0 s**, the operating system's own SYN budget | **2.0 s** |
+| proxy that accepts and forwards nothing | `with_connect_timeout(2 s)` | **still outstanding after 30 s** | **2.0 s** |
 
 Both are **U-15**: `tcp_connect_timeout` is a dead field upstream and no
-descriptor timeout key is parsed, so nothing can bound a connect. The first also
-produced **U-16**: upstream turns every `TimedOut` I/O error into
+descriptor timeout key is parsed, so nothing *upstream* can bound a connect. The
+first also produced **U-16**: upstream turns every `TimedOut` I/O error into
 `CallTimeoutExceeded`, so the driver reported "the call timeout armed for this
-statement expired" about a connection that never existed. That one is now
-corrected in `error::map_connect` — a socket timeout during connect is an
-`ErrorKind::Connection` that says the wait was the operating system's. The
-wrapper ignoring `ConnectionParams::connect_timeout()` entirely is recorded as
-**C-5** in §7; it is an owner decision, not something to change silently.
+statement expired" about a connection that never existed. That one is corrected
+in `error::map_connect` — a socket timeout during connect is an
+`ErrorKind::Connection` that says the wait was the operating system's.
+
+The wrapper ignoring `ConnectionParams::connect_timeout()` was recorded as
+**C-5** in §7 and left for the owner. It is now **fixed** (2026-09-20): the
+driver bounds the connect itself, defaulting to 15 s, and the right-hand column
+above is the same two endpoints re-measured with a deliberately short 2 s limit
+so the live suite stays quick. U-15 itself is unchanged — the attempt cannot be
+interrupted, only abandoned.
 
 ### S11 — NCLOB — **Pass**
 
@@ -815,7 +820,7 @@ everything below.
 | A `LONG` larger than one packet | **Pass** | a view whose text is **73 926 characters** came back at exactly 73 926, tail intact. No silent truncation |
 | `LONG RAW` | **Pass** | described `SqlType::Raw` / `LONG RAW`, read back byte-exact |
 | `DBMS_METADATA.GET_DDL` | **Pass** | table (352 bytes) and package (126 bytes), delivered as **CLOB locators**, streamed through the same lazy path; a Thai column name survived |
-| `CREATE TRIGGER` with `:NEW` | **Fail — upstream (U-18)** | see below |
+| `CREATE TRIGGER` with `:NEW` | **Fail — upstream (U-18)**; *guarded 2026-09-20* | see below. The defect is unchanged; the driver now rewrites such DDL automatically so it works, and says it did |
 
 **U-18 is the finding that matters.** `oracledb`'s SQL parser scans every
 statement — DDL included — for `:name` and turns each hit into a bind
@@ -827,13 +832,21 @@ CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW BEGIN :NEW.made := SYSDATE; END
 
 fails with "1 positional bind values are required but 0 were provided". An IDE
 built on this crate cannot create a trigger, and `SPEC.md` §16 lists Triggers as
-a first-class object group. The driver now reports it as
+a first-class object group. The driver first reported it as
 `ErrorKind::Unsupported` with a message naming the cause and the workaround
 (wrap the DDL in `BEGIN EXECUTE IMMEDIATE q'[…]'; END;`, which the parser skips
 because it is a quoted string) instead of passing on a `Configuration` error
 that blames the caller for a placeholder they did not write. The session is
 untouched. The workaround is proven in the same test and is what the rest of
 S12's fixtures use.
+
+**Superseded 2026-09-20:** the driver now applies that workaround itself, on by
+default, and reports it (owner decision, §9 item 11). `CREATE TRIGGER` with
+`:NEW` **works** through this driver; the row above stands as the record of the
+upstream defect, which is unchanged. The refusal is what a caller gets with
+`oracle.rewrite_trigger_ddl = false`. Evidence is in the new file
+`crates/drivers/oracle-thin/tests/s12b_trigger_rewrite.rs`; see the U-18 entry
+in §5.
 
 #### Metadata throughput — a first data point for `SPEC.md` §19
 
@@ -1606,10 +1619,13 @@ every extra terminator can only shorten a value and the one thing that must
 never happen to a pin is being shortened to nothing.
 
 Code: `crates/drivers/oracle-thin/src/descriptor.rs`, wired in `conn.rs`'s
-`build_config`; diagnostics in `error.rs`. Warnings reach the caller on the
-first statement that succeeds — see contract gap **C-6** in §7, which is what
-this implementation had to work around. **This is the design the lead proposed;
-the owner has not confirmed it** (§9 item 7).
+`build_config`; diagnostics in `error.rs`. Warnings reach the caller through
+`DatabaseConnection::take_connect_warnings`, which `db-core` collects once
+immediately after connect — the contract's own connect-time channel, added
+2026-09-19 (contract gap **C-6** in §7, ADR-0002 amendment W1/W2). Until that
+landed they rode on the first statement that succeeded, and a session that never
+executed one lost them. **This is the design the lead proposed; the owner has
+not confirmed it** (§9 item 7).
 
 ### U-15 — **A connect cannot be bounded in time at all**
 
@@ -1631,13 +1647,20 @@ Minimal reproduction, both measured by spike S10:
 | `192.0.2.1:1521/RELDEX` (RFC 5737 TEST-NET-1, discarded not refused) | returned after **22.0 s** — Windows's own SYN retry budget, not anything the client chose |
 | a proxy that completes the TCP handshake and then forwards nothing | **still outstanding after 30 s**, with `ConnectionParams::with_connect_timeout(2 s)` set |
 
-*Evidence:* `a_connect_to_an_unroutable_address_measures_the_operating_systems_patience`,
+*Evidence (original, 2026-09-19):* the two rows above, measured by
+`a_connect_to_an_unroutable_address_measures_the_operating_systems_patience` and
 `a_connect_into_a_black_hole_is_not_bounded_by_the_connect_timeout`.
-*Can the wrapper guard it?* Not without doing the connect on a thread of its
-own and abandoning it — see §7 C-5, which is an owner decision, not a silent
-one. The wrapper currently **ignores** `ConnectionParams::connect_timeout()`,
-which is the honest description of what it does but not an acceptable end
-state. Drafted as **Issue F**.
+*Can the wrapper guard it?* Yes, and it now does — **guarded 2026-09-20**, by
+running the connect on a thread of its own and abandoning it, which was the
+owner's decision rather than a silent one (§7 C-5, §9 item 8). The wrapper
+honours `ConnectionParams::connect_timeout()`, defaults to 15 s, and offers
+`oracle.connect_timeout_unbounded` for "no limit"; the same two endpoints now
+return in **2.0 s** with a 2 s limit asked for, under the renamed tests
+`the_default_connect_limit_ends_a_wait_the_operating_system_would_not` and
+`a_connect_into_a_black_hole_is_now_bounded_by_the_connect_timeout`. The defect
+itself is untouched: nothing can *interrupt* the attempt, only stop waiting for
+it, so one helper thread lives on per abandoned connect. Still drafted as
+**Issue F**, which would remove the need for the guard entirely.
 
 ### U-16 — **Every socket timeout is reported as "your call timeout expired"**
 
@@ -1729,18 +1752,102 @@ This is not an edge case: `:NEW` and `:OLD` are how a trigger body refers to the
 row, so **an Oracle IDE built on this crate cannot create a trigger**, and
 `SPEC.md` §16 lists Triggers as a first-class object group.
 
-*Evidence:* `a_trigger_body_that_mentions_new_is_refused_with_the_reason`.
+*Evidence:*
+`a_trigger_body_that_mentions_new_is_refused_with_the_reason_when_the_rewrite_is_off`
+(renamed on 2026-09-20: reaching the refusal now takes switching the rewrite
+below off, which is what makes it also the off switch's test).
 *Workaround, proven in the same test:* submit the DDL inside
 `BEGIN EXECUTE IMMEDIATE q'[…]'; END;`. The parser skips quoted strings
-(`sql_parser.rs:216-233`), so the body is invisible to it. The cost is that the
-statement is then reported as PL/SQL rather than DDL and any error position
-refers to the wrapper block.
-*Mitigation, applied:* when the caller declared **no** binds and upstream
-complains that bind values are missing, `error::explain_parsed_placeholders`
-replaces the message with one naming the cause and the workaround, and reports
-`ErrorKind::Unsupported` instead of `Configuration` — because blaming the caller
-for a placeholder they did not write is not an honest report. The session is
-untouched (`Usable`), which the test asserts. Drafted as **Issue G**.
+(`sql_parser.rs:216-233`), so the body is invisible to it.
+*Mitigation, applied (2026-09-19, first form):* when the caller declared **no**
+binds and upstream complains that bind values are missing,
+`error::explain_parsed_placeholders` replaces the message with one naming the
+cause and the workaround, and reports `ErrorKind::Unsupported` instead of
+`Configuration` — because blaming the caller for a placeholder they did not
+write is not an honest report. The session is untouched (`Usable`).
+
+*Guarded (2026-09-20, second form):* the driver now **applies** the workaround
+itself, on by default, per the owner's decision (§9 item 11, `SPEC.md` §8).
+`crates/drivers/oracle-thin/src/rewrite.rs` detects any
+`CREATE [OR REPLACE] [NON]EDITIONABLE TRIGGER` in which upstream's own scan
+would find a placeholder, and sends
+`BEGIN EXECUTE IMMEDIATE q'X…X'; END;` instead, reporting a `Warning` that
+carries the exact text sent. `oracle.rewrite_trigger_ddl = false` turns it off
+and brings the refusal above back. Details and evidence below; the upstream
+defect is untouched, and **Issue G** remains the fix.
+
+What the rewrite has to get right, and how:
+
+- **Detection uses upstream's own rules, twice.** The keyword scan is
+  `classify::Keywords`, the same one that decides `StatementKind`, so a
+  statement cannot be classified one way and rewritten another; and "would
+  upstream see a placeholder here" is a **literal transcription** of
+  `sql_parser.rs`'s `parse` loop and its `parse_bind_name`, written the way
+  `classify::upstream_would_return_rows` is and for the same reason. Getting it
+  wrong is silent in both directions. The transcription is what makes `:=` not a
+  placeholder (upstream requires `"`, a digit or an alphabetic character after
+  the colon), what makes a colon following a string JSON syntax rather than a
+  bind, and what makes a trigger with no placeholder at all pass through
+  untouched — no rewrite, no warning, no moved error positions.
+- **Any `CREATE … TRIGGER` qualifies, whatever the placeholder is called.**
+  `REFERENCING NEW AS n` makes the placeholder `:n` and a compound trigger is
+  still a trigger; a list of known names would have missed both. Leading
+  whitespace, a byte-order mark and `--` / `/* … */` comments do not defeat
+  detection, and `CREATE PACKAGE`, a PL/SQL block with real binds, and the words
+  inside a string literal do not trigger it.
+- **The delimiter cannot collide.** A `q'X…X'` literal ends at the first
+  `<close>'`, so the driver tries `[ { < ( ! ~ ^ # | + @ $` and takes the first
+  whose closing sequence does not occur in the body; if every one collides it
+  falls back to an ordinary literal with the quotes doubled, which always works.
+- **A trailing SQL\*Plus `/` line is stripped** along with trailing whitespace,
+  and the trigger's own final `END;` is kept — the first is SQL\*Plus talking to
+  itself, the second is PL/SQL.
+- **Too large is refused, not sent.** `EXECUTE IMMEDIATE` of a literal passes a
+  PL/SQL `VARCHAR2`, so the limit is **32767 bytes**. Measured against the live
+  database rather than taken from documentation: 32767 is accepted and 32768
+  fails with `PLS-00172: string literal too long`
+  (`the_plsql_string_literal_limit_the_refusal_is_derived_from_is_the_real_one`).
+  Beyond it the driver refuses with `ErrorKind::Unsupported` and says why.
+- **`StatementKind::Ddl` is unchanged**, so `db-core`'s transaction tracking and
+  `committed_implicitly` behave exactly as they would for the statement the user
+  typed. The block is a PL/SQL block only on the wire.
+- **`ORA-24344` is turned back into what the user would have seen.** A direct
+  `CREATE TRIGGER` that compiles with errors *succeeds* and reports a warning;
+  the same statement inside `EXECUTE IMMEDIATE` raises `ORA-24344: success with
+  compilation error` as a PL/SQL exception. The object **is** created either
+  way, so reporting a failure would tell the user nothing happened when
+  something did — and would hide the object their next statement is about to
+  find. The driver therefore reports success with a
+  `WarningKind::CompiledWithErrors` warning carrying the native code, alongside
+  the rewrite warning. Observed live: `kind=Ddl`, `native=Some(24344)`, the
+  trigger present with status `INVALID` and 2 rows in `ALL_ERRORS`.
+- **The wrapper's row count is dropped.** `EXECUTE IMMEDIATE` reports one row
+  "affected"; the DDL affected none, and a caller who sees `rows_affected = 1`
+  against a `CREATE TRIGGER` has been told something untrue. Nothing else is
+  dropped with it: a rewritten statement is always trigger DDL, so it has
+  neither a cursor nor output binds.
+
+*What the rewrite cannot preserve, stated rather than hidden:* the position of a
+**syntax** error now refers to the wrapper block rather than to the user's text
+(`SPEC.md` §24.14). That was already true of the workaround S12 documented; it
+is the price of the only mechanism that makes the statement runnable at all, and
+it is why `oracle.rewrite_trigger_ddl` exists. The compilation-error path does
+**not** lose anything, because its diagnostics come from `ALL_ERRORS` and carry
+their own line and column.
+
+*Evidence:* ten offline unit tests in `rewrite.rs` (detection across every
+spelling and every near-miss; the transcribed scan against upstream's rules;
+delimiter selection including the all-collide fallback; the `/` strip; the size
+refusal; the warning's content) and seven live tests in
+`crates/drivers/oracle-thin/tests/s12b_trigger_rewrite.rs` — **7 passed, 0
+failed, 0.77 s** on 2026-09-20 — covering a rewritten trigger that is created
+and **actually fires** (with no invented row count), the off switch returning
+the refusal unchanged with nothing created, a body containing `]'` and `}'`
+forcing a later delimiter and still producing the right value, a compound
+trigger, a trigger that compiles with errors, a trigger with no placeholder
+being sent untouched, and the literal limit. S12's own refusal test, renamed to
+`…_when_the_rewrite_is_off`, is the seventh independent check that the off
+switch changes nothing else.
 
 ---
 
@@ -2219,9 +2326,13 @@ so a UI that wants to say "table not found" has everything it needs.
 documented choice, asserted by a unit test with the reasoning in a comment
 beside it (`error.rs`), not an oversight.
 
-### C-5 — `ConnectionParams::connect_timeout` is accepted and ignored — **open, needs the owner**
+### C-5 — `ConnectionParams::connect_timeout` is accepted and ignored — **fixed**
 
-Found by spike S10. The contract has
+Found by spike S10; **fixed 2026-09-20**, option 3 as the owner decided (§9
+item 8, `SPEC.md` §8). The description below is kept as the record of what the
+gap was; what shipped is at the end of this entry.
+
+The contract has
 `ConnectionParams::with_connect_timeout(Duration)` and documents it as "how long
 the driver may spend establishing the connection". **This driver never reads
 it.** A profile that asks for a 2-second connect timeout waits as long as the
@@ -2252,9 +2363,70 @@ is bounded by the user's own retries — but it is the owner's call, and it shou
 be made alongside the upstream request (Issue F), which would remove the need
 for it entirely.
 
-### C-6 — there is no connect-time warning channel — **open, worked around**
+#### What shipped (2026-09-19)
 
-Found while implementing the U-14 guard (2026-09-19).
+Option 3, in `crates/drivers/oracle-thin/src/connect_timeout.rs`. The contract
+is unchanged; this is driver-local behaviour, and neither `db-core` nor the mock
+driver is affected.
+
+- **The limit.** `ConnectionParams::connect_timeout()` when the caller set one;
+  otherwise the driver default **15 s** (`DEFAULT_CONNECT_TIMEOUT`). An
+  explicit "no limit" is expressible — the owner's decision requires it — but
+  **not** by widening the vendor-neutral contract: `Option<Duration>` already
+  spends its `None` on "the caller expressed no preference", which is what the
+  15 s default answers, so a third state would have had to change
+  `ConnectionParams` for one driver's need. It lives in the driver's own
+  extension bag instead, as `oracle.connect_timeout_unbounded`
+  (`EXT_CONNECT_TIMEOUT_UNBOUNDED`), and only `Flag(true)` removes the bound —
+  every other shape leaves it in force, exactly as the other opt-ins resolve to
+  the safe side. The flag beats a `connect_timeout` set on the same profile,
+  because the flag is the explicit statement and an inherited timeout is not.
+  *If the contract should grow a three-state connect limit later, that is a
+  deliberate ADR-0002 change and this extension is what it would replace.*
+- **The mechanism.** Upstream's blocking `oracledb::connect` runs on a named
+  helper thread (`reldex-oracle-connect-<n>`) and the caller waits on a
+  `Handoff` — a single rendezvous under one mutex. On expiry the handoff is
+  marked abandoned **before** the error is returned, so the two outcomes are
+  mutually exclusive by construction: either the caller takes the connection, or
+  every later delivery hands it back to the helper thread, which closes it. **A
+  session that arrives late is never adopted**, and it is released on the only
+  thread that ever touched it (ADR-0002 D1/D2). The wallet/TLS handshake is
+  inside the bounded region, because the whole of `oracledb::connect` is.
+- **What it does not do.** Nothing interrupts the abandoned attempt — nothing
+  can, which is the entirety of U-15 — so one thread lives on per abandoned
+  attempt until upstream's call returns, which against a black hole may be
+  never (U-17). No `unsafe`, no new dependency. A panic in the helper is caught
+  and reported as a driver error, with the caveat U-4 already states: a panic
+  *inside* an `oracledb` round trip aborts the process, so `catch_unwind` is the
+  contract this driver owes its caller rather than a guarantee about that crate.
+- **The failure.** `ErrorKind::Connection`, not `Timeout`: `Timeout` in this
+  contract means a deadline armed on a *statement* fired, and there is no
+  statement and no session here. It is the same category `map_connect` gives
+  every other failure to reach the database, it is marked retryable (nothing was
+  opened, so nothing can be damaged by retrying), and the message names the
+  limit, says the attempt was abandoned, and names the extension that waits
+  indefinitely.
+
+*Evidence:* ten offline unit tests in `connect_timeout.rs`, including
+`a_connect_into_a_black_hole_is_bounded_by_the_limit_and_says_so` against a
+local `TcpListener` that accepts and never speaks — no database needed — and
+`a_handoff_that_expired_hands_a_late_value_back_instead_of_adopting_it`, which
+proves the no-adoption property **deterministically** (a real late `Connection`
+cannot be constructed offline, so what is tested is the rendezvous that governs
+adoption, on one thread, with no race to lose). Live, `run-it.ps1
+s10_network_loss -- --test-threads=1` on 2026-09-19: **14 passed, 0 failed,
+73.3 s**, with the two rewritten cases measuring **2.0 s** each where they
+previously measured 22.0 s and "still outstanding after 30 s", and a third,
+`a_connect_with_no_limit_at_all_is_still_expressible_and_still_unbounded`,
+showing the flag really does remove the bound.
+
+### C-6 — there is no connect-time warning channel — **fixed**
+
+Found while implementing the U-14 guard (2026-09-19); **fixed 2026-09-20**
+after the owner approved the additive contract change (§9 item 13), and
+recorded as ADR-0002's amendment W1/W2. The description below is kept as the
+record of what the gap was and what the interim workaround cost; what shipped
+is at the end of this entry.
 `DatabaseDriver::connect` returns `DbResult<Box<dyn DatabaseConnection>>`: a
 connection or an error, with nothing in between. `Warning` — the contract's own
 type for "non-fatal, worth showing" — travels only on an `ExecutionOutcome`. So
@@ -2268,14 +2440,14 @@ strictly than the parameter asked for — and the caller still has to be told th
 parameter did nothing, or a profile imported from another Oracle tool goes on
 believing it configured something.
 
-*Worked around, not redesigned.* The driver holds the findings on the
-connection (`OracleConnection::pending_warnings`) and attaches them to the
-**first statement that succeeds**, which reaches the user through the existing
-path end to end: `ExecutionOutcome::warnings` → `worker.rs` →
+*Worked around first, not redesigned.* Until the fix below, the driver held the
+findings on the connection (`OracleConnection::pending_warnings`) and attached
+them to the **first statement that succeeds**, which reached the user through
+the existing path end to end: `ExecutionOutcome::warnings` → `worker.rs` →
 `db-core::ExecuteOutcome::warnings`. Nothing in `db-driver-api` changed, and no
 Oracle vocabulary entered it.
 
-#### Evidence
+#### Evidence for the interim mechanism (superseded)
 
 Run 2026-09-19 on the machine in §1, `pwsh tools/oracle-test-db/run-it.ps1
 s8_tcps --nocapture` against `reldex-oracle19c`: **12 passed, 0 failed**, 44.8 s.
@@ -2308,12 +2480,15 @@ closed without ever executing a statement never delivers the finding. That is
 why the case that actually weakens a session — the unenforceable DN pin — is an
 **error** and not a warning: it does not depend on this path at all.
 
-*Minimal proposal, if the owner wants the gap closed properly.* One additive,
-vendor-neutral method with a default body, so no existing driver breaks:
+#### What shipped (2026-09-19)
+
+Exactly the minimal proposal, approved by the owner (§9 item 13) and recorded
+as ADR-0002 amendment **W1/W2**. One additive, vendor-neutral, **defaulted**,
+object-safe method:
 
 ```rust
 pub trait DatabaseConnection: Send {
-    /// Non-fatal messages produced while this connection was being opened.
+    /// Non-fatal findings produced while this connection was being opened.
     ///
     /// Taken rather than borrowed, so each is reported once. The default is
     /// empty, for a driver with nothing to say.
@@ -2323,12 +2498,37 @@ pub trait DatabaseConnection: Send {
 }
 ```
 
-`db-core` would call it once in `worker.rs` where `driver.connect(params)`
-returns, and carry the result out of `SessionManager::open_session` beside the
-`ConnectionId` — roughly ten lines in the contract and twenty in the core. It
-removes the "first statement" coupling entirely. Not done here: `db-driver-api`
-is frozen, and C-1 is the precedent that an additive change to it needs the
-lead's approval rather than a driver author's judgement.
+- `db-core` calls it **once**, on the session's worker thread, immediately
+  after `driver.connect(params)` returns and before the session is reported
+  ready, and the findings travel out with the successful open. The owner reads
+  them through `DatabaseSession::connect_warnings() -> &[Warning]` — an
+  accessor rather than a wider `open_session` return type, and deliberately not
+  the Phase 1 event queue, which is still deferred.
+- The core's copy **borrows** where the driver's **takes**: the driver must
+  hand its findings over once (keeping them is what caused the duplicate
+  delivery the interim mechanism had to guard against), while the session's copy
+  is fixed for its lifetime, so reading it late is not the same as losing it. It
+  is never mixed into `ExecuteOutcome::warnings`.
+- A panic inside `take_connect_warnings` is contained like any other driver
+  call: the connection is torn, so it is dropped rather than closed, and the
+  session does not open.
+- `oracle-thin` now delivers the descriptor findings here instead of on the
+  first statement, so a connection that is opened, pinged and closed reports
+  them — the hole named above — and a statement never carries them.
+
+*Evidence:* `a_driver_with_nothing_to_say_about_connecting_needs_no_code_at_all`
+(`db-driver-api`, a stub connection that implements only the *required* methods,
+so the default body is what runs);
+`connect_warnings_are_taken_once_and_default_to_none`
+(`crates/drivers/mock/tests/contract.rs`);
+`crates/db-core/tests/connect_warnings.rs` (three tests: the finding reaches the
+session's owner with no statement run, it is not mixed into a statement's
+warnings, and a driver with nothing to say reports none); live,
+`run-it.ps1 s8_tcps` on 2026-09-19 — **13 passed, 0 failed, 49.1 s** — covering
+`a_descriptor_that_sets_dn_matching_opens_a_session_and_reports_the_parameter_as_inert`
+(now asserting the connect channel and that the statement's warnings are
+**empty**) and the new
+`a_connect_time_finding_survives_a_session_that_never_executes_a_statement`.
 
 ---
 
@@ -2454,11 +2654,11 @@ own. Their verdicts against `SPEC.md` §8's operations list:
 
 | Item | Verdict | Basis |
 |---|---|---|
-| **network loss** (S10) | **GO, with two gaps** | A dead socket is noticed in microseconds and reported `NetworkLost`/`Lost`; loss mid-statement, mid-fetch and mid-LOB-stream all report and retire the handle; an open transaction dies and a fresh session sees only committed data 119 ms later; an in-doubt commit is reported as unknown, never as success. **But**: a black-holed link never returns without a deadline (U-17), the only deadline that ends it destroys the session (U-6), and a dead client's row locks blocked a second session for the whole 20 s measured because no dead-connection detection exists on either side |
+| **network loss** (S10) | **GO, with two gaps** | A dead socket is noticed in microseconds and reported `NetworkLost`/`Lost`; loss mid-statement, mid-fetch and mid-LOB-stream all report and retire the handle; an open transaction dies and a fresh session sees only committed data 119 ms later; an in-doubt commit is reported as unknown, never as success. **But**: a black-holed link never returns without a deadline (U-17), the only deadline that ends it destroys the session (U-6), and a dead client's row locks blocked a second session for the whole 20 s measured because no dead-connection detection exists on either side. *Updated 2026-09-20:* the third gap this row used to carry — an unbounded **connect** (U-15/C-5) — is closed; the driver bounds it itself, default 15 s |
 | **reconnect** (S10) | **GO** | Nothing reconnects by itself — after the loss every call fails and the proxy saw no second TCP connection. A new `connect()` is a new server session (SID/serial# differ) with none of the old session's state. `SPEC.md` §18 is satisfied |
 | **NCLOB** (S11) | **GO** | Thai and non-BMP text byte-exact through the lazy stream at six buffer sizes including ones that land inside a surrogate pair; `NULL` and `EMPTY_CLOB()` stay distinct; 1.2 M characters in 55 bounded chunks |
 | **EXPLAIN PLAN / DBMS_XPLAN** (S12) | **GO** | Both `DBMS_XPLAN` entry points return real plans on the test user's existing grants |
-| **metadata / dictionary access** (S12) | **GO, with one blocker** | Ten `ALL_*` views, four `V$` views, `LONG` and `LONG RAW` exact (including 73 926 characters), `DBMS_METADATA.GET_DDL` as a CLOB. **`CREATE TRIGGER` with `:NEW` is impossible (U-18)**, which `SPEC.md` §16 needs; a workaround exists and the driver now names it |
+| **metadata / dictionary access** (S12) | **GO** (was: with one blocker) | Ten `ALL_*` views, four `V$` views, `LONG` and `LONG RAW` exact (including 73 926 characters), `DBMS_METADATA.GET_DDL` as a CLOB. `CREATE TRIGGER` with `:NEW` is impossible **upstream** (U-18), which `SPEC.md` §16 needs — *resolved 2026-09-20*: the driver applies the `EXECUTE IMMEDIATE` workaround itself, on by default, and reports every rewrite with the text it sent. Two residual limits: the trigger must fit in a 32767-byte PL/SQL literal, and a syntax error's position refers to the wrapper |
 | **privileged connections** (S13) | **GO** | `AS SYSDBA` and `AS SYSOPER` over the listener through the existing `SessionRole` contract; no contract gap and no upstream gap |
 | **large result** (S14) | **GO** | 1 000 000 rows for about 1 MB of working-set growth: `SPEC.md` §12's bounded-memory claim holds. Throughput 50 000–92 000 rows/s, and **not** monotonic in the batch size |
 
@@ -2530,6 +2730,17 @@ own. Their verdicts against `SPEC.md` §8's operations list:
    ever adopted after the limit. Default **15 seconds**; user-configurable per
    connection profile, including "no limit". Status: approved, implementation
    pending.
+
+   **Status: done (2026-09-20).** Implemented exactly as decided, in
+   `crates/drivers/oracle-thin/src/connect_timeout.rs`; see §7 C-5 for the
+   design, the evidence and the one thing it does **not** fix (the abandoned
+   attempt cannot be interrupted, so it costs a thread until upstream returns).
+   "No limit" is expressed by the driver extension
+   `oracle.connect_timeout_unbounded` rather than by a change to the
+   vendor-neutral `ConnectionParams`, because `Option<Duration>`'s `None`
+   already means "unset → use the default". If the contract should carry all
+   three states, that is a deliberate ADR-0002 change and this extension is
+   what it would replace.
 9. **Whether Reldex should arm a default deadline on every call, and what to
    tell the user about a silent link.** S10 measured the shape of the problem:
    with no deadline a black-holed link never returns (U-17); with one, the
@@ -2579,6 +2790,19 @@ own. Their verdicts against `SPEC.md` §8's operations list:
     available for inspection — and can be turned **off** by the user
     (connection-level setting), in which case the existing explanatory
     refusal is returned. Status: approved, implementation pending.
+
+    **Status: done (2026-09-20).** Implemented as decided, in
+    `crates/drivers/oracle-thin/src/rewrite.rs`; the off switch is the
+    connection extension `oracle.rewrite_trigger_ddl`
+    (`EXT_REWRITE_TRIGGER_DDL`). See the U-18 entry in §5 for the design, what
+    it deliberately does **not** fire on, what it cannot preserve (a syntax
+    error's position, which the workaround always moved) and the evidence.
+    Two points worth the owner's attention: the exact text sent is carried
+    **in the warning's message**, because `Warning` has no field for it and
+    widening the vendor-neutral type for one driver's workaround was not worth
+    it; and a trigger larger than 32767 bytes cannot be created by this driver
+    at all, because that is the PL/SQL string-literal limit the only available
+    mechanism runs into — measured against the live database, not assumed.
 12. **Which fetch batch size Reldex should default to.** S14 found throughput is
     **not** monotonic in the batch size — 10 000 rows per fetch was 3.5× slower
     than the best of 100 and 1 000, and cost up to 1.1 s before the first row
@@ -2604,3 +2828,11 @@ own. Their verdicts against `SPEC.md` §8's operations list:
     implementation is sequenced after it lands. **Owner decision
     (2026-09-19):** approved in principle, as above; implementation is
     sequenced after pull request #5.
+
+    **Status: done (2026-09-20).** Pull request #5 has landed and the change is
+    implemented exactly as approved — `DatabaseConnection::take_connect_warnings`
+    (defaulted, object-safe), collected once in `db-core`'s session worker
+    immediately after `connect`, reported by
+    `DatabaseSession::connect_warnings()`, and the oracle-thin driver's interim
+    "first statement that succeeds" mechanism removed. Recorded as ADR-0002
+    amendment **W1/W2**; see §7 C-6 for the evidence.
