@@ -11,16 +11,30 @@
 //!    layer that can tell it a DDL statement committed the open transaction.
 //!
 //! The classifier is deliberately small: it looks at the first one or two
-//! keywords after skipping leading whitespace, `--` line comments, `/* … */`
-//! block comments and optimizer hints (`/*+ … */`). It never tries to
-//! understand the statement. Anything it does not recognize is
-//! [`StatementKind::Other`], which routes to the non-query path and makes
-//! `db-core` treat the transaction state as unknown — the conservative answer.
+//! keywords. It never tries to understand the statement. Anything it does not
+//! recognize is [`StatementKind::Other`], which routes to the non-query path
+//! and makes `db-core` treat the transaction state as unknown — the
+//! conservative answer.
 //!
-//! It agrees with `oracledb`'s own private parser on the keywords that drive
-//! bind handling (`DECLARE`/`BEGIN`/`CALL` are PL/SQL, `SELECT`/`WITH` are
-//! queries), which matters because the upstream parser decides whether binds
-//! are deduplicated by name.
+//! # Finding the first keyword the way `oracledb` does
+//!
+//! Getting this wrong loses data in one direction only — a query sent down the
+//! `execute` path has its rows discarded — so the rule for the **first**
+//! keyword is taken from `oracledb`'s own parser rather than invented here.
+//! `statement/sql_parser.rs` hands `determine_statement_type` the first maximal
+//! run of **ASCII alphabetic** characters in the text, having consumed `--`
+//! line comments, `/* … */` block comments (optimizer hints included) and
+//! `'…'` / `"…"` quoted strings on the way. Crucially it skips **any** other
+//! leading character, so `(SELECT 1 FROM dual)` — a legal top-level
+//! parenthesised subquery — is a query upstream, and treating it as anything
+//! else means silently dropping its rows. [`Keywords`] follows the same rule.
+//!
+//! Because that single decision is the one that loses data,
+//! [`upstream_would_return_rows`] transcribes the upstream loop **literally**,
+//! separately from the tokenizer below, and `conn::execute` refuses to run a
+//! statement down the non-query path when the two disagree. Neither function is
+//! derived from the other; `tests::the_classifier_and_the_upstream_rule_agree`
+//! checks them against each other.
 
 use reldex_db_driver_api::StatementKind;
 
@@ -92,15 +106,24 @@ pub(crate) fn classify(sql: &str) -> Classification {
     }
 }
 
-/// Yields the leading identifier-like words of a statement, skipping
-/// whitespace, `--` comments and `/* … */` comments (including `/*+ hints */`).
+/// Yields the leading keywords of a statement.
+///
+/// The **first** word follows `oracledb`'s own rule (see the module
+/// documentation): comments and quoted strings are consumed, every other
+/// non-alphabetic character is skipped, and the word is the first maximal run
+/// of ASCII letters. Subsequent words are ordinary SQL identifiers, which is
+/// what `ALTER SESSION` and `SET TRANSACTION` need.
 struct Keywords<'a> {
     rest: &'a str,
+    at_first: bool,
 }
 
 impl<'a> Keywords<'a> {
     const fn new(sql: &'a str) -> Self {
-        Self { rest: sql }
+        Self {
+            rest: sql,
+            at_first: true,
+        }
     }
 
     /// Advances past whitespace and comments, returning false at end of input.
@@ -121,12 +144,47 @@ impl<'a> Keywords<'a> {
             }
         }
     }
+
+    /// The first ASCII-letter run, skipping everything `oracledb` skips.
+    fn first_word(&mut self) -> Option<String> {
+        loop {
+            if !self.skip_noise() {
+                return None;
+            }
+            let mut chars = self.rest.chars();
+            let head = chars.next()?;
+            if head.is_ascii_alphabetic() {
+                let end = self
+                    .rest
+                    .find(|c: char| !c.is_ascii_alphabetic())
+                    .unwrap_or(self.rest.len());
+                let word = self.rest[..end].to_uppercase();
+                self.rest = &self.rest[end..];
+                return Some(word);
+            }
+            if head == '\'' || head == '"' {
+                // A quoted string or quoted identifier before the first
+                // keyword; upstream consumes it and carries on.
+                let after = &self.rest[head.len_utf8()..];
+                self.rest = after
+                    .find(head)
+                    .map_or("", |end| &after[end + head.len_utf8()..]);
+            } else {
+                // Anything else — `(`, a label's `<`, punctuation — is skipped
+                // one character at a time, exactly as upstream does.
+                self.rest = chars.as_str();
+            }
+        }
+    }
 }
 
 impl Iterator for Keywords<'_> {
     type Item = String;
 
     fn next(&mut self) -> Option<String> {
+        if std::mem::take(&mut self.at_first) {
+            return self.first_word();
+        }
         if !self.skip_noise() {
             return None;
         }
@@ -135,14 +193,80 @@ impl Iterator for Keywords<'_> {
             .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$' || c == '#'))
             .unwrap_or(self.rest.len());
         if end == 0 {
-            // A statement starting with punctuation (`(SELECT …)`, a label) is
-            // not something this classifier claims to understand.
             return None;
         }
         let word = self.rest[..end].to_uppercase();
         self.rest = &self.rest[end..];
         Some(word)
     }
+}
+
+/// Whether `oracledb` itself will treat this statement as row-returning.
+///
+/// A **literal** transcription of `statement/sql_parser.rs`'s `parse` loop and
+/// `statement/mod.rs`'s `determine_statement_type`, written independently of
+/// [`Keywords`] so that the two can be checked against each other and so that
+/// `conn::execute` has something to assert against before it sends a statement
+/// down a path that would discard its rows. Nothing else should depend on it.
+pub(crate) fn upstream_would_return_rows(sql: &str) -> bool {
+    let text: Vec<char> = sql.chars().collect();
+    let mut position = 0_usize;
+    let mut keyword_start: Option<usize> = None;
+    let mut last_was_alpha = false;
+    let mut last_ch = ' ';
+    while position < text.len() {
+        let ch = text[position];
+        let is_alpha = ch.is_ascii_alphabetic();
+        if is_alpha && !last_was_alpha {
+            keyword_start = Some(position);
+        } else if !is_alpha && last_was_alpha {
+            // The first keyword is the only one `determine_statement_type` sees.
+            let start = keyword_start.unwrap_or(position);
+            let keyword: String = text[start..position].iter().collect();
+            return matches!(keyword.to_uppercase().as_str(), "SELECT" | "WITH");
+        }
+
+        if ch == '\'' {
+            // A quoted string, or a q-string when the previous character was
+            // `q`/`Q`. Both end at the next occurrence of their terminator; for
+            // the purpose of finding the *first* keyword the difference cannot
+            // matter, because a leading `q` is itself the first keyword.
+            position += 1;
+            while position < text.len() && text[position] != '\'' {
+                position += 1;
+            }
+        } else if !ch.is_whitespace() {
+            if ch == '-' && last_ch == '-' {
+                while position < text.len() && text[position] != '\n' {
+                    position += 1;
+                }
+            } else if ch == '*' && last_ch == '/' {
+                position += 1;
+                while position + 1 < text.len()
+                    && !(text[position] == '*' && text[position + 1] == '/')
+                {
+                    position += 1;
+                }
+                position = (position + 1).min(text.len());
+            } else if ch == '"' {
+                position += 1;
+                while position < text.len() && text[position] != '"' {
+                    position += 1;
+                }
+            }
+        }
+
+        last_was_alpha = is_alpha;
+        last_ch = ch;
+        position += 1;
+    }
+    if let Some(start) = keyword_start
+        && last_was_alpha
+    {
+        let keyword: String = text[start..].iter().collect();
+        return matches!(keyword.to_uppercase().as_str(), "SELECT" | "WITH");
+    }
+    false
 }
 
 #[cfg(test)]
@@ -278,7 +402,6 @@ mod tests {
             "/* only a comment */",
             "EXPLAIN PLAN FOR SELECT 1 FROM DUAL",
             "LOCK TABLE t IN EXCLUSIVE MODE",
-            "(SELECT 1 FROM DUAL)",
             "๑๒๓",
         ] {
             let classification = classify(sql);
@@ -289,6 +412,114 @@ mod tests {
                 "{sql:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_parenthesised_query_is_a_query_and_keeps_its_rows() {
+        // `(SELECT 1 FROM dual)` is legal top-level SQL and `oracledb` treats
+        // it as a query. Classifying it as anything else sends it down
+        // `Statement::execute`, which does not reject a query — it **discards
+        // its rows**. The first keyword is therefore found the way upstream
+        // finds it: the first run of ASCII letters, whatever precedes it.
+        for sql in [
+            "(SELECT 1 FROM dual)",
+            "((SELECT 1 FROM dual))",
+            "  (  SELECT 1 FROM dual )",
+            "(select a from t) union (select b from u)",
+            "/* hint */ (SELECT 1 FROM dual)",
+            "(WITH x AS (SELECT 1 c FROM dual) SELECT c FROM x)",
+        ] {
+            let classification = classify(sql);
+            assert_eq!(classification.kind, StatementKind::Query, "{sql}");
+            assert!(classification.returns_rows, "{sql}");
+        }
+    }
+
+    /// Every statement shape the other tests use, plus the awkward ones.
+    fn corpus() -> Vec<&'static str> {
+        vec![
+            "",
+            "   ",
+            "-- only a comment\n",
+            "/* only a comment */",
+            "/* unterminated",
+            "SELECT 1 FROM DUAL",
+            "select * from t",
+            "  \n\t SELECT 1 FROM DUAL",
+            "\u{feff}SELECT 1 FROM DUAL",
+            "WITH x AS (SELECT 1 c FROM DUAL) SELECT c FROM x",
+            "(SELECT 1 FROM dual)",
+            "((SELECT 1 FROM dual))",
+            "(select a from t) union (select b from u)",
+            "-- fetch everything\nSELECT * FROM t",
+            "--select is a word in this comment\nSELECT * FROM t",
+            "/* block comment with the word insert */ SELECT * FROM t",
+            "/*+ FIRST_ROWS(10) */ SELECT * FROM t",
+            "/* one */ -- two\n /* three */ SELECT 1 FROM DUAL",
+            "/*+ APPEND */ INSERT INTO t VALUES (1)",
+            "INSERT INTO t (a) SELECT a FROM s",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "MERGE INTO t USING s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET t.a = s.a",
+            "BEGIN NULL; END;",
+            "DECLARE v NUMBER; BEGIN v := 1; END;",
+            "  /* run it */ CALL p(1)",
+            "COMMIT",
+            "ROLLBACK TO SAVEPOINT sp1",
+            "SAVEPOINT sp1",
+            "SET TRANSACTION READ ONLY",
+            "SET ROLE ALL",
+            "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'",
+            "ALTER TABLE t ADD (b NUMBER)",
+            "CREATE TABLE t (a NUMBER)",
+            "create or replace procedure p as begin null; end;",
+            "DROP TABLE t",
+            "TRUNCATE TABLE t",
+            "EXPLAIN PLAN FOR SELECT 1 FROM DUAL",
+            "LOCK TABLE t IN EXCLUSIVE MODE",
+            "๑๒๓",
+            "'a string' SELECT",
+            "\"quoted identifier\" SELECT 1 FROM dual",
+            "INSERT INTO t VALUES (q'[it's fine]')",
+            "SELECT 'don''t' FROM dual",
+            "SELECT",
+        ]
+    }
+
+    #[test]
+    fn the_classifier_and_the_upstream_rule_agree_on_every_statement() {
+        // The invariant `conn::execute` asserts before it runs anything down
+        // the non-query path. `upstream_would_return_rows` is a literal
+        // transcription of `oracledb`'s parser; `classify` is this crate's own
+        // keyword table. If they ever disagree, a result set is being dropped.
+        for sql in corpus() {
+            assert_eq!(
+                classify(sql).returns_rows,
+                upstream_would_return_rows(sql),
+                "{sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_upstream_rule_finds_the_keyword_past_comments_and_punctuation() {
+        assert!(upstream_would_return_rows("(SELECT 1 FROM dual)"));
+        assert!(upstream_would_return_rows("/* x */ select 1 from dual"));
+        assert!(upstream_would_return_rows(
+            "-- x\nWITH a AS (SELECT 1 FROM dual) SELECT * FROM a"
+        ));
+        assert!(!upstream_would_return_rows(
+            "INSERT INTO t (a) SELECT a FROM s"
+        ));
+        assert!(!upstream_would_return_rows(
+            "-- select 1\nINSERT INTO t VALUES (1)"
+        ));
+        assert!(!upstream_would_return_rows("/* select */ DELETE FROM t"));
+        assert!(!upstream_would_return_rows("'select' FROM t"));
+        assert!(!upstream_would_return_rows(""));
+        assert!(!upstream_would_return_rows("๑๒๓"));
+        // A statement that is nothing but the keyword still classifies.
+        assert!(upstream_would_return_rows("SELECT"));
     }
 
     #[test]

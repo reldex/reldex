@@ -7,8 +7,8 @@ use reldex_db_driver_api::{
     SqlType,
 };
 
-use crate::conn::Closed;
-use crate::value::{ColumnBuilder, ColumnPlan, column_metadata, plan_for};
+use crate::conn::{Closed, ResultSetGuard};
+use crate::value::{ColumnBuilder, ColumnPlan, column_metadata, native_type_name, plan_for};
 
 /// The refusal a `TIMESTAMP WITH TIME ZONE` column earns by default.
 ///
@@ -30,6 +30,27 @@ fn timestamp_with_time_zone_is_refused(column: &str) -> DbError {
     )
 }
 
+/// The refusal a column this upstream version cannot decode at all earns.
+///
+/// Unlike `ROWID` or an `INTERVAL`, there is no text to fall back to: upstream's
+/// `DbValue::from_response` has no branch for these types and returns
+/// `UnsupportedDbType` while deserializing the row. Reporting that from
+/// `fetch_batch` would fail a result set **after** earlier batches had already
+/// been handed to the caller, which is worse than not starting: ADR-0002 M1 asks
+/// for a clean answer, and at describe time there still is one.
+fn undecodable_column_is_refused(column: &str, native: &str) -> DbError {
+    DbError::new(
+        ErrorKind::Unsupported,
+        format!(
+            "column \"{column}\" is of type {native}, which oracledb 26.0.0-beta.3 cannot \
+             decode into any value this driver can render, so the whole statement is \
+             refused here rather than part-way through fetching it. Convert the column in \
+             the statement — TO_CLOB, JSON_SERIALIZE, XMLSERIALIZE or the type's own \
+             accessor — to read it as text"
+        ),
+    )
+}
+
 /// A forward-only, batched result set over an `oracledb` cursor.
 pub(crate) struct OracleCursor {
     id: ResultSetId,
@@ -43,6 +64,9 @@ pub(crate) struct OracleCursor {
     /// (ADR-0002 M4).
     failed: bool,
     exhausted: bool,
+    /// Keeps the connection's open-result-set count accurate for as long as this
+    /// cursor exists; see `conn::OpenResultSets`.
+    _open: ResultSetGuard,
 }
 
 impl OracleCursor {
@@ -62,14 +86,21 @@ impl OracleCursor {
     ///   in, because decoding one whose zone is a named region aborts the
     ///   process (upstream U-3 compounded by U-4) and the two forms cannot be
     ///   told apart before the decode happens.
+    /// - A column of a type upstream cannot decode at all — `JSON`, `XMLTYPE`,
+    ///   `VECTOR`, an object type, `BFILE` — is refused here rather than from
+    ///   `fetch_batch`, so a result set never fails after part of it has been
+    ///   delivered.
     ///
-    /// Every other unrepresentable type becomes a text rendering instead, so one
-    /// odd column never hides a whole table.
+    /// Every type the contract cannot express but upstream *can* decode —
+    /// `ROWID`, both `INTERVAL`s, `TIMESTAMP WITH LOCAL TIME ZONE` — becomes a
+    /// text rendering instead, so one odd column of those kinds never hides a
+    /// whole table.
     pub(crate) fn new(
         inner: oracledb::Cursor,
         connection: ConnectionId,
         closed: Closed,
         allow_timestamp_with_time_zone: bool,
+        open: ResultSetGuard,
     ) -> DbResult<Self> {
         let mut columns = Vec::with_capacity(inner.columns().len());
         let mut plans = Vec::with_capacity(inner.columns().len());
@@ -90,7 +121,14 @@ impl OracleCursor {
             {
                 return Err(timestamp_with_time_zone_is_refused(metadata.name()));
             }
-            plans.push(plan_for(meta.db_type()).1);
+            let plan = plan_for(meta.db_type()).1;
+            if plan == ColumnPlan::Unsupported {
+                return Err(undecodable_column_is_refused(
+                    metadata.name(),
+                    native_type_name(meta.db_type()),
+                ));
+            }
+            plans.push(plan);
             columns.push(metadata);
         }
         Ok(Self {
@@ -102,6 +140,7 @@ impl OracleCursor {
             closed,
             failed: false,
             exhausted: false,
+            _open: open,
         })
     }
 

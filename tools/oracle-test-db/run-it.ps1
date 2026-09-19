@@ -2,7 +2,12 @@
 #
 #   pwsh tools/oracle-test-db/run-it.ps1                 # every spike
 #   pwsh tools/oracle-test-db/run-it.ps1 s2_fidelity     # one test file
-#   pwsh tools/oracle-test-db/run-it.ps1 s4_cancel -- --nocapture
+#   pwsh tools/oracle-test-db/run-it.ps1 s4_cancel -- --test-threads=1
+#
+# Run S4 single-threaded, as above: its long joins, `KILL SESSION` and 20-second
+# sleep load this single-instance container enough to flip U-6's outcome when
+# they run in parallel. Works under both `pwsh` and Windows PowerShell 5.1
+# (`powershell`).
 #
 # It loads `tools/oracle-test-db/.env` (untracked; see `.env.example`) and turns
 # it into the environment the tests read. The passwords are never echoed, never
@@ -66,10 +71,18 @@ $cargo = @('test', '-p', 'reldex-driver-oracle-thin', '--features', 'oracle-it')
 # A leading `--` means "no test file was named; pass the rest to the harness".
 if ($Test -and $Test -ne '--') {
     $cargo += @('--test', $Test)
-} elseif ($Test -eq '--') {
-    $cargo += '--'
 }
-if ($Rest) { $cargo += $Rest }
+# Everything else goes to the test harness, behind the `--` separator that
+# cargo requires. The separator is inserted here rather than taken from the
+# command line because Windows PowerShell 5.1 consumes a bare `--` before the
+# script is entered (pwsh 7 passes it through), which would otherwise make the
+# documented `run-it.ps1 s4_cancel -- --test-threads=1` fail with
+# "unexpected argument '--test-threads' found".
+$harness = @($Rest | Where-Object { $_ -ne '--' })
+if ($harness.Count -gt 0) {
+    $cargo += '--'
+    $cargo += $harness
+}
 
 Push-Location $repo
 try {

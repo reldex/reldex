@@ -259,3 +259,85 @@ fn eight_sessions_can_work_at_the_same_time() {
     exec_quietly(setup.as_mut(), &format!("DROP TABLE {table} PURGE"));
     setup.close().expect("close");
 }
+
+#[test]
+fn a_batch_of_unread_lob_locators_costs_almost_nothing() {
+    // A locator used to allocate its 64 KiB staging buffer the moment it was
+    // created, so a 1000-row batch with two LOB columns claimed 128 MB before
+    // the caller had looked at a single cell — the opposite of what `SPEC.md`
+    // §12 asks for, since most locators in a grid are never opened. The buffer
+    // is allocated on the first read instead.
+    let mut connection = connect();
+    let table = unique("s7_lazy");
+    exec(
+        connection.as_mut(),
+        &format!("CREATE TABLE {table} (id NUMBER, a CLOB, b BLOB)"),
+    );
+    exec(
+        connection.as_mut(),
+        &format!(
+            "INSERT INTO {table} \
+             SELECT level, TO_CLOB('x'), UTL_RAW.CAST_TO_RAW('y') \
+             FROM dual CONNECT BY level <= 1000"
+        ),
+    );
+    exec(connection.as_mut(), "COMMIT");
+
+    let rows = std::num::NonZeroUsize::new(1000).expect("non-zero");
+    let before = working_set_kb();
+    let mut outcome = connection
+        .execute(&Statement::new(format!("SELECT id, a, b FROM {table}")).with_fetch_rows(rows))
+        .expect("select");
+    let mut cursor = outcome.take_cursor().expect("cursor");
+    let batch = cursor.fetch_batch(rows).expect("fetch");
+    let after = working_set_kb();
+    assert_eq!(batch.row_count(), 1000);
+
+    // Eagerly allocating would be 1000 rows x 2 columns x 64 KiB = 128 MB.
+    if let (Some(before), Some(after)) = (before, after) {
+        let growth = after.saturating_sub(before);
+        measurement("s7.working_set_growth_for_2000_unread_locators_kb", growth);
+        observation(format!(
+            "fetching 1000 rows with two LOB columns grew the working set by {growth} KB; \
+             allocating a staging buffer per locator would have cost 131072 KB"
+        ));
+        assert!(
+            growth < 32 * 1024,
+            "2000 unread LOB locators grew the working set by {growth} KB"
+        );
+    } else {
+        observation("working set unavailable; the allocation check was skipped");
+    }
+
+    // And a locator that *is* read still works, staging buffer and all.
+    let mut batch = batch;
+    let mut locator = batch
+        .column_mut(1)
+        .and_then(|column| column.take_lob(0))
+        .expect("a CLOB locator");
+    let mut buffer = [0_u8; 64];
+    let read = locator.read_chunk(&mut buffer).expect("read");
+    assert_eq!(&buffer[..read], b"x");
+    assert_eq!(locator.kind(), LobKind::Character);
+    assert_eq!(
+        locator.size_hint(),
+        None,
+        "a character LOB's length is counted in UCS-2 units, not bytes, so no byte \
+         count is reported"
+    );
+
+    let mut binary = batch
+        .column_mut(2)
+        .and_then(|column| column.take_lob(0))
+        .expect("a BLOB locator");
+    assert_eq!(
+        binary.size_hint(),
+        Some(1),
+        "a BLOB's units are bytes and are reported"
+    );
+    assert_eq!(binary.read_chunk(&mut buffer).expect("read"), 1);
+
+    cursor.close().expect("close cursor");
+    exec_quietly(connection.as_mut(), &format!("DROP TABLE {table} PURGE"));
+    connection.close().expect("close");
+}

@@ -38,7 +38,11 @@ use crate::conn::Closed;
 /// How much is read from the server at a time.
 ///
 /// Also the upper bound on this stream's own memory: one such buffer per open
-/// LOB, independent of the object's size.
+/// LOB, independent of the object's size — and **only once the stream is first
+/// read**. A batch of 1000 rows with two LOB columns hands back 2000 locators,
+/// and most of them are never opened; allocating this eagerly would have cost
+/// 128 MB for data nobody asked for, which is the opposite of what `SPEC.md`
+/// §12 is for.
 const STAGING_BYTES: usize = 64 * 1024;
 
 /// The smallest staging buffer worth retrying with after a split surrogate.
@@ -66,16 +70,22 @@ impl OracleLobStream {
         connection: ConnectionId,
         closed: Closed,
     ) -> Self {
-        // `get_size` is answered from the locator the fetch already returned,
-        // so this is not an extra round trip in the normal case.
-        let size_hint = lob.get_size().ok().map(|size| size as u64);
+        // `get_size` is answered from the value `Lob::new` already stored out of
+        // the fetch response, so this is not an extra round trip in the normal
+        // case. The **units** are upstream's, which is why a character LOB
+        // reports no hint at all: see `size_hint`.
+        let size_hint = match kind {
+            LobKind::Binary => lob.get_size().ok().map(|size| size as u64),
+            _ => None,
+        };
         Self {
             lob,
             kind,
             connection,
             closed,
             size_hint,
-            staging: vec![0; STAGING_BYTES],
+            // Deliberately empty: see `STAGING_BYTES`.
+            staging: Vec::new(),
             filled: 0,
             position: 0,
             exhausted: false,
@@ -88,6 +98,9 @@ impl OracleLobStream {
     fn refill(&mut self) -> DbResult<()> {
         self.position = 0;
         self.filled = 0;
+        if self.staging.is_empty() {
+            self.staging = vec![0; STAGING_BYTES];
+        }
         let mut limit = self.staging.len();
         loop {
             match self.lob.read(&mut self.staging[..limit]) {
@@ -108,10 +121,7 @@ impl OracleLobStream {
                 }
                 Err(error) => {
                     self.failed = true;
-                    return Err(DbError::new(
-                        ErrorKind::DataConversion,
-                        format!("reading a large object failed: {error}"),
-                    ));
+                    return Err(lob_read_failure(&error));
                 }
             }
         }
@@ -143,6 +153,19 @@ impl LobStream for OracleLobStream {
         self.kind
     }
 
+    /// The object's size **in bytes**, which is what the contract asks for — so
+    /// a character LOB reports nothing.
+    ///
+    /// `Lob::get_size` answers in the units the locator carries, and upstream
+    /// documents them: "Character LOB offsets and amounts use Oracle UCS-2
+    /// units, not UTF-8 bytes or Rust `char` counts." A `CLOB` of 100 000
+    /// characters is therefore 100 000 units and somewhere between 100 000 and
+    /// 400 000 UTF-8 bytes, and the ratio depends on the content. Returning the
+    /// unit count as a byte count would be wrong by up to four times, for a
+    /// value the contract says is used to size buffers and drive progress — so
+    /// it is not returned at all, and `read_chunk` returning `0` stays the only
+    /// end-of-stream signal, as the contract requires. A `BLOB`'s units *are*
+    /// bytes, and it does report.
     fn size_hint(&self) -> Option<u64> {
         self.size_hint
     }
@@ -182,6 +205,17 @@ impl LobStream for OracleLobStream {
         self.position += take;
         Ok(take)
     }
+}
+
+/// Classifies a failed `Lob::read`.
+///
+/// Delegated to [`crate::error::map_lob_read`] so a mid-stream network drop
+/// reports the same way it would anywhere else in this driver. Building a
+/// `DataConversion` error here — as this module used to — told `db-core` the
+/// session was still usable after the socket had gone, which `SPEC.md` §18
+/// forbids.
+fn lob_read_failure(error: &std::io::Error) -> DbError {
+    crate::error::map_lob_read(error)
 }
 
 /// Whether an `io::Error` from `Lob::read` is the split-character failure.

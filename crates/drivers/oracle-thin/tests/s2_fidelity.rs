@@ -729,6 +729,28 @@ fn a_type_the_contract_cannot_hold_becomes_text_instead_of_failing_the_batch() {
         observation(format!("unsupported column {column} -> {text}"));
     }
 
+    // A `TIMESTAMP WITH LOCAL TIME ZONE` must **not** be rendered with a
+    // trailing `Z`. Upstream's `Display` writes one whenever the offset fields
+    // are zero, which is how this type always arrives — the server normalized
+    // it to the database time zone and sent no offset — so a `Z` would assert
+    // UTC on no evidence at all. The driver has asked neither for `DBTIMEZONE`
+    // nor for the session zone, and the column's type name already says what
+    // the value means.
+    let local = batch
+        .value(0, 4)
+        .unwrap_or(ValueRef::Null)
+        .as_unsupported_text()
+        .expect("the LTZ column renders as text")
+        .to_owned();
+    assert!(
+        !local.ends_with('Z') && !local.contains('+'),
+        "a TIMESTAMP WITH LOCAL TIME ZONE must not claim a zone it was not told: {local}"
+    );
+    assert!(local.starts_with("20"), "{local}");
+    observation(format!(
+        "TIMESTAMP WITH LOCAL TIME ZONE renders without a zone claim: {local}"
+    ));
+
     // And the metadata says so honestly, with the server's own type name.
     let mut outcome = connection
         .execute(&Statement::new(
@@ -856,3 +878,407 @@ const _: fn(&ColumnData) -> usize = ColumnData::len;
 
 /// Keeps the connection trait object nameable in this file's signatures.
 const _: fn(&mut dyn DatabaseConnection) -> &mut dyn DatabaseConnection = |c| c;
+
+// ---------------------------------------------------------------------------
+// U-3 containment under re-execution (review must-fix 2)
+// ---------------------------------------------------------------------------
+
+/// The SQL both tests below run twice with binds of different lengths.
+fn re_execution_sql(table: &str) -> String {
+    format!("SELECT tz FROM {table} WHERE k = :1")
+}
+
+/// Creates a table holding a **region-encoded** `TIMESTAMP WITH TIME ZONE`
+/// under two keys of different lengths.
+fn region_table(connection: &mut dyn DatabaseConnection, table: &str) {
+    exec(
+        connection,
+        &format!("CREATE TABLE {table} (k VARCHAR2(40), tz TIMESTAMP(6) WITH TIME ZONE)"),
+    );
+    for key in ["a", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] {
+        exec(
+            connection,
+            &format!(
+                "INSERT INTO {table} VALUES ('{key}',
+                     TO_TIMESTAMP_TZ('2026-09-19 13:45:30 Asia/Bangkok',
+                                     'YYYY-MM-DD HH24:MI:SS TZR'))"
+            ),
+        );
+    }
+    exec(connection, "COMMIT");
+}
+
+/// **This test aborts the process on `oracledb` 26.0.0-beta.3.**
+///
+/// It is the mechanism this driver's statement handling exists to avoid, driven
+/// through the upstream crate directly so that it records the *upstream*
+/// behaviour rather than this wrapper's. The sequence is the one the review
+/// derived from `messages/execute.rs`:
+///
+/// 1. `Statement::prefetch_rows(0)` makes the first execute a describe, because
+///    `write_full_execute` uses `prefetch_rows` while the statement has **no**
+///    cursor. No value is decoded, and the response carries a `cursor_id`.
+/// 2. Dropping the cursor returns the statement to the cache (20 slots, on by
+///    default) **with that cursor id**.
+/// 3. Running the same SQL with a longer bind sets `binds_changed`, so
+///    `serialize` takes `write_full_execute` again — and this time
+///    `statement.has_cursor()` is true, so `num_iters` comes from
+///    `fetch_array_size` (100), the execute fetches rows, and the
+///    region-encoded value is decoded through the `todo!()` at
+///    `ora_type/timestamp.rs:238` before any caller could look at a column type.
+/// 4. U-4 turns that panic into a process abort.
+///
+/// Run it on its own; it will not report a failure, it will end the process:
+///
+/// ```text
+/// cargo test -p reldex-driver-oracle-thin --features oracle-it \
+///     --test s2_fidelity -- --ignored --exact \
+///     a_cached_cursor_makes_the_execute_fetch_rows_and_aborts
+/// ```
+#[test]
+#[ignore = "aborts the process on oracledb 26.0.0-beta.3; this is what exclude_from_cache prevents"]
+fn a_cached_cursor_makes_the_execute_fetch_rows_and_aborts() {
+    use common::{PASSWORD, USER, setting};
+
+    let table = unique("s2_u3re");
+    {
+        let mut setup = connect();
+        exec_quietly(setup.as_mut(), &format!("DROP TABLE {table} PURGE"));
+        region_table(setup.as_mut(), &table);
+        setup.close().expect("close");
+    }
+
+    // Upstream defaults: statement cache of 20 slots, nothing excluded.
+    let config = oracledb::Config::default()
+        .set_connect_string(&setting(common::DSN))
+        .expect("a valid connect string")
+        .set_credentials(&setting(USER), &setting(PASSWORD));
+    let connection = oracledb::connect(config).expect("connect");
+    let sql = re_execution_sql(&table);
+
+    // (1) and (2): describe only, then give the statement back to the cache.
+    {
+        let mut statement = connection.statement(&sql).expect("prepare");
+        statement.prefetch_rows(0);
+        let cursor = statement.query(&[&"a"]).expect("describe");
+        observation(format!(
+            "first execute described {} column(s) and decoded nothing",
+            cursor.columns().len()
+        ));
+        drop(cursor);
+    }
+
+    // (3): a longer bind, so `binds_changed` forces a full execute — which now
+    // finds a cursor id and fetches 100 rows inside it.
+    observation("re-executing with a longer bind; the process is expected to abort here");
+    let mut statement = connection.statement(&sql).expect("prepare");
+    statement.prefetch_rows(0);
+    let cursor = statement
+        .query(&[&"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])
+        .expect("re-execute");
+    panic!(
+        "UPSTREAM GAP NOT REPRODUCED: the re-execute returned {} column(s) without \
+         aborting. Re-check `write_full_execute`'s use of `fetch_array_size` before \
+         relaxing anything in `conn.rs`",
+        cursor.columns().len()
+    );
+}
+
+#[test]
+fn re_executing_a_refused_query_with_a_longer_bind_is_still_refused() {
+    // The containment for the sequence above. Through this driver the first
+    // execute never leaves a cursor id anywhere a second execute can find it —
+    // every statement is `exclude_from_cache`d and the upstream cache is sized
+    // to zero — so the second execute is a describe as well and the column is
+    // refused again, cleanly, with the session untouched.
+    let mut connection = connect();
+    let table = unique("s2_u3fix");
+    exec_quietly(connection.as_mut(), &format!("DROP TABLE {table} PURGE"));
+    region_table(connection.as_mut(), &table);
+
+    let sql = re_execution_sql(&table);
+    for key in [
+        "a",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "a",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        let statement =
+            Statement::new(sql.clone()).with_positional_binds(vec![Bind::input(key.to_owned())]);
+        let error = match connection.execute(&statement) {
+            Ok(_) => panic!("a TIMESTAMP WITH TIME ZONE column must be refused every time"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.kind(),
+            ErrorKind::Unsupported,
+            "bind {key:?}: {error}"
+        );
+        assert_eq!(error.session_state(), SessionState::Usable, "bind {key:?}");
+        // The session is genuinely fine, not merely claimed to be.
+        assert_eq!(scalar(connection.as_mut(), "SELECT 1 FROM dual"), "1");
+    }
+    observation(
+        "four executions of the same SQL with alternating bind lengths were each \
+         refused on the describe; no value was decoded",
+    );
+
+    // And the documented escape still reads the value as text, repeatedly.
+    for _ in 0..2 {
+        let text = scalar(
+            connection.as_mut(),
+            &format!("SELECT TO_CHAR(tz, 'YYYY-MM-DD HH24:MI:SS TZR') FROM {table} WHERE k = 'a'"),
+        );
+        assert!(text.to_ascii_uppercase().contains("ASIA/BANGKOK"), "{text}");
+    }
+
+    exec_quietly(connection.as_mut(), &format!("DROP TABLE {table} PURGE"));
+    connection.close().expect("close");
+}
+
+#[test]
+fn an_empty_string_is_the_same_thing_as_null_and_is_reported_as_null() {
+    // Oracle has no zero-length VARCHAR2: `''` **is** NULL, in a literal and in
+    // a bind alike. A tool that showed an empty cell for one and `NULL` for the
+    // other would be inventing a distinction the database does not make, so the
+    // driver reports what the server holds and this test pins both directions.
+    let mut connection = connect();
+    let table = unique("s2_empty");
+    exec(
+        connection.as_mut(),
+        &format!("CREATE TABLE {table} (id NUMBER, v VARCHAR2(20), n NVARCHAR2(20))"),
+    );
+    exec(
+        connection.as_mut(),
+        &format!("INSERT INTO {table} VALUES (1, '', '')"),
+    );
+    // The same value through a bind, which is the path a worksheet uses.
+    let bound = Statement::new(format!("INSERT INTO {table} VALUES (2, :1, :2)"))
+        .with_positional_binds(vec![Bind::input(String::new()), Bind::input(String::new())]);
+    connection.execute(&bound).expect("bind an empty string");
+    exec(connection.as_mut(), "COMMIT");
+
+    let batch = query(
+        connection.as_mut(),
+        &format!(
+            "SELECT id,
+                    v,
+                    n,
+                    CASE WHEN v IS NULL THEN 'null' ELSE 'not null' END AS server_says,
+                    NVL(LENGTH(v), -1) AS len
+             FROM {table} ORDER BY id"
+        ),
+    );
+    assert_eq!(batch.row_count(), 2);
+    for row in 0..2 {
+        assert!(
+            matches!(batch.value(row, 1), Some(ValueRef::Null)),
+            "row {row}: '' must read back as NULL, not as empty text"
+        );
+        assert!(
+            matches!(batch.value(row, 2), Some(ValueRef::Null)),
+            "row {row}: NVARCHAR2 too"
+        );
+        // The server's own opinion, so this is not the driver marking its own
+        // homework.
+        assert_eq!(
+            render(batch.value(row, 3).unwrap_or(ValueRef::Null)),
+            "null",
+            "row {row}"
+        );
+        assert_eq!(
+            render(batch.value(row, 4).unwrap_or(ValueRef::Null)),
+            "-1",
+            "row {row}: LENGTH('') is NULL on Oracle"
+        );
+    }
+    observation(
+        "'' and a bound empty string are both stored as NULL by the server, and both \
+         read back as NULL — Oracle has no zero-length VARCHAR2",
+    );
+
+    exec_quietly(connection.as_mut(), &format!("DROP TABLE {table} PURGE"));
+    connection.close().expect("close");
+}
+
+#[test]
+fn a_column_this_upstream_cannot_decode_is_refused_before_the_first_batch() {
+    // `XMLTYPE` has no branch in `oracledb`'s `DbValue::from_response`, so the
+    // fetch itself fails and there is no value to render as text the way an
+    // `INTERVAL` is. Failing from `fetch_batch` would mean failing a result set
+    // *after* earlier batches had been handed to the caller, which is worse
+    // than not starting: the refusal happens on the describe instead.
+    let mut connection = connect();
+    let table = unique("s2_xml");
+    exec(
+        connection.as_mut(),
+        &format!("CREATE TABLE {table} (id NUMBER, x XMLTYPE)"),
+    );
+    exec(
+        connection.as_mut(),
+        &format!("INSERT INTO {table} VALUES (1, XMLTYPE('<a>1</a>'))"),
+    );
+    exec(connection.as_mut(), "COMMIT");
+
+    let error = match connection.execute(&Statement::new(format!("SELECT id, x FROM {table}"))) {
+        Ok(_) => panic!("an XMLTYPE column must be refused on the describe"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
+    assert_eq!(error.session_state(), SessionState::Usable);
+    assert!(error.message().contains('X'), "{error}");
+    observation(format!("XMLTYPE column -> {error}"));
+
+    // Nothing was fetched and the session is fine, so the documented escape
+    // works straight away.
+    let text = scalar(
+        connection.as_mut(),
+        &format!("SELECT XMLSERIALIZE(CONTENT x AS VARCHAR2(100)) FROM {table}"),
+    );
+    assert!(text.contains("<a>1</a>"), "{text}");
+    // And the columns around it are readable on their own.
+    assert_eq!(
+        scalar(connection.as_mut(), &format!("SELECT id FROM {table}")),
+        "1"
+    );
+
+    exec_quietly(connection.as_mut(), &format!("DROP TABLE {table} PURGE"));
+    connection.close().expect("close");
+}
+
+#[test]
+fn a_forty_digit_bind_with_an_odd_decimal_point_index_is_refused_rather_than_aborting() {
+    // The case the old "magnitude >= 1E40" guard let through, and the reason
+    // the refusal predicate is now derived from the encoder rather than from
+    // examples. 40 significant digits with an **odd** decimal-point index makes
+    // `to_buf` prepend its alignment zero, walk 21 base-100 pairs and read
+    // `digits[40]` of a 40-byte array. The panic unwinds while the client mutex
+    // is held (U-4) and the **process aborts**; the magnitude is irrelevant —
+    // every value below is the size of one or two.
+    let mut connection = connect();
+    let table = unique("s2_forty");
+    exec(
+        connection.as_mut(),
+        &format!("CREATE TABLE {table} (id NUMBER(5), v NUMBER)"),
+    );
+
+    // What the server itself produces, recorded because it bounds how far this
+    // matters. Oracle's NUMBER holds 20 base-100 pairs, and a value whose
+    // decimal-point index is odd spends one digit position on the same
+    // alignment zero — so the server never returns 40 significant digits *and*
+    // an odd index together. This class is therefore reachable from a value the
+    // user typed or Reldex computed, not from one the database handed back.
+    for expression in ["10/3", "100/3", "1/7", "1000/7", "2/3"] {
+        let text = scalar(
+            connection.as_mut(),
+            &format!("SELECT TO_CHAR({expression}, 'TM') FROM dual"),
+        );
+        let digits = text.chars().filter(char::is_ascii_digit).count();
+        observation(format!(
+            "the server returns {expression} as {text} ({digits} digits)"
+        ));
+        let value = Number::parse(&text).unwrap_or_else(|e| panic!("{expression}: {e}"));
+        let statement = Statement::new(format!("INSERT INTO {table} (id, v) VALUES (1, :1)"))
+            .with_positional_binds(vec![Bind::input(value)]);
+        connection
+            .execute(&statement)
+            .unwrap_or_else(|e| panic!("{expression} = {text} must still bind: {e}"));
+    }
+
+    for (label, text) in [
+        (
+            "40 digits, index 1",
+            "1.234567890123456789012345678901234567891",
+        ),
+        (
+            "40 digits, index 3",
+            "123.4567890123456789012345678901234567891",
+        ),
+        (
+            "40 digits, index 1, negative",
+            "-3.333333333333333333333333333333333333339",
+        ),
+        ("41 digit positions", "1E40"),
+    ] {
+        let value = Number::parse(text).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let statement = Statement::new(format!("INSERT INTO {table} (id, v) VALUES (1, :1)"))
+            .with_positional_binds(vec![Bind::input(value)]);
+        let error = match connection.execute(&statement) {
+            Ok(_) => panic!("{label}: binding this must be refused, not attempted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::Unsupported, "{label}: {error}");
+        assert_eq!(error.session_state(), SessionState::Usable, "{label}");
+        assert!(error.message().contains("U-2"), "{label}: {error}");
+        observation(format!("binding {label} -> refused"));
+        // The process is still here and the session still works, which is the
+        // whole point.
+        assert_eq!(scalar(connection.as_mut(), "SELECT 1 FROM dual"), "1");
+    }
+
+    // Values of the same size with an **even** index are not refused, so the
+    // guard has not become a blanket ban on large numbers: 9.99E39 is larger
+    // than every refused value above and binds exactly.
+    for text in [
+        "1E39",
+        "9.99E39",
+        "1234567890123456789012345678901234567890",
+    ] {
+        let value = Number::parse(text).expect("legal");
+        let statement = Statement::new(format!("INSERT INTO {table} (id, v) VALUES (2, :1)"))
+            .with_positional_binds(vec![Bind::input(value)]);
+        connection
+            .execute(&statement)
+            .unwrap_or_else(|e| panic!("{text} should still bind: {e}"));
+        // Read back through the driver: `TO_CHAR(v, 'TM')` overflows its own
+        // buffer at this magnitude and returns `####…`, which says nothing
+        // about the value that was stored.
+        let stored = scalar(
+            connection.as_mut(),
+            &format!("SELECT v FROM {table} WHERE id = 2"),
+        );
+        let expected = Number::parse(text).expect("legal").to_string();
+        assert_eq!(stored, expected, "{text} was stored as {stored}");
+        exec(
+            connection.as_mut(),
+            &format!("DELETE FROM {table} WHERE id = 2"),
+        );
+    }
+    observation("40 digit positions with an even decimal-point index still bind exactly");
+
+    connection.rollback().expect("rollback");
+    exec_quietly(connection.as_mut(), &format!("DROP TABLE {table} PURGE"));
+    connection.close().expect("close");
+}
+
+/// **This test aborts the process on `oracledb` 26.0.0-beta.3.** It is the U-2
+/// case the old digit-count guard missed, driven through the upstream crate
+/// directly so that it records upstream's behaviour rather than this wrapper's.
+/// Run it on its own; it will not report a failure, it will end the process:
+///
+/// ```text
+/// cargo test -p reldex-driver-oracle-thin --features oracle-it ///     --test s2_fidelity -- --ignored --exact ///     binding_forty_digits_with_an_odd_index_aborts_upstream
+/// ```
+#[test]
+#[ignore = "aborts the process on oracledb 26.0.0-beta.3; this is what the bind refusal prevents"]
+fn binding_forty_digits_with_an_odd_index_aborts_upstream() {
+    use common::{PASSWORD, USER, setting};
+
+    let config = oracledb::Config::default()
+        .set_connect_string(&setting(common::DSN))
+        .expect("a valid connect string")
+        .set_credentials(&setting(USER), &setting(PASSWORD));
+    let connection = oracledb::connect(config).expect("connect");
+
+    let number: oracledb::OracleNumber = "1.234567890123456789012345678901234567891"
+        .parse()
+        .expect("a legal Oracle NUMBER, and `from_str` accepts it");
+    observation(
+        "binding 40 significant digits with a decimal-point index of 1; the process          is expected to abort here",
+    );
+    let result = connection.execute("SELECT :1 FROM dual", &[&number]);
+    panic!(
+        "UPSTREAM GAP NOT REPRODUCED: the bind returned {:?} without aborting.          Re-check `to_buf`'s pair loop before relaxing `binds::encoder_defect`",
+        result.is_ok()
+    );
+}

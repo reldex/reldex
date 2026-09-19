@@ -17,6 +17,34 @@ Where something failed, it is written down as a failure.
 > below say what changed and what it cost. Contract gap **C-2** is fixed in
 > ADR-0002.
 
+> **Updated again 2026-09-19, after an independent senior review.** The review
+> found four must-fix defects in the driver and in this document. All four were
+> verified against the source and against the live database before anything was
+> changed, and all four were real:
+>
+> 1. **U-2's guard had a false negative** and the abort it was meant to prevent
+>    was reproducible through it. The guard is now derived from the encoder and
+>    proven complete over the whole shape space — see U-2.
+> 2. **The U-3 containment was defeated on re-execution**, because a cached
+>    server-side cursor takes a TTC path that ignores `prefetch_rows(0)`. Fixed
+>    with `exclude_from_cache()` — see U-3.
+> 3. **`(SELECT …)` in parentheses, `WITH` and comment-prefixed queries were
+>    routed to the non-query path** and their rows discarded, because the
+>    driver's first-keyword scan did not match upstream's. It now follows
+>    upstream's rule exactly, with an independent transcription of it used as a
+>    second opinion at run time; a mismatch is an internal error rather than
+>    silently dropped rows.
+> 4. **LOB streaming failures were reported as `DataConversion` with the session
+>    `Usable`** even when the transport had gone. They are now mapped by cause
+>    (`NetworkLost`/`Lost`, `Timeout`, closed connection, genuine decode
+>    failure).
+>
+> Eleven smaller items were raised as should-fix; the ones that changed
+> behaviour are recorded in place below. Two review findings were examined and
+> **not** accepted: the claim that `SELECT 10/3 FROM dual` produces a bindable
+> 40-digit/odd-index NUMBER (it produces 39 digits — see U-2), and the claim
+> that ORA-00942 is mis-classified (see C-4).
+
 ---
 
 ## 1. Environment
@@ -59,7 +87,53 @@ code path.
 
 TLS itself is **not** exercised: the Phase 0 container has no TCPS listener, so
 spike S8 has not run. The driver reports `tls = false` and refuses
-`TlsMode::Required` rather than silently opening a plaintext connection.
+`TlsMode::Required` rather than silently opening a plaintext connection. One
+practical note for whoever runs S8: `rustls 0.23` needs a process-wide default
+crypto provider, and `aws-lc-rs` installs one only when it is the single
+provider compiled in. If a future dependency also pulls `ring`, connecting will
+fail at run time with "no process-level CryptoProvider available" until
+something calls `CryptoProvider::install_default`. The driver documents this and
+does **not** install one itself — that is the application's choice to make once.
+
+### Dependencies and licences
+
+Measured on 2026-09-19 with `cargo tree -p reldex-driver-oracle-thin --target
+x86_64-pc-windows-msvc` (`--edges normal` and `--edges normal,build`) and
+`cargo metadata`, not from the crates.io pages:
+
+| | |
+|---|---|
+| Third-party crates at **run time** | **55** |
+| Additional crates needed only **to build** | **8** (`cc`, `cmake`, `jobserver`, `shlex`, `find-msvc-tools`, `dunce`, `fs_extra` — all pulled in by `aws-lc-sys`'s build script — plus `autocfg` for `num-traits`) |
+| Third-party total | **63** (plus this crate and `reldex-db-driver-api`) |
+
+(The review quoted 56 transitive crates. The measured run-time figure is **55**,
+and 63 once the build-only crates are counted; the difference is which edges are
+counted, not a disagreement about the graph.)
+
+Every licence is permissive; there is no copyleft anywhere in the graph. The
+distinct identifiers that appear are **MIT**, **Apache-2.0**, **ISC**,
+**BSD-3-Clause** (`subtle`), **UPL-1.0** (`oracledb`, dual with Apache-2.0),
+**CDLA-Permissive-2.0** (`webpki-roots`, which is a data set rather than code),
+**BSL-1.0** (`whoami`, as one of three options), **CC0-1.0** and **MIT-0**
+(`dunce`, build-only). 52 of the 63 are the plain `MIT OR Apache-2.0` dual
+licence. The two compound strings belong to `aws-lc-rs` and `aws-lc-sys`, which
+carry the licences of the vendored AWS-LC C sources.
+
+Two consequences worth recording now rather than at release time:
+
+- **A closed-source Pro edition is unobstructed, but attribution is not
+  optional.** MIT, BSD-3-Clause, ISC, Apache-2.0 and UPL-1.0 all require their
+  licence text and copyright notices to be reproduced in the distributed
+  product. Reldex needs a generated third-party notices file (`cargo about` or
+  equivalent) in its release build, covering the **transitive** set above and
+  not just direct dependencies.
+- **`aws-lc-sys` is the only C/assembly build in the graph**, and it is the only
+  crate with a `links` key besides its own wrapper. It is what makes a cold
+  build slow and what makes a C toolchain (and `cmake`) a prerequisite on every
+  build machine. It arrives through `rustls`'s default provider, which arrives
+  through `oracledb`. If pure-Rust builds ever matter more than the provider
+  choice, this is the single edge to cut.
 
 ---
 
@@ -76,24 +150,47 @@ spike S8 has not run. The driver reports `tls = false` and refuses
 | S9 concurrency | **Pass** | 8 concurrent sessions, 400 inserts, 283 ms |
 | S6, S8 | **Not run** | Out of scope for this workstream (S6 metadata) / no TLS listener (S8) |
 
-Test counts (after the C-1 and U-3 changes): **52 unit tests** and **1
-documentation test** in this crate that need no database, and **44 integration
-tests** behind the `oracle-it` feature — 43 run and pass, 1 is `#[ignore]`d
-because it aborts the process on purpose, to record U-3 (it is the case the
-default refusal now prevents). Full opt-in run: `s1_connect` 7, `s2_fidelity`
-11 (10 + 1 ignored), `s3_session` 6, `s4_cancel` 7, `s5_plsql` 10,
-`s7_lob_and_s9_concurrency` 3.
+Test counts, as measured on **2026-09-19** after the review fixes:
 
-Across the workspace, DB-free: **199 tests and 10 documentation tests, all
-green** (`cargo test --workspace`).
+| | |
+|---|---|
+| DB-free, `cargo test -p reldex-driver-oracle-thin -p reldex-core-poc` | **65 unit tests** + **1 documentation test**, all pass (1 further doc test is `no_run`/ignored by design). `reldex-core-poc` is a binary with no tests of its own |
+| Opt-in, `--features oracle-it` | **54 integration tests** — **51 run and pass**, **3 are `#[ignore]`d** |
+| Per file | `s1_connect` 8, `s2_fidelity` 17 (14 + 3 ignored), `s3_session` 6, `s4_cancel` 7, `s5_plsql` 12, `s7_lob_and_s9_concurrency` 4 |
+
+The three ignored tests all **abort the process on purpose**, each recording a
+defect that a default in this driver now prevents, and each is the proof that
+the corresponding guard is load-bearing rather than decorative. Run them one at
+a time with `-- --ignored --exact <name>`; they do not report a failure, they
+end the process.
+
+| Ignored test | What it records | What prevents it |
+|---|---|---|
+| `a_named_time_zone_region_is_read_or_reported` | U-3: decoding a region-encoded `TIMESTAMP WITH TIME ZONE` hits a `todo!()` | the describe-time column refusal |
+| `a_cached_cursor_makes_the_execute_fetch_rows_and_aborts` | U-3 again, on **re-execution**: a cached cursor takes the re-execute path, which ignores `prefetch_rows(0)`, so rows arrive and are decoded before any check | `Statement::exclude_from_cache()` |
+| `binding_forty_digits_with_an_odd_index_aborts_upstream` | U-2: 40 digits with an odd, positive decimal-point index reads past the encoder's digit buffer | `binds::encoder_defect` |
+
+A workspace-wide count is deliberately **not** quoted here any more: another
+workstream is editing `db-core`, `drivers/mock` and `db-driver-api` in parallel,
+so a `cargo test --workspace` total taken from this branch would be stale the
+day it was written. The per-crate numbers above are what this document is
+accountable for.
 
 > **Run S4 with `--test-threads=1`.** Its seven tests include three long
 > cartesian joins, a `KILL SESSION` and a 20-second PL/SQL sleep; run in
 > parallel against this single-instance container they load the server enough
 > that the deadline-recovery outcome flips (see U-6, which is load-dependent by
 > construction). Serial runs are stable. This is pre-existing and not caused by
-> any change recorded here: it reproduces with the driver's pre-change fetch
-> path as well (three parallel runs, one failure).
+> any change recorded here — see the control runs under U-6.
+>
+> ```text
+> tools/oracle-test-db/run-it.ps1 s4_cancel -- --test-threads=1
+> tools/oracle-test-db/run-it.sh  s4_cancel -- --test-threads=1
+> ```
+>
+> (The PowerShell runner now inserts cargo's `--` separator itself: Windows
+> PowerShell 5.1 swallows a bare `--` before the script sees it, so the
+> documented invocation used to fail there while working under `pwsh`.)
 
 ---
 
@@ -142,11 +239,12 @@ affected values rather than storing them wrongly.
 
 | Check | Verdict | Evidence |
 |---|---|---|
-| NUMBER, 38 / 39 / 40 significant digits | Pass | `number_values_survive_...`; all three round-trip exactly and match the server's own `TO_CHAR(v,'TM')` |
-| NUMBER, `1/3` | Pass | `0.3333333333333333333333333333333333333333` (40 digits), identical to `TO_CHAR` |
+| NUMBER, 38 / 39 / 40 significant digits | Pass **as bound** | `number_values_survive_...`; the three literals used (`123…78`, `123…789`, `123…7891`) round-trip exactly and match the server's own `TO_CHAR(v,'TM')`. This is not a blanket "40 digits are fine": a **40**-digit value whose decimal point sits at an **odd, positive** index is refused on the bind, because that is the shape the upstream encoder reads past its buffer on (U-2). 38 and 39 digits are always safe |
+| NUMBER, `1/3` | Pass | `0.3333333333333333333333333333333333333333` (40 digits, index 0 — even, so bindable), identical to `TO_CHAR` |
 | NUMBER, `0`, `1`, `-1`, `.5`, `-0.5`, `123.45`, `0.005`, `1E-129` | Pass | same test |
+| NUMBER, `1E39`, `9.99E39`, `1234567890…890` (40 digits, index 40) | Pass **as bound** | `a_forty_digit_bind_with_an_odd_decimal_point_index_is_refused_rather_than_aborting`, second half: magnitude alone is not what the guard keys on — `9.99E39` is larger than every refused value and binds exactly |
 | NUMBER, `9.99…E125` (126 digits) and its negative | Pass **on read** | inserted as a literal, read back digit-for-digit |
-| NUMBER, `9.99…E125` **bound** | **Refused** | upstream aborts the process (U-2); the driver refuses with `ErrorKind::Unsupported` |
+| NUMBER, `9.99…E125` **bound**, and `1.234…891` (40 digits, index 1) | **Refused** | upstream aborts the process (U-2); the driver refuses with `ErrorKind::Unsupported` |
 | NUMBER, `0.05`, `0.0005`, `0.0123`, `0.000123`, `1E-4`, `1E-130`, `-0.05` **bound** | **Refused** | upstream stores them ten times too large (U-1); the driver refuses |
 | `CHAR(20 CHAR)` blank padding | Pass | padding preserved, not stripped |
 | `VARCHAR2` / `NVARCHAR2`, Thai `ทดสอบภาษาไทย` | Pass | byte-exact; server `DUMP(v,1016)` confirms 36 bytes AL32UTF8 |
@@ -162,7 +260,9 @@ affected values rather than storing them wrongly.
 | TIMESTAMP WITH TIME ZONE, any form, by default | **Refused** | `a_timestamp_with_time_zone_column_is_refused_before_anything_is_fetched`; the session stays `Usable` and `TO_CHAR(c, '… TZR')` reads the value as text |
 | RAW | Pass | `00FF107F80DEADBEEF` byte-exact |
 | NULLs of 10 types | Pass | every nullable column reads back `ValueRef::Null` |
-| `INTERVAL DAY TO SECOND`, `INTERVAL YEAR TO MONTH`, `ROWID`, `TIMESTAMP WITH LOCAL TIME ZONE` | Pass | rendered as `ColumnData::Unsupported` text (`P3DT0H0M0.000000000S`, `P2Y6M`, `AAAACPAABAAAAWRAAA`, `2026-…Z`) with the server's own type name; the columns either side of them still arrive |
+| `INTERVAL DAY TO SECOND`, `INTERVAL YEAR TO MONTH`, `ROWID`, `TIMESTAMP WITH LOCAL TIME ZONE` | Pass | rendered as `ColumnData::Unsupported` text (`P3DT0H0M0.000000000S`, `P2Y6M`, `AAAACPAABAAAAWRAAA`, and the LTZ as `YYYY-MM-DDThh:mm:ss.nnnnnnnnn` with no zone suffix) with the server's own type name; the columns either side of them still arrive |
+| `XMLTYPE` (and, by the same route, `JSON`, `VECTOR`, object types, `BFILE`) | **Refused on the describe** | `a_column_this_upstream_cannot_decode_is_refused_before_the_first_batch`. These are *not* the "renders as text" case above: upstream's `DbValue::from_response` has no branch for them, so the **fetch** fails and there is nothing to render. Failing from `fetch_batch` would kill a result set after earlier batches had been handed to the caller, so the column is refused before the first batch. Session stays `Usable`; `XMLSERIALIZE` works immediately afterwards. (19c has no native `JSON` column type — JSON there is `VARCHAR2`/`CLOB`/`BLOB` with `IS JSON`, all of which work) |
+| `TIMESTAMP WITH LOCAL TIME ZONE` renders **without** a `Z` | Pass **after a driver fix** | the first version of this document recorded `2026-…Z`. That was upstream's `Display`, which appends `Z` whenever the offset fields are zero — which is how this type always arrives, because the server normalizes it to the **database** time zone and sends no offset. `Z` would assert UTC on no evidence. `value::render_local_time_zone` now writes the bare civil fields; asserted by `a_type_the_contract_cannot_hold_becomes_text_instead_of_failing_the_batch` |
 
 No `NLS_LANG` or other NLS environment variable was set on the client for any
 of this. Correctness was established by comparing against the server's own
@@ -253,11 +353,46 @@ handle-lifecycle rule: after the connection closes, the stream reports
 `driver-internal: LOB stream was used after its connection was closed` and does
 not touch the socket.
 
+> **Corrected 2026-09-19.** Every failure during a LOB read used to be reported
+> as `ErrorKind::DataConversion` with the session `Usable`. That is a lie when
+> the transport is gone — a dropped connection mid-stream told the caller the
+> data was malformed and the session was fine, so a connection pool would hand
+> the dead session straight back out. The cause is upstream's
+> `Lob::io_error`, which collapses every error into
+> `io::Error::other(text)`, losing the kind. `error::map_lob_read` now
+> reclassifies by cause: an `ORA-`/`PLS-` code goes through the ordinary server
+> mapping; upstream's fixed transport strings become `NetworkLost` with
+> `SessionState::Lost`; "not connected to database" becomes a closed-connection
+> error; a fired call timeout becomes `Timeout`; genuinely undecodable UTF-16
+> stays `DataConversion`; anything unrecognised is an internal error rather
+> than a wrong guess. *Evidence:*
+> `a_lob_read_that_lost_the_connection_does_not_claim_the_session_is_fine`,
+> `the_upstream_split_surrogate_failure_is_recognized`.
+
 ### S9 — concurrency — **Pass**
 
 Eight threads, one connection each, 50 inserts and a commit and a read-back per
 thread: **282.8 ms** wall clock for 400 inserts across 8 sessions, every
 thread seeing exactly its own 50 rows.
+
+### Review fixes with observable behaviour
+
+Beyond U-2, U-3 and the LOB mapping (recorded in §5 and below), the review
+produced these behaviour changes. Each has a test; most need no database.
+
+| Change | Why | Evidence |
+|---|---|---|
+| The first SQL keyword is now found by **upstream's own rule** — skip comments, quoted text and any non-alpha character, then take the first maximal ASCII-alpha run | `(SELECT …)`, `WITH …`, and anything behind a comment or hint were classified as non-queries, sent to `execute_non_query`, and **their rows were discarded**. Upstream's `determine_statement_type` would have executed them as queries | `a_parenthesised_query_is_a_query_and_keeps_its_rows`, `comments_and_hints_before_the_first_keyword_are_skipped`, `the_first_keyword_is_not_confused_by_a_later_one` |
+| A second, independent transcription of that rule (`classify::upstream_would_return_rows`) is checked against the classifier over a corpus, and again at run time before the discarding path is taken | The two implementations exist to disagree. A disagreement is now an internal error, never silently dropped rows | `the_classifier_and_the_upstream_rule_agree_on_every_statement`, `a_statement_that_returns_rows_is_never_sent_down_the_discarding_path` |
+| Statement caching is **off** by default (`set_stmtcachesize(0)`), opt-in via the `oracle.statement_cache_size` extension, with the reason in the extension's documentation | A cached cursor defeats the U-3 containment (see U-3). Turning it on is a deliberate choice with a documented consequence | `the_statement_cache_is_off_unless_the_caller_turns_it_on` |
+| A `DML … RETURNING` row is read from `returned_data()`, with `out_bind_data()` only as the PL/SQL fallback; more than one returned row is refused as `Unsupported` | The two upstream accessors carry different things, and reading the wrong one gave all-NULL outputs for DML RETURNING | `a_single_row_dml_returning_gives_back_its_values` |
+| The number of OUT slots the server actually produced is probed and compared with what the caller declared, and a mismatch fails loudly | A bind the caller declared IN but the server treats as IN OUT shifts every later slot, so values would be read from the wrong variable | `an_in_bind_the_server_calls_in_out_fails_loudly_instead_of_shifting_slots` |
+| Host and service name in an Easy Connect endpoint are validated (`[A-Za-z0-9._-]`, non-empty, ≤255) | A host field carrying `)` or `(` could smuggle a TNS descriptor fragment into the connect string | `a_host_or_service_that_could_carry_a_descriptor_is_refused` |
+| Changing a statement's deadline while a result set is open produces a `Warning` on the outcome | The armed timeout is per **connection**, so a new deadline silently re-arms the socket under an open cursor | `changing_a_deadline_under_an_open_result_set_is_reported` |
+| `CancelOutcome::NotInterruptible` reports `deadline_remaining: None` when the work spans several round trips, rather than a number it cannot honour | The armed value is per round trip; quoting it for a multi-batch fetch would be a promise the driver cannot keep. The contract documents `None` as "cannot measure" | `no_stop_time_is_promised_for_work_that_spans_several_round_trips` |
+| `LobStream::size_hint` returns `Some` only for a binary LOB (`BLOB`) | The contract documents the hint in **bytes**; upstream counts a character LOB in UCS-2 units, which is wrong by up to 4× | crate docs + `reldex-core-poc` prints "(size not known in bytes)" |
+| A LOB locator allocates its staging buffer on first read | A batch of unopened locators used to allocate one buffer each | `a_batch_of_unread_lob_locators_costs_almost_nothing` |
+| Dropping a connection marks it closed, so handles that outlive it report instead of touching a dead socket | `close()` did this; `drop` did not | `a_handle_outliving_a_dropped_connection_reports_too` |
 
 ### S6, S8 — **Not run**
 
@@ -280,15 +415,20 @@ Four candidates, evaluated in the order ADR-0001 sets out.
 | Long **SQL** (3-way cartesian join over `ALL_OBJECTS`) | 2.0 s | **2.5 s** (overshoot 534 ms) | `ErrorKind::Timeout`, `SessionState::NeedsValidation`, **session survives** — `ping` and a query both succeed |
 | **PL/SQL** `DBMS_SESSION.SLEEP(20)` | 2.0 s | **4.0 s** | `ErrorKind::NetworkLost`, `SessionState::Lost`, **connection closed and gone** |
 
-*Tests:* `a_deadline_stops_a_long_sql_statement_and_the_session_survives`,
+*Tests:* `a_deadline_stops_a_long_sql_statement_and_reports_the_session_honestly`
+(renamed from `…_and_the_session_survives`, which asserted an outcome that is
+load-dependent — see U-6),
 `a_deadline_on_a_plsql_sleep_destroys_the_session`.
 
-> *Note added 2026-09-19.* Since the U-3 mitigation the driver describes before
-> it fetches, so a query's work — and therefore the moment its deadline fires —
-> is on the first `fetch_batch` rather than on `execute`; the SQL case above is
+> *Note added 2026-09-19.* Since the U-3 mitigation the driver defers the fetch,
+> so a query's rows — and therefore the moment its deadline fires — arrive on
+> the first `fetch_batch` rather than on `execute` (the statement is still
+> *executed* on `execute`; only the row transfer moves). The SQL case above is
 > now driven through `run_to_first_batch`. The mechanism, the outcomes and the
 > numbers are unchanged. Note also that which outcome the SQL case produces is
-> **load-dependent** (see U-6): these measurements are from a serial run.
+> **load-dependent** (see U-6): these measurements are from a serial run, and
+> the test now accepts either documented outcome while requiring the driver to
+> report it honestly.
 
 The difference is explained by upstream's recovery path, and it is a defect
 (U-6). On a read timeout, `Client::receive_data_packet` calls
@@ -469,32 +609,65 @@ Their even-leading-zero neighbours (`0.5`, `0.005`, `0.00005`, `0.123`,
 makes this so easy to miss.
 
 *Evidence:* `a_bound_number_is_never_silently_scaled_by_a_power_of_ten`.
-*Mitigation:* `binds::to_oracle_number` refuses these values with
+*Mitigation:* `binds::encoder_defect` refuses these values with
 `ErrorKind::Unsupported` and a message telling the caller to write the value as
-a literal. **This is a real functional limitation** — half of all decimals below
+a literal. It is one predicate covering both this defect and U-2 — an odd
+decimal-point index either prepends the alignment zero (safe unless the digit
+count reaches 40, which is U-2) or is silently skipped (this defect). **This is a real functional limitation** — half of all decimals below
 0.1 cannot be bound — but a database tool that stores the wrong number is worse
 than one that says no.
 
-### U-2 — **A large-magnitude NUMBER aborts the process** (critical)
+### U-2 — **A NUMBER of the wrong *shape* aborts the process** (critical)
+
+> **Corrected 2026-09-19.** This section previously said "anything of magnitude
+> ≥ 1E40", and the driver's guard was written from that description. Both were
+> wrong: magnitude is not the trigger, and the guard had a false negative that
+> aborted the process. What follows is derived from the encoder, not from
+> examples.
 
 `src/ora_type/number.rs:280-283` folds trailing zeros into `num_digits` without
-bounding it to the 40-byte `digits` array; `to_buf` then indexes that array with
-the inflated count at line 347.
+bounding it to the 40-byte `digits` array; `to_buf` then walks base-100 **pairs**
+over that array and can index one past its end (line 347/351).
 
-Minimal reproduction: bind `9.9999999999999999999999999999999999999E125`
-(a legal Oracle NUMBER) — or anything of magnitude ≥ 1E40.
+Two inputs reach the out-of-bounds read:
+
+1. `num_digits > 40` — the fold above, e.g. `1E40` or
+   `9.9999999999999999999999999999999999999E125`; and
+2. `num_digits == 40` with an **odd, positive** `decimal_point_index` — `to_buf`
+   then prepends an alignment zero, so 40 digits occupy 41 positions and the
+   last pair reads `digits[40]`. `1.234567890123456789012345678901234567891`
+   is of magnitude **one** and aborts; `9.99E39` is far larger and is fine.
 
 ```
-panicked at src/ora_type/number.rs:347:29:
+panicked at src/ora_type/number.rs:351:38:
 index out of bounds: the len is 40 but the index is 40
 ```
 
 That panic then meets U-4 and the **process aborts** with
-`STATUS_STACK_BUFFER_OVERRUN (0xC0000409)`.
+`STATUS_STACK_BUFFER_OVERRUN (0xC0000409)`. Both cases were reproduced against
+the live database before the guard was rewritten.
 
-*Mitigation:* `binds::to_oracle_number` refuses binds whose upstream digit count
-would exceed 40. Reading such values is unaffected and exact (verified to 126
-digits).
+*Mitigation:* `binds::encoder_defect` refuses exactly the shapes above
+(`ErrorKind::Unsupported`, session `Usable`), sharing its predicate with U-1's
+odd-index case. `the_refusal_predicate_covers_every_shape_the_encoder_mishandles`
+enumerates every (digit count 0..=130 × decimal-point index −129..=126) pair —
+the whole space a `Number` can occupy — and checks the predicate against
+line-by-line transcriptions of upstream's `from_str` and `to_buf`, so the
+refusal is complete by construction rather than by example. Reading such values
+is unaffected and exact (verified to 126 digits).
+
+*Evidence:* `a_forty_digit_bind_with_an_odd_decimal_point_index_is_refused_rather_than_aborting`
+(live, passing) and `binding_forty_digits_with_an_odd_index_aborts_upstream`
+(`#[ignore]`d — it drives the upstream crate directly and ends the process,
+which is the proof that the refusal is load-bearing).
+
+*How reachable is it?* The 40-digit/odd-index class cannot come back from the
+**server**: Oracle's NUMBER holds 20 base-100 pairs, and a value with an odd
+decimal-point index spends one position on the same alignment zero, so the
+server never returns 40 significant digits *and* an odd index together. Probing
+`10/3`, `100/3`, `1/7`, `1000/7` and `2/3` confirms it — `10/3` comes back as 39
+digits, and all five re-bind cleanly. The class is reachable from a value the
+**user typed** or Reldex computed, which is exactly the path an IDE exposes.
 
 ### U-3 — **A named time-zone region aborts the process** (critical)
 
@@ -537,11 +710,30 @@ it cannot be contained.
 | **Detecting the column from the describe, before fetching** | **Yes** — this is what is implemented |
 
 **What is implemented.** The driver asks `oracledb` for **zero prefetched rows**
-(`Statement::prefetch_rows(0)`) on every query. Without that, the execute round
-trip carries rows (default 2) and `oracledb` decodes them before the wrapper
-sees anything — so the abort happens before any check could run. With it, the
-execute is a describe: the column metadata arrives, no value has been decoded,
-and `OracleCursor::new` refuses a `TIMESTAMP WITH TIME ZONE` column with
+(`Statement::prefetch_rows(0)`) on every query, **and takes every statement out
+of the statement cache** (`Statement::exclude_from_cache()`). Both are needed,
+and the second was missing in the first version of this fix:
+
+- without `prefetch_rows(0)`, the execute round trip carries rows (default 2)
+  and `oracledb` decodes them before the wrapper sees anything, so the abort
+  happens before any check could run;
+- without `exclude_from_cache()`, `prefetch_rows(0)` stops being enough on the
+  **second** execution of the same SQL. A cached statement keeps its server-side
+  `cursor_id`, so `write_reexecute` takes the short TTC path, which does not
+  carry the prefetch setting — the server sends rows with the re-execute and
+  `oracledb` decodes them. Reproduced against the live database: the first
+  execute described one column and decoded nothing; the second panicked in
+  `ora_type/timestamp.rs:238` (`not yet implemented`), then again in
+  `statement/holder.rs:140` on the poisoned mutex, and the process ended with
+  `STATUS_STACK_BUFFER_OVERRUN (0xC0000409)`. This is recorded as the
+  `#[ignore]`d `a_cached_cursor_makes_the_execute_fetch_rows_and_aborts`, and
+  the containment is
+  `re_executing_a_refused_query_with_a_longer_bind_is_still_refused` (four
+  alternating executions of the same SQL, each still refused).
+
+With both in place the execute is a describe: the column metadata arrives, no
+value has been decoded, and `OracleCursor::new` refuses a
+`TIMESTAMP WITH TIME ZONE` column with
 `ErrorKind::Unsupported`, naming the column and the documented `TO_CHAR(c,
 '… TZR')` escape. The session is untouched — `SessionState::Usable` — because
 nothing failed; a column was declined. A nested cursor from an OUT bind never
@@ -568,20 +760,27 @@ the connection extension `oracle.allow_timestamp_with_time_zone`
 abort. Reldex itself must not set it by default.
 
 **What it costs.** One extra round trip on a *small* result: a one-row query
-takes a **1.3 ms** median against a **634 µs** median `ping` — that is, exactly
+takes a **1.4 ms** median against a **641 µs** median `ping` — that is, exactly
 one bare round trip more than before (`describing_before_fetching_costs_about_one_extra_round_trip`;
-20 iterations, median of the sorted samples). A large result pays **nothing**:
+20 iterations, median of the sorted samples; re-measured after
+`exclude_from_cache` was added, previously 1.3 ms against 634 µs — the
+difference is inside the run-to-run spread). A large result pays **nothing**:
 `fetch_array_size` still sizes every fetch, so the same number of batches
 crosses the wire either way.
 
-It also moves *where* a query blocks. A `SELECT`'s row source only runs when
-rows are asked for, so `execute` now returns as soon as the server has
-described the select list, and the work — and any deadline armed through
-`Statement::with_deadline` — lands on the first `fetch_batch`. For the UI that
-is an improvement (the grid's columns are known immediately). For spike S4 it
-means a long-running query has to be driven to its first batch to be observed
-running at all, which is what `run_to_first_batch` in `s4_cancel.rs` now does;
-§4's findings and measurements are unchanged.
+It also moves *where a query's rows are produced*, and it is worth being
+precise about what does **not** change. The execute message still carries
+`TTC_EXEC_OPTION_EXECUTE`, so the server still **executes the statement** on the
+`execute` call: the cursor is opened, the plan runs, and a statement that fails
+at run time still fails there. The statement is not executed twice. What is
+deferred is only the *fetch* — with `prefetch_rows(0)` the execute response
+carries no rows, so the work of materialising and sending them lands on the
+first `fetch_batch`, and so does any deadline armed through
+`Statement::with_deadline`. For the UI that is an improvement (the grid's
+columns are known immediately). For spike S4 it means a long-running query has
+to be driven to its first batch to be observed blocking at all, which is what
+`run_to_first_batch` in `s4_cancel.rs` now does; §4's findings and measurements
+are unchanged.
 
 *Evidence:* `a_timestamp_with_time_zone_column_is_refused_before_anything_is_fetched`
 and `a_timestamp_with_time_zone_output_bind_is_refused_before_the_statement_runs`
@@ -650,6 +849,28 @@ container — three cartesian joins, a `KILL SESSION` and a 20-second sleep at
 once — both S4 deadline tests have been observed flipping. Serial runs
 (`--test-threads=1`) are stable and are what §4's measurements were taken from.
 Reldex cannot rely on a fired deadline leaving the session usable.
+
+*Measured 2026-09-19, because the flip first looked like a regression.* The SQL
+deadline test began failing with `NetworkLost` where it had asserted `Timeout`,
+and the obvious suspect was this task's `exclude_from_cache()` change. It is
+not. Control runs of the same test, parallel, against the same container:
+
+| Statement cache | Runs | Passes |
+|---|---|---|
+| 20 (the pre-change default, cache on) | 4 | 3 |
+| 0 (cache off — the change) | 6 | 3 |
+
+Both configurations flip, so the cause is the load the parallel S4 run puts on
+a single-instance container, exactly as this defect predicts — it is
+**pre-existing**, not caused by any change recorded here. The test was
+therefore renamed to
+`a_deadline_stops_a_long_sql_statement_and_reports_the_session_honestly` and now
+accepts **either** documented outcome while asserting that the driver reports
+it honestly: `Timeout` must come with `SessionState::NeedsValidation` and a
+session that still answers, `NetworkLost` with `SessionState::Lost`. It has
+since passed 8 consecutive runs, and the full serial S4 suite passes (7/7).
+Asserting one branch of a genuinely load-dependent defect would be asserting
+the weather.
 
 ### U-7 — **A server-side cancel is not observed by the client**
 
@@ -965,11 +1186,64 @@ finer-grained flag. If the UI will behave differently for SQL and PL/SQL, the
 capability may need splitting; if not, the current reporting is honest enough
 and is documented in the crate.
 
+### C-4 — `ErrorKind` has no "object does not exist", so ORA-00942 is `Syntax`
+
+Raised in review as a mis-classification; recorded here as a **contract gap
+instead**, deliberately, because the alternatives are worse.
+
+`ORA-00942: table or view does not exist` is mapped to `ErrorKind::Syntax`. The
+contract documents that kind as an error where the statement could not be
+"parsed or compiled (**syntax or semantic**)", and name resolution is exactly
+the semantic half of compilation — Oracle raises ORA-00942 at parse time, before
+execution, and the statement never runs. The remaining candidates are
+`ErrorKind::Other`, which discards the one useful fact (the statement was
+rejected, not the data), and inventing a kind, which `db-driver-api` is frozen
+against in Phase 0. The native `ORA-00942` is preserved on the error either way,
+so a UI that wants to say "table not found" has everything it needs.
+
+*What the contract should grow later:* an `ObjectNotFound` kind (or a
+`Syntax { resolution: bool }` refinement). Until then this mapping is a
+documented choice, asserted by a unit test with the reasoning in a comment
+beside it (`error.rs`), not an oversight.
+
 ---
 
 ## 8. Secret handling
 
-No credential appears in any source file, test, script or this document.
+> **Corrected 2026-09-19.** This section previously claimed "no credential
+> appears in any source file, test, script or this document". That was **not
+> true when it was written**, and the claim is recorded here rather than quietly
+> deleted. Two tracked files carried working local passwords:
+> `tools/oracle-test-db/init/01_create_test_user.sql` had a literal
+> `IDENTIFIED BY "<value>"`, and `.env.example` shipped defaults that worked
+> against the image. Both were throwaway values for a container bound to
+> `127.0.0.1`, and neither is used anywhere else — but they were tracked, so
+> **they remain in git history** and history was not rewritten. What changed:
+>
+> - the `.sql` hook is gone, replaced by `init/01_create_test_user.sh`, which
+>   takes `RELDEX_TEST_USER` / `RELDEX_TEST_PWD` from the **container's
+>   environment** (passed through by `compose.yaml` from the untracked `.env`),
+>   refuses to run rather than invent a password, refuses a value containing a
+>   quote, ampersand, semicolon or whitespace because it interpolates into SQL
+>   text, and feeds `sqlplus` on **stdin** so the password is never on a command
+>   line where `ps` could read it;
+> - it is idempotent (`CREATE USER` or `ALTER USER … IDENTIFIED BY`, then
+>   re-grants), so a password change takes effect by re-running the hook
+>   against the running container — no `down -v`, no DBCA, no data loss:
+>   `docker exec -e RELDEX_TEST_PWD=… reldex-oracle19c bash
+>   /opt/oracle/scripts/setup/01_create_test_user.sh`. **Verified that way**
+>   against the live container for this task, which is also how the tests below
+>   were re-run;
+> - `.env.example` now carries `CHANGE_ME_local_only` placeholders that are
+>   deliberately **invalid for the image** (no digit), so an unedited copy fails
+>   loudly at container start instead of creating a database with a published
+>   password;
+> - `tools/oracle-test-db/README.md` documents all of the above, including a
+>   history note.
+>
+> `git check-ignore tools/oracle-test-db/.env` confirms the real file is
+> ignored, and it is the only place a value lives.
+
 `tools/oracle-test-db/.env` stays untracked and is read only by
 `tools/oracle-test-db/run-it.ps1` / `run-it.sh`, which export
 `RELDEX_TEST_ORACLE_DSN`, `_USER`, `_PASSWORD` (and the optional `_SYSTEM_USER`
@@ -981,8 +1255,9 @@ created under a name unique to the process and dropped at the end.
 
 No extra grants were needed: `RELDEX_TEST` could already read `V$SESSION`,
 `V$INSTANCE`, `V$MYSTAT` and `USER_ERRORS`, and execute `DBMS_SESSION`,
-`DBMS_OUTPUT`, `DBMS_APPLICATION_INFO`, `DBMS_LOB` and `UTL_RAW`. So
-`tools/oracle-test-db/init/01_create_test_user.sql` is unchanged.
+`DBMS_OUTPUT`, `DBMS_APPLICATION_INFO`, `DBMS_LOB` and `UTL_RAW`. The grant
+list in `init/01_create_test_user.sh` is therefore the same set the old `.sql`
+hook granted; only where the password comes from changed.
 
 `a_wrong_password_is_an_authentication_failure_not_a_network_one` asserts that a
 credential appears in neither the `Display` nor the `Debug` rendering of the

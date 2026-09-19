@@ -357,7 +357,7 @@ impl ColumnBuilder {
                     ColumnPlan::UnsupportedIntervalYm => get::<OracleIntervalYM>(row, index)?
                         .map(|value| render(&mut self.scratch, &value)),
                     ColumnPlan::UnsupportedTimestampLtz => get::<OracleTimestamp>(row, index)?
-                        .map(|value| render(&mut self.scratch, &value)),
+                        .map(|value| render_local_time_zone(&mut self.scratch, &value)),
                     _ => {
                         return Err(DbError::new(
                             ErrorKind::Unsupported,
@@ -400,6 +400,33 @@ impl ColumnBuilder {
 
 fn render(scratch: &mut String, value: &impl std::fmt::Display) {
     let _ = render_into(scratch, value);
+}
+
+/// Renders a `TIMESTAMP WITH LOCAL TIME ZONE` **without claiming a zone**.
+///
+/// `OracleTimestamp`'s own `Display` writes a trailing `Z` whenever the offset
+/// fields are zero, which is exactly how this type arrives: the server
+/// normalizes the value to the database time zone and sends no offset at all.
+/// Rendering it as `2026-09-19T13:45:30.000000000Z` therefore asserts UTC on no
+/// evidence — the driver has not asked for `DBTIMEZONE` and does not know the
+/// session's zone either — and a user comparing the cell against `SELECT c FROM
+/// t` in any other tool would see a different instant. The fields are written
+/// bare instead; the column's `native_type_name` already says
+/// `TIMESTAMP WITH LOCAL TIME ZONE`, which is what the value means.
+fn render_local_time_zone(scratch: &mut String, value: &OracleTimestamp) {
+    use std::fmt::Write as _;
+    scratch.clear();
+    let _ = write!(
+        scratch,
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}",
+        value.year(),
+        value.month(),
+        value.day(),
+        value.hour(),
+        value.minute(),
+        value.second(),
+        value.nanoseconds()
+    );
 }
 
 fn get<'a, T>(row: &'a Row, index: usize) -> DbResult<Option<T>>

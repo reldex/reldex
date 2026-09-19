@@ -383,8 +383,12 @@ fn preview(locator: LobLocator) -> DbResult<String> {
         Ok(text) => elide(&text),
         Err(error) => format!("{} byte(s) of binary", error.into_bytes().len()),
     };
+    // `size_hint` is documented as bytes, and the driver only reports one when
+    // it really has bytes: a CLOB's length is counted by the server in UCS-2
+    // units, so a character LOB reports `None` rather than a number that would
+    // be wrong by up to four times. "bytes" here is therefore never a guess.
     Ok(match size {
         Some(size) => format!("{kind:?} ({size} bytes): {body}"),
-        None => format!("{kind:?}: {body}"),
+        None => format!("{kind:?} (size not known in bytes): {body}"),
     })
 }

@@ -61,6 +61,26 @@
 //! [`TlsMode::Required`](reldex_db_driver_api::TlsMode::Required) rather than
 //! silently opening a plaintext connection.
 //!
+//! **A note for whoever lands TCPS (spike S8).** This crate installs no `rustls`
+//! crypto provider, and does not need to: only `aws-lc-rs` is enabled, so
+//! `rustls` resolves its default unambiguously. The moment a second provider can
+//! be enabled — a `ring` feature for a platform without a C toolchain, or a
+//! dependency that turns one on transitively — that stops being true and
+//! `rustls` panics at the first handshake with "no process-level
+//! `CryptoProvider` available". The fix belongs in the application's startup,
+//! once, and must be idempotent, because a library that installs a provider
+//! steals the choice from its host:
+//!
+//! ```ignore
+//! if rustls::crypto::CryptoProvider::get_default().is_none() {
+//!     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+//! }
+//! ```
+//!
+//! This is a note rather than code on purpose: installing a provider from a
+//! driver crate would be a side effect on a global the host may already have
+//! configured.
+//!
 //! # What this driver can and cannot do
 //!
 //! The capabilities it reports are deliberately conservative — every `true` is
@@ -103,9 +123,31 @@
 //! historical constructor, so a value the proleptic Gregorian calendar rejects
 //! (a `1500-02-29` stored years ago, a BC date) is returned instead of failing
 //! the fetch. `CLOB`, `NCLOB` and `BLOB` stay lazy locators streamed in bounded
-//! chunks. A column whose type this contract cannot express becomes
-//! [`Unsupported`](reldex_db_driver_api::ColumnData::Unsupported) text, so one
-//! odd column never hides a whole table.
+//! chunks; a locator allocates its staging buffer on the first read, so a batch
+//! of unopened locators costs nothing.
+//!
+//! A column whose type this contract cannot express becomes
+//! [`Unsupported`](reldex_db_driver_api::ColumnData::Unsupported) text **where
+//! `oracledb` can decode the value at all** — `ROWID`, `UROWID`, both
+//! `INTERVAL`s and `TIMESTAMP WITH LOCAL TIME ZONE` — so one odd column of those
+//! kinds never hides a whole table. `JSON`, `XMLTYPE`, `VECTOR`, object types
+//! and `BFILE` are a different case: upstream's row deserializer has no branch
+//! for them and fails the fetch, with nothing to render. Those columns are
+//! refused **at describe time**, before any batch is delivered, so a result set
+//! never dies part-way through; see "Known limitations".
+//!
+//! [`size_hint`](reldex_db_driver_api::LobStream::size_hint) is in bytes, as the
+//! contract says, which is why a `CLOB` or `NCLOB` reports `None`: upstream
+//! counts a character LOB in Oracle UCS-2 units, and passing that off as a byte
+//! count would be wrong by up to a factor of four. A `BLOB` reports its real
+//! size.
+//!
+//! A `TIMESTAMP WITH LOCAL TIME ZONE` is rendered without a zone suffix.
+//! Upstream's own `Display` writes a trailing `Z` whenever the offset fields are
+//! zero — which is how this type always arrives, the server having normalized it
+//! to the database time zone — and that would assert UTC without the driver
+//! having asked for `DBTIMEZONE` or the session zone. The column's native type
+//! name says what the value means.
 //!
 //! # Known limitations
 //!
@@ -128,18 +170,64 @@
 //!   as text. The offset-only form does decode correctly, and
 //!   [`EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE`] turns the refusal off for a caller
 //!   that knows its data — at the price of the abort.
-//! - **A `NUMBER` with an odd number of leading zeros after the decimal point
-//!   cannot be bound** (U-1): the upstream encoder stores it ten times too
-//!   large, silently. `0.05`, `0.0005`, `1E-4` and friends are refused; write
-//!   them as literals.
-//! - **A `NUMBER` of magnitude 1E40 or larger cannot be bound** (U-2): the
-//!   upstream encoder indexes past its digit buffer and the process aborts.
-//!   Reading such values is exact and unaffected.
+//! - **Some `NUMBER` values cannot be bound.** Both defects are in the same
+//!   upstream encoder and the refusal set is derived from it rather than from
+//!   the examples that exposed it. Upstream's encoder works on a digit count
+//!   `n` (the significant digits, or the decimal exponent when trailing zeros
+//!   pad an integer) and an index `d` (that exponent); a value is refused when
+//!   `n > 40`, when `d` is **odd and positive** and `n == 40`, or when `d` is
+//!   **odd and negative**.
+//!     - Odd **negative** exponent (U-1): the encoder skips the alignment zero,
+//!       because `-1 % 2` is `-1` in Rust, and the server silently stores a
+//!       value ten times too large. `0.05`, `0.0005`, `1E-4` and half of all
+//!       decimals below `0.1` are affected.
+//!     - Odd **positive** exponent with 40 digits, or `n` above 40 (U-2): the
+//!       encoder prepends its alignment zero, so 40 digits occupy 41 positions,
+//!       and it reads `digits[40]` of a 40-byte array — the process aborts.
+//!       "Magnitude ≥ 1E40" is **not** the criterion:
+//!       `1.234567890123456789012345678901234567891` is the size of *one* and
+//!       aborts, while `9.99E39` is larger than anything refused and encodes
+//!       perfectly. The server cannot produce this shape itself (an odd `d`
+//!       costs one of its 40 digit positions, so `SELECT 10/3 FROM dual`
+//!       returns 39 digits); it comes from values a user types or the
+//!       application computes.
+//!
+//!   Reading is exact in every case, verified to 126 digits; only binding is
+//!   affected, and a refused value can always be written as a literal.
 //! - **A running statement cannot be interrupted** (U-10); see the capability
-//!   note above.
+//!   note above. The deadline that *can* be armed is upstream's per-round-trip
+//!   socket timeout, so it bounds each round trip and not a whole multi-batch
+//!   fetch, and it lives on the connection rather than on a statement:
+//!   [`CancelHandle::request_cancel`](reldex_db_driver_api::CancelHandle::request_cancel)
+//!   reports no remaining time while a result set is open, and a statement that
+//!   changes the connection's limit while one is open says so through a warning.
 //! - **A cursor-typed result column** (`SELECT CURSOR(…) …`) is refused rather
 //!   than silently dropped (ADR-0002 lead decision 3). A `REF CURSOR` through an
 //!   *output bind* is fully supported.
+//! - **`JSON`, `XMLTYPE`, `VECTOR`, object types and `BFILE` columns are refused
+//!   on the describe.** `oracledb` 26.0.0-beta.3's `DbValue::from_response` has
+//!   no branch for them, so the fetch itself fails and there is no value to
+//!   render as text. Refusing before the first batch keeps the failure from
+//!   arriving after part of a result set has been delivered. (`SPEC.md` §8 lists
+//!   JSON: on Oracle Database 19c, which Phase 0 tests against, there is no
+//!   native `JSON` column type — JSON is stored in `VARCHAR2`, `CLOB` or `BLOB`
+//!   with an `IS JSON` constraint, and those all work. The native type is 21c
+//!   and later, and is untested here.)
+//! - **Multi-row `RETURNING … INTO` is refused.** A single-row `RETURNING` is
+//!   read from upstream's `returned_data`, which is where it lives; more than
+//!   one returned row cannot be expressed as one value per output bind, so it is
+//!   reported rather than truncated.
+//! - **An output bind the server does not agree about is refused.** The wrapper
+//!   numbers output slots from the caller's declared directions, while the row
+//!   it reads comes from the server's describe. A parameter declared `In` that
+//!   the PL/SQL signature makes `IN OUT` shifts every later slot — silently,
+//!   when the types happen to match — so the two counts are compared and a
+//!   mismatch fails loudly.
+//! - **`Endpoint::HostPort` accepts plain names only.** `Config`'s connect
+//!   string is also where a full TNS descriptor goes, so a host beginning with
+//!   `(` would turn an Easy Connect target into a descriptor pointing elsewhere.
+//!   The host and service name are validated; descriptors go through
+//!   [`Endpoint::ConnectString`](reldex_db_driver_api::Endpoint::ConnectString).
 //!
 //! # Threading
 //!

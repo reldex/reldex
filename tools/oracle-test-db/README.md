@@ -21,7 +21,7 @@ deliberately; never move this to `latest`.
 
 ```bash
 cd tools/oracle-test-db
-cp .env.example .env      # edit ORACLE_PWD / RELDEX_TEST_PWD if desired
+cp .env.example .env      # REQUIRED: replace every CHANGE_ME_... placeholder
 docker compose pull       # ~2.3 GB compressed download
 docker compose up -d
 ```
@@ -80,11 +80,29 @@ not usable here; if a SID-only connection is ever required, build a full
 `CONNECT_DATA=(SID=RELDEX)` descriptor instead.
 
 The test/application user `RELDEX_TEST` is created idempotently on first
-start by `init/01_create_test_user.sql` (mounted read-only into the image's
-`/opt/oracle/scripts/setup` hook, which the image runs automatically via
-`sqlplus / as sysdba @script.sql` on first boot only). Its password is the
-dev default `Reldex_Test_19c` documented in `.env.example`, or your own
-value if you edited `.env` and `init/01_create_test_user.sql` to match.
+start by `init/01_create_test_user.sh`, mounted read-only into the image's
+`/opt/oracle/scripts/setup` hook. The image's `runUserScripts.sh` sources
+every `*.sh` there on first boot, so the script runs with the container's
+environment available.
+
+**Its password comes from `RELDEX_TEST_PWD` in the untracked `.env`**, which
+`compose.yaml` passes into the container; no password appears in any tracked
+file. The script refuses to run rather than invent one if the variable is
+missing, and refuses a value containing a quote, ampersand, semicolon or
+whitespace, because it interpolates the value into SQL text.
+
+It is idempotent and safe to re-run against a container that is already up,
+which is how to change the test user's password **without destroying the
+database**:
+
+```bash
+docker exec -e RELDEX_TEST_PWD="<the new value>" reldex-oracle19c \
+  bash /opt/oracle/scripts/setup/01_create_test_user.sh
+```
+
+(Update `.env` to match, or the next `run-it.sh` will use the old value.)
+`ORACLE_PWD` is different: DBCA consumes it on first start only, so changing
+it afterwards needs the image's own `/opt/oracle/setPassword.sh`.
 
 ### Important: set `NLS_LANG` for Unicode/Thai correctness
 
@@ -106,9 +124,11 @@ just a test-harness quirk.
 ```bash
 docker exec -it reldex-oracle19c bash -c 'sqlplus / as sysdba'
 
-# or, to test the actual listener path as the test user:
+# or, to test the actual listener path as the test user. The credentials come
+# from the container's own environment, so nothing is typed here and nothing
+# reaches the host's shell history:
 docker exec -it -e NLS_LANG=AMERICAN_AMERICA.AL32UTF8 reldex-oracle19c \
-  sqlplus reldex_test/Reldex_Test_19c@//localhost:1521/RELDEX
+  bash -c 'sqlplus "$RELDEX_TEST_USER/$RELDEX_TEST_PWD@//localhost:1521/RELDEX"'
 ```
 
 ## Stop / start / reset
@@ -165,6 +185,14 @@ See **Limitations** for a follow-up.
 - **Local testing only.** Never expose this container's port beyond
   `127.0.0.1`, never reuse its dev password anywhere real, and never point
   it at anything other than disposable test data.
+- **History note.** Before 2026-09-19 the test user was created by
+  `init/01_create_test_user.sql`, which carried a literal
+  `IDENTIFIED BY "<value>"`, and `.env.example` shipped working defaults for
+  both passwords. Those files were tracked, so **those values remain in git
+  history**. They were throwaway defaults for a database bound to
+  `127.0.0.1` and are not used anywhere else, but if this container was ever
+  reachable from another host, change `RELDEX_TEST_PWD` in `.env` and re-run
+  the setup hook as shown above.
 
 ### Official alternative (for later CDB/PDB coverage)
 
@@ -180,5 +208,6 @@ logging in with an Oracle Single Sign-On (SSO) account at
   healthcheck, `restart: "no"`, `stop_grace_period: 2m`).
 - `.env.example` — placeholder env values; copy to `.env` (gitignored) for
   real local use.
-- `init/01_create_test_user.sql` — idempotent `RELDEX_TEST` user/grants,
-  auto-run by the image's setup hook on first start.
+- `init/01_create_test_user.sh` — idempotent `RELDEX_TEST` user/grants, with
+  the password taken from the container environment. Auto-run by the image's
+  setup hook on first start, and re-runnable by hand at any time.

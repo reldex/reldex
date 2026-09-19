@@ -23,6 +23,13 @@ services:
       ORACLE_SID: ${ORACLE_SID:-RELDEX}
       ORACLE_PWD: ${ORACLE_PWD}
       ORACLE_CHARACTERSET: ${ORACLE_CHARACTERSET:-AL32UTF8}
+      # Read by `init/01_create_test_user.sh`, which the image's setup hook
+      # sources on first start. It is passed through here (rather than written
+      # into the SQL) so that no password lives in a tracked file. `env_file`
+      # already injects it; naming it explicitly is what makes the dependency
+      # visible to whoever changes either side.
+      RELDEX_TEST_PWD: ${RELDEX_TEST_PWD}
+      RELDEX_TEST_USER: ${RELDEX_TEST_USER:-RELDEX_TEST}
     ports:
       # Bind to loopback only - never expose the listener beyond this host.
       - "127.0.0.1:1521:1521"

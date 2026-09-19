@@ -13,7 +13,8 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{
-    DSN, PASSWORD, USER, connect, measurement, observation, params, setting, try_connect,
+    DSN, PASSWORD, USER, connect, exec, exec_quietly, measurement, observation, params, setting,
+    try_connect, unique,
 };
 use reldex_db_driver_api::{
     ConnectionParams, Credentials, Endpoint, ErrorKind, Secret, SessionState, Statement,
@@ -155,6 +156,76 @@ fn a_cursor_outliving_its_connection_reports_rather_than_panics() {
     assert_eq!(error.session_state(), SessionState::Lost);
     observation(format!("cursor after connection close -> {error}"));
     cursor.close().expect("closing a dead cursor is still fine");
+}
+
+#[test]
+fn a_handle_outliving_a_dropped_connection_reports_too() {
+    // `close()` is the polite path. A `db-core` worker thread that unwinds, or
+    // any owner that simply lets the connection go, is the impolite one — and
+    // `oracledb`'s own `Cursor` and `Lob` hold a cloned `Arc<Mutex<Client>>`, so
+    // without help they would go on using a session nothing owns. ADR-0002 D2's
+    // handle lifecycle makes no distinction between the two, so neither does
+    // this driver.
+    let mut connection = connect();
+    let mut outcome = connection
+        .execute(&Statement::new(
+            "SELECT level FROM dual CONNECT BY level <= 100",
+        ))
+        .expect("select should execute");
+    let mut cursor = outcome.take_cursor().expect("a query returns a cursor");
+
+    let table = unique("s1_drop");
+    let mut lob_connection = connect();
+    exec(
+        lob_connection.as_mut(),
+        &format!("CREATE TABLE {table} (c CLOB)"),
+    );
+    exec(
+        lob_connection.as_mut(),
+        &format!("INSERT INTO {table} VALUES (RPAD('x', 5000, 'x'))"),
+    );
+    exec(lob_connection.as_mut(), "COMMIT");
+    let mut batch = {
+        let mut outcome = lob_connection
+            .execute(&Statement::new(format!("SELECT c FROM {table}")))
+            .expect("select");
+        let mut lob_cursor = outcome.take_cursor().expect("cursor");
+        let batch = lob_cursor
+            .fetch_batch(std::num::NonZeroUsize::MIN)
+            .expect("fetch");
+        lob_cursor.close().expect("close");
+        batch
+    };
+    let mut locator = batch
+        .column_mut(0)
+        .and_then(|column| column.take_lob(0))
+        .expect("a CLOB locator");
+
+    // Dropped, not closed.
+    drop(connection);
+    drop(lob_connection);
+
+    let error = match cursor.fetch_batch(std::num::NonZeroUsize::MIN) {
+        Ok(_) => panic!("fetching over a dropped connection must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ErrorKind::DriverInternal, "got {error}");
+    assert_eq!(error.session_state(), SessionState::Lost);
+    observation(format!("cursor after connection drop -> {error}"));
+    cursor.close().expect("closing a dead cursor is still fine");
+
+    let mut buffer = [0_u8; 64];
+    let error = match locator.read_chunk(&mut buffer) {
+        Ok(_) => panic!("reading a LOB over a dropped connection must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ErrorKind::DriverInternal, "got {error}");
+    assert_eq!(error.session_state(), SessionState::Lost);
+    observation(format!("LOB after connection drop -> {error}"));
+
+    let mut cleanup = connect();
+    exec_quietly(cleanup.as_mut(), &format!("DROP TABLE {table} PURGE"));
+    cleanup.close().expect("close");
 }
 
 #[test]

@@ -149,6 +149,60 @@ pub(crate) fn map_connect(error: &oracledb::Error) -> DbError {
     rebuilt
 }
 
+/// Converts a failure raised by `Lob::read` while streaming a large object.
+///
+/// `oracledb` collapses its structured error into
+/// `io::Error::other(error.to_string())` (`src/lob.rs`'s `io_error`), so by the
+/// time the wrapper sees it the only thing left is the message text. Calling
+/// every one of those a [`ErrorKind::DataConversion`] — which
+/// [`SessionState::initial_for`] reads as "the session is fine" — would tell
+/// `db-core` that a network drop half way through a 100 MB CLOB left the
+/// transaction intact, and `SPEC.md` §18 exists precisely so that cannot happen.
+///
+/// So the text is classified the way every other failure is: by its `ORA-` code
+/// where it has one, by upstream's own fixed wording for the transport kinds
+/// where it does not, and otherwise as [`ErrorKind::DriverInternal`], whose
+/// default session state is [`SessionState::NeedsValidation`]. `DataConversion`
+/// is left for the one case that really is one: a decode the wrapper recognizes.
+pub(crate) fn map_lob_read(error: &std::io::Error) -> DbError {
+    let text = error.to_string();
+    if first_native_code(&text).is_some() {
+        return from_server_message(&text);
+    }
+    // Upstream's `Display` for the transport and lifecycle kinds is a fixed
+    // string per kind, listed in `src/error.rs`. Matching it is fragile across
+    // versions, which is exactly why the `oracledb` dependency is pinned exactly
+    // and why the fall-through below is conservative rather than cheerful.
+    let lost = |message: &str| {
+        DbError::new(ErrorKind::NetworkLost, message.to_owned())
+            .with_session_state(SessionState::Lost)
+    };
+    if text.contains("the database or network closed the connection")
+        || text.contains("stream operation failed")
+        || text.contains("unable to recover from error")
+    {
+        return lost(&format!(
+            "the connection failed while reading a large object: {text}"
+        ));
+    }
+    if text.contains("not connected to database") {
+        return DbError::connection_closed("LOB stream");
+    }
+    if text.contains("the configured call timeout was exceeded") {
+        return DbError::new(
+            ErrorKind::Timeout,
+            "the call timeout armed for this connection expired while reading a large object",
+        );
+    }
+    if text.contains("invalid encoded string") || text.contains("invalid utf-16") {
+        return DbError::new(
+            ErrorKind::DataConversion,
+            format!("a large object contained text this driver could not decode: {text}"),
+        );
+    }
+    DbError::internal(format!("reading a large object failed: {text}"))
+}
+
 /// Builds a contract error from a server error message such as
 /// `ORA-00942: table or view does not exist`.
 fn from_server_message(message: &str) -> DbError {
@@ -198,14 +252,26 @@ fn find_code(message: &str, prefix: &str) -> Option<i32> {
 /// Recovers `line n, column m` from a PL/SQL compilation error message.
 ///
 /// `ORA-06550` reports the position in its own text, which is the only place
-/// this upstream version leaves one (see the module documentation).
+/// this upstream version leaves one (see the module documentation). The format
+/// is fixed — `ORA-06550: line 3, column 5:` — and only that format is read: an
+/// earlier version searched the whole message for the word "line ", which any
+/// server message or application `RAISE_APPLICATION_ERROR` text may contain
+/// ("ORA-20001: line 7 of the input file is malformed"), and reported whatever
+/// number followed as a position in the *statement*. A position pointing at the
+/// wrong token is worse than none, because `SPEC.md` §24.14 has the editor
+/// highlight it.
 fn plsql_position(message: &str) -> Option<SqlPosition> {
-    let start = message.find("line ")? + "line ".len();
-    let rest = &message[start..];
-    let line: u32 = take_number(rest)?;
-    let column_start = rest.find("column ")? + "column ".len();
-    let column: u32 = take_number(&rest[column_start..])?;
-    Some(SqlPosition::at_line_column(line, column))
+    message.lines().find_map(|line| {
+        let rest = line
+            .trim_start()
+            .strip_prefix("ORA-06550:")
+            .or_else(|| line.trim_start().strip_prefix("ORA-06553:"))?
+            .trim_start()
+            .strip_prefix("line ")?;
+        let number = take_number(rest)?;
+        let column = take_number(rest.strip_prefix(&format!("{number}, column "))?)?;
+        Some(SqlPosition::at_line_column(number, column))
+    })
 }
 
 fn take_number(text: &str) -> Option<u32> {
@@ -418,6 +484,94 @@ mod tests {
         );
         // The short message is only the first line.
         assert_eq!(error.message(), "ORA-06550: line 3, column 5:");
+    }
+
+    #[test]
+    fn a_position_is_only_read_from_the_format_that_carries_one() {
+        // Every one of these contains the word "line " followed by a number,
+        // and none of them is reporting a position in the submitted statement.
+        // Highlighting a token on the strength of them would point the editor
+        // at something unrelated (`SPEC.md` §24.14).
+        for message in [
+            "ORA-20001: line 7 of the import file is malformed",
+            "ORA-29283: invalid file operation: line 3, column 9 unreadable",
+            "ORA-00942: table or view does not exist",
+            "ORA-06512: at line 4",
+            "something about a line 9, column 2 that is not an Oracle position",
+        ] {
+            assert!(
+                server(message).position().is_none(),
+                "{message} must not produce a statement position"
+            );
+        }
+
+        // The ORA-06550 family does carry one, and it is still recovered even
+        // when the compile error is not the first line of the stack.
+        let wrapped = "ORA-06512: at \"RELDEX_TEST.P\", line 12\n\
+                       ORA-06550: line 2, column 3:\n\
+                       PLS-00103: Encountered the symbol \"END\"";
+        let position = server(wrapped).position().copied().expect("recovered");
+        assert_eq!((position.line(), position.column()), (Some(2), Some(3)));
+    }
+
+    #[test]
+    fn an_object_that_is_not_there_is_a_compile_failure_not_a_lost_session() {
+        // ORA-00942 is deliberately `Syntax`. The contract defines that kind as
+        // "the statement could not be parsed or compiled (**syntax or
+        // semantic**)", and an object that does not exist — or that the session
+        // cannot see, which Oracle reports identically — is exactly a semantic
+        // compile failure. There is no object-not-found kind to move it to, and
+        // the native ORA-00942 is preserved for anything that wants to tell the
+        // two apart.
+        let error = server("ORA-00942: table or view does not exist");
+        assert_eq!(error.kind(), ErrorKind::Syntax);
+        assert_eq!(error.native().map(NativeError::code), Some(942));
+        assert_eq!(error.session_state(), SessionState::Usable);
+    }
+
+    #[test]
+    fn a_lob_read_that_lost_the_connection_does_not_claim_the_session_is_fine() {
+        // `SPEC.md` §18: a lost transaction is never hidden. `Lob::read` throws
+        // the structured error away, so the text is all there is — but calling
+        // every one of them `DataConversion` told `db-core` the session was
+        // `Usable` after the socket had gone.
+        for text in [
+            "the database or network closed the connection",
+            "stream operation failed",
+            "unable to recover from error: connection has been closed",
+        ] {
+            let error = map_lob_read(&std::io::Error::other(text));
+            assert_eq!(error.kind(), ErrorKind::NetworkLost, "{text}");
+            assert_eq!(error.session_state(), SessionState::Lost, "{text}");
+        }
+
+        // A server error keeps its code and its own classification.
+        let error = map_lob_read(&std::io::Error::other(
+            "ORA-03113: end-of-file on communication channel",
+        ));
+        assert_eq!(error.kind(), ErrorKind::NetworkLost);
+        assert_eq!(error.native().map(NativeError::code), Some(3113));
+
+        let error = map_lob_read(&std::io::Error::other("not connected to database"));
+        assert!(error.session_may_be_unusable());
+
+        let error = map_lob_read(&std::io::Error::other(
+            "the configured call timeout was exceeded",
+        ));
+        assert_eq!(error.kind(), ErrorKind::Timeout);
+
+        // Only a decode failure is a conversion failure.
+        let error = map_lob_read(&std::io::Error::other(
+            "invalid encoded string: invalid utf-16: lone surrogate",
+        ));
+        assert_eq!(error.kind(), ErrorKind::DataConversion);
+        assert_eq!(error.session_state(), SessionState::Usable);
+
+        // Anything unrecognized is a driver problem, and the session is in
+        // doubt rather than fine.
+        let error = map_lob_read(&std::io::Error::other("something nobody has seen"));
+        assert_eq!(error.kind(), ErrorKind::DriverInternal);
+        assert_eq!(error.session_state(), SessionState::NeedsValidation);
     }
 
     #[test]

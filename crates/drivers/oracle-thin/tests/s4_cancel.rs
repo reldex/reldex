@@ -99,7 +99,25 @@ fn describe(error: &DbError) -> String {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_deadline_stops_a_long_sql_statement_and_the_session_survives() {
+fn a_deadline_stops_a_long_sql_statement_and_reports_the_session_honestly() {
+    // **Which outcome this produces is not deterministic, and that is the
+    // finding.** U-6: when the deadline fires, `Client::recover_from_error`
+    // sends an interrupt marker and then reads the reset reply from the same
+    // socket *with the expired timeout still armed*. Whether the server answers
+    // inside another full window decides everything:
+    //
+    // - answered in time → `Timeout`, and the session survives;
+    // - not answered     → a second timeout, `unrecoverable_error` closes the
+    //                      transport, and the caller gets `NetworkLost`.
+    //
+    // The 2-second deadline and the 2- or 4-second stop below are the two
+    // shapes, and the second one has been observed on a **serial** run against
+    // an idle container, not only under load. So this test asserts what the
+    // driver owes the caller either way — the statement stops, and the reported
+    // session state matches reality — and records which way it went. Asserting
+    // the happy outcome would be asserting a coin flip, and Reldex must not
+    // build on one: this is why `SPEC.md` §24.8 is NO-GO on this upstream
+    // version.
     let mut connection = connect();
     let deadline = Duration::from_secs(2);
 
@@ -125,24 +143,45 @@ fn a_deadline_stops_a_long_sql_statement_and_the_session_survives() {
         "the statement was not stopped at all"
     );
 
-    // A deadline the caller armed is a Timeout, not a cancellation someone
-    // requested, and the session is left needing validation rather than lost.
-    assert_eq!(error.kind(), ErrorKind::Timeout, "{error}");
-    assert_eq!(error.session_state(), SessionState::NeedsValidation);
+    match error.kind() {
+        ErrorKind::Timeout => {
+            // A deadline the caller armed is a timeout, not a cancellation
+            // someone requested, and the session is left needing validation
+            // rather than declared lost.
+            assert_eq!(error.session_state(), SessionState::NeedsValidation);
+            still_usable(connection.as_mut()).unwrap_or_else(|error| {
+                panic!(
+                    "the driver reported Timeout, which promises a recoverable \
+                     session, but the session did not survive: {}",
+                    describe(&error)
+                )
+            });
+            observation(
+                "recovery completed inside the remaining window: the session survived \
+                 its own deadline and is usable",
+            );
+        }
+        ErrorKind::NetworkLost => {
+            // U-6's other outcome. The driver must not dress it up: a lost
+            // session is reported as lost, so `db-core` can surface the lost
+            // transaction instead of silently opening a new one
+            // (`SPEC.md` §18).
+            assert_eq!(error.session_state(), SessionState::Lost);
+            assert!(error.session_may_be_unusable());
+            assert!(
+                elapsed >= deadline,
+                "a lost session should follow at least one full timeout"
+            );
+            observation(
+                "UPSTREAM GAP U-6: recovery timed out as well, so the connection was \
+                 closed and the deadline cost the session. Reported as NetworkLost / \
+                 Lost, which is the honest answer",
+            );
+        }
+        other => panic!("a fired deadline must be Timeout or NetworkLost, not {other:?}: {error}"),
+    }
 
-    // The half of the answer that decides whether a deadline is a usable stop
-    // at all: the session has to survive. For a **SQL** statement it does —
-    // the server answers the interrupt marker promptly, so upstream's
-    // `recover_from_error` completes its reset inside the same timeout.
-    still_usable(connection.as_mut()).unwrap_or_else(|error| {
-        panic!(
-            "the session did not survive its deadline: {}",
-            describe(&error)
-        )
-    });
-    observation("the session survived its own deadline and is usable");
-
-    connection.close().expect("close");
+    let _ = connection.close();
 }
 
 #[test]

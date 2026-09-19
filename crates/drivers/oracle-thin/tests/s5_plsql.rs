@@ -509,3 +509,155 @@ fn a_syntax_error_in_an_anonymous_block_carries_its_line_and_column() {
     assert_eq!(scalar(connection.as_mut(), "SELECT 1 FROM dual"), "1");
     connection.close().expect("close");
 }
+
+// ---------------------------------------------------------------------------
+// DML RETURNING and output-slot alignment (review should-fix)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_single_row_dml_returning_gives_back_its_values() {
+    // The values do not arrive through `ExecResult::out_bind_data` — that is
+    // populated only for PL/SQL — but through `returned_data`, and reading the
+    // wrong one failed with "invalid column index 0", a message about nothing
+    // the caller had done.
+    let mut connection = connect();
+    let table = unique("s5_ret");
+    exec(
+        connection.as_mut(),
+        &format!("CREATE TABLE {table} (id NUMBER, label VARCHAR2(40))"),
+    );
+
+    let insert = Statement::new(format!(
+        "INSERT INTO {table} (id, label) VALUES (:id, :label) \
+         RETURNING id, label INTO :out_id, :out_label"
+    ))
+    .with_named_binds(vec![
+        NamedBind::new("id", Bind::input(7_i64)),
+        NamedBind::new("label", Bind::input("ทดสอบ")),
+        NamedBind::new("out_id", Bind::output(SqlType::Number)),
+        NamedBind::new("out_label", Bind::output(SqlType::VARCHAR)),
+    ]);
+    let outcome = connection.execute(&insert).expect("insert … returning");
+    assert_eq!(outcome.statement_kind(), StatementKind::Dml);
+    assert_eq!(outcome.rows_affected(), Some(1));
+    let values = outcome.out_values();
+    let id = values.named("out_id").expect("out_id came back");
+    assert!(
+        matches!(id, Value::Number(n) if n.to_string() == "7"),
+        "{id:?}"
+    );
+    let label = values.named("out_label").expect("out_label came back");
+    assert!(matches!(label, Value::Text(t) if t == "ทดสอบ"), "{label:?}");
+    observation("INSERT … RETURNING INTO returned both values, Thai text included");
+
+    // An UPDATE that matches nothing returns no row, and the outputs are NULL
+    // rather than an error about a missing column.
+    let update = Statement::new(format!(
+        "UPDATE {table} SET label = :label WHERE id = :id RETURNING label INTO :out_label"
+    ))
+    .with_named_binds(vec![
+        NamedBind::new("label", Bind::input("unused")),
+        NamedBind::new("id", Bind::input(999_i64)),
+        NamedBind::new("out_label", Bind::output(SqlType::VARCHAR)),
+    ]);
+    let outcome = connection.execute(&update).expect("update … returning");
+    assert_eq!(outcome.rows_affected(), Some(0));
+    assert!(
+        matches!(outcome.out_values().named("out_label"), Some(Value::Null)),
+        "a RETURNING that matched no row must report NULL, not a stale value"
+    );
+    observation("a RETURNING that matched no row reported NULL outputs");
+
+    // More than one returned row cannot be expressed as one value per bind, so
+    // it is refused rather than silently truncated to the first.
+    exec(
+        connection.as_mut(),
+        &format!("INSERT INTO {table} (id, label) VALUES (8, 'second')"),
+    );
+    let many = Statement::new(format!(
+        "UPDATE {table} SET label = label RETURNING id INTO :out_id"
+    ))
+    .with_named_binds(vec![NamedBind::new(
+        "out_id",
+        Bind::output(SqlType::Number),
+    )]);
+    match connection.execute(&many) {
+        Ok(outcome) => panic!(
+            "a multi-row RETURNING must be refused, not truncated: {:?}",
+            outcome.out_values()
+        ),
+        Err(error) => {
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "{error}");
+            observation(format!("multi-row RETURNING -> {error}"));
+        }
+    }
+
+    connection.rollback().expect("rollback");
+    exec_quietly(connection.as_mut(), &format!("DROP TABLE {table} PURGE"));
+    connection.close().expect("close");
+}
+
+#[test]
+fn an_in_bind_the_server_calls_in_out_fails_loudly_instead_of_shifting_slots() {
+    // The wrapper numbers output slots from what the caller declared; the row
+    // it indexes comes from the server's describe. Declaring an `IN OUT`
+    // parameter as `In` makes the server send one more output than the caller
+    // expects, and with matching types every later slot would quietly return
+    // its neighbour's value.
+    let mut connection = connect();
+    let procedure = unique("s5_shift");
+    exec(
+        connection.as_mut(),
+        &format!(
+            "CREATE OR REPLACE PROCEDURE {procedure} \
+               (a IN OUT VARCHAR2, b OUT VARCHAR2) AS \
+             BEGIN a := 'first'; b := 'second'; END;"
+        ),
+    );
+
+    // Declared honestly: both come back, in the right places.
+    let honest = Statement::new(format!("BEGIN {procedure}(:a, :b); END;")).with_named_binds(vec![
+        NamedBind::new(
+            "a",
+            Bind::InOut {
+                value: reldex_db_driver_api::BindValue::Text("in".to_owned()),
+                spec: OutBindSpec::new(SqlType::VARCHAR),
+            },
+        ),
+        NamedBind::new("b", Bind::output(SqlType::VARCHAR)),
+    ]);
+    let outcome = connection.execute(&honest).expect("declared correctly");
+    let values = outcome.out_values();
+    assert!(
+        matches!(values.named("a"), Some(Value::Text(t)) if t == "first"),
+        "{:?}",
+        values.named("a")
+    );
+    assert!(
+        matches!(values.named("b"), Some(Value::Text(t)) if t == "second"),
+        "{:?}",
+        values.named("b")
+    );
+
+    // Declared as a plain input, which it is not.
+    let wrong = Statement::new(format!("BEGIN {procedure}(:a, :b); END;")).with_named_binds(vec![
+        NamedBind::new("a", Bind::input("in")),
+        NamedBind::new("b", Bind::output(SqlType::VARCHAR)),
+    ]);
+    match connection.execute(&wrong) {
+        Ok(outcome) => panic!(
+            "the driver must not read output slots it cannot align: {:?}",
+            outcome.out_values()
+        ),
+        Err(error) => {
+            assert_eq!(error.kind(), ErrorKind::DataConversion, "{error}");
+            assert!(error.message().contains("IN OUT"), "{error}");
+            observation(format!("mis-declared IN OUT -> {error}"));
+        }
+    }
+    // The session is unharmed by the refusal.
+    assert_eq!(scalar(connection.as_mut(), "SELECT 1 FROM dual"), "1");
+
+    exec_quietly(connection.as_mut(), &format!("DROP PROCEDURE {procedure}"));
+    connection.close().expect("close");
+}
