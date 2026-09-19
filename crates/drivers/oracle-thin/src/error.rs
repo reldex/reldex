@@ -168,10 +168,17 @@ pub(crate) fn map_connect(error: &oracledb::Error) -> DbError {
     let mut rebuilt = DbError::new(
         ErrorKind::Connection,
         format!("the database could not be reached: {}", mapped.message()),
-    );
+    )
+    .with_retryable(mapped.is_retryable());
     if let Some(native) = mapped.native() {
         rebuilt = rebuilt.with_native(NativeError::new(native.code(), native.message()));
     }
+    // The session state is **not** carried over, and that is the point of this
+    // function: `map` would have said `Lost`, and there is no session to lose
+    // while one is being opened. `ErrorKind::Connection`'s own default —
+    // `NeedsValidation` — is the honest answer, and
+    // `a_connect_that_times_out_in_the_socket_is_not_reported_as_a_call_timeout`
+    // asserts it. A position is likewise meaningless for a connect failure.
     rebuilt
 }
 
@@ -211,6 +218,109 @@ pub(crate) fn explain_parsed_placeholders(error: DbError) -> DbError {
         ),
     )
     .with_session_state(SessionState::Usable)
+}
+
+/// Adds the sentence a certificate **name** failure needs when the descriptor
+/// carried Oracle's own server-certificate parameters.
+///
+/// The two are easy to confuse and the confusion wastes real time: a descriptor
+/// that sets `SSL_SERVER_CERT_DN` or `SSL_SERVER_DN_MATCH` looks like it
+/// configures which name is checked, and it does not — neither parameter
+/// reaches this client's TLS layer at all (upstream gap U-14). The name that
+/// fails is the descriptor's `HOST`, matched against `subjectAltName`, so
+/// "the DN is right, why is this failing" has an answer only if somebody says
+/// so. Called only when [`crate::descriptor`] found one of the parameters, so an
+/// ordinary TCPS deployment never sees it.
+///
+/// # How the failure is recognized
+///
+/// Not by a transcribed string. `oracledb` keeps the `rustls` failure as a
+/// private `cause` and exposes it only through `Display` (its `ErrorKind` for
+/// the whole family is the payload-free `StreamOperation`), so the text is all
+/// there is. What can be avoided is *guessing* at the text: the markers are
+/// rendered by the `rustls` that is actually linked, from the two variants that
+/// mean "this certificate does not cover that name", so a change to its wording
+/// changes the markers with it rather than silently stopping the match. A
+/// unit test asserts the markers still derive to something usable.
+pub(crate) fn explain_name_verification(error: DbError) -> DbError {
+    if !names_a_certificate_name_failure(error.message()) {
+        return error;
+    }
+    // Every field is carried across deliberately: `DbError` has no setter for
+    // its message, so the only way to add a sentence is to rebuild, and a
+    // rebuild that copies three fields out of five quietly resets the other
+    // two. `source` is the one that cannot be carried — `Error::source` lends
+    // it, it cannot be taken back out — and it is always `None` here because
+    // neither `map` nor `map_connect` ever sets one (`oracledb::Error` does not
+    // implement `std::error::Error`; see the module documentation). The
+    // assertion says so out loud rather than leaving it to be rediscovered.
+    debug_assert!(
+        std::error::Error::source(&error).is_none(),
+        "this rebuild would drop a source; give `DbError` a way to take one first"
+    );
+    let mut rebuilt = DbError::new(
+        error.kind(),
+        format!(
+            "{}. The name this driver verifies is the one in the descriptor's HOST, matched \
+             against the certificate's subjectAltName — not its distinguished name. \
+             SSL_SERVER_CERT_DN and SSL_SERVER_DN_MATCH have no influence on it: the Oracle \
+             crate underneath parses them, sends them to the server and never applies them \
+             (upstream gap U-14). A certificate that identifies the server only by DN, or a \
+             HOST its subjectAltName does not list, cannot be accepted by any descriptor \
+             setting",
+            error.message()
+        ),
+    )
+    .with_session_state(error.session_state())
+    .with_retryable(error.is_retryable());
+    if let Some(native) = error.native() {
+        rebuilt = rebuilt.with_native(NativeError::new(native.code(), native.message()));
+    }
+    if let Some(position) = error.position() {
+        rebuilt = rebuilt.with_position(*position);
+    }
+    rebuilt
+}
+
+fn names_a_certificate_name_failure(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    name_mismatch_markers()
+        .iter()
+        .any(|marker| lowered.contains(marker))
+}
+
+/// What `rustls` itself says when a certificate does not cover the name asked
+/// for, taken from `rustls` rather than copied out of it.
+fn name_mismatch_markers() -> Vec<String> {
+    /// A name no certificate carries, used to find where `rustls` renders the
+    /// expected name inside its own message so the invariant wording around it
+    /// can be kept and the variable part dropped.
+    const SENTINEL: &str = "reldex-marker.invalid";
+
+    // The context-free variant renders as its own `Debug` name.
+    let mut markers = vec![
+        rustls::CertificateError::NotValidForName
+            .to_string()
+            .to_ascii_lowercase(),
+    ];
+    // The one with context renders a sentence, and is what a real handshake
+    // produces: `certificate not valid for name "…"; certificate is only valid
+    // for DnsName("…")`.
+    if let Ok(expected) = rustls::pki_types::ServerName::try_from(SENTINEL) {
+        let rendered = rustls::CertificateError::NotValidForNameContext {
+            expected,
+            presented: Vec::new(),
+        }
+        .to_string()
+        .to_ascii_lowercase();
+        if let Some((prefix, _)) = rendered.split_once(SENTINEL) {
+            let prefix = prefix.trim_end_matches(['"', '\'', ' ']);
+            if !prefix.is_empty() {
+                markers.push(prefix.to_owned());
+            }
+        }
+    }
+    markers
 }
 
 /// Converts a failure raised by `Lob::read` while streaming a large object.
@@ -700,6 +810,96 @@ mod tests {
             std::io::ErrorKind::TimedOut,
         )));
         assert_eq!(on_a_session.kind(), ErrorKind::Timeout);
+    }
+
+    #[test]
+    fn a_name_failure_says_which_name_was_checked() {
+        // Driven through the **real** composition rather than a hand-built
+        // error: `connect` applies `map_connect` first, so by the time the
+        // explanation is added the kind is already `Connection` and the text
+        // already carries the "could not be reached" prefix. Asserting against
+        // a `NetworkLost` error built here would have pinned a shape production
+        // never produces. The cause text is the one spike S8 observed.
+        let cause = "invalid peer certificate: certificate not valid for name \"127.0.0.1\"; \
+                     certificate is only valid for DnsName(\"localhost\") or \
+                     DnsName(\"reldex-oracle19c\")";
+        let mapped = map_connect(&oracledb::Error::from(std::io::Error::other(cause)));
+        assert_eq!(
+            mapped.kind(),
+            ErrorKind::Connection,
+            "the connect-phase correction runs first"
+        );
+        let explained = explain_name_verification(mapped);
+        assert_eq!(explained.kind(), ErrorKind::Connection);
+        assert_eq!(explained.session_state(), SessionState::NeedsValidation);
+        assert!(
+            explained
+                .message()
+                .starts_with("the database could not be reached: stream operation failed: "),
+            "the whole composition must survive: {explained}"
+        );
+        assert!(explained.message().contains(cause), "{explained}");
+        assert!(
+            explained.message().contains("subjectAltName"),
+            "{explained}"
+        );
+        assert!(
+            explained.message().contains("SSL_SERVER_CERT_DN"),
+            "{explained}"
+        );
+
+        // The context-free variant, which is what `rustls` renders when it has
+        // no names to report, through the same path.
+        let bare = map_connect(&oracledb::Error::from(std::io::Error::other(
+            "invalid peer certificate: NotValidForName",
+        )));
+        assert!(
+            explain_name_verification(bare)
+                .message()
+                .contains("subjectAltName")
+        );
+    }
+
+    #[test]
+    fn a_failure_that_is_not_about_the_name_is_left_exactly_as_it_was() {
+        // Nothing may be appended to an untrusted issuer, an expired
+        // certificate or a dead socket: the sentence would point at the wrong
+        // thing, which is worse than no sentence (the same rule the error
+        // position follows).
+        for message in [
+            "stream operation failed: invalid peer certificate: UnknownIssuer",
+            "stream operation failed: invalid peer certificate: Expired",
+            "stream operation failed: connection reset by peer",
+            "ORA-01017: invalid username/password; logon denied",
+        ] {
+            let error = DbError::new(ErrorKind::NetworkLost, message);
+            assert_eq!(
+                explain_name_verification(error).message(),
+                message,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_name_failure_markers_are_derived_from_the_rustls_that_is_linked() {
+        // This is the test that makes the recognition non-fragile. The markers
+        // are rendered by `rustls` itself, so if its wording changes they change
+        // with it — and if a future version stops producing something usable,
+        // this fails loudly instead of the match quietly never firing again.
+        let markers = name_mismatch_markers();
+        assert_eq!(markers.len(), 2, "{markers:?}");
+        for marker in &markers {
+            assert!(!marker.is_empty(), "{markers:?}");
+            assert!(
+                marker.chars().all(|c| !c.is_ascii_uppercase()),
+                "markers are matched against lowercased text: {markers:?}"
+            );
+        }
+        // And each one really does identify the failure it was derived from.
+        let rendered = rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName)
+            .to_string();
+        assert!(names_a_certificate_name_failure(&rendered), "{rendered}");
     }
 
     #[test]

@@ -149,7 +149,10 @@ For every mapping, document:
   with certificate and host-name verification on, confirmed server-side; trust comes from a
   user-supplied PEM. Not available upstream: mTLS with a private CA, Oracle wallet files, OS trust
   store, revocation, `SSL_SERVER_DN_MATCH` (U-12…U-14). `TlsMode::Required` refuses non-TCPS endpoints
-  rather than silently connecting in plaintext.
+  rather than silently connecting in plaintext, and (2026-09-19) a descriptor that sets
+  `SSL_SERVER_CERT_DN` is refused rather than connected with an unenforced pin, with
+  `oracle.allow_unenforced_server_cert_dn` as the opt-out; `SSL_SERVER_DN_MATCH` produces a warning.
+  Design proposed by the lead, **owner confirmation pending** (results file U-14 and §9 item 7).
 - [x] timeout behavior. Per spike S4's findings: a pre-armed deadline stops a long SQL statement
   about 0.5 s past the deadline with the session intact, but a fired deadline on a PL/SQL block the
   server will not interrupt promptly costs the connection entirely (upstream recovery defect U-6,
@@ -326,8 +329,11 @@ criterion's honest status is softened to make the table look more finished than 
   connect, recorded as an ADR-0002 amendment when implemented; its detailed write-up arrives with
   pull request #5 (the TCPS descriptor guard), and implementation is sequenced after that PR.
   **Still outstanding and undecided:** item 4 (relax the NUMBER-bind refusal U-1 — recommendation:
-  no) and items 6–7 (how far TCPS is advertised to customers; whether to guard against
-  `SSL_SERVER_DN_MATCH` being silently ignored, U-14).
+  no).
+  **Items 6–7 confirmed by the owner 2026-09-19** by accepting pull request #5: TCPS is described
+  exactly as `SPEC.md` §8 states it, and the driver guards U-14 — a descriptor carrying
+  `SSL_SERVER_CERT_DN` is refused unless `oracle.allow_unenforced_server_cert_dn` is set,
+  `SSL_SERVER_DN_MATCH` is accepted with a warning (results file §9 items 6–7, U-14, C-6).
 
 This is a draft assessment for the owner's use, not a go/no-go decision — per "Deliverables" below,
 that decision is the owner's to make.
