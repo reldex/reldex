@@ -269,9 +269,12 @@ Until then, no code should assume an answer.
 
 1. **Thin driver selection — RESOLVED by [ADR-0001](../decisions/0001-database-driver-strategy.md).**
    The primary driver is Oracle's official `oracledb` crate (`oracle/rust-oracledb`; pure Rust, thin,
-   blocking), pinned to an exact version and wrapped by `crates/drivers/oracle-thin`. Still open and
-   tracked by the ADR's spike plan: statement cancellation (no public cancel API yet), beta maturity,
-   TCPS, and Android/iOS viability.
+   blocking), pinned to an exact version and wrapped by `crates/drivers/oracle-thin`. Still open:
+   statement cancellation (no public cancel API yet; accepted as a Phase 0 limitation, ADR-0001 "Owner
+   decision (2026-09-20)") and beta maturity. TCPS has since passed with limits (spike S8: one-way
+   TLS 1.2, PEM-supplied trust; no mTLS+private CA, no Oracle wallet files, no revocation — U-12…U-14).
+   Android/iOS viability has cross-compile-and-link evidence (spike S6, `phase-0-s6-mobile-cross-compile.md`)
+   but still needs physical-device evidence before any mobile-support claim.
 2. **FFI mechanism.** Which Rust/C++ interop approach provides a stable, typed, small boundary, and
    how is ABI/version compatibility guaranteed?
 3. **Threading and callbacks across FFI — core side settled; FFI event delivery still open.**

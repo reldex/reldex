@@ -104,6 +104,25 @@ docker exec -e RELDEX_TEST_PWD="<the new value>" reldex-oracle19c \
 `ORACLE_PWD` is different: DBCA consumes it on first start only, so changing
 it afterwards needs the image's own `/opt/oracle/setPassword.sh`.
 
+### What `run-it.ps1` / `run-it.sh` put in the environment
+
+Nothing is written to a file, nothing appears on a command line, and the
+PowerShell runner clears the password variables again in its `finally` block.
+
+| Variable | From | Used by |
+|---|---|---|
+| `RELDEX_TEST_ORACLE_DSN` / `_USER` / `_PASSWORD` | `RELDEX_TEST_PWD` | every spike |
+| `RELDEX_TEST_ORACLE_SYSTEM_USER` / `_SYSTEM_PASSWORD` | `ORACLE_PWD`, as `SYSTEM` | S4's privileged-cancel candidate only |
+| `RELDEX_TEST_ORACLE_SYSDBA_USER` / `_SYSDBA_PASSWORD` | `ORACLE_PWD`, as `SYS` | S13 (`AS SYSDBA` over the listener) only |
+| `RELDEX_TEST_ORACLE_TCPS_DSN` / `_TCPS_CA_DIR` / `_TCPS_WRONG_CA_DIR` | the exported CA PEMs, when present | S8 |
+
+Every test that needs one of the optional pairs **skips itself and says so**
+when the variables are absent, so an ordinary run never requires a DBA
+password. `AS SYSDBA` over the listener works on this image because
+`remote_login_passwordfile = EXCLUSIVE` (confirmed by S13); with `NONE` it
+could not, and the S13 tests would report that as a database-configuration
+finding rather than a driver failure.
+
 ### Important: set `NLS_LANG` for Unicode/Thai correctness
 
 The container's OS locale is `POSIX` and `NLS_LANG` is unset by default.

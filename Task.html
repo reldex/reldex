@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-20T19:30:00+07:00",
+  "updatedAt": "2026-09-20T22:15:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P0",
@@ -511,15 +511,21 @@
     "goal": "Prove the Rust core, thin database connectivity, cancellation, transaction behavior, and mobile feasibility before substantial UI investment.",
     "exitGate": "Desktop POC passes. Android/iOS feasibility is documented from physical-device tests."
   },
-  "summary": "Phase 0 — Architecture Validation. Core stack proven against Oracle 19.3: vendor-neutral driver contract, db-core session layer, and a wrapper over Oracle's official oracledb crate (pinned beta). Spikes S1, S3, S5, S7, S8 (TCPS, with limits) and S9 pass; S2 partial (NUMBER bind restrictions); S4 cancel is an accepted limitation (owner decision 2026-09-20: pre-armed per-statement deadline + honest UI; SPEC §24.8 unmet until upstream ships a break API). S6 (mobile cross-compile) not run.",
+  "summary": "Phase 0 — Architecture Validation. Core stack proven against Oracle 19.3: vendor-neutral driver contract, db-core session layer, and a wrapper over Oracle's official oracledb crate (pinned beta). Spikes S1, S3, S5, S7, S8 (TCPS, with limits), S9, S10 (network loss/reconnect, two upstream gaps), S11 (NCLOB), S12 (developer features, one upstream blocker), S13 (privileged connections) and S14 (large result) all pass; S2 is partial (NUMBER bind restrictions); S4 cancel is an accepted limitation (owner decision 2026-09-20: pre-armed per-statement deadline + honest UI; SPEC §24.8 unmet until upstream ships a break API). S6 (mobile cross-compile) passed 2026-09-19 in CI (PR #3) — cross-compile and link only, physical-device validation still outstanding. Five of seven drafted upstream issues (A–E) were submitted 2026-09-20 (#21–#25); F and G await the owner's go-ahead.",
   "focus": [
-    "Phase 0 exit assessment for the owner's go/no-go",
-    "Remaining evidence gaps: network-loss/reconnect, NCLOB, EXPLAIN PLAN/DBMS_XPLAN, metadata access"
+    "Phase 0 exit assessment for the owner's go/no-go (phase-0.md)",
+    "Owner decisions outstanding: upstream issues F/G submission, C-5 connect_timeout approach, default deadline/EXPIRE_TIME guidance, CREATE TRIGGER rewrite, default fetch batch size, TCPS wording/SSL_SERVER_DN_MATCH guard"
   ],
   "blockers": [
     {
-      "title": "Owner action: submit the drafted upstream issues (results file §6, issues A–E)",
-      "detail": "Four issues are fully drafted in docs/exec-plans/active/phase-0-spike-results.md §6 — a public break/interrupt API, the NUMBER-bind data-corruption defect (U-1, submit first per the owner's priority), the two process-abort defects (U-2/U-3), and the recovery/cancel-observation defects (U-6/U-7). Nothing has been posted to oracle/rust-oracledb yet; the lead is confirming with the owner who posts them.",
+      "title": "Owner action: approve submission of drafted upstream issues F and G (results file §6)",
+      "detail": "Issues A–E were submitted 2026-09-20 by the owner's account (SupawitNu): B -> #21, C -> #22, D -> #23, A -> #24, E -> #25. F (U-15…U-17: connect cannot be bounded, timeout cause discarded, no keepalive/EXPIRE_TIME) and G (U-18: CREATE TRIGGER … :NEW impossible) are fully drafted in docs/exec-plans/active/phase-0-spike-results.md §6 but await the owner's go-ahead to submit.",
+      "severity": "blocked",
+      "since": "2026-09-19"
+    },
+    {
+      "title": "Owner action: provide an Android test device for physical-device validation (Phase 0 criterion 7)",
+      "detail": "Spike S6 proved Android/iOS/iOS-simulator cross-compile and link in CI (PR #3) with no local NDK/Xcode needed — that is cross-compile evidence only, not mobile support. Phase 0 success criterion 7 needs physical-device evidence: Android needs a physical arm64 device (API 26+) with USB debugging and network access to a reachable Oracle instance, plus a local Android NDK to build the harness. iOS additionally needs a Mac + Apple Developer account + a physical iPhone/iPad.",
       "severity": "blocked",
       "since": "2026-09-19"
     }
@@ -528,7 +534,7 @@
     {
       "title": "On-demand Cancel unavailable — accepted limitation (owner decision 2026-09-20)",
       "detail": "The owner decided on 2026-09-20 to stay on oracledb and ship the pre-armed per-statement deadline with an honest UI rather than change drivers. SPEC.md §24.8 remains an unmet Definition-of-Done target until upstream ships a break/cancel API (ADR-0001 'Owner decision (2026-09-20)').",
-      "mitigation": "SPEC.md §10 carries an explicit interim note: the UI must state plainly that on-demand Cancel is unavailable with the current driver and must never present the time-limit control as Cancel. The four drafted upstream issues are pending submission (see blockers)."
+      "mitigation": "SPEC.md §10 carries an explicit interim note: the UI must state plainly that on-demand Cancel is unavailable with the current driver and must never present the time-limit control as Cancel. Upstream issues were submitted 2026-09-20: oracle/rust-oracledb#24 asks for a public break/interrupt API, #23 covers call-timeout recovery and the unobserved server-side cancel."
     },
     {
       "title": "TIMESTAMP WITH TIME ZONE columns are refused, not rendered",
@@ -546,9 +552,9 @@
       "mitigation": "The driver refuses every input shape known to panic upstream (the TSTZ and NUMBER cases above) before it reaches the crate. An unidentified panicking input would still abort the process, which is why the version stays pinned exactly."
     },
     {
-      "title": "Mobile (Android/iOS) viability is still unproven",
-      "detail": "Spike S6 (cross-compile to aarch64-linux-android / aarch64-apple-ios) has not been run. It needs the Android NDK, which needs owner approval to download, and an iOS build needs a macOS host.",
-      "mitigation": "SPEC.md §25 requires physical-device evidence before any mobile direct-connect claim regardless of build success; tracked as a standalone P0 follow-up task."
+      "title": "Mobile (Android/iOS) has no physical-device evidence yet",
+      "detail": "Spike S6 passed 2026-09-19 (PR #3): aarch64-linux-android, aarch64-apple-ios and aarch64-apple-ios-sim all compile and link in CI, no local NDK/Xcode needed. That is cross-compile-and-link evidence only, not mobile support — no device has run connect, SQL, a transaction, cancellation, a LOB, or TCPS.",
+      "mitigation": "SPEC.md §25 requires physical-device evidence before any mobile direct-connect claim regardless of build success. Blocker: no physical Android or iOS test device has been provided yet (see blockers above); phase-0-s6-mobile-cross-compile.md documents the harness plan for when one is."
     },
     {
       "title": "Local test database has coverage limitations",
@@ -559,20 +565,30 @@
       "title": "TCPS is narrower than enterprise deployments expect",
       "detail": "The oracledb beta supports one-way TLS 1.2 with PEM-supplied trust only: no mTLS combined with a private CA, no Oracle wallet files, no OS trust store, no revocation, SSL_SERVER_DN_MATCH silently ignored (U-12…U-14).",
       "mitigation": "SPEC §8 states the supported configuration precisely; Issue E drafted for the owner to submit upstream."
+    },
+    {
+      "title": "Black-holed connection hangs without a deadline; no keepalive upstream (U-15…U-17)",
+      "detail": "Spike S10: a connect cannot be bounded at all (ConnectionParams::connect_timeout is accepted and ignored, C-5) — 22.0 s against an unroutable address, still outstanding after 30 s against a black hole. A black-holed link with no deadline armed never returns; the only deadline that ends it destroys the session (U-6). No TCP keepalive exists upstream and SQLNET.EXPIRE_TIME is parsed and never acted on, so a dead client's row lock blocked a second session for the full 20 s measured.",
+      "mitigation": "Documented as U-15…U-17 and drafted as upstream Issue F (awaiting the owner's go-ahead to submit). C-5 (connect_timeout) has three options recorded in phase-0-spike-results.md §7; owner decision pending (results file §9 items 8–10)."
+    },
+    {
+      "title": "Trigger DDL with :NEW/:OLD cannot be executed directly (U-18) — workaround documented",
+      "detail": "oracledb's SQL parser scans every statement, DDL included, for :name and treats each hit as a bind placeholder, so CREATE TRIGGER … BEGIN :NEW.col := …; END; fails with a missing-bind-values error.",
+      "mitigation": "The driver reports ErrorKind::Unsupported naming the cause and the workaround: submit the DDL inside BEGIN EXECUTE IMMEDIATE q'[…]'; END;, which the parser skips (proven in spike S12). Drafted as upstream Issue G (awaiting the owner's go-ahead). Whether Reldex's editor should offer to auto-rewrite the statement is owner decision item 11 (results file §9)."
     }
   ],
   "nextSteps": [
-    "Owner: submit upstream issues A–E (or authorise the lead to post them)",
-    "Owner: approve Android NDK download for spike S6 (mobile cross-compile)",
-    "Close remaining Phase 0 evidence gaps (network-loss/reconnect, NCLOB, EXPLAIN PLAN/DBMS_XPLAN, metadata dictionary access)",
+    "Owner: approve submission of drafted upstream issues F and G (results file §6)",
+    "Owner: provide an Android physical test device (+ local NDK) for physical-device validation; iOS needs a Mac + Apple Developer account + device",
     "Owner: TCPS wording + SSL_SERVER_DN_MATCH guard decisions (results file §9 items 6–7)",
+    "Owner: C-5 connect_timeout approach, default deadline/EXPIRE_TIME guidance, CREATE TRIGGER rewrite, default fetch batch size (results file §9 items 8–12)",
     "Phase 0 go/no-go → Phase 1 (Qt Quick shell, thin C++/Rust FFI adapter)"
   ],
   "decisions": [
     {
       "id": "ADR-0001",
       "title": "Database driver strategy — primary driver is Oracle's oracledb (rust-oracledb)",
-      "status": "Accepted — owner decision 2026-09-20: stay on oracledb; pre-armed deadline + honest UI; upstream issues pending",
+      "status": "Accepted — owner decision 2026-09-20: stay on oracledb; pre-armed deadline + honest UI; upstream issues pending — upstream issues #21–#25 filed 2026-09-20",
       "date": "2026-09-19",
       "link": "docs/decisions/0001-database-driver-strategy.md"
     },
@@ -627,11 +643,11 @@
     },
     {
       "id": "S6",
-      "title": "Cross-compile checks: cargo build —target aarch64-linux-android and aarch64-apple-ios",
+      "title": "Cross-compile checks: cargo build --target aarch64-linux-android and aarch64-apple-ios",
       "box": "0.5 d",
       "killCriterion": "Either target fails to build and no provider swap fixes it",
-      "status": "blocked",
-      "result": "Not run. Needs the Android NDK (aarch64-linux-android target) and, for iOS, a macOS host — both unavailable in this workstream's environment. Owner approval is needed to download the NDK."
+      "status": "done",
+      "result": "Pass (PR #3, 2026-09-19). aarch64-linux-android, aarch64-apple-ios and aarch64-apple-ios-sim all compile AND link on GitHub-hosted runners with no local NDK/Xcode and no extra tools for aws-lc-sys; a provider swap to ring is confirmed unavailable without forking oracledb. Cross-compile evidence only, not mobile support — physical-device validation still open (needs an Android device from the owner; iOS needs a Mac + Apple Developer account + device)."
     },
     {
       "id": "S7",
@@ -656,6 +672,46 @@
       "killCriterion": "Lost sessions are hidden rather than surfaced",
       "status": "done",
       "result": "Pass (concurrency half only — see the Functional POC 'Network-loss behavior' task for the untested half). 8 concurrent sessions, 400 inserts (50 per thread) plus commit and read-back, 282.8 ms wall clock; every thread saw exactly its own 50 rows."
+    },
+    {
+      "id": "S10",
+      "title": "Network loss and reconnect: idle/mid-statement/mid-fetch/mid-LOB link loss, row-lock survival, reconnect semantics",
+      "box": "—",
+      "killCriterion": "— (evidence spike, no kill criterion)",
+      "status": "done",
+      "result": "Pass, with two upstream gaps: a dead socket is detected and reported Lost in microseconds and nothing reconnects silently, but a black-holed link never returns without a deadline and a dead client's row lock blocked a second session for the full 20 s measured (U-15…U-17)."
+    },
+    {
+      "id": "S11",
+      "title": "NCLOB: Thai/non-BMP text fidelity through the lazy stream, NULL vs EMPTY_CLOB()",
+      "box": "—",
+      "killCriterion": "— (evidence spike, no kill criterion)",
+      "status": "done",
+      "result": "Pass: Thai and non-BMP text byte-exact through the lazy stream at six buffer sizes, including 1.2 million characters in 55 chunks with memory bounded by the caller's buffer."
+    },
+    {
+      "id": "S12",
+      "title": "Developer features: EXPLAIN PLAN, DBMS_XPLAN, V$, dictionary views, LONG/LONG RAW, DBMS_METADATA.GET_DDL, CREATE TRIGGER",
+      "box": "—",
+      "killCriterion": "— (evidence spike, no kill criterion)",
+      "status": "done",
+      "result": "Pass, with one upstream blocker: EXPLAIN PLAN, both DBMS_XPLAN entry points, V$, ten dictionary views, LONG/LONG RAW (exact to 73,926 characters) and DBMS_METADATA.GET_DDL all work, but CREATE TRIGGER with :NEW is impossible (U-18, documented EXECUTE IMMEDIATE workaround)."
+    },
+    {
+      "id": "S13",
+      "title": "Privileged connections: AS SYSDBA / AS SYSOPER over the listener",
+      "box": "—",
+      "killCriterion": "— (evidence spike, no kill criterion)",
+      "status": "done",
+      "result": "Pass: AS SYSDBA connects in 119 ms through the existing SessionRole contract with no contract gap and no upstream gap; privilege does not leak to a concurrent ordinary session."
+    },
+    {
+      "id": "S14",
+      "title": "Large result: 1,000,000-row streaming throughput and memory",
+      "box": "—",
+      "killCriterion": "— (evidence spike, no kill criterion)",
+      "status": "done",
+      "result": "Pass: 1,000,000 rows streamed for about 1 MB of working-set growth (SPEC.md §12's bounded-memory claim holds); throughput 50,000–92,000 rows/s and not monotonic in the batch size."
     }
   ],
   "phases": [
@@ -740,7 +796,7 @@
             {
               "title": "(S4 critical path) Draft upstream request to oracle/rust-oracledb for a public statement-cancel/break API — plus accessors for OracleNumber digits and the transaction-in-progress flag (owner to submit)",
               "status": "done",
-              "note": "Four issues drafted in full: docs/exec-plans/active/phase-0-spike-results.md §6 (public break API; NUMBER-bind data corruption; the two process aborts; the recovery/cancel-observation defects). Nothing has been submitted yet — see the separate owner task."
+              "note": "Seven issues drafted in full: docs/exec-plans/active/phase-0-spike-results.md §6 (public break API; NUMBER-bind data corruption; the two process aborts; the recovery/cancel-observation defects; TCPS trust; timeouts/dead-link detection; CREATE TRIGGER). A–E submitted 2026-09-20 (#21–#25); F and G await the owner's go-ahead — see the separate owner task."
             },
             {
               "title": "Add normalized DbError",
@@ -810,7 +866,7 @@
             {
               "title": "CLOB/NCLOB/BLOB",
               "status": "done",
-              "note": "Spike S7 — pass; 100 MB CLOB and BLOB streamed, +4.7 MB working set."
+              "note": "Spike S7 — pass, CLOB/BLOB: 100 MB each streamed, +4.7 MB working set. Spike S11 — pass, NCLOB: Thai/non-BMP text byte-exact, 1.2M characters in 55 bounded chunks."
             },
             {
               "title": "DBMS_OUTPUT",
@@ -829,8 +885,8 @@
             },
             {
               "title": "Network-loss behavior",
-              "status": "todo",
-              "note": "Not directly spiked; only recovery-path failure modes seen incidentally during S4 (U-6, U-7)."
+              "status": "done",
+              "note": "Spike S10 — pass, with two upstream gaps: a black-holed link never returns without a caller-set deadline (U-17); a dead client's row lock blocked a second session for the full 20 s measured because SQLNET.EXPIRE_TIME is unset and upstream has no keepalive (U-15…U-17)."
             },
             {
               "title": "Concurrent independent sessions",
@@ -860,12 +916,12 @@
             {
               "title": "Android ARM64 physical device",
               "status": "todo",
-              "note": "Spike S6 not run — needs the Android NDK; owner approval to download."
+              "note": "Cross-compile + link proven in CI — spike S6, PR #3. Physical-device evidence still needed; needs a test device from the owner."
             },
             {
               "title": "iOS/iPadOS ARM64 physical device",
               "status": "todo",
-              "note": "Not started."
+              "note": "Cross-compile + link proven in CI — spike S6, PR #3. Physical-device evidence still needed; needs a Mac + Apple Developer account + device."
             }
           ]
         },
@@ -878,7 +934,12 @@
               "note": "Decision 2026-09-20: stay on oracledb; ship the pre-armed per-statement deadline with an honest UI; pursue upstream fixes via the four drafted issues. See ADR-0001 'Owner decision (2026-09-20)'."
             },
             {
-              "title": "Owner: submit the four drafted upstream issues (phase-0-spike-results.md §6, Issue B first)",
+              "title": "Owner: submit the drafted upstream issues (phase-0-spike-results.md §6)",
+              "status": "done",
+              "note": "Five submitted 2026-09-20 by the owner's account (SupawitNu): B -> #21, C -> #22, D -> #23, A -> #24, E -> #25."
+            },
+            {
+              "title": "Owner: approve submission of drafted upstream issues F and G (results file §6)",
               "status": "todo"
             },
             {
@@ -905,8 +966,24 @@
               "status": "todo"
             },
             {
-              "title": "S6 Android/iOS cross-compile check (needs NDK / macOS)",
-              "status": "todo"
+              "title": "S6 Android/iOS cross-compile check",
+              "status": "done",
+              "note": "Pass — kill criterion did not fire (PR #3: https://github.com/reldex/reldex/pull/3); physical-device validation still needed."
+            },
+            {
+              "title": "Driver: honour connect_timeout (C-5)",
+              "status": "todo",
+              "note": "ConnectionParams::connect_timeout is accepted and ignored (phase-0-spike-results.md §7 C-5)."
+            },
+            {
+              "title": "Owner decisions §9 items 8–12",
+              "status": "todo",
+              "note": "Default deadline, EXPIRE_TIME recommendation, trigger DDL rewrite, default fetch batch size, C-5 approach."
+            },
+            {
+              "title": "Android physical-device harness",
+              "status": "todo",
+              "note": "Needs a test device from the owner + local NDK."
             }
           ]
         }
@@ -1243,6 +1320,18 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-20",
+      "text": "Upstream issues #21–#25 filed on oracle/rust-oracledb (five of seven drafted issues, submitted by the owner's account; F and G await go-ahead)."
+    },
+    {
+      "date": "2026-09-19",
+      "text": "Spike S6 passed: Android/iOS cross-compile + link proven in CI (PR #3). Cross-compile evidence only; physical-device validation still open."
+    },
+    {
+      "date": "2026-09-19",
+      "text": "Spikes S10–S14 run: network loss/reconnect (two upstream gaps), NCLOB, developer features (one upstream blocker), SYSDBA/SYSOPER, 1M-row streaming."
+    },
     {
       "date": "2026-09-20",
       "text": "Spike S8 (TCPS) passed with limits; test DB gained a TCPS listener (127.0.0.1:2484) and a memory cap (~2 GiB); upstream gaps U-12…U-14 recorded, Issue E drafted."

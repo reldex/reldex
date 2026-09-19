@@ -1,11 +1,25 @@
 # Phase 0 spike results — Oracle thin driver
 
-Workstream A, ADR-0001 spikes S1–S5 (plus S7, S8 and S9). Everything below was
-run against the live Phase 0 test database on **2026-09-19**. Nothing here is
-projected, estimated or inferred from documentation: each row names the test
-that produced it, and every measurement says how it was taken.
+Workstream A, ADR-0001 spikes S1–S5 (plus S7, S8 and S9), and the
+evidence-gap spikes S10–S14. Everything below was run against the live Phase 0
+test database on **2026-09-19**. Nothing here is projected, estimated or
+inferred from documentation: each row names the test that produced it, and every
+measurement says how it was taken.
 
 Where something failed, it is written down as a failure.
+
+> **Extended 2026-09-19 — the Phase 0 items that had no evidence at all.**
+> `phase-0.md`'s exit assessment listed five: network loss, reconnect, NCLOB,
+> EXPLAIN PLAN/DBMS_XPLAN, and metadata access as a capability in its own
+> right; `SPEC.md` §8 also lists privileged connections, and `phase-0.md`'s
+> Measurements section asked for fetch throughput and memory during a large
+> fetch. Five new spikes now cover all of them — **S10** network loss and
+> reconnect, **S11** NCLOB, **S12** developer features, **S13** privileged
+> connections, **S14** large-result throughput and memory. Four new upstream
+> defects came out of them (**U-15** to **U-18**), two drafted as issues **F**
+> and **G**, and one new contract problem (**C-5**). Two driver fixes were made
+> and are covered by tests. Issues F and G have not been posted to GitHub
+> (A–E were submitted on 2026-09-20 — see §6).
 
 > **Updated 2026-09-19, after the first run.** Two of the problems this
 > document recorded have been fixed and the fixes re-verified against the same
@@ -59,6 +73,8 @@ Where something failed, it is written down as a failure.
 | Container | `doctorkirk/oracle-19c:19.3` as `reldex-oracle19c`, listener `127.0.0.1:1521` (TCP) and `127.0.0.1:2484` (TCPS, added for S8), service name `RELDEX` |
 | TCPS endpoint | TLS 1.2, `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`, server certificate signed by a throwaway private CA generated in the container (`tools/oracle-test-db/startup/10_enable_tcps.sh`) |
 | Test user | `RELDEX_TEST` (credentials only via environment; see §7) |
+| Privileged user | `SYS AS SYSDBA` over the listener, `remote_login_passwordfile = EXCLUSIVE` (S13 only; credentials only via environment) |
+| Dead connection detection | `SQLNET.EXPIRE_TIME` is **not set** on this database — only the shipped sample `sqlnet.ora` mentions it. S10's row-lock measurements depend on this |
 | Date | 2026-09-19 |
 
 ### Why `=26.0.0-beta.3`
@@ -167,54 +183,85 @@ Two consequences worth recording now rather than at release time:
 | S7 LOB streaming | **Pass** | 100 MB CLOB and BLOB streamed with +4.7 MB working set |
 | S9 concurrency | **Pass** | 8 concurrent sessions, 400 inserts, 283 ms |
 | S8 TCPS | **Pass, with limits** | TLS 1.2 / `ECDHE-RSA-AES256-GCM-SHA384`, private CA trusted, certificate **and host name** verified, 39 ms handshake. The ADR-0001 kill criterion does not fire. No mutual TLS, no Oracle wallet, no DN matching — see S8 |
-| S6 | **Not run** | Out of scope for this workstream (metadata queries) |
+| S10 network loss / reconnect | **Pass, with two upstream gaps** | A dead socket is detected in microseconds and reported `Lost`; nothing ever reconnects by itself; an in-doubt commit is surfaced, not guessed. But a **black-holed** link never returns without a deadline (U-17), a connect cannot be bounded at all (U-15), and a dead client's row locks blocked a second session for the whole 20 s measured |
+| S11 NCLOB | **Pass** | Thai and non-BMP text byte-exact through the lazy stream at six buffer sizes; `NULL` and `EMPTY_CLOB()` stay distinguishable; 1.2 M characters in 55 chunks |
+| S12 developer features | **Pass, with one upstream blocker** | EXPLAIN PLAN, both `DBMS_XPLAN` entry points, `V$`, ten dictionary views, `LONG`/`LONG RAW` (exact, including 73 926 characters) and `DBMS_METADATA.GET_DDL` all work. `CREATE TRIGGER` with `:NEW` does **not** (U-18) |
+| S13 privileged connection | **Pass** | `AS SYSDBA` over the listener in 119 ms through the existing `SessionRole` contract; no contract gap, no upstream gap |
+| S14 large result | **Pass** | 1 000 000 rows streamed for **~1 MB** of working-set growth; 50 000–92 000 rows/s. Throughput is **not** monotonic in the batch size |
+| S6 mobile cross-compile | **Pass** | `aarch64-linux-android`, `aarch64-apple-ios`, `aarch64-apple-ios-sim` all compile and link in CI (PR #3); no extra tools needed for `aws-lc-sys`; provider swap to `ring` confirmed unavailable without forking. Cross-compile evidence only — physical-device validation still open |
 
-Test counts, as measured on **2026-09-19** after the review fixes:
+Test counts, as measured on **2026-09-19** after the review fixes and the
+evidence-gap spikes:
 
 | | |
 |---|---|
-| DB-free, `cargo test -p reldex-driver-oracle-thin -p reldex-core-poc` | **68 unit tests** + **1 documentation test**, all pass (1 further doc test is `no_run`/ignored by design). `reldex-core-poc` is a binary with no tests of its own |
-| Opt-in, `--features oracle-it` | **63 integration tests** — **60 run and pass**, **3 are `#[ignore]`d** |
-| Per file | `s1_connect` 8, `s2_fidelity` 17 (14 + 3 ignored), `s3_session` 6, `s4_cancel` 7, `s5_plsql` 12, `s7_lob_and_s9_concurrency` 4, `s8_tcps` 9 |
+| DB-free, `cargo test --workspace` | **271 pass**, 0 fail, 0 ignored (including doc tests) |
+| DB-free, driver unit tests only | **69**, all pass |
+| Opt-in, `--features oracle-it` | **96 integration tests** — **90 run and pass**, **6 are `#[ignore]`d** (all six run separately and pass too) |
+| Per file | `s1_connect` 8, `s2_fidelity` 17 (14 + 3 ignored), `s3_session` 6, `s4_cancel` 7, `s5_plsql` 12, `s7_lob_and_s9_concurrency` 4, `s8_tcps` 9, `s10_network_loss` 13, `s11_nclob` 4, `s12_dev_features` 10 (7 + 3 ignored), `s13_privileged` 4, `s14_large_result` 2 |
 
-(Re-measured on 2026-09-19 after S8. The unit-test count rose by three — one
-test of the old "TLS is refused" behaviour was replaced by four covering the new
-one. Every `s8_tcps` test skips itself, and says so, when the TLS listener is not
-configured, so the file is green on a checkout with a plain TCP container too.)
+(Every `s8_tcps` test skips itself, and says so, when the TLS listener is not
+configured, so that file is green on a checkout with a plain TCP container too;
+`s13_privileged` does the same when no SYSDBA credentials are configured.)
 
-The three ignored tests all **abort the process on purpose**, each recording a
-defect that a default in this driver now prevents, and each is the proof that
-the corresponding guard is load-bearing rather than decorative. Run them one at
-a time with `-- --ignored --exact <name>`; they do not report a failure, they
-end the process.
+Six tests are `#[ignore]`d, for two different reasons. The first three **abort
+the process on purpose**, each recording a defect that a default in this driver
+now prevents, and each is the proof that the corresponding guard is load-bearing
+rather than decorative; they do not report a failure, they end the process. The
+last three are quarantined against a failure mode rather than a current
+outcome: a `LONG` this upstream version cannot decode would abort (U-4) and take
+every other result in `s12_dev_features` with it. All three passed when run.
+Run any of them one at a time with `-- --ignored --exact <name>`.
 
-| Ignored test | What it records | What prevents it |
+| Ignored test | What it records | Why it is ignored |
 |---|---|---|
-| `a_named_time_zone_region_is_read_or_reported` | U-3: decoding a region-encoded `TIMESTAMP WITH TIME ZONE` hits a `todo!()` | the describe-time column refusal |
-| `a_cached_cursor_makes_the_execute_fetch_rows_and_aborts` | U-3 again, on **re-execution**: a cached cursor takes the re-execute path, which ignores `prefetch_rows(0)`, so rows arrive and are decoded before any check | `Statement::exclude_from_cache()` |
-| `binding_forty_digits_with_an_odd_index_aborts_upstream` | U-2: 40 digits with an odd, positive decimal-point index reads past the encoder's digit buffer | `binds::encoder_defect` |
+| `a_named_time_zone_region_is_read_or_reported` | U-3: decoding a region-encoded `TIMESTAMP WITH TIME ZONE` hits a `todo!()` | aborts; prevented in normal use by the describe-time column refusal |
+| `a_cached_cursor_makes_the_execute_fetch_rows_and_aborts` | U-3 again, on **re-execution**: a cached cursor takes the re-execute path, which ignores `prefetch_rows(0)`, so rows arrive and are decoded before any check | aborts; prevented by `Statement::exclude_from_cache()` |
+| `binding_forty_digits_with_an_odd_index_aborts_upstream` | U-2: 40 digits with an odd, positive decimal-point index reads past the encoder's digit buffer | aborts; prevented by `binds::encoder_defect` |
+| `a_long_column_from_the_dictionary_is_read_or_refused` | S12: `ALL_VIEWS.TEXT`, `ALL_TRIGGERS.TRIGGER_BODY`, `ALL_TAB_COLUMNS.DATA_DEFAULT` all read exact | quarantined against U-4; **passes** |
+| `a_long_value_longer_than_one_packet_is_read_whole_or_visibly_short` | S12: a 73 926-character `LONG` arrives whole | quarantined against U-4; **passes** |
+| `a_long_raw_column_is_read_or_refused` | S12: `LONG RAW` reads byte-exact | quarantined against U-4; **passes** |
 
-A workspace-wide count is deliberately **not** quoted here any more: another
-workstream is editing `db-core`, `drivers/mock` and `db-driver-api` in parallel,
-so a `cargo test --workspace` total taken from this branch would be stale the
-day it was written. The per-crate numbers above are what this document is
-accountable for.
+The workspace total is quoted again above because it was measured on this
+branch on 2026-09-19 (`cargo test --workspace`: 271 pass, 0 fail, 0 ignored).
+It is a snapshot: other workstreams edit `db-core`, `drivers/mock` and
+`db-driver-api`, so re-measure rather than cite it. The per-crate numbers are
+what this document is accountable for.
 
-> **Run S4 with `--test-threads=1`.** Its seven tests include three long
-> cartesian joins, a `KILL SESSION` and a 20-second PL/SQL sleep; run in
-> parallel against this single-instance container they load the server enough
-> that the deadline-recovery outcome flips (see U-6, which is load-dependent by
-> construction). Serial runs are stable. This is pre-existing and not caused by
-> any change recorded here — see the control runs under U-6.
+> **Run S4, S10 and S14 with `--test-threads=1`.**
+>
+> - **S4**'s seven tests include three long cartesian joins, a `KILL SESSION`
+>   and a 20-second PL/SQL sleep; in parallel against this single-instance
+>   container they load the server enough that the deadline-recovery outcome
+>   flips (U-6, load-dependent by construction).
+> - **S10** deliberately leaves server sessions the database still believes in,
+>   and two of its tests measure how long a row lock survives; in parallel they
+>   would measure each other.
+> - **S14** streams three million rows and samples the process's own working
+>   set; anything else running in the process makes that number meaningless.
 >
 > ```text
-> tools/oracle-test-db/run-it.ps1 s4_cancel -- --test-threads=1
-> tools/oracle-test-db/run-it.sh  s4_cancel -- --test-threads=1
+> tools/oracle-test-db/run-it.ps1 s4_cancel        -- --test-threads=1
+> tools/oracle-test-db/run-it.sh  s10_network_loss -- --test-threads=1
 > ```
 >
-> (The PowerShell runner now inserts cargo's `--` separator itself: Windows
+> (The PowerShell runner inserts cargo's `--` separator itself: Windows
 > PowerShell 5.1 swallows a bare `--` before the script sees it, so the
 > documented invocation used to fail there while working under `pwsh`.)
+
+> **Corrected 2026-09-19.** This note used to say "serial runs are stable". That
+> is true of the file as a whole and was **not** true of
+> `a_deadline_on_a_plsql_sleep_destroys_the_session`, which asserted the
+> `NetworkLost` branch of U-6 outright. Measured: three runs of that test on its
+> own gave `NetworkLost` three times; two runs of the whole file serially gave
+> `NetworkLost` once and `Timeout` once, because the earlier tests in the file
+> leave the container busy. A flaky assertion is worse than either outcome — it
+> teaches the reader to re-run — so the test (now
+> `a_deadline_on_a_plsql_sleep_usually_destroys_the_session`) asserts the
+> invariant that holds either way: the call returns after at least its own
+> deadline, is classified `Timeout` **or** `NetworkLost`, and the session state
+> it reports matches what the session actually does. It prints which branch it
+> got. Three consecutive whole-file serial runs are green.
 
 ---
 
@@ -417,10 +464,21 @@ produced these behaviour changes. Each has a test; most need no database.
 | `LobStream::size_hint` returns `Some` only for a binary LOB (`BLOB`) | The contract documents the hint in **bytes**; upstream counts a character LOB in UCS-2 units, which is wrong by up to 4× | crate docs + `reldex-core-poc` prints "(size not known in bytes)" |
 | A LOB locator allocates its staging buffer on first read | A batch of unopened locators used to allocate one buffer each | `a_batch_of_unread_lob_locators_costs_almost_nothing` |
 | Dropping a connection marks it closed, so handles that outlive it report instead of touching a dead socket | `close()` did this; `drop` did not | `a_handle_outliving_a_dropped_connection_reports_too` |
+| A socket-level timeout during **connect** is `ErrorKind::Connection`, not `Timeout` | Upstream turns every `TimedOut` I/O error into `CallTimeoutExceeded` (U-16), so a 22-second TCP connect failure was reported as "the call timeout armed for this statement expired" — about a session that never existed, with a session state attached to it | `a_connect_that_times_out_in_the_socket_is_not_reported_as_a_call_timeout` (no database), `a_connect_to_an_unroutable_address_measures_the_operating_systems_patience` (live) |
+| A missing bind value for a statement that declared **no** binds is `ErrorKind::Unsupported` with the cause and the workaround | Upstream's parser reads `:NEW` in a trigger body as a placeholder (U-18); passing its message on blamed the caller for something they did not write, and left them with nothing to do about it | `a_trigger_body_that_mentions_new_is_refused_with_the_reason` |
 
-### S6 — **Not run**
+### S6 — mobile cross-compile — **Pass**
 
-S6 (metadata queries) belongs to a later slice and was not attempted.
+Run 2026-09-19, evidence PR [reldex/reldex#3](https://github.com/reldex/reldex/pull/3). ADR-0001's S6
+kill criterion — "either target fails to build and no provider swap fixes it" — did **not** fire:
+`aarch64-linux-android`, `aarch64-apple-ios` and `aarch64-apple-ios-sim` all **compile and link** on
+ordinary GitHub-hosted runners, no local NDK or Xcode, and no extra tools (no `cmake`, no
+`bindgen`/`libclang`) were needed for `aws-lc-sys`. A provider swap to `ring` is confirmed
+unavailable without forking `oracledb` (feature unification pulls in `aws-lc-rs` regardless). This is
+cross-compile-and-link evidence only — **not mobile support** — and does not change Phase 0 success
+criterion 7 (`phase-0.md`), which still needs physical-device evidence. Full detail, per-target sizes
+and next steps toward device validation:
+[`phase-0-s6-mobile-cross-compile.md`](phase-0-s6-mobile-cross-compile.md).
 
 ### S8 — TCPS — **Pass, with limits**
 
@@ -588,6 +646,275 @@ generated inside it and only the signed certificate imported; and OpenSSL 1.0.2
 ignores `-subj` when the config names a `distinguished_name` section under
 `prompt = no`, which quietly produced a CA and a server certificate with
 identical subject DNs.
+
+### S10 — network loss and reconnect — **Pass, with two upstream gaps**
+
+Run 2026-09-19. `SPEC.md` §8 lists "network loss" and "reconnect"; §18 forbids
+ever silently replacing a lost transactional session. Phase 0 had no evidence
+for any of it.
+
+#### Method — the link is simulated inside the test process
+
+`tests/common/proxy.rs` is a standard-library TCP forwarding proxy: the session
+connects to `127.0.0.1:<ephemeral>`, which forwards to the real listener, and
+the test switches it between **forward**, **hard drop** (`FIN` both ways, at
+once) and **black hole** (both sockets open, nothing moves), plus two
+packet-triggered variants for killing a link at a chosen point inside a round
+trip. Nothing touches Docker, the container or the host's network, so the
+Phase 0 database survives the suite exactly as it was. The first test asserts
+that the session really went through the proxy, because a listener that
+redirected the client would make every other measurement meaningless — this one
+does not redirect (direct handoff on Linux).
+
+Two honesty notes about the instrument. A mode switch other than a hard drop is
+noticed within 20 ms, so that is the error bar on "time to detect" for the
+black-hole cases; a hard drop has none, because the switch shuts the sockets
+down itself. And a call that may never return is run on its own thread behind a
+30 s watchdog: the test reports "did not return" as a finding and abandons the
+thread, rather than hanging the suite.
+
+#### An idle session whose link dies
+
+| Failure | Deadline | Time to detect | Reported as |
+|---|---|---|---|
+| hard drop, then `ping` | none | **332 µs – 568 µs** | `NetworkLost` / `SessionState::Lost` (`os error 10053`) |
+| hard drop, then `execute` | none | **54 µs – 61 µs** | `NetworkLost` / `Lost` |
+| black hole, then `ping` | none | **did not return within 30 s** | — (watchdog; thread abandoned) |
+| black hole, then `execute` | 3 s | **6.0 s** | `NetworkLost` / `Lost` |
+
+The first two are the good case and they are as fast as they can be: the socket
+is already dead, so the failure is local. The third is **U-17**: nothing in
+`oracledb` bounds a wait — the read timeout is `None`, no TCP keepalive is
+enabled, and `EXPIRE_TIME` is parsed and then only written back into descriptor
+text. The fourth is **U-6 on this path**: the deadline fired at 3 s, upstream's
+recovery waited out the same read timeout a second time, and the session was
+destroyed. Twice the deadline, and the connection gone. `Lost` is the honest
+report of that, and it is what the driver gives.
+
+#### Loss in the middle of something
+
+| Where the link died | Result |
+|---|---|
+| mid-statement (20 s `DBMS_SESSION.SLEEP`) | detected **465 – 809 µs** after the cut; `NetworkLost` / `Lost` |
+| mid-fetch (50-row batches over 50 000 rows) | the next `fetch_batch` fails `NetworkLost` / `Lost`; a second call on the same cursor is refused with "cursor used after a failed fetch; the only legal call was close"; `close()` succeeds |
+| mid-LOB-stream (8 MB CLOB, 8 KiB caller buffer) | **13 653 further bytes** came out of the driver's staging buffer, then `NetworkLost` / `Lost`; a second read is refused with "LOB stream read after a failure; the only legal action was to drop it" |
+
+The LOB number is worth keeping: a stream can deliver a little more data after
+the link is gone, because the driver had already staged a server-side chunk. It
+never reports a clean end of data, which is the failure that would matter — a
+truncated value that looked complete.
+
+#### An open transaction, and what it costs other people
+
+With a transaction open and the link hard-dropped, the next statement fails
+`NetworkLost` / `Lost`, and a **new** session sees only the committed row
+**119 ms** later: the server noticed the closed socket and rolled the dead
+session back.
+
+Row locks are the part that affects other users, and the two failure shapes
+differ completely:
+
+| Failure | A second session's `SELECT … FOR UPDATE NOWAIT` |
+|---|---|
+| hard drop (server's socket closed too) | succeeds after **253.5 ms** |
+| black hole (server's socket still open) | **still blocked after 20 s** (ORA-00054 throughout) |
+
+`SQLNET.EXPIRE_TIME` is **not set** on the Phase 0 test database — only the
+shipped sample `sqlnet.ora` mentions it — so nothing on the server side probes a
+client that has gone quiet either. A Reldex user whose Wi-Fi drops mid-
+transaction therefore blocks their colleagues indefinitely, and neither end of
+this driver stack currently prevents that. See U-17 and §9.
+
+#### A commit whose reply never arrives
+
+The proxy forwards the commit request and destroys the link on the server's
+reply. The server **committed** (the row is there, seen from another session);
+the client is told `NetworkLost` / `Lost` and claims nothing about the commit.
+That is the only honest answer available to it, and it is the one `SPEC.md` §18
+requires: the in-doubt outcome is surfaced, not guessed.
+
+> An earlier version of this test reported a **successful commit**. That was a
+> race in the test proxy, not in the driver — the forwarding thread decided
+> from a mode it had read before blocking in `read`, so the reply slipped
+> through. It is recorded here because it is exactly the kind of bug that
+> produces a false "everything is fine" result, and it was caught by the test
+> failing its own assertion rather than by review.
+
+#### Reconnect
+
+After the loss, three `execute`s and a `ping` all fail with a non-usable
+session, and **the proxy sees no second TCP connection**: nothing under the
+contract re-opens a socket. A reconnect is the caller's own act, and produces a
+different session — `v$session` SID/serial# went `4.2755` → `455.19711` — with
+none of the old one's state: an `ALTER SESSION SET NLS_DATE_FORMAT` made on the
+dead session was gone (`TO_CHAR` reverted to the instance default `19-SEP-26`).
+
+#### Connect-time behaviour
+
+| Endpoint | Asked for | Measured |
+|---|---|---|
+| `192.0.2.1:1521` (RFC 5737, discarded) | nothing | **22.0 s**, the operating system's own SYN budget |
+| proxy that accepts and forwards nothing | `with_connect_timeout(2 s)` | **still outstanding after 30 s** |
+
+Both are **U-15**: `tcp_connect_timeout` is a dead field upstream and no
+descriptor timeout key is parsed, so nothing can bound a connect. The first also
+produced **U-16**: upstream turns every `TimedOut` I/O error into
+`CallTimeoutExceeded`, so the driver reported "the call timeout armed for this
+statement expired" about a connection that never existed. That one is now
+corrected in `error::map_connect` — a socket timeout during connect is an
+`ErrorKind::Connection` that says the wait was the operating system's. The
+wrapper ignoring `ConnectionParams::connect_timeout()` entirely is recorded as
+**C-5** in §7; it is an owner decision, not something to change silently.
+
+### S11 — NCLOB — **Pass**
+
+Run 2026-09-19. Phase 0 had CLOB/BLOB streaming (S7) and NVARCHAR2 character
+fidelity (S2) and inferred NCLOB from the two. It no longer has to.
+
+| Check | Verdict | Evidence |
+|---|---|---|
+| Thai + non-BMP + mixed text through the lazy stream | **Pass** | 82 UTF-8 bytes round-tripped byte-exact against the server's own `DUMP`/`GETLENGTH`; the same text in a CLOB agrees |
+| Arrives as a locator, not a materialised value | **Pass** | `ValueRef::Lob`, never a `Text` column |
+| Reported kind | **Pass** | `LobKind::NationalCharacter` — the contract's third kind, not collapsed into `Character` |
+| Chunk boundaries through a surrogate pair | **Pass** | a 400× repetition of 19 ASCII + `🐘` read back identical through buffers of **16, 17, 23, 64, 100 and 4096** bytes: 600 / 550 / 400 / 146 / 93 / 3 chunks. No boundary split a character; every read was valid UTF-8 |
+| `NULL` vs `EMPTY_CLOB()` | **Pass** | `NULL` → `ValueRef::Null`; `EMPTY_CLOB()` → a locator whose **first** read returns 0 (zero chunks), which is a different thing and stays different |
+| `size_hint` | **Pass, and `None` by design** | a national character LOB counts in UCS-2 units server-side, so the contract's byte hint stays `None` — the same rule S7 established for CLOB |
+| 1 200 000-character NCLOB | **Pass** | 3 600 000 UTF-8 bytes in **55 chunks** of at most 64 KiB in **326 ms**; memory bounded by the caller's buffer |
+
+Nothing here needed a driver change, and nothing new was found. Compared with
+S7's CLOB numbers the shape is the same: the chunk count is set by the caller's
+buffer and by upstream sizing its request in UCS-2 units, not by the object.
+
+### S12 — developer features — **Pass, with one upstream blocker**
+
+Run 2026-09-19. Workstream E. Permission failures are reported separately from
+driver failures throughout; none occurred — `RELDEX_TEST` holds
+`SELECT ANY DICTIONARY` and `SELECT_CATALOG_ROLE` (see
+`tools/oracle-test-db/init/01_create_test_user.sh`), and that was enough for
+everything below.
+
+| Feature | Verdict | Evidence |
+|---|---|---|
+| `EXPLAIN PLAN … FOR` | **Pass** | classified `StatementKind::Other` — no cursor, transaction reported unpredictable, which is right: it writes rows into `PLAN_TABLE`. `PLAN_TABLE` is reachable through the public synonym with no extra grant; 3 rows written |
+| `DBMS_XPLAN.DISPLAY` | **Pass** | 26 lines of real plan, `INDEX UNIQUE SCAN` chosen for the indexed predicate |
+| `DBMS_XPLAN.DISPLAY_CURSOR` | **Pass** | 35 lines for the previous statement in the same session. Needs `V$SESSION`/`V$SQL`/`V$SQL_PLAN`; `SELECT ANY DICTIONARY` suffices. The test also treats DISPLAY_CURSOR's *diagnostic sentence* about a missing privilege as a permission finding, because it returns that instead of failing |
+| `V$` queries | **Pass** | `v$version` → "Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production"; `v$session` own row; `v$parameter`; `v$instance` |
+| Dictionary views | **Pass** | `ALL_OBJECTS`, `ALL_TABLES`, `ALL_TAB_COLUMNS`, `ALL_CONSTRAINTS`, `ALL_SOURCE`, `ALL_ERRORS`, `ALL_DEPENDENCIES`, `ALL_SYNONYMS`, `ALL_SEQUENCES`, `ALL_TRIGGERS` all queried against one fixture of each `SPEC.md` §16 object group |
+| `LONG` columns | **Pass** | `ALL_VIEWS.TEXT`, `ALL_TRIGGERS.TRIGGER_BODY`, `ALL_TAB_COLUMNS.DATA_DEFAULT` — all three read **exact**, described as `SqlType::Text` with native type name `LONG`, Thai text in a column default included |
+| A `LONG` larger than one packet | **Pass** | a view whose text is **73 926 characters** came back at exactly 73 926, tail intact. No silent truncation |
+| `LONG RAW` | **Pass** | described `SqlType::Raw` / `LONG RAW`, read back byte-exact |
+| `DBMS_METADATA.GET_DDL` | **Pass** | table (352 bytes) and package (126 bytes), delivered as **CLOB locators**, streamed through the same lazy path; a Thai column name survived |
+| `CREATE TRIGGER` with `:NEW` | **Fail — upstream (U-18)** | see below |
+
+**U-18 is the finding that matters.** `oracledb`'s SQL parser scans every
+statement — DDL included — for `:name` and turns each hit into a bind
+placeholder, so
+
+```sql
+CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW BEGIN :NEW.made := SYSDATE; END;
+```
+
+fails with "1 positional bind values are required but 0 were provided". An IDE
+built on this crate cannot create a trigger, and `SPEC.md` §16 lists Triggers as
+a first-class object group. The driver now reports it as
+`ErrorKind::Unsupported` with a message naming the cause and the workaround
+(wrap the DDL in `BEGIN EXECUTE IMMEDIATE q'[…]'; END;`, which the parser skips
+because it is a quoted string) instead of passing on a `Configuration` error
+that blames the caller for a placeholder they did not write. The session is
+untouched. The workaround is proven in the same test and is what the rest of
+S12's fixtures use.
+
+#### Metadata throughput — a first data point for `SPEC.md` §19
+
+`SELECT owner, object_name, object_type, status, created FROM all_objects ORDER
+BY owner, object_name`, **63 414 rows**, `fetch_rows = 1000`, 64 batches:
+**871 ms**, **≈ 72 800 rows/s**, first batch in 1.5–45 ms. Method: one session,
+wall clock around `execute` plus every `fetch_batch`, batches dropped as they
+arrive. One machine, one run, no comparative claim. `SPEC.md` §19 asks about
+100 000+ objects; this is 63 % of that in under a second, which says the
+dictionary read is not where an object browser will struggle.
+
+#### The quarantine, and why it turned out to be unnecessary
+
+The three `LONG` probes and the `LONG RAW` probe are `#[ignore]`d and were run
+one at a time, because a decode upstream cannot do aborts the process (U-4) and
+would have hidden every other result in the file. They all passed. They stay
+`#[ignore]`d: the reason for the quarantine is the *failure mode*, not the
+current outcome, and an upstream version that does abort on a `LONG` should cost
+one deliberate run rather than the whole file.
+
+```text
+tools/oracle-test-db/run-it.ps1 s12_dev_features -- --ignored --exact <name>
+```
+
+### S13 — privileged connections — **Pass**
+
+Run 2026-09-19. `SPEC.md` §8 lists "privileged connections where supported";
+Phase 0 had only a `SYSTEM` account, which is an ordinary session that happens
+to hold DBA privileges — not a privileged *connection*.
+
+**No contract gap and no upstream gap.** `ConnectionParams::with_role`
+(`SessionRole::{Normal, SysDba, SysOper}`) already expresses it, no extension
+bag is needed, and `conn.rs`'s `build_config` maps the two privileged roles onto
+`oracledb`'s `AUTH_MODE_SYSDBA` / `AUTH_MODE_SYSOPER`. Nothing had exercised the
+path.
+
+| Check | Result |
+|---|---|
+| `AS SYSDBA` over the listener | connects in **119.0 ms** (the same as an ordinary connect), authenticating against the password file — `remote_login_passwordfile = EXCLUSIVE` |
+| The session's own account | `USER = SYS`, `SYS_CONTEXT('USERENV','ISDBA') = TRUE`, `CURRENT_SCHEMA = SYS` |
+| Something only a privileged session sees | `v$instance` → `RELDEX/OPEN/ACTIVE` |
+| Privilege does not leak | an ordinary `RELDEX_TEST` session open at the same time still reports `ISDBA = FALSE`; the two are different SIDs |
+| `AS SYSOPER` | connects; the server reports `USER = PUBLIC`, `ISDBA = FALSE` — which is what SYSOPER is, and is recorded rather than asserted to be anything else |
+
+The credentials come from `RELDEX_TEST_ORACLE_SYSDBA_USER` /
+`..._SYSDBA_PASSWORD`, added to `tools/oracle-test-db/run-it.ps1` and `.sh` for
+this spike; every test skips itself and says so when they are absent. Nothing is
+printed, asserted on, or put in a failure message — a failed privileged connect
+is reported by `ErrorKind` and native code only.
+
+S13 lives in its own test binary on purpose: it is the only place that exercises
+this authentication path, and U-4 means a panic anywhere inside a round trip
+aborts the process. A separate binary confines that to this file's results.
+
+### S14 — large-result throughput and memory — **Pass**
+
+Run 2026-09-19. `phase-0.md`'s "Measurements" asked for fetch throughput and
+memory during a large fetch; Phase 0 had LOB streaming numbers and nothing for
+rows.
+
+**1 000 000 rows**, three columns (NUMBER, VARCHAR2(40), DATE), generated
+server-side by cross-joining a 1 000-row `CONNECT BY` with itself, streamed
+through `fetch_batch` with **every batch dropped as it arrives**:
+
+| `fetch_rows` | Batches | Rows/s | Time to first batch | Working-set growth |
+|---|---|---|---|---|
+| 100 | 10 000 | 52 300 – 59 400 | 5.0 ms | **+480 – 504 KB** |
+| 1 000 | 1 000 | 50 500 – 92 100 | 14.0 ms | **+996 – 1 032 KB** |
+| 10 000 | 100 | 14 800 – 17 700 | 0.53 – 1.1 s | **+1 204 – 6 772 KB** |
+
+*Method:* one session; wall clock from before `execute` to after the last
+`fetch_batch`; working set read from `tasklist` every 250 ms and once at the
+end, growth = peak minus the sample taken before the execute. The instrument is
+coarse and shared with S7: it is the operating system's view of the whole
+process, sampled, so it includes allocator caching and cannot see an allocation
+freed between samples. It is enough to separate "bounded" from "grows with the
+row count" and not enough for an allocation figure. Ranges are two runs on one
+machine; no comparative claim is made.
+
+**The claim under test — `SPEC.md` §12's bounded memory — holds.** A driver
+that materialised this result would need at least 56 MB of row data; the
+measured growth is about **1 MB**, and the isolated comparison is flatter still:
+10 000 rows and 1 000 000 rows at the same batch size cost **0 KB** and **52 KB**
+of working-set growth respectively. Memory tracks the batch, not the result.
+
+**Throughput is not monotonic in the batch size**, which is a finding rather
+than a measurement: `fetch_rows = 10000` was consistently **3.5× slower** than
+the best of the other two *and* cost the longest wait for the first row (up to
+1.1 s, against 5 ms at 100). 100 and 1 000 are within run-to-run noise of each
+other. The cause is not established here and this is not enough evidence to pick
+a default — but it is enough to say that "bigger batches are faster" must not be
+assumed when Reldex chooses one.
 
 ---
 
@@ -1168,9 +1495,142 @@ reported rather than worked around, but silently ignoring a security parameter
 is worse than rejecting it: a caller that believes it turned verification off
 should be told it did not. Drafted as part of **Issue E**.
 
+### U-15 — **A connect cannot be bounded in time at all**
+
+`client/mod.rs:616` opens the socket with a bare `TcpStream::connect(sock_addr)`
+— no timeout, on either the first address or the one a redirect names
+(`:635`). The configuration field that would supply one,
+`ConnectOptions::tcp_connect_timeout` (`config/connect_options.rs:265`), is
+**dead**: it is declared, defaulted to `None` (`:573`) and never read, and the
+descriptor parser has no arm for `TRANSPORT_CONNECT_TIMEOUT`,
+`TCP_CONNECT_TIMEOUT` or `CONNECT_TIMEOUT` (`:455-500` handles
+`EXPIRE_TIME`, `RETRY_COUNT`, `RETRY_DELAY`, `SDU` and others, but none of the
+timeouts). `RETRY_COUNT`/`RETRY_DELAY` *are* honoured, so a descriptor can ask
+for the wait to be repeated but not for it to end.
+
+Minimal reproduction, both measured by spike S10:
+
+| Endpoint | What happened |
+|---|---|
+| `192.0.2.1:1521/RELDEX` (RFC 5737 TEST-NET-1, discarded not refused) | returned after **22.0 s** — Windows's own SYN retry budget, not anything the client chose |
+| a proxy that completes the TCP handshake and then forwards nothing | **still outstanding after 30 s**, with `ConnectionParams::with_connect_timeout(2 s)` set |
+
+*Evidence:* `a_connect_to_an_unroutable_address_measures_the_operating_systems_patience`,
+`a_connect_into_a_black_hole_is_not_bounded_by_the_connect_timeout`.
+*Can the wrapper guard it?* Not without doing the connect on a thread of its
+own and abandoning it — see §7 C-5, which is an owner decision, not a silent
+one. The wrapper currently **ignores** `ConnectionParams::connect_timeout()`,
+which is the honest description of what it does but not an acceptable end
+state. Drafted as **Issue F**.
+
+### U-16 — **Every socket timeout is reported as "your call timeout expired"**
+
+`error.rs:131`:
+
+```rust
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Error {
+        if e.kind() == std::io::ErrorKind::WouldBlock
+            || e.kind() == std::io::ErrorKind::TimedOut
+        {
+            Error::new(ErrorKind::CallTimeoutExceeded, None)
+        } else {
+            Error::new(ErrorKind::StreamOperation, Some(Box::new(e)))
+        }
+    }
+}
+```
+
+Two problems in four lines. The **classification** is wrong whenever no call
+timeout was armed — a TCP connect that the operating system gave up on is not a
+deadline the caller set — and the `None` **discards the cause**, so the
+underlying `os error 10060` and its text are gone by the time any caller sees
+it. Spike S10 hit both at once: connecting to `192.0.2.1` produced
+`ErrorKind::Timeout` with the message "the call timeout armed for this statement
+expired", about a session that never existed.
+
+*Evidence:* `a_connect_to_an_unroutable_address_measures_the_operating_systems_patience`
+(live), `a_connect_that_times_out_in_the_socket_is_not_reported_as_a_call_timeout`
+(unit, no database).
+*Mitigation, applied:* `error::map_connect` now reclassifies a
+`CallTimeoutExceeded` raised during `connect` as `ErrorKind::Connection` with a
+message that says the wait was the operating system's. The wrapper can only do
+this at connect time — mid-session the two really are indistinguishable from
+outside, because the kind is all that is left. Drafted as **Issue F**.
+
+### U-17 — **Nothing detects a dead link: no keepalive, and `EXPIRE_TIME` goes nowhere**
+
+`transport.rs:245-246` sets `set_nodelay(true)` and `set_read_timeout(None)` and
+nothing else; no `SO_KEEPALIVE` is enabled anywhere in the crate.
+`EXPIRE_TIME` — Oracle's own client-side dead-connection-detection knob — is
+parsed (`config/connect_options.rs:465`) and then written back into the
+descriptor text by `build_description_segment` (`:360`) and never acted on. So a
+client whose link has gone silent has no mechanism of its own to notice, at any
+layer.
+
+Measured by spike S10 against a black-holed link (sockets open, nothing
+forwarded):
+
+| Call | Deadline armed | Result |
+|---|---|---|
+| `ping` | none | **had not returned after 30 s**; the watchdog gave up, the thread was abandoned |
+| `execute` | 3 s | returned after **6.0 s** as `NetworkLost`/`Lost` — the deadline fired, upstream's recovery waited out the same read timeout again, and the session was destroyed (U-6 on this path) |
+
+The practical consequence is not the client's alone. With no client-side
+detection and `SQLNET.EXPIRE_TIME` unset on the server — which it is on the
+Phase 0 test database; only the sample `sqlnet.ora` mentions it — a session
+whose client has vanished keeps its row locks. S10 measured **20 s and still
+held** when the server's socket stayed open, against **253.5 ms** when it was
+closed. A Reldex user whose Wi-Fi drops mid-transaction blocks their colleagues
+until something else times the session out.
+
+*Evidence:* `an_idle_session_behind_a_black_hole_never_returns_without_a_deadline`,
+`a_black_holed_call_with_a_deadline_comes_back_and_says_what_it_knows`,
+`a_dead_sessions_row_locks_survive_exactly_as_long_as_the_server_believes_in_it`.
+*Can the wrapper guard it?* Only by arming a deadline on every call, which costs
+the session whenever it fires (U-6). Drafted as **Issue F**.
+
+### U-18 — **`CREATE TRIGGER` is impossible: `:NEW` is parsed as a bind placeholder**
+
+`statement/sql_parser.rs` scans the whole statement text for `:name` and calls
+`statement.add_bind` for each hit (`:233`). `determine_statement_type`
+(`statement/mod.rs:88-105`) sets `is_ddl` for `CREATE`/`ALTER`/`DROP`/… and the
+scan carries on regardless — there is no branch that stops looking for binds in
+DDL, and no option to turn the scan off. The server then asks for a value for a
+placeholder the caller never wrote.
+
+Minimal reproduction:
+
+```sql
+CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW BEGIN :NEW.made := SYSDATE; END;
+```
+
+→ `1 positional bind values are required but 0 were provided`
+(`bind_params.rs:101`). Two `:NEW` references give `2 positional bind values are
+required but 0 were provided`.
+
+This is not an edge case: `:NEW` and `:OLD` are how a trigger body refers to the
+row, so **an Oracle IDE built on this crate cannot create a trigger**, and
+`SPEC.md` §16 lists Triggers as a first-class object group.
+
+*Evidence:* `a_trigger_body_that_mentions_new_is_refused_with_the_reason`.
+*Workaround, proven in the same test:* submit the DDL inside
+`BEGIN EXECUTE IMMEDIATE q'[…]'; END;`. The parser skips quoted strings
+(`sql_parser.rs:216-233`), so the body is invisible to it. The cost is that the
+statement is then reported as PL/SQL rather than DDL and any error position
+refers to the wrapper block.
+*Mitigation, applied:* when the caller declared **no** binds and upstream
+complains that bind values are missing, `error::explain_parsed_placeholders`
+replaces the message with one naming the cause and the workaround, and reports
+`ErrorKind::Unsupported` instead of `Configuration` — because blaming the caller
+for a placeholder they did not write is not an honest report. The session is
+untouched (`Usable`), which the test asserts. Drafted as **Issue G**.
+
 ---
 
-## 6. Drafted upstream issues — **for the owner to submit; nothing has been posted**
+## 6. Drafted upstream issues — **five submitted 2026-09-20; F and G await the owner's go-ahead**
+
+> **Submitted 2026-09-20 by the owner's account (SupawitNu):** B → [oracle/rust-oracledb#21](https://github.com/oracle/rust-oracledb/issues/21) (NUMBER bind ×10), C → [#22](https://github.com/oracle/rust-oracledb/issues/22) (process aborts: NUMBER index OOB, region TSTZ `todo!()`, poisoned-mutex double panic), D → [#23](https://github.com/oracle/rust-oracledb/issues/23) (call-timeout recovery closes the connection; server-side cancel not observed), A → [#24](https://github.com/oracle/rust-oracledb/issues/24) (public break/interrupt API), E → [#25](https://github.com/oracle/rust-oracledb/issues/25) (TCPS trust / `SSL_SERVER_DN_MATCH`). Issues **F** and **G** below are drafted but **not yet submitted**, pending the owner's go-ahead.
 
 ### Issue A — the one ADR-0001 asks for
 
@@ -1436,6 +1896,120 @@ smell.
 > 1.98.1 MSVC, Windows 11, Oracle Database 19.3 EE, listener TLS 1.2 /
 > `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`.
 
+### Issue F — timeouts and dead links (U-15, U-16, U-17)
+
+**Title:** `No way to bound a connect, no dead-connection detection, and every socket timeout is reported as a call timeout`
+
+**Body:**
+
+> **Summary**
+>
+> Three related gaps mean a client cannot control, or correctly diagnose, how
+> long it waits for a database that has stopped answering.
+>
+> **1. A connect cannot be bounded.** `client/mod.rs:616` calls
+> `TcpStream::connect(sock_addr)` with no timeout (and again at `:635` after a
+> redirect). `ConnectOptions::tcp_connect_timeout`
+> (`config/connect_options.rs:265`) is declared, defaulted to `None` and never
+> read, and the descriptor parser has no arm for `TRANSPORT_CONNECT_TIMEOUT`,
+> `TCP_CONNECT_TIMEOUT` or `CONNECT_TIMEOUT`. `RETRY_COUNT` and `RETRY_DELAY`
+> *are* honoured, so a descriptor can ask for the wait to be repeated but not
+> for it to end.
+>
+> Reproduction: connecting to `192.0.2.1:1521/svc` (RFC 5737 TEST-NET-1, which
+> is discarded rather than refused) returned after 22.0 s on Windows — the
+> operating system's SYN retry budget. Nothing in the crate shortens it.
+>
+> **2. Every socket timeout is reported as a call timeout, and the cause is
+> discarded.** `error.rs:131`:
+>
+> ```rust
+> if e.kind() == std::io::ErrorKind::WouldBlock
+>     || e.kind() == std::io::ErrorKind::TimedOut
+> {
+>     Error::new(ErrorKind::CallTimeoutExceeded, None)
+> }
+> ```
+>
+> In the reproduction above, the caller receives `CallTimeoutExceeded` — "the
+> call timeout exceeded" — for a connection that was never established and a
+> call timeout that was never set, with the underlying `os error 10060` thrown
+> away by the `None`. Two suggestions: only classify as `CallTimeoutExceeded`
+> when a call timeout is actually armed, and keep the `io::Error` as the cause
+> in both branches.
+>
+> **3. Nothing detects a link that has gone silent.** `transport.rs:245-246`
+> sets `set_nodelay(true)` and `set_read_timeout(None)`; no `SO_KEEPALIVE` is
+> set anywhere. `EXPIRE_TIME` is parsed (`config/connect_options.rs:465`) and
+> written back into the descriptor text (`:360`), but nothing acts on it — in
+> other Oracle drivers it enables client-side dead-connection detection.
+>
+> Reproduction: with a TCP proxy that keeps both sockets open and forwards
+> nothing, `Connection::ping()` with no call timeout had not returned after
+> 30 s. With a 3 s call timeout it returned after 6.0 s — the timeout fired,
+> `recover_from_error` waited out the same read timeout again, and the
+> connection was closed. So the only available mechanism costs the session
+> (this is the same recovery path as the separate call-timeout report).
+>
+> **Why it matters for us**
+>
+> We are building a desktop database client. A user on flaky Wi-Fi is the
+> ordinary case, not the edge case: today their UI has no bounded way to
+> discover the session is gone, and the workaround (arm a call timeout on
+> everything) destroys sessions.
+>
+> Environment: `oracledb` 26.0.0-beta.3, Rust 1.98.1 MSVC, Windows 11, Oracle
+> Database 19.3 EE.
+
+### Issue G — `CREATE TRIGGER` cannot be executed (U-18)
+
+**Title:** `Bind placeholders are parsed inside DDL, so CREATE TRIGGER with :NEW/:OLD cannot be executed`
+
+**Body:**
+
+> **Reproduction**
+>
+> ```rust
+> conn.statement("CREATE TABLE t (id NUMBER, made DATE)")?.execute(&[])?;
+> conn.statement(
+>     "CREATE TRIGGER t_bi BEFORE INSERT ON t FOR EACH ROW \
+>      BEGIN :NEW.made := SYSDATE; END;",
+> )?
+> .execute(&[])?;
+> ```
+>
+> → `Error: 1 positional bind values are required but 0 were provided`
+>
+> Two `:NEW` references give `2 positional bind values are required but 0 were
+> provided`. The same DDL runs fine in SQL\*Plus.
+>
+> **Cause**
+>
+> `statement/sql_parser.rs` scans the statement text for `:name` and calls
+> `statement.add_bind` for each hit (`:233`).
+> `Statement::determine_statement_type` (`statement/mod.rs:88`) recognises
+> `CREATE`/`ALTER`/`DROP`/… and sets `is_ddl`, but the bind scan continues
+> regardless, and there is no option to turn it off. `:NEW` and `:OLD` are how
+> a trigger body refers to the row being changed, so any trigger with a body is
+> affected.
+>
+> **Suggested fix**
+>
+> Skip bind-placeholder detection when `is_ddl` is set — a DDL statement's text
+> is sent to the server verbatim and cannot carry binds — or expose a way for
+> the caller to say "this statement has no binds, do not scan".
+>
+> **Workaround, for anyone who finds this**
+>
+> Wrap the DDL in a PL/SQL block with a q-string, which the parser skips:
+>
+> ```sql
+> BEGIN EXECUTE IMMEDIATE q'[CREATE TRIGGER … BEGIN :NEW.made := SYSDATE; END;]'; END;
+> ```
+>
+> Environment: `oracledb` 26.0.0-beta.3, Rust 1.98.1 MSVC, Windows 11, Oracle
+> Database 19.3 EE.
+
 ---
 
 ## 7. Contract problems found in `reldex-db-driver-api`
@@ -1529,6 +2103,39 @@ so a UI that wants to say "table not found" has everything it needs.
 documented choice, asserted by a unit test with the reasoning in a comment
 beside it (`error.rs`), not an oversight.
 
+### C-5 — `ConnectionParams::connect_timeout` is accepted and ignored — **open, needs the owner**
+
+Found by spike S10. The contract has
+`ConnectionParams::with_connect_timeout(Duration)` and documents it as "how long
+the driver may spend establishing the connection". **This driver never reads
+it.** A profile that asks for a 2-second connect timeout waits as long as the
+operating system feels like — 22.0 s against an unroutable address, and still
+outstanding after 30 s against a black hole (U-15).
+
+The contract is not at fault and needs no change; the driver is, and its options
+are not equal:
+
+1. **Leave it.** Silently ignoring a caller's timeout is exactly the shape of
+   failure the rest of this driver refuses to ship (`TlsMode::Required`, the
+   NUMBER bind guard): the caller is given a promise nobody keeps.
+2. **Refuse the parameter** (`ErrorKind::Unsupported`) when it is set, the way
+   `TlsMode::Required` refuses a non-TCPS endpoint. Honest, and it turns an
+   imported connection profile that merely carries a timeout into one that
+   cannot connect at all.
+3. **Honour it** by running `oracledb::connect` on a helper thread, returning
+   `ErrorKind::Timeout` when the deadline passes, and closing the connection if
+   it arrives afterwards. This is the only option that gives a UI a bounded
+   connect. It costs a thread per connect and leaks one per timed-out connect
+   until the attempt finishes, and it changes the threading behaviour of
+   `connect()` for every caller.
+
+Not decided here: option 3 is a production behaviour change in a crate under
+review, and option 2 makes a working configuration stop working. Recommendation
+is **3**, because a desktop client must be able to bound a connect and the leak
+is bounded by the user's own retries — but it is the owner's call, and it should
+be made alongside the upstream request (Issue F), which would remove the need
+for it entirely.
+
 ---
 
 ## 8. Secret handling
@@ -1574,7 +2181,8 @@ beside it (`error.rs`), not an oversight.
 `tools/oracle-test-db/.env` stays untracked and is read only by
 `tools/oracle-test-db/run-it.ps1` / `run-it.sh`, which export
 `RELDEX_TEST_ORACLE_DSN`, `_USER`, `_PASSWORD` (and the optional `_SYSTEM_USER`
-/ `_SYSTEM_PASSWORD` used by S4's privileged candidate) into the environment of
+/ `_SYSTEM_PASSWORD` used by S4's privileged candidate, and `_SYSDBA_USER` /
+`_SYSDBA_PASSWORD` added for S13) into the environment of
 the `cargo test` child and clear them again afterwards. The integration tests
 read those variables and nothing else; tests that need the privileged extras
 skip themselves and say so when the variables are absent. Every test object is
@@ -1584,7 +2192,20 @@ No extra grants were needed: `RELDEX_TEST` could already read `V$SESSION`,
 `V$INSTANCE`, `V$MYSTAT` and `USER_ERRORS`, and execute `DBMS_SESSION`,
 `DBMS_OUTPUT`, `DBMS_APPLICATION_INFO`, `DBMS_LOB` and `UTL_RAW`. The grant
 list in `init/01_create_test_user.sh` is therefore the same set the old `.sql`
-hook granted; only where the password comes from changed.
+hook granted; only where the password comes from changed. **S12 confirmed this
+holds for the developer features too** — `PLAN_TABLE`, `DBMS_XPLAN.DISPLAY`,
+`DBMS_XPLAN.DISPLAY_CURSOR`, `DBMS_METADATA.GET_DDL`, ten `ALL_*` views and
+four `V$` views all worked on the existing `SELECT ANY DICTIONARY` /
+`SELECT_CATALOG_ROLE` / `EXECUTE ON DBMS_XPLAN` grants, so the init script did
+not have to change for this task either.
+
+**S13 uses SYS's existing password.** `run-it.ps1` / `run-it.sh` now also set
+`RELDEX_TEST_ORACLE_SYSDBA_USER=SYS` and `..._SYSDBA_PASSWORD` from the same
+`ORACLE_PWD` value in the untracked `.env` that the `SYSTEM` variables already
+used; no new secret was created, nothing new is tracked, and `run-it.ps1` clears
+the new variable in its `finally` block alongside the others. The S13 tests read
+it through `common::sysdba_params()` and never print, assert on, or quote it —
+a failed privileged connect is reported by `ErrorKind` and native code only.
 
 `a_wrong_password_is_an_authentication_failure_not_a_network_one` asserts that a
 credential appears in neither the `Display` nor the `Debug` rendering of the
@@ -1634,6 +2255,19 @@ kept out of git regardless, because the alternative teaches the wrong habit.
 | **S9** Concurrency | **GO** | 8 sessions, 400 inserts, 283 ms |
 | **S8** TCPS cannot be established without Instant Client | **GO** | The criterion does not fire: a pure-Rust TCPS session, TLS 1.2 / `ECDHE-RSA-AES256-GCM-SHA384`, certificate **and** host name verified against a private CA, `USERENV.NETWORK_PROTOCOL = tcps`, 39 ms of handshake on top of a 116 ms connect. Qualified by what is **not** covered: no mutual TLS, no Oracle wallet file, no DN matching, no revocation checking, and a 19c listener hardened below TLS 1.2 or to CBC suites cannot connect at all (U-12 to U-14) |
 
+The four spikes added on 2026-09-19 have no ADR-0001 kill criterion of their
+own. Their verdicts against `SPEC.md` §8's operations list:
+
+| Item | Verdict | Basis |
+|---|---|---|
+| **network loss** (S10) | **GO, with two gaps** | A dead socket is noticed in microseconds and reported `NetworkLost`/`Lost`; loss mid-statement, mid-fetch and mid-LOB-stream all report and retire the handle; an open transaction dies and a fresh session sees only committed data 119 ms later; an in-doubt commit is reported as unknown, never as success. **But**: a black-holed link never returns without a deadline (U-17), the only deadline that ends it destroys the session (U-6), and a dead client's row locks blocked a second session for the whole 20 s measured because no dead-connection detection exists on either side |
+| **reconnect** (S10) | **GO** | Nothing reconnects by itself — after the loss every call fails and the proxy saw no second TCP connection. A new `connect()` is a new server session (SID/serial# differ) with none of the old session's state. `SPEC.md` §18 is satisfied |
+| **NCLOB** (S11) | **GO** | Thai and non-BMP text byte-exact through the lazy stream at six buffer sizes including ones that land inside a surrogate pair; `NULL` and `EMPTY_CLOB()` stay distinct; 1.2 M characters in 55 bounded chunks |
+| **EXPLAIN PLAN / DBMS_XPLAN** (S12) | **GO** | Both `DBMS_XPLAN` entry points return real plans on the test user's existing grants |
+| **metadata / dictionary access** (S12) | **GO, with one blocker** | Ten `ALL_*` views, four `V$` views, `LONG` and `LONG RAW` exact (including 73 926 characters), `DBMS_METADATA.GET_DDL` as a CLOB. **`CREATE TRIGGER` with `:NEW` is impossible (U-18)**, which `SPEC.md` §16 needs; a workaround exists and the driver now names it |
+| **privileged connections** (S13) | **GO** | `AS SYSDBA` and `AS SYSOPER` over the listener through the existing `SessionRole` contract; no contract gap and no upstream gap |
+| **large result** (S14) | **GO** | 1 000 000 rows for about 1 MB of working-set growth: `SPEC.md` §12's bounded-memory claim holds. Throughput 50 000–92 000 rows/s, and **not** monotonic in the batch size |
+
 ### What the owner has to decide
 
 1. **Cancellation.** `SPEC.md` §24.8 cannot be met now. The options are: ship
@@ -1675,3 +2309,39 @@ kept out of git regardless, because the alternative teaches the wrong habit.
    refuse a descriptor containing it, with a message saying why. Not done:
    `Endpoint::ConnectString` is deliberately opaque, and one more special case
    in it needs the owner's call.
+8. **What to do about `connect_timeout` (C-5, U-15).** The contract offers it,
+   the driver ignores it, and nothing else can bound a connect — 22.0 s against
+   an unroutable address, unbounded against a black hole. Three options are set
+   out in §7 C-5 (leave it, refuse it, or implement it on a helper thread); the
+   recommendation is to implement it, because a desktop client must be able to
+   bound a connect, but it changes `connect()`'s threading for every caller and
+   is therefore not a change to make without the owner.
+9. **Whether Reldex should arm a default deadline on every call, and what to
+   tell the user about a silent link.** S10 measured the shape of the problem:
+   with no deadline a black-holed link never returns (U-17); with one, the
+   deadline costs the session more often than not (U-6). Neither is acceptable
+   as a silent default. The realistic options are a long default deadline with
+   an explicit "the connection stopped answering; the session is gone" in the
+   UI, or no default and a user-visible cancel that cannot actually stop the
+   call. Both need the UI to exist, so the decision can wait — but it must not
+   be made by accident.
+10. **Whether the Phase 0 test database should set `SQLNET.EXPIRE_TIME`, and
+    whether Reldex should tell customers to.** It is unset today, which is why
+    S10 measured a dead client holding a row lock for the full 20 s budget. This
+    is a database-configuration recommendation Reldex may need to document
+    (server-side dead connection detection is the only thing that protects other
+    users from a Reldex client that vanished), not something the driver can fix.
+11. **`CREATE TRIGGER` (U-18).** The driver now explains the failure and names
+    the `EXECUTE IMMEDIATE q'[…]'` workaround, but it does **not** apply the
+    workaround itself, because that silently changes a DDL statement into a
+    PL/SQL block and moves any error position — which `SPEC.md` §24.14 cares
+    about. Whether Reldex's editor should offer to rewrite the statement (with
+    the rewrite visible to the user) is a product decision. Issue G is drafted.
+12. **Which fetch batch size Reldex should default to.** S14 found throughput is
+    **not** monotonic in the batch size — 10 000 rows per fetch was 3.5× slower
+    than the best of 100 and 1 000, and cost up to 1.1 s before the first row
+    appeared, which is the number a user actually feels. 100 and 1 000 are
+    within run-to-run noise of each other. This is one machine and one run: it
+    is enough to forbid assuming "bigger is faster", not enough to pick a
+    number. A short follow-up measurement across row shapes and a real network
+    should precede the choice.

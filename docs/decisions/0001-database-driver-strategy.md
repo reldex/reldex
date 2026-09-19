@@ -1,6 +1,6 @@
 # 0001 — Database Driver Strategy
 
-**Status:** Accepted — owner decision 2026-09-20: stay on oracledb; pre-armed deadline + honest UI; upstream issues pending
+**Status:** Accepted — owner decision 2026-09-20: stay on oracledb; pre-armed deadline + honest UI; upstream issues pending — upstream issues #21–#25 filed 2026-09-20
 **Date:** 2026-09-19
 **Amended:** 2026-09-19 — **C1 revised and spike S4 widened.** The ADR-0002 API review re-read
 `oracledb`'s source and established that `set_call_timeout` locks the same `Arc<Mutex<Client>>` that
@@ -24,9 +24,13 @@ primary source are labelled **Unverified**.
 ## Spike outcome (2026-09-20)
 
 Spikes S1–S5, S7 and S9 ran against the live Phase 0 test database (Oracle 19.3 EE, container
-`reldex-oracle19c`) on **2026-09-19**. Full detail, measurements and evidence are in
-[`docs/exec-plans/active/phase-0-spike-results.md`](../exec-plans/active/phase-0-spike-results.md);
-what follows is the verdict summary only — read that file for the numbers behind each line.
+`reldex-oracle19c`) on **2026-09-19**; S6 (mobile cross-compile) ran in CI on 2026-09-19 (PR #3); the
+evidence-gap spikes S10–S14 (network loss/reconnect, NCLOB, developer features, privileged
+connections, large result) ran against the same test database on 2026-09-19. Full detail,
+measurements and evidence are in
+[`docs/exec-plans/active/phase-0-spike-results.md`](../exec-plans/active/phase-0-spike-results.md)
+and, for S6, [`docs/exec-plans/active/phase-0-s6-mobile-cross-compile.md`](../exec-plans/active/phase-0-s6-mobile-cross-compile.md);
+what follows is the verdict summary only — read those files for the numbers behind each line.
 
 | Spike | Verdict |
 | --- | --- |
@@ -38,7 +42,12 @@ what follows is the verdict summary only — read that file for the numbers behi
 | S7 LOB streaming | **Pass** |
 | S9 concurrency | **Pass** |
 | S8 | **Pass with limits** (2026-09-20): pure-Rust TCPS session with certificate and host-name verification on, TLS 1.2 `ECDHE-RSA-AES256-GCM-SHA384`, confirmed server-side (`NETWORK_PROTOCOL = tcps`); trust via a user-supplied PEM only — no mTLS combined with a private CA (U-13), no `ewallet.p12`/OS trust store (U-12), `SSL_SERVER_DN_MATCH` ignored upstream (U-14), no revocation — kill criterion did NOT fire |
-| S6 | **Not run** — Android/iOS cross-compile needs the Android NDK (owner approval to download) and a macOS host |
+| S6 mobile cross-compile | **Pass** (2026-09-20, PR #3): `aarch64-linux-android`, `aarch64-apple-ios` and `aarch64-apple-ios-sim` all compile and link in CI, no extra tools for `aws-lc-sys`, provider swap to `ring` impossible without forking — kill criterion did NOT fire. Cross-compile evidence only, not mobile support; physical-device validation is still open (`phase-0-s6-mobile-cross-compile.md`) |
+| S10 network loss / reconnect | **Pass, two upstream gaps** (2026-09-19, evidence-gap spike, no kill criterion of its own): a dead socket is detected in microseconds and reported `Lost`; nothing reconnects by itself; an in-doubt commit is surfaced, not guessed. A black-holed link never returns without a deadline (U-17), a connect cannot be bounded at all (U-15), and a dead client's row lock blocked a second session for the full 20 s measured |
+| S11 NCLOB | **Pass** (2026-09-19) — Thai and non-BMP text byte-exact through the lazy stream at six buffer sizes; `NULL`/`EMPTY_CLOB()` stay distinguishable |
+| S12 developer features | **Pass, one upstream blocker** (2026-09-19) — EXPLAIN PLAN, both `DBMS_XPLAN` entry points, `V$`, ten dictionary views, `LONG`/`LONG RAW` and `DBMS_METADATA.GET_DDL` all work; `CREATE TRIGGER` with `:NEW` does not (U-18) |
+| S13 privileged connection | **Pass** (2026-09-19) — `AS SYSDBA` over the listener through the existing `SessionRole` contract; no contract gap, no upstream gap |
+| S14 large result | **Pass** (2026-09-19) — 1,000,000 rows streamed for ~1 MB of working-set growth; throughput not monotonic in batch size |
 
 **S4 is the spike this ADR's decision rests on, and its kill criterion fired.** A pre-armed
 per-round-trip deadline (`CancelKind::PreArmedDeadline`) is the only mechanism that works at all, and
@@ -53,9 +62,16 @@ upstream crate (assessed, not built; see the results file §4 candidate 4). Per 
 1. **Ship with a pre-armed deadline and an honest UI, and submit the upstream issues.** The driver
    reports `CancelKind::PreArmedDeadline` and the UI says plainly that a running statement can only be
    stopped by a limit set before it starts. **Recommended by the spike author and the lead.**
-2. **Wait for upstream.** The four drafted issues (results file §6) include a public break/interrupt
-   API request; its lead time is weeks to months, and nothing has been submitted yet — that is a
-   separate owner action regardless of which option is chosen.
+2. **Wait for upstream.** Of the seven drafted issues (results file §6), five were submitted
+   2026-09-20 by the owner's account (SupawitNu) — A (public break/interrupt API) →
+   [#24](https://github.com/oracle/rust-oracledb/issues/24), B (NUMBER bind ×10) →
+   [#21](https://github.com/oracle/rust-oracledb/issues/21), C (process aborts) →
+   [#22](https://github.com/oracle/rust-oracledb/issues/22), D (call-timeout recovery / cancel not
+   observed) → [#23](https://github.com/oracle/rust-oracledb/issues/23), E (TCPS trust) →
+   [#25](https://github.com/oracle/rust-oracledb/issues/25) — and lead time from here is weeks to
+   months regardless. F (U-15…U-17: connect cannot be bounded, timeout cause discarded, no
+   keepalive/`EXPIRE_TIME`) and G (U-18: `CREATE TRIGGER … :NEW` impossible) are drafted but await the
+   owner's go-ahead to submit — a separate owner action regardless of which option is chosen.
 3. **Re-open this ADR's rejected alternatives** (embedding a non-Rust thin driver, ODPI-C + Instant
    Client, writing a Rust driver from scratch) — see "Alternatives considered" above. Each was
    rejected for reasons independent of cancellation and those reasons still hold.
@@ -64,9 +80,14 @@ upstream crate (assessed, not built; see the results file §4 candidate 4). Per 
 and nothing in the S4 result changes that choice — only the cancellation mechanism the product can
 offer is in question. Adopting a different driver is alternative 3 above, not a decision made here.
 
-The other kill criteria did not fire: S1, S3, S5, S7 and S9 pass outright; S2's NUMBER and
-`TIMESTAMP WITH TIME ZONE` findings were upstream defects contained by refusal (see U-1, U-2, U-3 in
-the results file), not silent precision loss or corruption, so S2 is a **conditional go**, not a kill.
+The other kill criteria did not fire: S1, S3, S5, S7, S9 and S6 (mobile cross-compile) pass outright;
+S2's NUMBER and `TIMESTAMP WITH TIME ZONE` findings were upstream defects contained by refusal (see
+U-1, U-2, U-3 in the results file), not silent precision loss or corruption, so S2 is a **conditional
+go**, not a kill. The evidence-gap spikes S10–S14 carry no ADR-0001 kill criterion of their own; they
+added four more upstream defects — **U-15** (a connect cannot be bounded in time), **U-16** (a socket
+timeout is misreported as a call timeout, cause discarded), **U-17** (no dead-link detection: no
+keepalive, `EXPIRE_TIME` unused), and **U-18** (`CREATE TRIGGER … :NEW` cannot be executed) — drafted
+as issues F and G above.
 
 ## Owner decision (2026-09-20)
 
@@ -79,9 +100,11 @@ The project owner reviewed the lead's summary of the spike outcome above and, in
    UI.** The product must state plainly that on-demand Cancel is unavailable with the current driver.
    `SPEC.md` §10 carries this as an interim note, and §24.8 stays an **unmet target** — marked "not
    yet met — blocked on upstream driver (ADR-0001)" rather than redefined as satisfied.
-3. **Pursue the upstream fixes via the four drafted issues** (`phase-0-spike-results.md` §6), Issue B
-   (the silent NUMBER-bind corruption, U-1) first. Submission itself is a separate, still-open action
-   (`TASKS.md` — the lead is confirming with the owner who posts them).
+3. **Pursue the upstream fixes via the drafted issues** (`phase-0-spike-results.md` §6), Issue B
+   (the silent NUMBER-bind corruption, U-1) first. **Update 2026-09-20:** issues A–E, including B,
+   were submitted by the owner's account — see the links in "Spike outcome" above; F and G (from the
+   later evidence-gap spikes) are drafted and await the owner's go-ahead to submit
+   (`TASKS.md`).
 
 Spike S4's kill criterion fired, and the owner's decision is to **accept the limitation rather than
 change drivers**: the gap is real, but none of the rejected alternatives (a different driver, an
@@ -91,10 +114,11 @@ its own cost for this gap alone, and the upstream maintainer has been responsive
 This ADR is **re-closed** as `Accepted` with this decision recorded. It would be **re-opened again**
 if:
 
-- upstream declines to add a cancel/break API (Issue A) after a reasonable review period, or
+- upstream declines to add a cancel/break API (Issue A, submitted as [#24](https://github.com/oracle/rust-oracledb/issues/24)) after a reasonable review period, or
 - a data-corruption defect surfaces with no wrapper-side guard — i.e. a value upstream mis-handles
   silently that Reldex cannot detect and refuse the way U-1/U-2 are refused today, or
-- a new kill criterion fires in the still-outstanding spike S6 (S8 has since passed with limits).
+- a new kill criterion fires in a spike run after this decision (S6 and S8 have since passed, S8 with
+  limits; S10–S14 carry no ADR-0001 kill criterion of their own).
 
 Everything in "Spike outcome (2026-09-20)" above remains the technical record of what was found; this
 section records only what the owner decided to do about it. The "undecided"/"re-opened for the owner"

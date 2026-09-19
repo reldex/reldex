@@ -1,4 +1,5 @@
-//! Shared helpers for the opt-in Oracle integration spikes (ADR-0001 S1–S9).
+//! Shared helpers for the opt-in Oracle integration spikes (ADR-0001 S1–S9,
+//! plus the evidence-gap spikes S10–S14).
 //!
 //! Every test in `tests/` is behind the `oracle-it` feature, so
 //! `cargo test --workspace` stays green without a database. Run them through
@@ -7,9 +8,11 @@
 //!
 //! **No credential appears in test source.** Everything comes from
 //! `RELDEX_TEST_ORACLE_DSN`, `RELDEX_TEST_ORACLE_USER` and
-//! `RELDEX_TEST_ORACLE_PASSWORD`; the privileged extras
-//! (`RELDEX_TEST_ORACLE_SYSTEM_USER`, `..._SYSTEM_PASSWORD`) are optional and
-//! only spike S4 looks for them.
+//! `RELDEX_TEST_ORACLE_PASSWORD`; the privileged extras are optional and every
+//! test that needs one skips itself and says so when it is absent —
+//! `..._SYSTEM_USER`/`..._SYSTEM_PASSWORD` for spike S4's privileged cancel,
+//! `..._SYSDBA_USER`/`..._SYSDBA_PASSWORD` for spike S13, and the `..._TCPS_*`
+//! group for spike S8.
 
 #![allow(dead_code, reason = "each spike file uses a different subset")]
 #![allow(
@@ -21,13 +24,19 @@
     reason = "spike results are measurements a human reads from the test output"
 )]
 
+pub mod proxy;
+
 use std::env;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use reldex_db_driver_api::{
     ConnectionParams, Credentials, DatabaseConnection, DatabaseDriver, DbResult, Endpoint,
-    ExecutionOutcome, ExtensionValue, Extensions, RowBatch, Secret, Statement, TlsMode, ValueRef,
+    ExecutionOutcome, ExtensionValue, Extensions, RowBatch, Secret, SessionRole, Statement,
+    TlsMode, ValueRef,
 };
 use reldex_driver_oracle_thin::OracleThinDriver;
 
@@ -49,6 +58,10 @@ pub const TCPS_CA_DIR: &str = "RELDEX_TEST_ORACLE_TCPS_CA_DIR";
 /// Optional: a directory holding `ewallet.pem` with a CA that signed **nothing**,
 /// for the negative case.
 pub const TCPS_WRONG_CA_DIR: &str = "RELDEX_TEST_ORACLE_TCPS_WRONG_CA_DIR";
+/// Optional: the user spike S13 connects as with [`SessionRole::SysDba`].
+pub const SYSDBA_USER: &str = "RELDEX_TEST_ORACLE_SYSDBA_USER";
+/// Optional: that user's password. Never printed, never asserted on.
+pub const SYSDBA_PASSWORD: &str = "RELDEX_TEST_ORACLE_SYSDBA_PASSWORD";
 
 /// Reads an optional setting.
 pub fn optional(name: &str) -> Option<String> {
@@ -113,6 +126,78 @@ pub fn params() -> ConnectionParams {
             password: Secret::new(setting(PASSWORD)),
         },
     )
+}
+
+/// The host and port half of the configured DSN (`127.0.0.1:1521`).
+///
+/// Spike S10 needs it to point its forwarding proxy at the real listener
+/// without hard-coding an address the runner is free to change.
+pub fn dsn_address() -> String {
+    let dsn = setting(DSN);
+    let without_scheme = dsn.split("://").last().unwrap_or(&dsn).to_owned();
+    without_scheme
+        .split('/')
+        .next()
+        .unwrap_or(&without_scheme)
+        .to_owned()
+}
+
+/// The service name half of the configured DSN (`RELDEX`).
+pub fn dsn_service() -> String {
+    let dsn = setting(DSN);
+    dsn.rsplit('/')
+        .next()
+        .filter(|service| !service.is_empty())
+        .unwrap_or("RELDEX")
+        .to_owned()
+}
+
+/// The ordinary credentials aimed at a different endpoint — S10's proxy, or a
+/// deliberately unreachable address.
+pub fn params_at(connect_string: impl Into<String>) -> ConnectionParams {
+    ConnectionParams::new(
+        Endpoint::ConnectString(connect_string.into()),
+        Credentials::UserPassword {
+            username: setting(USER),
+            password: Secret::new(setting(PASSWORD)),
+        },
+    )
+}
+
+/// Parameters for a `SYSDBA` session, when one is configured.
+///
+/// The password is read here and nowhere else; no test prints it and no
+/// assertion quotes it.
+pub fn sysdba_params() -> Option<ConnectionParams> {
+    let username = optional(SYSDBA_USER)?;
+    let password = optional(SYSDBA_PASSWORD)?;
+    Some(
+        ConnectionParams::new(
+            Endpoint::ConnectString(setting(DSN)),
+            Credentials::UserPassword {
+                username,
+                password: Secret::new(password),
+            },
+        )
+        .with_role(SessionRole::SysDba),
+    )
+}
+
+/// Runs `work` on its own thread and gives up after `limit`.
+///
+/// `None` means the work had not finished in time. The thread is **not**
+/// joined: S10 deliberately provokes calls that may never return, and a spike
+/// that reports "this hangs" is more useful than a suite that hangs. The
+/// abandoned thread holds its connection until the process exits.
+pub fn with_watchdog<T: Send + 'static>(
+    limit: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    receiver.recv_timeout(limit).ok()
 }
 
 /// Parameters for the privileged user, when one is configured.

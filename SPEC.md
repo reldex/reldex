@@ -158,9 +158,17 @@ recorded in `docs/exec-plans/active/phase-0.md` (Workstreams C–G) and
 interim note under §10); TCPS is validated only as one-way TLS 1.2 with an AEAD suite, trusting a
 PEM the user supplies — mutual TLS combined with a private CA, reading an existing Oracle wallet
 (`ewallet.p12`/`cwallet.sso`), OS trust stores and certificate revocation are not available with this
-driver version (spike S8, U-12…U-14); network loss, reconnect, and EXPLAIN PLAN/DBMS_XPLAN were not
-run in Phase 0; privileged connections and metadata/dictionary access have only incidental evidence; NCLOB
-was not directly tested.
+driver version (spike S8, U-12…U-14). Network loss/reconnect, NCLOB, EXPLAIN PLAN/DBMS_XPLAN,
+metadata/dictionary access and privileged connections are all validated (spikes S10–S14): a dead
+socket is detected and reported honestly (`NetworkLost`/`Lost`) in microseconds, and nothing
+reconnects silently — but a **black-holed** connection needs a caller-set deadline to return at all,
+and that deadline then costs the session (no TCP keepalive exists upstream, `EXPIRE_TIME` is parsed
+and never used, and a connect cannot be bounded either — U-15…U-17). `CREATE TRIGGER` with `:NEW`/
+`:OLD` cannot be executed directly, because the upstream parser treats them as bind placeholders even
+inside DDL (U-18); the documented workaround is to submit the DDL inside
+`BEGIN EXECUTE IMMEDIATE q'[…]'; END;`, proven in the same spike. Mobile: cross-compile to
+`aarch64-linux-android`/`aarch64-apple-ios`/`aarch64-apple-ios-sim` is proven in CI (spike S6);
+physical-device validation is still pending (§25, unchanged).
 
 Connectivity:
 - host/port
