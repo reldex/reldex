@@ -17,12 +17,39 @@
 # variables only *after* the import sidesteps this entirely.
 
 # --- CMake / Ninja (portable, per-user, under C:\Qt\Tools) -------------
+# Only this developer's machine has these under C:\Qt\Tools (the toolchain
+# doc installed them there by hand). A CI runner (M1.4, ui.yml) ships its
+# own cmake/ninja already on PATH, so these are prepended only when they
+# actually exist -- never assumed.
 CMAKE_BIN_UNIX="/c/Qt/Tools/CMake/bin"
 NINJA_BIN_UNIX="/c/Qt/Tools/Ninja"
 
 # --- MSVC (vcvars64) - import into THIS shell only ----------------------
-VCVARSALL_WIN="C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat"
 VSWHERE_DIR_WIN="C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer"
+VSWHERE_UNIX="$(cygpath -u "$VSWHERE_DIR_WIN")/vswhere.exe"
+
+# Found via vswhere rather than a hardcoded edition path (the previous
+# version of this script hardcoded ".../2022/Community/...", which only
+# happened to match this developer's workstation. Discovered as a real
+# portability bug in M1.4 (ui.yml): GitHub-hosted windows-latest runners
+# ship Visual Studio *Enterprise* 2022, at a different path, so the
+# hardcoded form failed there outright). This is the same tool
+# docs/exec-plans/active/phase-1-toolchain.md section 2 step 7 already uses
+# by hand to verify the toolchain; using it here too removes the one
+# machine-specific assumption left in this script.
+if [ ! -x "$VSWHERE_UNIX" ]; then
+    echo "env.sh: vswhere.exe not found at $VSWHERE_DIR_WIN -- is Visual Studio installed?" >&2
+    return 1 2>/dev/null || exit 1
+fi
+VS_INSTALL_WIN="$("$VSWHERE_UNIX" -latest -products '*' \
+    -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
+    -property installationPath)"
+VS_INSTALL_WIN="${VS_INSTALL_WIN%$'\r'}"
+if [ -z "$VS_INSTALL_WIN" ]; then
+    echo "env.sh: vswhere found no Visual Studio install with the VC++ x86/x64 toolset." >&2
+    return 1 2>/dev/null || exit 1
+fi
+VCVARSALL_WIN="${VS_INSTALL_WIN}\\VC\\Auxiliary\\Build\\vcvars64.bat"
 
 # Run vcvars64.bat via a tiny generated .bat file (avoids fragile quoting of
 # nested double-quotes / && when going through Git Bash -> cmd.exe), then
@@ -81,16 +108,32 @@ EOF
 unset _vcvars_env _vcvars_capture_unix _vcvars_capture_win _key _value _new_path_unix _entry _conv _old_ifs
 
 # --- Qt (exported AFTER the vcvars import -- see note above) ------------
-export QT_DIR="C:\\Qt\\6.8.3\\msvc2022_64"
-QT_DIR_UNIX="/c/Qt/6.8.3/msvc2022_64"
-export CMAKE_PREFIX_PATH="$QT_DIR"
+# Only exported when this developer's local install exists at its fixed
+# path. A CI runner (M1.4, ui.yml) installs Qt itself via
+# jurplel/install-qt-action, which sets its own Qt6_DIR/PATH -- overriding
+# QT_DIR/CMAKE_PREFIX_PATH here would fight that instead of complementing
+# it, so this script gets out of the way when its own hardcoded Qt is not
+# the one present.
+QT_DIR_CANDIDATE_WIN="C:\\Qt\\6.8.3\\msvc2022_64"
+QT_DIR_CANDIDATE_UNIX="/c/Qt/6.8.3/msvc2022_64"
+_extra_path=""
+if [ -d "$QT_DIR_CANDIDATE_UNIX" ]; then
+    export QT_DIR="$QT_DIR_CANDIDATE_WIN"
+    export CMAKE_PREFIX_PATH="$QT_DIR"
+    _extra_path="$QT_DIR_CANDIDATE_UNIX/bin"
+else
+    echo "env.sh: no local Qt install at $QT_DIR_CANDIDATE_UNIX -- leaving QT_DIR/CMAKE_PREFIX_PATH as already set (e.g. by CI)."
+fi
+[ -d "$CMAKE_BIN_UNIX" ] && _extra_path="${_extra_path:+$_extra_path:}$CMAKE_BIN_UNIX"
+[ -d "$NINJA_BIN_UNIX" ] && _extra_path="${_extra_path:+$_extra_path:}$NINJA_BIN_UNIX"
 
-# --- Prepend Qt/CMake/Ninja to PATH (process-local only) ---------------
-export PATH="$QT_DIR_UNIX/bin:$CMAKE_BIN_UNIX:$NINJA_BIN_UNIX:$PATH"
+# --- Prepend whatever was found above to PATH (process-local only) -----
+export PATH="${_extra_path:+$_extra_path:}$PATH"
+unset _extra_path
 
 echo "Reldex toolchain environment ready (this shell only):"
-echo "  QT_DIR             = $QT_DIR"
-echo "  CMAKE_PREFIX_PATH  = $CMAKE_PREFIX_PATH"
+echo "  QT_DIR             = ${QT_DIR:-<not set by this script -- using whatever was already set>}"
+echo "  CMAKE_PREFIX_PATH  = ${CMAKE_PREFIX_PATH:-<not set by this script -- using whatever was already set>}"
 echo "  cmake              = $(command -v cmake || true)"
 echo "  ninja              = $(command -v ninja || true)"
 echo "  cl (MSVC)          = $(command -v cl || true)"

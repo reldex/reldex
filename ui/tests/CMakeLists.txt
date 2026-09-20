@@ -54,3 +54,9 @@ add_test(NAME tst_coreinfo COMMAND tst_coreinfo)
 set_tests_properties(tst_coreinfo PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
 )
+
+# M1.4: the Qt-free C/C++ smoke harness (ADR-0003 D10 item 2). Reuses the
+# reldex_ffi-shared target and RELDEX_FFI_INCLUDE_DIR that ui/CMakeLists.txt
+# already imported/set; see ui/tests/ffi_smoke/CMakeLists.txt for the guard
+# that keeps this from double-importing Corrosion when built standalone.
+add_subdirectory(ffi_smoke)

@@ -381,3 +381,75 @@ these gotchas produced).
    unaffected; this only bites when invoking `cl`/`dumpbin`/etc. by hand
    from Git Bash for diagnosis, exactly as `cygpath`/`MSYS_NO_PATHCONV`
    are already called out in §6's `env.sh` notes for other tools.
+6. **`tools/dev-env/env.sh`/`env.ps1` hardcoded this one workstation**,
+   discovered while writing `.github/workflows/ui.yml` (M1.4): both scripts
+   hardcoded `...\2022\Community\...` for `vcvars64.bat`, and unconditionally
+   exported `QT_DIR`/`CMAKE_PREFIX_PATH` and prepended `C:\Qt\Tools\CMake`
+   /`C:\Qt\Tools\Ninja` to `PATH`. All four assumptions hold on this
+   developer's machine and fail on a CI runner: GitHub-hosted `windows-latest`
+   ships **Visual Studio Enterprise 2022** (not Community) at a different
+   path (confirmed against `actions/runner-images`' published manifest), and
+   it already has its own `cmake`/`ninja` on `PATH` plus its own Qt install
+   from `jurplel/install-qt-action` (which sets its own `QT_ROOT_DIR`
+   /`PATH`). Fixed minimally, in both scripts: the VS install path is now
+   found via `vswhere.exe -latest -requires
+   Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property
+   installationPath` (the same tool step 7 above already uses by hand,
+   just automated), and the Qt/CMake/Ninja exports and `PATH` prepends only
+   happen when their hardcoded local paths actually exist — otherwise the
+   scripts print a note and leave whatever is already set (CI's own
+   `CMAKE_PREFIX_PATH`/`PATH`) alone. Verified afterwards to still produce
+   an identical environment on this machine (see §6 above); the CI-side
+   behaviour is verified in `ui.yml`'s `qt-build` job (§13 below).
+
+## 13. UI CI (M1.4, ADR-0003 D10/K7)
+
+`.github/workflows/ui.yml` is separate from the fast, hermetic `ci.yml`
+(Rust-only: fmt/clippy/test, plus the `reldex.h`-is-not-stale check). It
+triggers on `push` to `main` and on `pull_request`, filtered to
+`ui/**`, `crates/**`, `Cargo.toml`, `Cargo.lock`, and the workflow file
+itself, with a `concurrency` group that cancels a superseded run — the same
+pattern `ci.yml` already uses.
+
+### Jobs
+
+1. **`ffi-smoke`** (windows/ubuntu/macos, `timeout-minutes: 15`) — builds
+   and runs `ui/tests/ffi_smoke` standalone, no Qt install. Windows uses the
+   `Visual Studio 17 2022` CMake generator specifically so the job needs no
+   vcvars setup at all (this job never touches `tools/dev-env/env.sh`).
+   Ubuntu additionally configures `-DRELDEX_SANITIZE=ON` and runs with
+   `ASAN_OPTIONS=detect_leaks=1`.
+2. **`qt-build`** (windows/ubuntu/macos, `timeout-minutes: 25` — this is
+   spike criterion K7's budget) — installs Qt 6.8.3 (LGPL, `qtshadertools`
+   module only, matching §4-5 above) via `jurplel/install-qt-action`, then
+   runs `bash ui/build.sh --test` with `QT_QPA_PLATFORM=offscreen`. Ubuntu
+   additionally installs `libgl1 libegl1 libxkbcommon0 libfontconfig1
+   libdbus-1-3` — the runtime libraries Qt Quick's plugins `dlopen()` even
+   under the offscreen QPA backend.
+
+### Action pins (commit SHA, per repository policy)
+
+| Action | Pinned commit | Version |
+| --- | --- | --- |
+| `actions/checkout` | `11d5960a326750d5838078e36cf38b85af677262` | v4.4.0 |
+| `dtolnay/rust-toolchain` | `02cb101ec7c40f2c49e1d9714d64511d8e1b74de` | master, 2026-09-20 (no version tags; `toolchain: stable` passed explicitly per the action's own SHA-pinning guidance) |
+| `Swatinem/rust-cache` | `6323deb102c322ba6fcbdcafc7e3dddab59af2b6` | v2.9.2 |
+| `jurplel/install-qt-action` | `bcb88e3bed2e992f5f9e24c0f9e364a231d278eb` | v4.4.0 |
+
+`ci.yml`'s own `Swatinem/rust-cache@v2` is left as-is (out of scope for this
+task); `ui.yml` pins its own copy of the same action by commit per this
+project's third-party-action policy.
+
+### Cold/warm job times
+
+_Filled in from the first real runs on the `phase-1/m1-4-ffi-smoke` PR;
+updated once warm-cache numbers are available from a second run._
+
+| Job | OS | Cold | Warm | Budget |
+| --- | --- | --- | --- | --- |
+| `ffi-smoke` | windows-latest | TBD | TBD | (no formal budget; K7 is `qt-build` only) |
+| `ffi-smoke` | ubuntu-latest (+ASan/UBSan) | TBD | TBD | — |
+| `ffi-smoke` | macos-latest | TBD | TBD | — |
+| `qt-build` | windows-latest | TBD | TBD | 25 min (K7) |
+| `qt-build` | ubuntu-latest | TBD | TBD | 25 min (K7) |
+| `qt-build` | macos-latest | TBD | TBD | 25 min (K7) |

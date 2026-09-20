@@ -57,6 +57,8 @@ ui/adapter/         reldex_adapter: thin static lib + QML module
                      (Reldex.Adapter) — CoreInfo singleton only
 ui/app/             Reldex executable + Main.qml (Reldex.App QML module)
 ui/tests/           tst_coreinfo (QTest), offscreen, run via CTest
+ui/tests/ffi_smoke/ Qt-free C/C++ smoke harness for reldex-ffi (M1.4);
+                     see "The ffi_smoke harness" below
 ui/build.sh         One-command build (bash-first; see AGENTS.md)
 ```
 
@@ -99,6 +101,47 @@ found` the moment they tried to load `Main.qml`. Setting
 warning and the runtime failure, because it is also what
 `_qt_internal_collect_qml_import_paths()` adds to every consumer's import
 path automatically.
+
+## The `ffi_smoke` harness (M1.4)
+
+`ui/tests/ffi_smoke` is a plain **C11** program (also compiled as **C++17**,
+from the same source, to prove `crates/ffi/include/reldex.h` is C++-clean
+too) that links `reldex-ffi`'s cdylib directly and drives the mock driver
+end to end: ABI version check, hub, waker, session open, execute, fetch
+every batch (row counts, a text column via its offsets/data view, a
+`NUMBER` mirror, the null bitmap, column names, a formatted column through
+a `ReldexTextArena`), a failing execute, `struct_size` forward/backward
+compatibility, then a clean teardown. **No Qt** anywhere in this directory
+(ADR-0003 D10 item 2) — it is the boundary test that has to pass before the
+Qt half of the stack is even worth building.
+
+It builds two ways:
+
+```bash
+# Standalone (has its own project(), fetches Corrosion itself):
+bash ui/tests/ffi_smoke/run.sh --clean
+
+#   --sanitize   -fsanitize=address,undefined for the C/C++ targets
+#                (GCC/Clang only; reldex-ffi's Rust code is never
+#                instrumented, but ASan still intercepts its malloc/free
+#                calls from this process). Sets ASAN_OPTIONS=detect_leaks=1
+#                for the ctest run.
+bash ui/tests/ffi_smoke/run.sh --sanitize --clean
+
+# As part of the full UI build (ui/tests/CMakeLists.txt add_subdirectory's
+# it; it reuses reldex_ffi-shared and RELDEX_FFI_INCLUDE_DIR from
+# ui/CMakeLists.txt rather than importing Corrosion a second time):
+bash ui/build.sh --test
+```
+
+Both `reldex_ffi_smoke_c` and `reldex_ffi_smoke_cpp` are registered with
+CTest and print one `[PASS]`/`[FAIL]` line per check; exit code 0 only if
+every check passed. `RELDEX_SANITIZE=ON` is a CMake option on that
+directory alone — it never instruments `reldex-ffi` itself, only the C/C++
+harness targets, on GCC/Clang.
+
+`.github/workflows/ui.yml`'s `ffi-smoke` job runs this on all three OSes
+(no Qt install needed), with ASan+UBSan enabled on the ubuntu leg.
 
 ## Dependencies
 
