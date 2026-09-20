@@ -5,10 +5,12 @@
 ADR-0001 Phase 0 spikes, see "Amendments after the Phase 0 spikes"; amended again after the
 independent review of the `db-core` session layer, see "Amendments after the db-core session review";
 amended again by the owner's connect-time-warning decision, see "Amendment: the connect-time warning
-channel"
+channel"; amended again to say where a connection is *created*, see "Amendment: a connection is
+created on a helper thread"
 **Date:** 2026-09-19
 **Amended:** 2026-09-19 (API review), 2026-09-19 (Phase 0 spikes), 2026-09-19 (db-core session
-review), 2026-09-20 (owner confirmation), 2026-09-20 (connect-time warning channel, C-6)
+review), 2026-09-20 (owner confirmation), 2026-09-20 (connect-time warning channel, C-6),
+2026-09-20 (connection created on a helper thread, C-5)
 
 ## Context
 
@@ -886,6 +888,56 @@ into a statement's warnings, and is empty for a driver with nothing to say); and
 TCPS listener, `a_descriptor_that_sets_dn_matching_opens_a_session_and_reports_the_parameter_as_inert`
 and `a_connect_time_finding_survives_a_session_that_never_executes_a_statement` in
 `crates/drivers/oracle-thin/tests/s8_tcps.rs` — 13 passed, 0 failed, 49.1 s.
+
+## Amendment: a connection is *created* on a helper thread (2026-09-20, contract gap C-5)
+
+Numbering: `H`. Prompted by the independent review of the C-5 work, which found that the code and
+D1/D2 no longer said the same thing.
+
+### H1 — D2's "one worker thread, for the connection's whole life" starts at adoption, not at birth
+
+D2 says a `DatabaseConnection` "is moved to its owning worker thread and never touched from anywhere
+else", and the C-5 work (results file §7, `SPEC.md` §8) makes that literally untrue for one instant:
+the Oracle driver now runs `oracledb::connect` on a **helper thread**, because upstream cannot bound
+a connect and the only way to stop waiting for one is to stop waiting on a different thread (U-15).
+The connection is therefore created on a thread that is not its owner and then moved.
+
+The rule is amended to say what it has always meant:
+
+> A connection is used by exactly one thread at a time, and by exactly one thread for its whole
+> useful life. It may be **constructed** on another thread and moved to its owner before any
+> statement is issued.
+
+This is the ordinary Rust meaning of `Send`, which is what `DatabaseConnection` requires and all
+D2 ever needed. What D2 forbids — two threads holding it, or a second thread touching it after the
+worker has it — is unchanged and unweakened.
+
+### H2 — why the move is a move, and not a race
+
+The handover is a single rendezvous under one mutex (`connect_timeout::Handoff`), which admits
+exactly one of two outcomes and has no window between them:
+
+- the caller collects the connection **before** its limit passes, and from that moment the helper
+  thread holds nothing and never refers to it again; or
+- the limit passes (or the waiting frame unwinds), the rendezvous is marked abandoned *under the
+  lock*, and every later delivery hands the connection straight back to the helper thread, which
+  closes it there.
+
+So a late connection is never adopted, and a connection that is adopted was released by the helper
+thread first. Two threads never hold it, and the thread that closes an abandoned one is the same
+thread that opened it — which is the property D2 cares about. The cost, stated plainly because it is
+real: one thread per abandoned attempt, alive until upstream's connect finally returns, since
+nothing can interrupt it (U-15).
+
+`db-core` is unaffected. It still receives one connection, moves it to one worker thread, and knows
+nothing about how it was made — the driver contract is unchanged, and no other driver has to do
+anything.
+
+*Evidence:* `crates/drivers/oracle-thin/src/connect_timeout.rs` unit tests — in particular
+`a_handoff_that_expired_hands_a_late_value_back_instead_of_adopting_it`,
+`a_session_that_arrives_after_the_limit_is_closed_on_its_own_thread` and
+`a_waiter_that_unwinds_still_leaves_nothing_adopted_or_leaked`, the last two driving the shipped
+`within` rather than a copy of it.
 
 ## Notes for driver implementers
 

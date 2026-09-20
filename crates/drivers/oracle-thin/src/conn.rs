@@ -1296,7 +1296,20 @@ fn finish_rewritten(
             warnings.push(crate::error::compiled_with_errors(&error));
         }
         Err(error) => return Err(error),
-        Ok(outcome) => warnings.extend(outcome.warnings().iter().cloned()),
+        Ok(outcome) => {
+            // The caller plans the rewrite only on the non-query branch, so
+            // this cannot happen; asserting it means that if a row-returning
+            // statement ever becomes rewritable, the tests say so instead of
+            // the result set quietly disappearing into the outcome rebuilt
+            // below.
+            debug_assert!(
+                !outcome.has_cursor()
+                    && matches!(outcome.out_values(), reldex_db_driver_api::OutValues::None),
+                "a rewritten statement produced a cursor or output binds, which rebuilding \
+                 its outcome would discard"
+            );
+            warnings.extend(outcome.warnings().iter().cloned());
+        }
     }
     Ok(ExecutionOutcome::new()
         .with_statement_kind(kind)
@@ -1347,21 +1360,6 @@ impl DatabaseConnection for OracleConnection {
             .as_ref()
             .map(|names| names.iter().map(String::as_str).collect());
 
-        // `CREATE … TRIGGER` whose body upstream would misread as carrying bind
-        // placeholders is submitted inside `EXECUTE IMMEDIATE` instead, because
-        // otherwise it cannot be executed at all (U-18). Only when the caller
-        // declared **no** binds: a statement with real binds is one upstream's
-        // scan is right about, and rewriting it would move the caller's own
-        // placeholders inside a string literal.
-        let rewrite = if self.rewrite_trigger_ddl && statement.binds().is_empty() {
-            crate::rewrite::plan(statement.sql())?
-        } else {
-            None
-        };
-        let sql = rewrite
-            .as_ref()
-            .map_or_else(|| statement.sql(), crate::rewrite::Rewrite::text);
-
         let deadline_warning = deadline_change_warning(
             self.open_result_sets.count(),
             self.armed_deadline,
@@ -1369,10 +1367,33 @@ impl DatabaseConnection for OracleConnection {
         );
         self.apply_deadline(statement.deadline())?;
 
-        let outcome = if returns_rows {
-            self.execute_query(statement, &owned, name_refs.as_deref())
+        // The rewrite is planned **inside** the non-query branch, and only
+        // there. `finish_rewritten` rebuilds the outcome from scratch, which is
+        // safe for DDL and would silently swallow a cursor for anything else; a
+        // future `Rewritable` that returned rows would then lose its result set
+        // without a word. Planning here means such a statement cannot reach
+        // that code at all, rather than relying on a comment saying it must not.
+        let (plan, outcome) = if returns_rows {
+            (
+                crate::rewrite::Plan::AsSubmitted,
+                self.execute_query(statement, &owned, name_refs.as_deref()),
+            )
         } else {
-            self.execute_non_query(statement, sql, kind, &owned, name_refs.as_deref())
+            // `CREATE … TRIGGER` whose body upstream would misread as carrying
+            // bind placeholders is submitted inside `EXECUTE IMMEDIATE`
+            // instead, because otherwise it cannot be executed at all (U-18).
+            // Only when the caller declared **no** binds: a statement with real
+            // binds is one upstream's scan is right about, and rewriting it
+            // would move the caller's own placeholders inside a string literal.
+            let plan = if self.rewrite_trigger_ddl && statement.binds().is_empty() {
+                crate::rewrite::plan(statement.sql())?
+            } else {
+                crate::rewrite::Plan::AsSubmitted
+            };
+            let sql = plan.text(statement.sql());
+            let outcome =
+                self.execute_non_query(statement, sql, kind, &owned, name_refs.as_deref());
+            (plan, outcome)
         };
         // A caller who supplied no binds can still be told that a bind value is
         // missing, because upstream's parser found a `:name` in the statement
@@ -1386,9 +1407,9 @@ impl DatabaseConnection for OracleConnection {
         // A rewritten statement must end the way the one the user wrote would
         // have, which takes more than sending different text; see
         // [`finish_rewritten`].
-        let outcome = match (&rewrite, outcome) {
-            (Some(rewrite), outcome) => finish_rewritten(kind, rewrite, outcome),
-            (None, outcome) => outcome,
+        let outcome = match plan.wrapped() {
+            Some(rewrite) => finish_rewritten(kind, rewrite, outcome),
+            None => outcome,
         };
 
         // One thing the statement did not produce may still have to travel with

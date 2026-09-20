@@ -24,6 +24,20 @@
 //! that is what the user submitted and what the server ran, and the
 //! vendor-neutral [`Warning`] type is used exactly as it is.
 //!
+//! # Two jobs, one switch
+//!
+//! [`plan`] decides two things about a statement, and both are governed by that
+//! one extension:
+//!
+//! 1. **Normalisation**, for every trigger this module recognises: the
+//!    punctuation a SQL\*Plus user types for their own client is removed, and
+//!    the PL/SQL the server needs is not. See [`normalize`].
+//! 2. **Wrapping**, only for the triggers upstream's scan would misread.
+//!
+//! The first applies whether or not the second does, which is the point:
+//! two statements that differ only in a `:NEW` must not differ in whether their
+//! terminator is understood.
+//!
 //! # Scope, and how it grows
 //!
 //! Only `CREATE … TRIGGER` is rewritten today, because only triggers are known
@@ -45,8 +59,23 @@ use crate::classify::Keywords;
 /// is 32767 bytes — bytes, not characters, which is why Thai or emoji in a
 /// trigger body reaches it sooner than its length suggests. Beyond that the
 /// server rejects the block for a reason that has nothing to do with the
-/// trigger, so this refuses first and says why. Verified against the live
-/// database by `s12b_trigger_rewrite.rs`.
+/// trigger, so this refuses first and says why.
+///
+/// # What is measured, and why it is the body
+///
+/// The limit is on what the literal is **worth**, not on how long it is
+/// *written*, and the body is exactly its value on both wrapping paths: `q'X…X'`
+/// quotes the body verbatim, and the doubled-quote fallback un-escapes back to
+/// it. The source text is longer than the value on both — four characters for a
+/// q-string, one per quote for the fallback, so a body at the limit made almost
+/// entirely of quotes is written out in nearly 64 KB — and none of that counts.
+///
+/// Measured against the live database rather than reasoned about, by
+/// `the_plsql_string_literal_limit_is_on_the_value_not_on_the_source_text` in
+/// `s12b_trigger_rewrite.rs`: a 32767-byte value is accepted when written as
+/// 32772, as 36769 and as 65512 bytes of source, and a 32768-byte value is
+/// rejected with `PLS-00172` however it is written. Measuring the emitted
+/// literal instead would refuse statements the server accepts.
 const MAX_WRAPPED_BYTES: usize = 32767;
 
 /// Alternative-quote delimiters, tried in order.
@@ -101,7 +130,44 @@ impl Rewritable {
     }
 }
 
-/// A statement to send in place of what the caller submitted.
+/// What the driver decided to send in place of the text the caller submitted.
+#[derive(Debug, Clone)]
+pub(crate) enum Plan<'a> {
+    /// Send the statement exactly as it was written.
+    AsSubmitted,
+    /// Send this: the same statement with client-side punctuation removed — a
+    /// trailing SQL\*Plus `/` line, and the statement terminator after a trigger
+    /// body that is not a PL/SQL block. See [`normalize`] for what that means
+    /// and why it is not reported as a change.
+    Trimmed(&'a str),
+    /// Send the wrapped form, and tell the caller that it was wrapped.
+    Wrapped(Rewrite),
+}
+
+impl Plan<'_> {
+    /// The text to send, given the text the caller submitted.
+    pub(crate) fn text<'b>(&'b self, submitted: &'b str) -> &'b str {
+        match self {
+            Self::AsSubmitted => submitted,
+            Self::Trimmed(text) => text,
+            Self::Wrapped(rewrite) => &rewrite.text,
+        }
+    }
+
+    /// The rewrite, when the statement was wrapped.
+    ///
+    /// A wrapped statement arrives back from the server as a PL/SQL block's
+    /// outcome rather than as the DDL's, so the caller has repairs to make that
+    /// the other two plans do not; see `conn::finish_rewritten`.
+    pub(crate) fn wrapped(&self) -> Option<&Rewrite> {
+        match self {
+            Self::Wrapped(rewrite) => Some(rewrite),
+            Self::AsSubmitted | Self::Trimmed(_) => None,
+        }
+    }
+}
+
+/// A statement wrapped so upstream's bind scan cannot see into it.
 #[derive(Debug, Clone)]
 pub(crate) struct Rewrite {
     kind: Rewritable,
@@ -110,11 +176,6 @@ pub(crate) struct Rewrite {
 }
 
 impl Rewrite {
-    /// The text to send instead of the caller's.
-    pub(crate) fn text(&self) -> &str {
-        &self.text
-    }
-
     /// The warning that must travel with the outcome.
     ///
     /// The exact text sent is **in the message**. [`Warning`] carries a kind, a
@@ -145,48 +206,87 @@ impl Rewrite {
     }
 }
 
-/// Decides whether `sql` has to be rewritten, and builds the replacement.
+/// Decides what to send for `sql`.
 ///
-/// `Ok(None)` means send it unchanged — which is the answer for everything that
-/// is not a trigger, and for a trigger upstream's scan would leave alone.
+/// [`Plan::AsSubmitted`] is the answer for everything that is not a recognised
+/// trigger. Trigger DDL is normalised either way ([`Plan::Trimmed`]) and wrapped
+/// only when upstream's scan would misread it ([`Plan::Wrapped`]), so a trigger
+/// that needs no rewrite keeps the server's own error positions and reported
+/// kind.
 ///
 /// # Errors
 ///
 /// [`ErrorKind::Unsupported`] when the statement needs the rewrite and is too
 /// large to wrap ([`MAX_WRAPPED_BYTES`]). Refusing with that reason is better
 /// than sending a block the server rejects for an unrelated one.
-pub(crate) fn plan(sql: &str) -> DbResult<Option<Rewrite>> {
+pub(crate) fn plan(sql: &str) -> DbResult<Plan<'_>> {
     let Some(kind) = Rewritable::detect(sql) else {
-        return Ok(None);
+        return Ok(Plan::AsSubmitted);
     };
-    if !upstream_finds_a_bind_placeholder(sql) {
-        // Nothing to work around. Leaving it alone keeps the statement's error
-        // positions and its reported kind exactly as the server produced them.
-        return Ok(None);
+
+    // Normalising before the scan, not after: the punctuation removed here
+    // cannot contain a placeholder, and the text that gets scanned has to be the
+    // text that gets sent.
+    let body = normalize(sql);
+    if !upstream_finds_a_bind_placeholder(body) {
+        // Nothing to work around, so nothing is wrapped. The normalisation still
+        // applies — see `normalize` for why it has to apply to every trigger the
+        // driver recognises rather than only to the ones it wraps.
+        return Ok(if body.len() == sql.len() {
+            Plan::AsSubmitted
+        } else {
+            Plan::Trimmed(body)
+        });
     }
 
-    let body = strip_sqlplus_terminator(sql);
     if body.len() > MAX_WRAPPED_BYTES {
         return Err(DbError::new(
             ErrorKind::Unsupported,
             format!(
                 "this {} statement is {} bytes, and the only way this driver can submit a \
                  trigger body containing `:NEW` or `:OLD` is inside \
-                 `EXECUTE IMMEDIATE q'…'`, whose PL/SQL string literal holds at most \
+                 `EXECUTE IMMEDIATE q'…'`, whose PL/SQL string literal can be worth at most \
                  {MAX_WRAPPED_BYTES} bytes (upstream gap U-18: the Oracle crate reads those \
-                 as bind placeholders and offers no way to stop it). Shorten the trigger — \
-                 moving its body into a package procedure the trigger calls is the usual \
-                 way — or create it with another client",
+                 as bind placeholders and offers no way to stop it). It is the trigger text \
+                 itself that has to fit; how long the literal is written out does not \
+                 matter. Shorten the trigger — moving its body into a package procedure the \
+                 trigger calls is the usual way — or create it with another client",
                 kind.what(),
                 body.len()
             ),
         ));
     }
 
-    Ok(Some(Rewrite {
+    Ok(Plan::Wrapped(Rewrite {
         kind,
         text: wrap(body),
     }))
+}
+
+/// Removes the punctuation a SQL\*Plus user types that the server must not see.
+///
+/// Applied to **every** trigger this module recognises, not only to the ones it
+/// wraps. Doing it only on the wrapped path made the driver's behaviour depend
+/// on something the user cannot see: `CREATE TRIGGER … :NEW … END;\n/` worked
+/// because it was wrapped and trimmed on the way, while the same trigger without
+/// a placeholder was sent with its `/` attached and failed `ORA-00911`. Two
+/// statements that differ only in a `:NEW` must not differ in whether their
+/// terminator is understood.
+///
+/// Two things are removed, both of them addressed to the client rather than to
+/// the server:
+///
+/// - a trailing `/` on a line of its own, which is SQL\*Plus telling *itself* to
+///   submit the buffer ([`strip_sqlplus_terminator`]);
+/// - the statement terminator after a trigger body that is **not** a PL/SQL
+///   block — `… FOR EACH ROW CALL p(:NEW.id);` — which the server rejects with
+///   `ORA-00911` whether it is sent directly or inside `EXECUTE IMMEDIATE`
+///   ([`strip_statement_terminator`]).
+///
+/// The `END;` that closes a PL/SQL body is *not* removed: that semicolon is part
+/// of the language, not punctuation for the client.
+fn normalize(sql: &str) -> &str {
+    strip_statement_terminator(strip_sqlplus_terminator(sql))
 }
 
 /// Builds `BEGIN EXECUTE IMMEDIATE <literal>; END;` around `body`.
@@ -242,6 +342,69 @@ fn strip_sqlplus_terminator(sql: &str) -> &str {
     } else {
         trimmed
     }
+}
+
+/// Removes a trailing statement terminator that PL/SQL would not have written.
+///
+/// A trigger whose body is a PL/SQL block ends with that block's own `END;`, and
+/// that semicolon has to stay. A trigger whose body is a `CALL` ends with the
+/// call, and the `;` a user types after it is SQL\*Plus punctuation the server
+/// rejects (`ORA-00911`) — directly and inside `EXECUTE IMMEDIATE` alike.
+///
+/// **Conservative by construction:** the semicolon is removed only when the text
+/// before it clearly does not close a PL/SQL block. Anything this cannot read —
+/// a quoted trailing identifier such as `END "My Trigger"`, and equally
+/// `CALL "My Proc"` — is left exactly as the user wrote it, because sending a
+/// statement the server rejects is a far smaller harm than silently deleting a
+/// character that mattered.
+fn strip_statement_terminator(text: &str) -> &str {
+    match text.strip_suffix(';') {
+        Some(without) if !closes_a_plsql_block(without) => without.trim_end(),
+        _ => text,
+    }
+}
+
+/// Whether `text` ends where a PL/SQL block ends: `END`, `END name` or
+/// `END "name"`.
+fn closes_a_plsql_block(text: &str) -> bool {
+    let text = text.trim_end();
+    // A quoted name is the case this deliberately does not try to read: both
+    // `END "My Trigger"` and `CALL "My Proc"` end this way, telling them apart
+    // means parsing the statement, and "leave it alone" is the safe answer.
+    if text.ends_with('"') {
+        return true;
+    }
+    let (before_last, last) = split_last_word(text);
+    if last.eq_ignore_ascii_case("END") {
+        return true;
+    }
+    if last.is_empty() {
+        // The body ends in punctuation — `CALL p(:NEW.id)` — so there is no
+        // `END` to be closing anything.
+        return false;
+    }
+    // `END my_trigger`, which is how a compound trigger closes.
+    split_last_word(before_last.trim_end())
+        .1
+        .eq_ignore_ascii_case("END")
+}
+
+/// Splits off the trailing run of identifier characters, which is empty when the
+/// text ends in punctuation.
+fn split_last_word(text: &str) -> (&str, &str) {
+    let start = text
+        .char_indices()
+        .rev()
+        .take_while(|(_, ch)| is_identifier_char(*ch))
+        .last()
+        .map_or(text.len(), |(index, _)| index);
+    text.split_at(start)
+}
+
+/// Oracle's unquoted-identifier characters, minus the rule that the first must
+/// be a letter — which does not matter for reading the last word of a statement.
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '_' | '$' | '#')
 }
 
 /// Whether `oracledb` would find at least one bind placeholder in this text.
@@ -381,15 +544,23 @@ mod tests {
     use super::*;
 
     fn rewritten(sql: &str) -> String {
-        plan(sql)
-            .unwrap_or_else(|error| panic!("{sql}\n  refused: {error}"))
-            .unwrap_or_else(|| panic!("{sql}\n  was not rewritten"))
-            .text()
-            .to_owned()
+        match plan(sql) {
+            Ok(Plan::Wrapped(rewrite)) => rewrite.text.clone(),
+            Ok(other) => panic!("{sql}\n  was not rewritten: {other:?}"),
+            Err(error) => panic!("{sql}\n  refused: {error}"),
+        }
     }
 
     fn unchanged(sql: &str) -> bool {
-        matches!(plan(sql), Ok(None))
+        matches!(plan(sql), Ok(Plan::AsSubmitted))
+    }
+
+    /// What would actually be sent for `sql`.
+    fn sent(sql: &str) -> String {
+        plan(sql)
+            .unwrap_or_else(|error| panic!("{sql}\n  refused: {error}"))
+            .text(sql)
+            .to_owned()
     }
 
     // ----------------------------------------------------------- detection
@@ -414,7 +585,7 @@ mod tests {
              BEFORE EACH ROW IS BEGIN :NEW.a := 1; END BEFORE EACH ROW; END t;",
         ] {
             assert!(
-                plan(sql).is_ok_and(|planned| planned.is_some()),
+                matches!(plan(sql), Ok(Plan::Wrapped(_))),
                 "not rewritten: {sql}"
             );
         }
@@ -431,7 +602,7 @@ mod tests {
             "\u{feff}CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW BEGIN :NEW.a := 1; END;",
         ] {
             assert!(
-                plan(sql).is_ok_and(|planned| planned.is_some()),
+                matches!(plan(sql), Ok(Plan::Wrapped(_))),
                 "not rewritten: {sql}"
             );
         }
@@ -563,7 +734,7 @@ mod tests {
             wrapped,
             format!(
                 "BEGIN EXECUTE IMMEDIATE '{}'; END;",
-                strip_sqlplus_terminator(&sql).replace('\'', "''")
+                normalize(&sql).replace('\'', "''")
             )
         );
     }
@@ -585,10 +756,94 @@ mod tests {
             strip_sqlplus_terminator(body).ends_with("END;"),
             "the trigger's own final END; is PL/SQL and stays"
         );
-        // A `/` that is not alone on the last line is part of the statement.
-        let divides = "CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW\n\
-                       BEGIN :NEW.a := 1 / 2; END;";
-        assert_eq!(strip_sqlplus_terminator(divides), divides);
+    }
+
+    #[test]
+    fn a_slash_that_is_not_a_terminator_line_of_its_own_is_never_stripped() {
+        for kept in [
+            // Division, on the last line.
+            "CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW\nBEGIN :NEW.a := 1 / 2; END;",
+            // A `/` at the end of a line that also holds the statement.
+            "CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW\nBEGIN :NEW.a := 1; END;/",
+            // A `/` inside a literal on the last line.
+            "CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW\nBEGIN :NEW.a := '/'; END;",
+            // A trailing comment line is not a terminator either.
+            "CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW\nBEGIN :NEW.a := 1; END;\n-- /",
+        ] {
+            assert_eq!(strip_sqlplus_terminator(kept), kept, "{kept:?}");
+        }
+    }
+
+    #[test]
+    fn the_terminator_is_stripped_for_every_trigger_the_driver_recognises_not_only_wrapped_ones() {
+        // The asymmetry this exists to prevent: two statements that differ only
+        // in a `:NEW` must not differ in whether their `/` is understood.
+        let with_placeholder =
+            "CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW\nBEGIN :NEW.a := 1; END;\n/";
+        let without = "CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW\nBEGIN NULL; END;\n/";
+
+        assert!(
+            !sent(with_placeholder).contains("END;\n/"),
+            "a wrapped trigger loses its terminator: {}",
+            sent(with_placeholder)
+        );
+        assert_eq!(
+            sent(without),
+            "CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW\nBEGIN NULL; END;",
+            "so must a trigger that needs no wrapping"
+        );
+        assert!(
+            matches!(plan(without), Ok(Plan::Trimmed(_))),
+            "trimming without wrapping is its own plan, and carries no warning"
+        );
+        assert!(
+            plan(without)
+                .expect("a plain trigger is not refused")
+                .wrapped()
+                .is_none(),
+            "trimming must not be mistaken for a rewrite"
+        );
+    }
+
+    #[test]
+    fn a_statement_terminator_after_a_call_body_goes_and_a_plsql_end_stays() {
+        // `CALL` is a trigger body that is not a PL/SQL block, so the `;` a
+        // SQL*Plus user types after it is punctuation the server rejects.
+        assert_eq!(
+            sent("CREATE TRIGGER t AFTER INSERT ON x FOR EACH ROW CALL p(:NEW.id);"),
+            "BEGIN EXECUTE IMMEDIATE \
+             q'[CREATE TRIGGER t AFTER INSERT ON x FOR EACH ROW CALL p(:NEW.id)]'; END;"
+        );
+        // …including behind a `/` line, and when no rewrite is needed.
+        assert_eq!(
+            sent("CREATE TRIGGER t AFTER INSERT ON x FOR EACH ROW CALL p(1);\n/"),
+            "CREATE TRIGGER t AFTER INSERT ON x FOR EACH ROW CALL p(1)"
+        );
+
+        // A PL/SQL block's own `END;` is the language, not punctuation.
+        for kept in [
+            "BEGIN :NEW.a := 1; END;",
+            "BEGIN :NEW.a := 1; END t;",
+            "BEGIN :NEW.a := 1; end My_Trigger;",
+            "BEGIN :NEW.a := 1; END \"My Trigger\";",
+            // Uncertain on purpose: a quoted name could be either, so it stays.
+            "CALL \"My Proc\";",
+        ] {
+            assert_eq!(strip_statement_terminator(kept), kept, "{kept:?}");
+        }
+        for (submitted, stripped) in [
+            ("CALL p(1);", "CALL p(1)"),
+            ("CALL p;", "CALL p"),
+            ("CALL p(1)  ;  ", "CALL p(1)"),
+            // A doubled terminator loses one and keeps PL/SQL's own.
+            ("BEGIN NULL; END;;", "BEGIN NULL; END;"),
+        ] {
+            assert_eq!(
+                strip_statement_terminator(submitted.trim_end()),
+                stripped,
+                "{submitted:?}"
+            );
+        }
     }
 
     // ------------------------------------------------------------ the limit
@@ -619,7 +874,7 @@ mod tests {
         );
         // Trailing whitespace is trimmed before the measurement, so this one is
         // comfortably inside it.
-        assert!(plan(&sql).is_ok_and(|planned| planned.is_some()));
+        assert!(matches!(plan(&sql), Ok(Plan::Wrapped(_))));
     }
 
     // ---------------------------------------------------------- the warning
@@ -627,9 +882,10 @@ mod tests {
     #[test]
     fn the_warning_names_the_cause_the_switch_and_the_exact_text_sent() {
         let sql = "CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW BEGIN :NEW.a := 1; END;";
-        let planned = plan(sql)
-            .expect("a plain trigger is rewritable")
-            .expect("a plain trigger is rewritten");
+        let planned = match plan(sql) {
+            Ok(Plan::Wrapped(rewrite)) => rewrite,
+            other => panic!("a plain trigger is rewritten, got {other:?}"),
+        };
         let warning = planned.warning();
         assert_eq!(warning.kind(), WarningKind::Informational);
         let message = warning.message();
@@ -641,7 +897,7 @@ mod tests {
             "the off switch must be named: {message}"
         );
         assert!(
-            message.contains(planned.text()),
+            message.contains(&planned.text),
             "the exact text sent must be available for inspection: {message}"
         );
     }

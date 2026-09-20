@@ -144,6 +144,15 @@
 //!   [`StatementKind::Ddl`](reldex_db_driver_api::StatementKind::Ddl).
 //!   [`EXT_REWRITE_TRIGGER_DDL`] turns it off, and the explanatory refusal
 //!   comes back instead.
+//!
+//!   The same switch also governs one smaller thing: for **every** trigger this
+//!   driver recognises, wrapped or not, the punctuation a SQL\*Plus user types
+//!   for their client is removed — a trailing `/` on a line of its own, and the
+//!   statement terminator after a body that is not a PL/SQL block, such as
+//!   `… FOR EACH ROW CALL p(:NEW.id);`. A PL/SQL body's own `END;` is kept.
+//!   This is not cosmetic: Oracle does not reject a trigger whose text still
+//!   carries its `/` — it **accepts** it and leaves an `INVALID` trigger
+//!   behind, reporting success.
 //! - **A connect is bounded, by this driver rather than by `oracledb`.**
 //!   `oracledb` 26.0.0-beta.3 cannot bound one at all (upstream gap U-15), so
 //!   [`connect`](reldex_db_driver_api::DatabaseDriver::connect) runs its
@@ -267,8 +276,10 @@
 //!   mismatch fails loudly.
 //! - **A rewritten trigger is limited to 32767 bytes, and its error positions
 //!   move.** The rewrite above puts the DDL in a PL/SQL string literal, whose
-//!   limit is 32767 **bytes** (verified against the live database:
-//!   32768 is `PLS-00172: string literal too long`). A longer trigger is
+//!   limit is 32767 **bytes** of *value* — how long the literal is written out
+//!   does not count (verified against the live database: a 32767-byte value is
+//!   accepted written as 65512 bytes, and 32768 is `PLS-00172: string literal
+//!   too long`). A longer trigger is
 //!   refused with that reason rather than sent to fail obscurely. A trigger
 //!   that compiles with errors is turned back into the success plus
 //!   [`CompiledWithErrors`](reldex_db_driver_api::WarningKind::CompiledWithErrors)
@@ -320,4 +331,6 @@ pub use conn::{
     EXT_REWRITE_TRIGGER_DDL, EXT_STATEMENT_CACHE_SIZE, EXT_WALLET_DIR, EXT_WALLET_PASSWORD,
     OracleThinDriver, install_default_crypto_provider,
 };
-pub use connect_timeout::{DEFAULT_CONNECT_TIMEOUT, EXT_CONNECT_TIMEOUT_UNBOUNDED};
+pub use connect_timeout::{
+    DEFAULT_CONNECT_TIMEOUT, EXT_CONNECT_TIMEOUT_UNBOUNDED, MAX_CONNECT_TIMEOUT,
+};
