@@ -381,3 +381,113 @@ these gotchas produced).
    unaffected; this only bites when invoking `cl`/`dumpbin`/etc. by hand
    from Git Bash for diagnosis, exactly as `cygpath`/`MSYS_NO_PATHCONV`
    are already called out in §6's `env.sh` notes for other tools.
+6. **`tools/dev-env/env.sh`/`env.ps1` hardcoded this one workstation**,
+   discovered while writing `.github/workflows/ui.yml` (M1.4): both scripts
+   hardcoded `...\2022\Community\...` for `vcvars64.bat`, and unconditionally
+   exported `QT_DIR`/`CMAKE_PREFIX_PATH` and prepended `C:\Qt\Tools\CMake`
+   /`C:\Qt\Tools\Ninja` to `PATH`. All four assumptions hold on this
+   developer's machine and fail on a CI runner: GitHub-hosted `windows-latest`
+   ships **Visual Studio Enterprise 2022** (not Community) at a different
+   path (confirmed against `actions/runner-images`' published manifest), and
+   it already has its own `cmake`/`ninja` on `PATH` plus its own Qt install
+   from `jurplel/install-qt-action` (which sets its own `QT_ROOT_DIR`
+   /`PATH`). Fixed minimally, in both scripts: the VS install path is now
+   found via `vswhere.exe -latest -requires
+   Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property
+   installationPath` (the same tool step 7 above already uses by hand,
+   just automated), and the Qt/CMake/Ninja exports and `PATH` prepends only
+   happen when their hardcoded local paths actually exist — otherwise the
+   scripts print a note and leave whatever is already set (CI's own
+   `CMAKE_PREFIX_PATH`/`PATH`) alone. Verified afterwards to still produce
+   an identical environment on this machine (see §6 above); the CI-side
+   behaviour is verified in `ui.yml`'s `qt-build` job (§13 below).
+
+## 13. UI CI (M1.4, ADR-0003 D10/K7)
+
+`.github/workflows/ui.yml` is separate from the fast, hermetic `ci.yml`
+(Rust-only: fmt/clippy/test, plus the `reldex.h`-is-not-stale check). It
+triggers on `push` to `main` and on `pull_request`, filtered to
+`ui/**`, `crates/**`, `Cargo.toml`, `Cargo.lock`, and the workflow file
+itself, with a `concurrency` group that cancels a superseded run — the same
+pattern `ci.yml` already uses.
+
+### Jobs
+
+1. **`ffi-smoke`** (windows/ubuntu/macos, `timeout-minutes: 15`) — runs
+   `bash ui/tests/ffi_smoke/run.sh` directly (`--sanitize` on ubuntu only),
+   the exact script a developer runs locally, no Qt install. On Windows this
+   still goes through `tools/dev-env/env.sh` for MSVC discovery (via
+   vswhere) plus `-G Ninja`; an earlier version of this job tried a
+   `Visual Studio 17 2022` CMake generator specifically to avoid needing
+   vcvars at all, but that generator failed to find any VS instance on the
+   actual `windows-latest` runner (§12 item 6 below covers why env.sh's own
+   VS discovery had to become dynamic first), so this job now shares the
+   exact same env.sh + Ninja path `qt-build` already used successfully.
+   Ubuntu additionally configures `-DRELDEX_SANITIZE=ON` and runs with
+   `ASAN_OPTIONS=detect_leaks=1`.
+2. **`qt-build`** (windows/ubuntu/macos, `timeout-minutes: 25` — this is
+   spike criterion K7's budget) — installs Qt 6.8.3 (LGPL, `qtshadertools`
+   module only, matching §4-5 above) via `jurplel/install-qt-action`, then
+   runs `bash ui/build.sh --test` with `QT_QPA_PLATFORM=offscreen`. Ubuntu
+   additionally installs `libgl1 libegl1 libxkbcommon0 libfontconfig1
+   libdbus-1-3` — the runtime libraries Qt Quick's plugins `dlopen()` even
+   under the offscreen QPA backend. macOS additionally runs
+   `.github/scripts/patch-macos-qt-agl.py` against the installed Qt right
+   after the install step, working around
+   [QTBUG-137687](https://bugreports.qt.io/browse/QTBUG-137687): Qt 6.8.3's
+   `FindWrapOpenGL.cmake` still links a hardcoded `-framework AGL`, which
+   Apple removed from the macOS 26 (Tahoe) / Xcode 26 SDK that
+   `macos-latest` now ships, so every Qt Quick target failed to link
+   (`ld: framework 'AGL' not found`) without this. Fixed upstream in Qt
+   6.8.4/6.9.2; not applied by bumping the version pin because 6.8.4 was not
+   yet published to aqtinstall's open-source macOS channel as of
+   2026-09-20 (`aqt list-qt mac desktop --spec 6.8` tops out at 6.8.3), and
+   moving to the 6.9 minor line is a version-policy decision for the owner,
+   not this task. The script fails the job loudly if the installed file's
+   text does not match what it expects, rather than silently no-op'ing.
+
+### Action pins (commit SHA, per repository policy)
+
+| Action | Pinned commit | Version |
+| --- | --- | --- |
+| `actions/checkout` | `11d5960a326750d5838078e36cf38b85af677262` | v4.4.0 |
+| `dtolnay/rust-toolchain` | `02cb101ec7c40f2c49e1d9714d64511d8e1b74de` | master, 2026-09-20 (no version tags; `toolchain: stable` passed explicitly per the action's own SHA-pinning guidance) |
+| `Swatinem/rust-cache` | `6323deb102c322ba6fcbdcafc7e3dddab59af2b6` | v2.9.2 |
+| `jurplel/install-qt-action` | `bcb88e3bed2e992f5f9e24c0f9e364a231d278eb` | v4.4.0 |
+
+`ci.yml`'s own `Swatinem/rust-cache@v2` is left as-is (out of scope for this
+task); `ui.yml` pins its own copy of the same action by commit per this
+project's third-party-action policy.
+
+### Cold/warm job times
+
+Measured on PR #16 (`phase-1/m1-4-ffi-smoke`): "cold" is the first-ever run
+of this workflow (run `35492858488`, no `Swatinem/rust-cache` or
+`jurplel/install-qt-action` cache yet existed); "warm" is the third run
+(run `35494036735`, the first fully green one, benefiting from both caches
+populated by the first two runs). Total job wall time, `Set up job` through
+`Complete job`.
+
+| Job | OS | Cold | Warm | Budget |
+| --- | --- | --- | --- | --- |
+| `ffi-smoke` | windows-latest | n/a¹ | 1m27s | (no formal budget; K7 is `qt-build` only) |
+| `ffi-smoke` | ubuntu-latest (+ASan/UBSan) | 38s | 33s | — |
+| `ffi-smoke` | macos-latest | 28s | 24s | — |
+| `qt-build` | windows-latest | 3m2s | 2m35s | 25 min (K7) |
+| `qt-build` | ubuntu-latest | 2m10s | 1m26s | 25 min (K7) |
+| `qt-build` | macos-latest | n/a² | 54s | 25 min (K7) |
+
+¹ The cold run used an earlier `ffi-smoke` design (a `Visual Studio 17 2022`
+CMake generator, to avoid touching vcvars) that failed outright on
+`windows-latest` (`could not find any instance of Visual Studio`) before
+this job existed in its current form (`run.sh` + `env.sh` + Ninja, same as
+`qt-build`) — no cold timing exists for the current implementation.
+² The cold run's `qt-build`/macos-latest failed at `bash ui/build.sh --test`
+(the dylib-copy race `ui/cmake/CopyIfDifferentRetry.cmake` now absorbs, see
+§12), before the QTBUG-137687 workaround above even existed. Its `Install
+Qt 6.8` step alone (genuinely cold, no cache) took 76s, vs. 19s once warm —
+the only cold data point available for that step on this OS.
+
+Every `qt-build` leg finishes in under 3m5s against K7's 25-minute budget —
+no OS is close to the limit; Qt install (cold) plus `ui/build.sh --test`
+account for nearly all of it.

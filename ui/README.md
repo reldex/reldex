@@ -44,19 +44,24 @@ On Windows, `ui/build.sh` sources `tools/dev-env/env.sh` itself (detected via
 `uname -s` matching `MINGW*`/`MSYS*`/`CYGWIN*`) — you do not need to source
 it yourself first. On Linux/macOS the script assumes `cmake`/`ninja` are
 already on `PATH` and Qt 6.8 is discoverable via `CMAKE_PREFIX_PATH` or
-`Qt6_DIR`; **that path has not been exercised** by whoever last verified
-this file — only Windows was available. If something is wrong with it,
-that is the first thing to check.
+`Qt6_DIR`. This path is now exercised on every PR by `.github/workflows/ui.yml`
+(`qt-build`, M1.4), which installs Qt via `jurplel/install-qt-action` and runs
+this exact script on `ubuntu-latest` and `macos-latest` with
+`QT_QPA_PLATFORM=offscreen` — so it is no longer untested, though nobody has
+run it on a Linux/macOS **developer workstation** (as opposed to a fresh CI
+runner) yet.
 
 ## Layout
 
 ```text
 ui/CMakeLists.txt   Top-level: Qt, Corrosion/reldex-ffi, shared helpers
-ui/cmake/           CompilerWarnings.cmake (the only CMake helper module)
+ui/cmake/           CompilerWarnings.cmake, CopyIfDifferentRetry.cmake
 ui/adapter/         reldex_adapter: thin static lib + QML module
                      (Reldex.Adapter) — CoreInfo singleton only
 ui/app/             Reldex executable + Main.qml (Reldex.App QML module)
 ui/tests/           tst_coreinfo (QTest), offscreen, run via CTest
+ui/tests/ffi_smoke/ Qt-free C/C++ smoke harness for reldex-ffi (M1.4);
+                     see "The ffi_smoke harness" below
 ui/build.sh         One-command build (bash-first; see AGENTS.md)
 ```
 
@@ -100,6 +105,47 @@ warning and the runtime failure, because it is also what
 `_qt_internal_collect_qml_import_paths()` adds to every consumer's import
 path automatically.
 
+## The `ffi_smoke` harness (M1.4)
+
+`ui/tests/ffi_smoke` is a plain **C11** program (also compiled as **C++17**,
+from the same source, to prove `crates/ffi/include/reldex.h` is C++-clean
+too) that links `reldex-ffi`'s cdylib directly and drives the mock driver
+end to end: ABI version check, hub, waker, session open, execute, fetch
+every batch (row counts, a text column via its offsets/data view, a
+`NUMBER` mirror, the null bitmap, column names, a formatted column through
+a `ReldexTextArena`), a failing execute, `struct_size` forward/backward
+compatibility, then a clean teardown. **No Qt** anywhere in this directory
+(ADR-0003 D10 item 2) — it is the boundary test that has to pass before the
+Qt half of the stack is even worth building.
+
+It builds two ways:
+
+```bash
+# Standalone (has its own project(), fetches Corrosion itself):
+bash ui/tests/ffi_smoke/run.sh --clean
+
+#   --sanitize   -fsanitize=address,undefined for the C/C++ targets
+#                (GCC/Clang only; reldex-ffi's Rust code is never
+#                instrumented, but ASan still intercepts its malloc/free
+#                calls from this process). Sets ASAN_OPTIONS=detect_leaks=1
+#                for the ctest run.
+bash ui/tests/ffi_smoke/run.sh --sanitize --clean
+
+# As part of the full UI build (ui/tests/CMakeLists.txt add_subdirectory's
+# it; it reuses reldex_ffi-shared and RELDEX_FFI_INCLUDE_DIR from
+# ui/CMakeLists.txt rather than importing Corrosion a second time):
+bash ui/build.sh --test
+```
+
+Both `reldex_ffi_smoke_c` and `reldex_ffi_smoke_cpp` are registered with
+CTest and print one `[PASS]`/`[FAIL]` line per check; exit code 0 only if
+every check passed. `RELDEX_SANITIZE=ON` is a CMake option on that
+directory alone — it never instruments `reldex-ffi` itself, only the C/C++
+harness targets, on GCC/Clang.
+
+`.github/workflows/ui.yml`'s `ffi-smoke` job runs this on all three OSes
+(no Qt install needed), with ASan+UBSan enabled on the ubuntu leg.
+
 ## Dependencies
 
 **Corrosion** (`corrosion-rs/corrosion`, MIT licence) drives `cargo` from
@@ -139,12 +185,15 @@ directly, per D9.
 Windows has no rpath, so `reldex_ffi.dll` (and its `.pdb`) must sit next to
 every executable that (transitively) links `reldex_ffi-shared`. A small
 CMake function in `ui/CMakeLists.txt`, `reldex_deploy_ffi_dll(<target>)`,
-adds a `POST_BUILD` step doing
-`cmake -E copy_if_different $<TARGET_FILE:reldex_ffi-shared> $<TARGET_FILE_DIR:target>`;
-it is called once each for `Reldex` and `tst_coreinfo`. Qt's own DLLs are
-resolved via `PATH` (`tools/dev-env/env.sh` puts Qt's `bin/` there); no
-`windeployqt` step exists yet because this is a dev-build skeleton, not
-packaging (that is a later M6 task).
+adds a `POST_BUILD` step that copies it via
+`ui/cmake/CopyIfDifferentRetry.cmake` (a plain `copy_if_different` wrapped
+with a retry — M1.4's CI hit a transient "source not found" from a bare
+`copy_if_different` under enough ninja parallelism on macOS once
+`ui/tests/ffi_smoke` added two more targets doing the same copy; see that
+script's header comment); it is called once each for `Reldex` and
+`tst_coreinfo`. Qt's own DLLs are resolved via `PATH` (`tools/dev-env/env.sh`
+puts Qt's `bin/` there); no `windeployqt` step exists yet because this is a
+dev-build skeleton, not packaging (that is a later M6 task).
 
 Rust's own build artefacts (the actual `target/` cargo uses) live inside
 the CMake build tree, under `build/ui-<config>/cargo/`, which is Corrosion's
@@ -166,11 +215,14 @@ module (`Qt6Charts`, `Qt6WebEngineCore`, etc.) is present.
 
 ## Known limitations
 
-- **Linux/macOS are untested.** The CMake is written to work there (Qt
-  discovered via `CMAKE_PREFIX_PATH`/`Qt6_DIR`, Corrosion is
-  platform-agnostic, `ui/build.sh` has a non-Windows branch), but nobody
-  has run it — only a Windows 11 + MSVC 2022 + Qt 6.8.3 machine was
-  available. CI for all three OSes is M6.7, not this task.
+- **Linux/macOS are CI-tested, not developer-workstation-tested.** M1.4
+  added `.github/workflows/ui.yml`, which builds and runs this whole tree
+  (`ffi-smoke` standalone, `qt-build` full Qt Quick build + `ctest`,
+  offscreen) on `windows-latest`/`ubuntu-latest`/`macos-latest` on every PR.
+  That proves the non-Windows CMake path (Qt via `CMAKE_PREFIX_PATH`,
+  Corrosion, `ui/build.sh`'s non-Windows branch) works on a fresh CI runner;
+  nobody has yet run it by hand on a real Linux/macOS development machine
+  (only Windows 11 + MSVC 2022 + Qt 6.8.3 was available for that).
 - **No `windeployqt` / packaging step.** Qt DLLs are found via `PATH` in
   this dev environment; a real installer/package needs `windeployqt` (or
   the CMake `qt_generate_deploy_app_script()` equivalent), which is out of
