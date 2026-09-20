@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-21T02:06:00+07:00",
+  "updatedAt": "2026-09-21T03:51:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1166,8 +1166,8 @@
               "status": "done"
             },
             {
-              "title": "M2.6 ★ SessionRegistry + non-blocking open, abandon semantics (opus, review mandatory)",
-              "status": "todo"
+              "title": "M2.6 ★ SessionRegistry + non-blocking open, abandon semantics (opus, review mandatory) — done 2026-09-21: SessionRegistry — open never blocks (one Opened/OpenFailed, one Terminal, last); abandon never blocks and is never refused, a late connect is closed by the worker (0 leaks in 960 randomized sessions); Terminal.transaction_possibly_lost computed on the worker covers abandon/retire/drop/lost; one-deadline teardown; independently reviewed twice (3 must-fix fixed); ADR-0002 amendment R",
+              "status": "done"
             },
             {
               "title": "M2.7 ★ Server output capability (DBMS_OUTPUT) in contract + driver + core polling when enabled (opus, review mandatory)",
@@ -1648,6 +1648,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-21",
+      "text": "M2.6 done: SessionRegistry with non-blocking open and abandon. Independent review found no leaked connection in 960 randomized sessions and clean lock discipline, and 3 must-fix, all about not hiding transaction loss or blocking shutdown: abandon() reported 'no transaction lost' from a caller-thread snapshot while a queued INSERT was still to run and be rolled back; registry teardown waited N x 500 ms serially although the ADR claimed the waits overlapped (now one deadline: ~0.51 s for 8 stuck sessions); and a DML that dies with its connection re-read the dead connection's cached 'inactive' state. The authoritative answer is now Terminal.transaction_possibly_lost, computed on the worker when the session really ends. The C ABI is unchanged; M2.11 switches the FFI to this path and must carry the new field to the user."
+    },
     {
       "date": "2026-09-21",
       "text": "M2.5 done: db-core event queue, sink and the ReplyTo refactor — replies go either through Completion (unchanged) or as typed SessionEvents into one queue with an edge-triggered waker, no thread per session. Independent review could not break exactly-once (200 x 91 requests racing a close, 300 double closes, 8-session fan-in) but found 3 must-fix: TransactionStateChanged could be dropped behind a ServerOutput burst at the cap, max_outstanding_requests did not bound the queue as four documents claimed (measured 5,000 queued against a limit of 1,024; now a slot rides on the queued reply and is released on pop), and a contention-flaky waker test. Also fixed: 7.7% spurious close errors under concurrent close, bind_events after Terminal, close refused at the cap. The FFI still uses its interim pump; M2.11 switches it (mapping recorded). Per-event cost ~430-640 ns vs ~2,000 ns on the Completion path at one producer."
