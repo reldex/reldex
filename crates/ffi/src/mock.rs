@@ -69,6 +69,17 @@ pub enum ReldexMockStatement {
     ///
     /// Mock-only, and compiled in only with the `mock-driver` feature.
     PumpPanic = 6,
+    /// A result set with the S14 columns and **no rows**.
+    ///
+    /// The case a grid gets wrong: `EXECUTED` reports three columns, the first
+    /// fetch comes back empty, and there is never a batch to read the column
+    /// names from. A header built from the first batch shows nothing here; one
+    /// built from `reldex_session_result_column` is correct.
+    ///
+    /// Deliberately a separate statement rather than
+    /// [`ReldexMockScenarioConfig::rows`] `= 0`, which keeps its documented
+    /// meaning of "1,000".
+    EmptyQuery = 7,
 }
 
 /// How a mock session's scripted world is parameterised.
@@ -131,6 +142,8 @@ pub extern "C" fn reldex_mock_statement(kind: i32) -> ReldexStr {
     entry_value(ReldexStr::empty(), || {
         let text = if kind == ReldexMockStatement::GeneratedQuery as i32 {
             statements::GENERATED_QUERY
+        } else if kind == ReldexMockStatement::EmptyQuery as i32 {
+            statements::EMPTY_QUERY
         } else if kind == ReldexMockStatement::Block as i32 {
             statements::BLOCK
         } else if kind == ReldexMockStatement::Failing as i32 {
@@ -153,6 +166,7 @@ pub extern "C" fn reldex_mock_statement(kind: i32) -> ReldexStr {
 /// it.
 pub(crate) mod statements {
     pub(crate) const GENERATED_QUERY: &str = "SELECT * FROM reldex_generated\0";
+    pub(crate) const EMPTY_QUERY: &str = "SELECT * FROM reldex_generated WHERE 1 = 0\0";
     pub(crate) const BLOCK: &str = "BEGIN reldex_block; END;\0";
     pub(crate) const FAILING: &str = "SELECT * FROM reldex_missing\0";
     pub(crate) const PANICKING: &str = "SELECT reldex_panic FROM dual\0";
@@ -268,6 +282,12 @@ pub(crate) fn build_driver(options: &ReldexOpenOptions) -> Result<DriverChoice, 
     scenario.on_sql(
         statements::text(statements::GENERATED_QUERY),
         Action::GeneratedQuery(spec),
+    );
+    // The same three columns, zero rows: a result whose headers exist and
+    // whose batches never will.
+    scenario.on_sql(
+        statements::text(statements::EMPTY_QUERY),
+        Action::GeneratedQuery(GeneratedQuerySpec::s14_shape(0, config.seed)),
     );
 
     let gate = BlockGate::new();

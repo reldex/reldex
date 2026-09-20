@@ -369,10 +369,11 @@ cast that is wrong on one platform. The rule, now stated on the struct:
 * an **id** is `uint64_t`; an **enum** is `int32_t`.
 
 That changes `ReldexEvent`'s layout, which D7 says is a **major** bump, so
-`RELDEX_ABI_VERSION_MAJOR` is `2`. Version 1 was never accepted and never shipped — this ADR is
-still Proposed — so the number moves once, here, together with the other review changes, rather
-than pretending a recompiled adapter would still be compatible. `ReldexMockStatement` also gained
-`PUMP_PANIC = 6`, which would only have been a minor bump on its own.
+`RELDEX_ABI_VERSION_MAJOR` moved to `2` here. (A19 moved it again, to `3`; `2` is what this
+amendment set.) Version 1 was never accepted and never shipped — this ADR is still Proposed — so
+the number moves rather than pretending a recompiled adapter would still be compatible.
+`ReldexMockStatement` also gained `PUMP_PANIC = 6`, which would only have been a minor bump on its
+own.
 
 ### A12 — what is thread-safe about a fetched batch, and what that cost
 
@@ -504,3 +505,206 @@ All now in the header, on the function each belongs to:
   while the code allowed the second; both are now stated and tested.
 * **`ReldexArenaView::data` is never null**, even for an empty arena, where it used to be a
   dangling `0x1`.
+
+## Amendment (pre-acceptance): what the first consumers changed (2026-09-20, ABI round 2)
+
+Numbering continues: `A19`–`A25`. A1–A9 came from building `crates/ffi` (M1.3), A10–A18 from the
+independent review of it. **These came from the first two things that actually used the boundary**:
+the Qt adapter (M1.6) and the C smoke harness (M1.4). Nothing here is a new idea about what the
+boundary should be; each item is a place where a real consumer paid for something it did not want,
+or had to invent a workaround the ABI should have made unnecessary. **The status is unchanged: this
+is still Proposed, and spike S15 is still the gate.** Doing this now is deliberate — once S15 has
+measured the boundary, changing it means measuring it again.
+
+The ABI major version moves 2 → 3 (A11 moved it 1 → 2). One of these changes is silent for a
+recompiled caller, which is exactly what a major bump is for.
+
+### A19 — `reldex_batch_column` builds no mirror; the mirror has its own call (D4)
+
+D4 and A1/A2 describe `fixed` as the zero-copy element array for the fixed-width kinds. For `bool`,
+`f32` and `f64` it really is zero-copy: the driver's storage *is* a C-compatible array and the view
+borrows it. For `NUMBER` and `TIMESTAMP` it never was. The driver-contract types are Rust shapes;
+crossing them means building a `ReldexNumber[]` (46 bytes per row) or a `ReldexTimestamp[]` (16
+bytes per row) and **retaining it for the batch's life**, cached in a `OnceLock` per column.
+
+`reldex_batch_column` built that on first sight of the column. The Qt model calls it once per
+column per batch — and never reads `fixed`. It renders cells through the bulk formatter (D4's own
+design) or, for `TEXT`/`JSON`, straight out of the borrowed UTF-8. So every mirror was pure waste,
+and it was not small:
+
+| 1,000,000 rows of the S14 shape, every batch retained | live bytes | per row |
+| --- | --- | --- |
+| every column described, no mirror | 123,313,892 | 123.3 B |
+| every column viewed *with* its fixed mirror | 185,301,203 | 185.3 B |
+
+(`cargo test --release -p reldex-ffi --test allocations -- --ignored --nocapture
+measure_the_bytes`, counting `#[global_allocator]`; three columns: `NUMBER`, `VARCHAR2`, `DATE`.)
+
+**Read the delta, not the absolutes.** Those totals are whole-process live bytes — they include the
+mock driver's generation buffers and whatever the pump thread held at the sampling instant — and
+they are not RSS. What is solid is the **62.0 B/row difference**, exactly 46 + 16, because the two
+runs differ in exactly one thing. That is about **59 MiB per million rows, roughly 30% of spike
+S15's 200 MB K3 budget, spent on arrays no consumer read.** It is not by itself a breach of K3, and
+nothing here claims it is: K3 is an RSS measurement that S15 and M1.8 will make properly.
+
+For context only, and not as evidence: while building M1.6 the adapter worker measured Windows
+working-set growth after 1M rows of about +177 MB headless and +231 MB in the real app, with the
+mirrors in place. That is an informal number from an unmerged branch (recorded in `ui/README.md`
+there), taken with a different method on one machine. It is the reason this was looked at, not the
+reason it was changed — the reason it was changed is that 59 MiB was being spent on nothing.
+
+**Decision.** `reldex_batch_column` allocates nothing, ever. For `NUMBER` and `TIMESTAMP` it leaves
+`fixed` NULL and `fixed_len` 0, and still reports `fixed_stride` so a caller can size its own
+buffer. The new `reldex_batch_column_fixed(batch, column, out)` builds the mirror through the same
+`OnceLock` — same thread-safety as A12, same cache, one allocation per column for the batch's life
+— and is the only allocating function in the batch API. Its header entry states the per-element
+cost in bytes and points a caller that only wants text at `reldex_batch_format_column`.
+
+**The natively compatible kinds stay zero-copy in the plain view**, and that is not an
+inconsistency. `BOOLEAN`, `BINARY_FLOAT` and `BINARY_DOUBLE` are stored by the driver as `bool[]`,
+`f32[]` and `f64[]`, which already *are* the C arrays the header promises: pointing at them costs
+nothing and retains nothing. Hiding them behind the second call would make `fixed` mean "sometimes
+present, ask twice" for kinds whose first answer is free. The rule is therefore mechanical and
+checkable: **`reldex_batch_column` exposes `fixed` exactly when the bytes already exist**, and
+`reldex_batch_column_fixed` is the only way to make bytes that do not.
+
+Asserted by `tests/allocations.rs::describing_every_column_allocates_nothing`: viewing every column
+of a `NUMBER`/`TEXT`/`TIMESTAMP` batch allocates zero times, twice over; the mirror then costs
+exactly one allocation, and the second ask costs none.
+
+### A20 — a result's columns are described at `EXECUTED`, not at the first batch (D4, D6)
+
+`ReldexEvent::column_count` told the adapter how many columns a result had; the names and types
+needed `reldex_batch_column_info` on a batch. The Qt model therefore put an unnamed header up on
+`EXECUTED` and rebuilt it — `beginResetModel()`, drop everything, re-read the headers — when the
+first batch arrived. Two costs: a mid-stream model reset on every query, and a result with columns
+and **no rows** whose headers never arrive at all, because there is no batch to ask.
+
+`reldex_session_result_column_count(hub, session, result)` and
+`reldex_session_result_column(hub, session, result, column, out)` answer from the moment the
+`EXECUTED` event naming that result is drained. They allocate nothing: the shared, NUL-terminated
+column descriptions are already built once per result set, in the pump, and shared by every batch
+of it — these read the same object.
+
+**Ownership was the only real decision.** Two shapes were considered and rejected:
+
+* *An owned handle on the event* (a `ReldexColumns*` the caller releases). It answers the lifetime
+  question perfectly and adds a third kind of thing a caller can leak, on the hottest event there
+  is. A16/A17's problem is already "the adapter forgets to release something"; this would make the
+  common path allocate and hand out an object where today it hands out nothing.
+* *Copying the descriptions into the event struct.* Not possible with a fixed-size `#[repr(C)]`
+  struct without allocating per event, which is what A15's whole argument is against.
+
+An accessor keyed by the result id borrows what already exists and adds nothing to release. The
+price is that the strings have a lifetime the header must state exactly, and it does: they are
+valid until the caller **submits** `reldex_session_close_result` for that result, submits
+`reldex_session_close` for the session, or calls `reldex_hub_destroy` — "submits", not "is
+answered", because the pump may free them from its own thread the moment it takes the command. A Qt
+model copies them into `QString`s at that first call anyway, which is what makes the conservative
+rule free in practice.
+
+One deliberate difference from the batch version: `kind` here is what the column's **declared** SQL
+type maps to, while `reldex_batch_column_info` reports the storage a particular batch actually
+used. They agree for every type the ADR-0002 contract can represent. Where they cannot — a driver
+falling back to best-effort text for a type it could not carry — the batch is the one telling the
+truth about the bytes, and the header says a cell reader must use the batch's `kind`.
+`reldex_batch_column_info` is unchanged and keeps working on a batch held past the close, because
+the batch holds its own claim on the same shared description.
+
+**Making the documented lifetime true in every path (from the round-2 review).** The three
+invalidators are all things the *caller* does, so no path of ours may free those strings. Two did.
+The pump's panic containment (A14) tore the session down by clearing its result map on the **pump**
+thread, and the accessor's own `Arc` clone could be the last one alive if the map was cleared while
+it was returning — in both cases the caller was left holding freed pointers, with nothing
+caller-initiated behind it. Both are fixed the same way: **the pump retires, it never frees.**
+Columns removed because the caller submitted a close go to a `released` holder that the caller's own
+thread empties on its next call into that session; columns of results that were still open when the
+session was *lost* go to a `lost` holder that only a submitted `reldex_session_close` or
+`reldex_hub_destroy` empties — and `reldex_hub_destroy` empties it synchronously, on the thread that
+called it. What that does **not** promise is that the result is still there: on a lost session the
+accessor reports `NOT_FOUND`, because the result really is gone. What was handed out stays readable;
+what was not is not invented.
+
+### A21 — `FETCHED` and `RESULT_CLOSED` carry the result id
+
+`ReldexEvent::result` was set only on `EXECUTED`. A `FETCHED` event therefore said which *request*
+it answered but not which *result*, so the adapter kept a request-to-result map of its own and
+looked every reply up in it — pure bookkeeping for something this library already knows.
+
+`result`/`has_result` are now set on `FETCHED` and `RESULT_CLOSED` too, including on a failure:
+which result failed to fetch is exactly what an error report needs. On `RESULT_CLOSED` the id names
+what **ended** — it is no longer valid by the time the event is drained, and the header says so.
+
+That has to hold for *synthesised* replies as well, which the round-2 review caught it not doing: a
+fetch queued behind a pump panic came back with `has_result == false`, because the containment built
+its reply from a shape that carried only the kind and the request id. The shape now carries the
+result id too, so a contained panic answers with the same-shaped event a success would have. An
+adapter that routes a `FETCHED` by `event.result` never has to special-case the failure path —
+which is the only reason the field is worth having.
+
+### A22 — an empty result set is reachable in the mock
+
+There was no way to script "three columns, zero rows": `ReldexMockScenarioConfig::rows = 0` is
+documented as "1,000", and changing that would silently alter every existing caller's world. The
+new `RELDEX_MOCK_STATEMENT_EMPTY_QUERY` is a separate statement with the same S14 columns and no
+rows. It is the case A20 exists for, and both the Rust suite and the C harness now cover it.
+
+### A23 — live-object counts, because ASan is not available (D2, K5)
+
+D2 plans ASan for the C harness and K5 is written in terms of it. A9 already records that Miri
+cannot run here; ASan is in the same position on this machine. More to the point, a sanitizer would
+not catch the failure most likely to actually happen at this boundary, which is not a
+use-after-free but a `ReldexBatch*` or `ReldexError*` nobody released — invisible to every test
+until memory runs out.
+
+`reldex_live_counts(out)` reports how many hubs, sessions, batches, errors and text arenas this
+library currently holds. Process-wide relaxed atomics: one increment per object created, one
+decrement per drop, nothing on the per-cell or per-row path, and no change to the allocation count
+or the ns/cell figures. **Compiled unconditionally**, never behind a feature, per A8 — a diagnostic
+that exists only in some builds is one the adapter cannot call. The header states that it is for
+tests and diagnostics, and that "live" includes a batch sitting inside an event nobody has drained,
+which is the honest answer: its rows are still in memory.
+
+Asserted on the three paths worth asserting: a whole lifecycle returns every count to its baseline;
+destroying a hub with undrained events frees what they hold; and the contained pump panic (A14)
+leaks neither the session nor the error objects it answers with. The C harness takes a baseline
+before creating its hub and checks every count is back after `reldex_hub_destroy`.
+
+### A24 — `ReldexWakeFn` is hand-written, with C language linkage
+
+cbindgen emits every typedef *above* the `extern "C"` block it opens for the functions. In C++ that
+made `ReldexWakeFn` a pointer to a **C++**-linkage function while `reldex_hub_set_waker` — declared
+inside the block — took a pointer to a C-linkage one. Every mainstream implementation treats the
+two identically; the standard makes them different types. A header whose entire job is to be
+portable should not depend on that indulgence, so the typedef is now written by hand in
+`cbindgen.toml`'s `after_includes`, inside its own `extern "C"` guard, and excluded from
+generation.
+
+The guard for that alias is `_MSVC_LANG`-aware. MSVC reports `__cplusplus == 199711L` unless
+`/Zc:__cplusplus` is passed, so a plain `__cplusplus >= 201703L` test silently dropped the alias on
+the compiler most likely to build the adapter — the code still compiled, and the rule simply stopped
+being enforced. The header now derives `RELDEX_CPLUSPLUS` from `_MSVC_LANG` where it exists, defines
+`RELDEX_HAVE_WAKE_FN_NOEXCEPT` when the alias is present, and the C++17 smoke target `#error`s if a
+C++17 build does not get it, so the claim below cannot quietly become false again.
+
+The same block adds, under C++17 only, a `noexcept`-qualified alias `ReldexWakeFnNoexcept`. A18
+records that letting an exception escape the trampoline is undefined behaviour and that
+`catch_unwind` does not contain it — a rule that until now existed only as a comment. A pointer of
+the alias type converts to `ReldexWakeFn` implicitly, so `reldex_hub_set_waker` takes it unchanged,
+and an adapter that holds its trampoline in one gets a compile error the day somebody drops the
+`noexcept`. It is opt-in: making `ReldexWakeFn` itself `noexcept` in C++17 would enforce the rule
+outright, but it would break every existing adapter declaration for a benefit the alias already
+offers to anyone who wants it. The C smoke harness uses the alias, so both forms stay compiled.
+
+### A25 — `reldex_session_fetch`'s `max_rows` stays `uint32_t` (A11)
+
+A11 fixed the width rule: a count of things in this process is `size_t`. `max_rows` is the one
+deliberate exception, and the header now says why next to the rule rather than leaving it looking
+like an oversight. It is not a count of anything that exists; it is a cap the caller chooses, and a
+batch above four billion rows is a bug in the caller rather than a use case. Fixing the width also
+keeps the meaning of a call identical on a 32-bit host, which the mobile target may be.
+
+Stated in the same round: what a grid should do with a `RELDEX_COLUMN_KIND_UNSUPPORTED` column —
+route it through `reldex_batch_format_column` like any other non-text kind, never read
+`data`/`offsets` as if they were UTF-8 — and show `native_type_name` when the user asks what the
+type actually is.

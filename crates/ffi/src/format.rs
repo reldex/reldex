@@ -185,8 +185,15 @@ pub struct ReldexTextArena {
     scratch: Scratch,
 }
 
+impl Drop for ReldexTextArena {
+    fn drop(&mut self) {
+        crate::counters::destroyed(crate::counters::Kind::Arena);
+    }
+}
+
 impl ReldexTextArena {
     fn new() -> Self {
+        crate::counters::created(crate::counters::Kind::Arena);
         Self {
             buffer: String::new(),
             offsets: vec![0],

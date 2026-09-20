@@ -16,10 +16,10 @@ use reldex_ffi::{
     ReldexArenaView, ReldexColumnInfo, ReldexColumnKind, ReldexColumnView, ReldexEventKind,
     ReldexFormatOptions, ReldexMockScenarioConfig, ReldexMockStatement, ReldexNumber, ReldexStatus,
     ReldexStr, ReldexTimestamp, ReldexTimestampStyle, reldex_batch_column,
-    reldex_batch_column_count, reldex_batch_column_info, reldex_batch_format_column,
-    reldex_batch_row_count, reldex_mock_statement, reldex_text_arena_clear,
-    reldex_text_arena_count, reldex_text_arena_create, reldex_text_arena_release,
-    reldex_text_arena_view,
+    reldex_batch_column_count, reldex_batch_column_fixed, reldex_batch_column_info,
+    reldex_batch_format_column, reldex_batch_row_count, reldex_mock_statement,
+    reldex_text_arena_clear, reldex_text_arena_count, reldex_text_arena_create,
+    reldex_text_arena_release, reldex_text_arena_view,
 };
 
 use support::{Harness, OwnedBatch};
@@ -116,6 +116,16 @@ fn column_view(batch: *const reldex_ffi::ReldexBatch, column: usize) -> ReldexCo
     view
 }
 
+/// The view with the fixed-element mirror built, which the plain
+/// [`column_view`] deliberately no longer does.
+fn column_fixed_view(batch: *const reldex_ffi::ReldexBatch, column: usize) -> ReldexColumnView {
+    let mut view = ReldexColumnView::default();
+    // SAFETY: as `column_view`.
+    let status = unsafe { reldex_batch_column_fixed(batch, column, std::ptr::from_mut(&mut view)) };
+    assert_eq!(status, ReldexStatus::Ok);
+    view
+}
+
 fn column_info(batch: *const reldex_ffi::ReldexBatch, column: usize) -> (String, i32) {
     let mut info = ReldexColumnInfo::default();
     // SAFETY: as `column_view`.
@@ -173,9 +183,11 @@ fn a_fetched_batch_reads_back_exactly_what_the_mock_generated() {
             ReldexColumnKind::Timestamp as i32
         );
 
-        let ids = column_view(batch.0, 0);
+        // The two mirrored kinds are read through the explicit call; `NAME`
+        // borrows its bytes and needs nothing extra.
+        let ids = column_fixed_view(batch.0, 0);
         let names = column_view(batch.0, 1);
-        let created = column_view(batch.0, 2);
+        let created = column_fixed_view(batch.0, 2);
 
         for row in 0..rows {
             let absolute = fetched_rows + row as u64;

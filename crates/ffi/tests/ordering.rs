@@ -199,6 +199,19 @@ fn a_panic_in_the_pump_answers_every_request_behind_it_instead_of_stranding_them
             // SAFETY: the error came from the event and is freed once.
             unsafe { reldex_ffi::reldex_error_free(event.error) };
         }
+        // A reply the containment synthesised must have the same *shape* a
+        // success would have had, result id included (ADR-0003 A21): the
+        // fetches queued behind the panic are `FETCHED` events for `result`,
+        // and an adapter that routes on `event.result` must not have to
+        // special-case the failure path.
+        if event.kind == ReldexEventKind::Fetched as i32 {
+            assert!(
+                event.has_result,
+                "a FETCHED reply must name its result even when the pump answered it after a                  panic (request {})",
+                event.request
+            );
+            assert_eq!(event.result, result);
+        }
         answered.push(event.request);
     }
 

@@ -63,6 +63,23 @@ static void smoke_sleep_ms(unsigned ms)
 #endif
 }
 
+/* Seconds of WALL-CLOCK time since some fixed point in this process.
+ *
+ * Deliberately not clock(): that is CPU time, and every wait here is spent
+ * sleeping, so a clock()-based guard barely advances and a genuine deadlock
+ * would hang CI instead of failing it. Monotonic, so a clock adjustment
+ * mid-run cannot make a guard fire early or never. */
+static double smoke_now_seconds(void)
+{
+#ifdef _WIN32
+    return (double)GetTickCount64() / 1000.0;
+#else
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (double)now.tv_sec + (double)now.tv_nsec / 1e9;
+#endif
+}
+
 static long g_checks_run = 0;
 static long g_checks_failed = 0;
 
@@ -99,16 +116,46 @@ static void smoke_require(bool condition, const char *what)
 static volatile int g_wake_flag = 0;
 static volatile long g_wake_count = 0;
 
+/* This target is built twice: as C11, and as C++17 from a generated .cpp.
+ * In the C++17 build the header must have given us ReldexWakeFnNoexcept --
+ * including on MSVC, where __cplusplus stays at 199711L unless
+ * /Zc:__cplusplus is passed. Failing to compile is the point: a silent
+ * fallback would leave ADR-0003 A24's claim untested on Windows. */
+#ifdef __cplusplus
+#ifndef RELDEX_HAVE_WAKE_FN_NOEXCEPT
+#error "reldex.h did not define ReldexWakeFnNoexcept; this target is built as C++17 (see ui/tests/ffi_smoke/CMakeLists.txt), so the header's guard is wrong -- most likely it tests __cplusplus without _MSVC_LANG"
+#endif
+#endif
+
 #ifdef __cplusplus
 extern "C"
 #endif
 void
 smoke_wake(void *user_data)
+#if defined(RELDEX_HAVE_WAKE_FN_NOEXCEPT)
+/* Letting an exception out of the trampoline is undefined behaviour and
+ * catch_unwind does NOT contain it, so a C++ adapter should say so to the
+ * compiler. The header's ReldexWakeFnNoexcept below holds this pointer and
+ * converts to ReldexWakeFn implicitly; drop the noexcept and it stops
+ * compiling. */
+    noexcept
+#endif
 {
     (void)user_data;
     g_wake_flag = 1;
     g_wake_count += 1;
 }
+
+#if defined(RELDEX_HAVE_WAKE_FN_NOEXCEPT)
+static ReldexWakeFnNoexcept smoke_waker = smoke_wake;
+/* Positive proof that the noexcept branch above was really taken, rather
+ * than the whole thing having been preprocessed away: this fails to compile
+ * if smoke_wake lost its noexcept, and it is only reachable at all when the
+ * header defined the alias. */
+static_assert(noexcept(smoke_wake(NULL)), "the waker trampoline must be noexcept");
+#else
+static ReldexWakeFn smoke_waker = smoke_wake;
+#endif
 
 /* Waits for the next wake, resetting the flag first is the CALLER's job
  * (see the call sites): the pattern throughout this file is
@@ -120,15 +167,26 @@ smoke_wake(void *user_data)
  * elapsed first. */
 static bool wait_for_wake(void)
 {
-    clock_t start = clock();
+    double start = smoke_now_seconds();
     while (!g_wake_flag) {
-        double elapsed = (double)(clock() - start) / (double)CLOCKS_PER_SEC;
+        double elapsed = smoke_now_seconds() - start;
         if (elapsed > HANG_GUARD_SECONDS) {
             return false;
         }
         smoke_sleep_ms(5);
     }
     return true;
+}
+
+/* The live-object counts right now; see reldex_live_counts in the header. */
+static ReldexLiveCounts live_counts(void)
+{
+    ReldexLiveCounts counts;
+    memset(&counts, 0, sizeof(counts));
+    counts.struct_size = sizeof(counts);
+    ReldexStatus status = reldex_live_counts(&counts);
+    smoke_check(status == RELDEX_STATUS_OK, "reldex_live_counts succeeds");
+    return counts;
 }
 
 static uint64_t next_request_id(void)
@@ -228,13 +286,26 @@ int main(void)
         major, minor, (unsigned)RELDEX_ABI_VERSION_MAJOR, (unsigned)RELDEX_ABI_VERSION_MINOR);
     smoke_require(major == (uint32_t)RELDEX_ABI_VERSION_MAJOR, "ABI major version matches the header");
 
+    /* 1b. Live-object baseline. Everything this harness is handed must come
+     * back by the end; reldex_live_counts is how that is asserted without a
+     * sanitizer. */
+    ReldexLiveCounts baseline;
+    memset(&baseline, 0, sizeof(baseline));
+    baseline.struct_size = sizeof(baseline);
+    ReldexStatus counts_status = reldex_live_counts(&baseline);
+    smoke_require(counts_status == RELDEX_STATUS_OK, "reldex_live_counts succeeds");
+    printf(
+        "live at start: hubs=%zu sessions=%zu batches=%zu errors=%zu arenas=%zu\n",
+        baseline.hubs, baseline.sessions, baseline.batches, baseline.errors, baseline.arenas);
+
     /* 2. Hub create. */
     ReldexHub *hub = reldex_hub_create();
     smoke_require(hub != NULL, "reldex_hub_create returns a non-null hub");
+    smoke_check(live_counts().hubs == baseline.hubs + 1, "the new hub is counted as live");
 
     /* 3. Set waker. The callback above touches nothing but its own
      * flag/counter, so it satisfies "must not call back into reldex_*". */
-    ReldexStatus status = reldex_hub_set_waker(hub, smoke_wake, NULL);
+    ReldexStatus status = reldex_hub_set_waker(hub, smoke_waker, NULL);
     smoke_require(status == RELDEX_STATUS_OK, "reldex_hub_set_waker(smoke_wake) succeeds");
 
     /* 4-5-6. Session open (mock scenario), wait for wake, drain events. */
@@ -288,6 +359,37 @@ int main(void)
     smoke_check(column_count_a == 3, "the S14 shape has 3 columns (ID, NAME, CREATED)");
     smoke_check(!reldex_hub_next_event(hub, &event), "the queue is empty after draining session A's EXECUTED event");
 
+    /* 7b. The result's columns, described from the EXECUTED event alone --
+     * no batch has been fetched yet. This is what lets a grid put its header
+     * row up immediately instead of resetting the model when rows arrive. */
+    smoke_check(
+        reldex_session_result_column_count(hub, session_a, result_a) == column_count_a,
+        "reldex_session_result_column_count matches the EXECUTED event's column_count");
+    for (size_t col = 0; col < column_count_a; col += 1) {
+        ReldexColumnInfo early;
+        memset(&early, 0, sizeof(early));
+        early.struct_size = sizeof(early);
+        ReldexStatus early_status = reldex_session_result_column(hub, session_a, result_a, col, &early);
+        smoke_check(early_status == RELDEX_STATUS_OK, "reldex_session_result_column succeeds before any fetch");
+        smoke_check(early.name.ptr != NULL && early.name.len > 0, "the early column description has a name");
+        smoke_check(early.name.ptr[early.name.len] == '\0', "the early column name is NUL-terminated");
+        printf(
+            "  early column %zu: name=\"%s\" kind=%d\n",
+            col, (const char *)early.name.ptr, (int)early.kind);
+    }
+    {
+        ReldexColumnInfo missing;
+        memset(&missing, 0, sizeof(missing));
+        missing.struct_size = sizeof(missing);
+        ReldexStatus missing_status =
+            reldex_session_result_column(hub, session_a, result_a, column_count_a, &missing);
+        smoke_check(missing_status == RELDEX_STATUS_NOT_FOUND, "an out-of-range column is refused, not invented");
+        ReldexError *stale = reldex_last_error_take();
+        if (stale != NULL) {
+            reldex_error_free(stale);
+        }
+    }
+
     /* 8. Fetch all batches, exercising the column-view contract on the
      * first non-trivial batch: row counts, a text column via
      * offsets/data, a NUMBER mirror, the null bitmap, column names as
@@ -311,6 +413,7 @@ int main(void)
         smoke_require(wait_and_take_event(hub, &event), "session A's FETCHED event arrives");
         smoke_check(event.kind == RELDEX_EVENT_KIND_FETCHED, "session A's event is FETCHED");
         smoke_check(event.request == fetch_request, "session A's FETCHED event carries the request id");
+        smoke_check(event.has_result && event.result == result_a, "session A's FETCHED event carries the result id");
         smoke_check(event.error == NULL, "the fetch did not fail");
 
         if (event.row_count == 0) {
@@ -392,17 +495,33 @@ int main(void)
             }
             printf("  NAME column: %zu of %zu rows are SQL NULL\n", null_rows_seen, text_view.row_count);
 
-            /* NUMBER mirror. */
+            /* The plain view of a NUMBER column costs nothing: no mirror is
+             * built and `fixed` stays NULL, because the adapter reads cells
+             * through the bulk formatter and never looks at it. Only the
+             * stride is reported, so a caller can size its own buffer. */
+            ReldexColumnView plain_number_view;
+            memset(&plain_number_view, 0, sizeof(plain_number_view));
+            plain_number_view.struct_size = sizeof(plain_number_view);
+            view_status = reldex_batch_column(batch, (size_t)number_column, &plain_number_view);
+            smoke_check(view_status == RELDEX_STATUS_OK, "reldex_batch_column succeeds for the NUMBER column");
+            smoke_check(plain_number_view.fixed == NULL, "reldex_batch_column builds no NUMBER mirror");
+            smoke_check(plain_number_view.fixed_len == 0, "a NULL fixed array reports a zero fixed_len");
+            smoke_check(
+                plain_number_view.fixed_stride == sizeof(ReldexNumber),
+                "the NUMBER column's fixed_stride matches sizeof(ReldexNumber) even with no mirror");
+
+            /* Asking for the element array explicitly is the one call that
+             * allocates: 46 bytes per row, retained for the batch's life. */
             ReldexColumnView number_view;
             memset(&number_view, 0, sizeof(number_view));
             number_view.struct_size = sizeof(number_view);
-            view_status = reldex_batch_column(batch, (size_t)number_column, &number_view);
-            smoke_check(view_status == RELDEX_STATUS_OK, "reldex_batch_column succeeds for the NUMBER column");
+            view_status = reldex_batch_column_fixed(batch, (size_t)number_column, &number_view);
+            smoke_check(view_status == RELDEX_STATUS_OK, "reldex_batch_column_fixed succeeds for the NUMBER column");
             smoke_check(
                 number_view.fixed_stride == sizeof(ReldexNumber),
-                "the NUMBER column's fixed_stride matches sizeof(ReldexNumber)");
+                "the mirrored NUMBER column's fixed_stride matches sizeof(ReldexNumber)");
             smoke_check(number_view.fixed_len == number_view.row_count, "the NUMBER column's fixed_len matches row_count");
-            smoke_require(number_view.fixed != NULL, "the NUMBER column has a fixed element array");
+            smoke_require(number_view.fixed != NULL, "reldex_batch_column_fixed builds the element array");
             const ReldexNumber *numbers = (const ReldexNumber *)number_view.fixed;
             bool numbers_well_formed = true;
             for (size_t row = 0; row < number_view.row_count; row += 1) {
@@ -453,8 +572,58 @@ int main(void)
     smoke_require(status == RELDEX_STATUS_OK, "reldex_session_close_result is accepted");
     smoke_require(wait_and_take_event(hub, &event), "session A's RESULT_CLOSED event arrives");
     smoke_check(event.kind == RELDEX_EVENT_KIND_RESULT_CLOSED, "session A's event is RESULT_CLOSED");
+    smoke_check(event.has_result && event.result == result_a, "RESULT_CLOSED names the result that ended");
     smoke_check(event.error == NULL, "closing the result set did not fail");
+    smoke_check(
+        reldex_session_result_column_count(hub, session_a, result_a) == 0,
+        "a closed result has no columns to describe");
     smoke_check(!reldex_hub_next_event(hub, &event), "the queue is empty after draining RESULT_CLOSED");
+
+    /* 8b. A result set with columns and no rows. The case a grid that builds
+     * its header from the first batch gets wrong: there is never a batch with
+     * a row in it, yet the result has three named columns. */
+    {
+        uint64_t empty_request = next_request_id();
+        g_wake_flag = 0;
+        ReldexStr empty_sql = reldex_mock_statement(RELDEX_MOCK_STATEMENT_EMPTY_QUERY);
+        smoke_check(empty_sql.len > 0, "the EMPTY_QUERY statement text is available");
+        status = reldex_session_execute(hub, session_a, empty_request, empty_sql, 0);
+        smoke_require(status == RELDEX_STATUS_OK, "reldex_session_execute(EMPTY_QUERY) is accepted");
+        smoke_require(wait_and_take_event(hub, &event), "the empty query's EXECUTED event arrives");
+        smoke_check(event.error == NULL, "the empty query executed without an error");
+        smoke_require(event.has_result, "an empty result is still a result");
+        uint64_t empty_result = event.result;
+        smoke_check(event.column_count == 3, "the empty result still reports 3 columns");
+
+        ReldexColumnInfo empty_info;
+        memset(&empty_info, 0, sizeof(empty_info));
+        empty_info.struct_size = sizeof(empty_info);
+        ReldexStatus empty_status =
+            reldex_session_result_column(hub, session_a, empty_result, 1, &empty_info);
+        smoke_check(empty_status == RELDEX_STATUS_OK, "an empty result's columns are still described");
+        smoke_check(
+            empty_info.name.ptr != NULL && empty_info.name.ptr[empty_info.name.len] == '\0',
+            "the empty result's column name is a usable C string");
+        printf("  empty result column 1: \"%s\"\n", (const char *)empty_info.name.ptr);
+
+        uint64_t empty_fetch = next_request_id();
+        g_wake_flag = 0;
+        status = reldex_session_fetch(hub, session_a, empty_fetch, empty_result, 10);
+        smoke_require(status == RELDEX_STATUS_OK, "reldex_session_fetch is accepted on the empty result");
+        smoke_require(wait_and_take_event(hub, &event), "the empty result's FETCHED event arrives");
+        smoke_check(event.kind == RELDEX_EVENT_KIND_FETCHED, "the empty result's event is FETCHED");
+        smoke_check(event.row_count == 0, "the empty result is exhausted on its first fetch");
+        smoke_check(event.has_result && event.result == empty_result, "the empty result's FETCHED event names it");
+        release_event_batch(&event);
+
+        uint64_t empty_close = next_request_id();
+        g_wake_flag = 0;
+        status = reldex_session_close_result(hub, session_a, empty_close, empty_result);
+        smoke_require(status == RELDEX_STATUS_OK, "closing the empty result is accepted");
+        smoke_require(wait_and_take_event(hub, &event), "the empty result's RESULT_CLOSED event arrives");
+        smoke_check(event.error == NULL, "closing the empty result did not fail");
+        smoke_check(!reldex_hub_next_event(hub, &event), "the queue is empty after the empty result is closed");
+    }
 
     /* 9. An execute that fails: check the error view (kind, native
      * code, message, position). */
@@ -611,6 +780,36 @@ int main(void)
 
     reldex_hub_destroy(hub);
     printf("reldex_hub_destroy returned; process is intact\n");
+
+    /* 14. Nothing this harness was handed is still alive. A hub's teardown
+     * finishes on its session pump threads, so the counts fall shortly after
+     * the call returns -- waited for under the same hang guard as everything
+     * else, which asserts no upper bound on how fast it happens. */
+    {
+        double counts_started = smoke_now_seconds();
+        ReldexLiveCounts final_counts = live_counts();
+        while (final_counts.hubs != baseline.hubs
+               || final_counts.sessions != baseline.sessions
+               || final_counts.batches != baseline.batches
+               || final_counts.errors != baseline.errors
+               || final_counts.arenas != baseline.arenas) {
+            double elapsed = smoke_now_seconds() - counts_started;
+            if (elapsed > HANG_GUARD_SECONDS) {
+                break;
+            }
+            smoke_sleep_ms(5);
+            final_counts = live_counts();
+        }
+        printf(
+            "live at end: hubs=%zu sessions=%zu batches=%zu errors=%zu arenas=%zu\n",
+            final_counts.hubs, final_counts.sessions, final_counts.batches,
+            final_counts.errors, final_counts.arenas);
+        smoke_check(final_counts.hubs == baseline.hubs, "no hub is left alive");
+        smoke_check(final_counts.sessions == baseline.sessions, "no session is left alive");
+        smoke_check(final_counts.batches == baseline.batches, "no batch is left alive");
+        smoke_check(final_counts.errors == baseline.errors, "no error object is left alive");
+        smoke_check(final_counts.arenas == baseline.arenas, "no text arena is left alive");
+    }
 
     printf(
         "\nreldex-ffi C smoke harness: %ld/%ld checks passed (%ld waker call(s) observed)\n",
