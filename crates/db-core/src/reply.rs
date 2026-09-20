@@ -23,7 +23,7 @@
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
-use reldex_db_driver_api::DbResult;
+use reldex_db_driver_api::{CancelKind, ConnectionId, DbResult, Warning};
 
 use crate::events::{CompletedOperation, RequestId, SessionEvent};
 use crate::ids::{LobHandle, ResultId, SessionId};
@@ -48,6 +48,49 @@ pub(crate) trait ReplyPayload: Send + Sized + 'static {
         subject: Self::Subject,
         value: DbResult<Self>,
     ) -> SessionEvent;
+}
+
+/// What one successful open produced, on its way to
+/// [`SessionEvent::Opened`].
+///
+/// The open is a request like any other on the event path
+/// (`docs/exec-plans/active/phase-1.md` §B3): it reserves a slot, it is
+/// answered exactly once, and — this is the whole reason it is a
+/// [`ReplyPayload`] rather than a bespoke path —
+/// [`crate::SessionRegistry::abandon`] answers it by *dropping* the reply
+/// channel, which emits `OpenFailed` through the same mechanism that covers
+/// every other request (ADR-0002 E2).
+#[derive(Debug)]
+pub(crate) struct OpenedSession {
+    pub(crate) connection: ConnectionId,
+    pub(crate) cancel_kind: CancelKind,
+    pub(crate) warnings: Vec<Warning>,
+}
+
+impl ReplyPayload for OpenedSession {
+    type Subject = ();
+
+    fn into_event(
+        session: SessionId,
+        request: RequestId,
+        (): Self::Subject,
+        value: DbResult<Self>,
+    ) -> SessionEvent {
+        match value {
+            Ok(opened) => SessionEvent::Opened {
+                session,
+                request,
+                connection: opened.connection,
+                cancel_kind: opened.cancel_kind,
+                warnings: opened.warnings,
+            },
+            Err(error) => SessionEvent::OpenFailed {
+                session,
+                request,
+                error,
+            },
+        }
+    }
 }
 
 impl ReplyPayload for ExecuteOutcome {

@@ -453,6 +453,14 @@ impl SessionLimits {
     /// submitter is reported rather than allowed to grow the queue without
     /// limit.
     ///
+    /// [`crate::SessionRegistry::open`] reserves an ordinary slot for the
+    /// open, on a session that has nothing outstanding, so it fits inside this
+    /// limit and cannot be refused;
+    /// [`crate::SessionRegistry::abandon`] reserves none at all, which is what
+    /// makes it impossible to refuse. The published bound
+    /// (`2R + U + 3` events per session, see [`crate::EventQueue`]) is
+    /// therefore unchanged by either.
+    ///
     /// It does **not** apply to [`Completion`]-path calls: those hold their
     /// reply in the caller's own `Completion`, so they are bounded by the
     /// caller, and the command queue itself stays unbounded on purpose
@@ -554,6 +562,32 @@ pub struct DatabaseSession {
 }
 
 impl DatabaseSession {
+    /// Builds the handle for a worker whose `connect` has just succeeded.
+    ///
+    /// Both openers go through here — the blocking [`SessionManager`] and the
+    /// non-blocking [`crate::SessionRegistry`] — so there is one definition of
+    /// what a session handle is made of, and the two paths cannot drift.
+    pub(crate) fn assemble(
+        id: SessionId,
+        command_tx: mpsc::Sender<Command>,
+        join: thread::JoinHandle<()>,
+        shared: Arc<SessionShared>,
+        ready: &worker::Ready,
+        limits: SessionLimits,
+    ) -> Self {
+        Self {
+            id,
+            connection_id: ready.connection_id,
+            command_tx: Mutex::new(command_tx),
+            worker: Mutex::new(Some(join)),
+            shared,
+            cancel_handle: Arc::clone(&ready.cancel_handle),
+            cancel_kind: ready.cancel_kind,
+            connect_warnings: ready.connect_warnings.clone(),
+            limits,
+        }
+    }
+
     /// This session's identifier, stable for its whole lifetime.
     #[must_use]
     pub fn id(&self) -> SessionId {
@@ -725,6 +759,34 @@ impl DatabaseSession {
         let reply = ReplyTo::event(Arc::clone(&self.shared), self.id, request, subject);
         let _ = self.send(make_command(reply));
         Ok(())
+    }
+
+    /// Asks the worker to release this session **without waiting for it and
+    /// without committing** — what [`crate::SessionRegistry::abandon`] does to
+    /// a session that is already open.
+    ///
+    /// The same [`CloseIntent::Abandon`] [`Drop`] uses, and the same
+    /// guarantees: it never commits and never rolls back explicitly, so the
+    /// server's own rollback-on-disconnect is what resolves any transaction
+    /// the session held (ADR-0002 K5). The difference from `Drop` is the wait:
+    /// there is none. Nothing is joined, nothing is parked on a reply, and a
+    /// worker inside an uninterruptible driver call simply runs the abandon
+    /// when that call returns — at which point it emits this session's one
+    /// [`crate::SessionEvent::Terminal`].
+    ///
+    /// No event is produced *here*: the close reply goes to a channel nobody
+    /// reads, deliberately, because `abandon` is not a request and the caller
+    /// did not give it a [`RequestId`].
+    pub(crate) fn abandon_now(&self) {
+        // Best effort, and honest about it: on a driver that cannot interrupt
+        // a running call this does nothing at all, exactly as in `Drop`.
+        let _ = self.cancel();
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        let _ = self.send(Command::Close {
+            intent: CloseIntent::Abandon,
+            reply: CloseReplyTo::one_shot(tx),
+        });
     }
 
     fn check_event_route(&self) -> DbResult<()> {
@@ -1247,8 +1309,10 @@ impl SessionManager {
     /// Spawns the session's dedicated worker thread and blocks the calling
     /// thread only on that thread's reply that the connection is ready — the
     /// actual `connect` call runs on the worker thread, never on the caller's
-    /// (`SPEC.md` §11/§19). Making the *wait* asynchronous too is Phase 1 FFI
-    /// work (ADR-0002, amendments after the db-core review).
+    /// (`SPEC.md` §11/§19). The non-blocking shape is
+    /// [`crate::SessionRegistry::open`], which answers with a
+    /// [`crate::SessionEvent::Opened`] instead of a return value; this one is
+    /// unchanged and stays, for tests, tools and the device-check binary.
     ///
     /// Anything non-fatal the driver noticed while opening the connection is
     /// collected once on that worker thread and reported through
@@ -1266,18 +1330,48 @@ impl SessionManager {
         params: ConnectionParams,
     ) -> DbResult<DatabaseSession> {
         let id = SessionId::allocate();
-        let handle = worker::spawn(driver, params, id, self.limits)?;
-        Ok(DatabaseSession {
+        let shared = Arc::new(SessionShared::new(id));
+        let (ready_tx, ready_rx) = mpsc::channel::<DbResult<worker::Ready>>();
+        let spawned = worker::spawn(
+            driver,
+            params,
             id,
-            connection_id: handle.connection_id,
-            command_tx: Mutex::new(handle.command_tx),
-            worker: Mutex::new(Some(handle.join)),
-            shared: handle.shared,
-            cancel_handle: handle.cancel_handle,
-            cancel_kind: handle.cancel_kind,
-            connect_warnings: handle.connect_warnings,
-            limits: self.limits,
-        })
+            self.limits,
+            Arc::clone(&shared),
+            Box::new(move |outcome| {
+                // Unchanged behaviour: the worker hands the outcome to the
+                // thread parked below, and a send that fails means that thread
+                // gave up, so nothing adopts the connection.
+                if ready_tx.send(outcome).is_ok() {
+                    worker::Adoption::Adopted
+                } else {
+                    worker::Adoption::Abandoned
+                }
+            }),
+        )?;
+
+        match ready_rx.recv() {
+            Ok(Ok(ready)) => Ok(DatabaseSession::assemble(
+                id,
+                spawned.command_tx,
+                spawned.join,
+                shared,
+                &ready,
+                self.limits,
+            )),
+            Ok(Err(err)) => {
+                let _ = spawned.join.join();
+                Err(err)
+            }
+            Err(_) => {
+                let panicked = spawned.join.join().is_err();
+                Err(DbError::internal(if panicked {
+                    "reldex-db-core: session worker thread panicked while connecting"
+                } else {
+                    "reldex-db-core: session worker exited without connecting"
+                }))
+            }
+        }
     }
 }
 

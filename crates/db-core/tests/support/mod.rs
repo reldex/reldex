@@ -34,8 +34,8 @@ use std::thread;
 use reldex_db_core::{
     CloseDisposition, CloseError, CompletedOperation, ConnectionParams, DatabaseDriver,
     DatabaseSession, DbError, DbResult, EventCaps, EventQueue, ExecuteOutcome, FetchedBatch,
-    LobHandle, RequestId, ResultId, SavepointName, SessionEvent, SessionLimits, SessionManager,
-    Statement, event_channel,
+    LobHandle, RequestId, ResultId, SavepointName, SessionEvent, SessionId, SessionLimits,
+    SessionManager, SessionRegistry, Statement, event_channel,
 };
 use reldex_db_driver_api::{Credentials, Endpoint};
 use reldex_driver_mock::{MockDriver, Scenario};
@@ -44,6 +44,56 @@ use reldex_driver_mock::{MockDriver, Scenario};
 #[must_use]
 pub(crate) fn scenario() -> Arc<Scenario> {
     Scenario::new()
+}
+
+/// The driver a test opens sessions through.
+#[must_use]
+pub(crate) fn driver(scenario: &Arc<Scenario>) -> Arc<dyn DatabaseDriver> {
+    Arc::new(MockDriver::new(Arc::clone(scenario)))
+}
+
+/// The connection parameters a test opens sessions with. The mock ignores
+/// them; they exist because the contract requires them.
+#[must_use]
+pub(crate) fn params() -> ConnectionParams {
+    ConnectionParams::new(
+        Endpoint::ConnectString("mock".to_owned()),
+        Credentials::External,
+    )
+}
+
+/// A registry feeding one fresh queue, which is the shape an application has.
+#[must_use]
+pub(crate) fn registry() -> (SessionRegistry, EventQueue) {
+    registry_with(SessionLimits::new(), EventCaps::new())
+}
+
+/// [`registry`] with non-default limits and caps.
+#[must_use]
+pub(crate) fn registry_with(
+    limits: SessionLimits,
+    caps: EventCaps,
+) -> (SessionRegistry, EventQueue) {
+    let (sink, queue) = event_channel(caps);
+    (
+        SessionRegistry::new(SessionManager::new().with_limits(limits), sink),
+        queue,
+    )
+}
+
+/// Every event `seen` holds for `session`, in delivery order.
+pub(crate) fn of_session(seen: &[SessionEvent], session: SessionId) -> Vec<&SessionEvent> {
+    seen.iter()
+        .filter(|event| event.session() == session)
+        .collect()
+}
+
+/// Drains until `session`'s `Terminal` has arrived, keeping everything else.
+pub(crate) fn drain_until_terminal_of(queue: &EventQueue, session: SessionId) -> Vec<SessionEvent> {
+    drain_until(queue, |seen| {
+        seen.iter()
+            .any(|event| event.is_terminal() && event.session() == session)
+    })
 }
 
 /// Opens a session against `scenario` through the real `db-core` session
@@ -60,13 +110,8 @@ pub(crate) fn open_with_limits(scenario: &Arc<Scenario>, limits: SessionLimits) 
 }
 
 fn open_with(scenario: &Arc<Scenario>, manager: SessionManager) -> DatabaseSession {
-    let driver: Arc<dyn DatabaseDriver> = Arc::new(MockDriver::new(Arc::clone(scenario)));
-    let params = ConnectionParams::new(
-        Endpoint::ConnectString("mock".to_owned()),
-        Credentials::External,
-    );
     manager
-        .open_session(driver, params)
+        .open_session(driver(scenario), params())
         .expect("session should open against the mock driver")
 }
 

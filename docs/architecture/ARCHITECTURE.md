@@ -133,6 +133,16 @@ lifecycle adds `Lost` (unrecoverable, terminal, no reconnect) and `Closed` (clos
 on top of the driver contract's own `SessionState`, so a closed or dead session is never mistaken for
 one still usable (ADR-0002 K8).
 
+Event-bound sessions are owned by a `SessionRegistry`, which is the single place an open, an
+abandon, a close and a worker's finishing `connect` are serialised against each other (ADR-0002
+R2, `phase-1.md` §B3). It registers a session in one of four states — `Opening`, `Open`, `Ending`,
+`Ended` — hands out the `Arc<DatabaseSession>` only while it is `Open`, and lets go of it only when
+the consumer retires it on that session's `Terminal`. Nothing there pools or replaces a session: a
+reconnect is a new `open` with a new `SessionId`, exactly as above. Giving up on a session is
+`abandon`, which never commits — it is `Drop`'s abandon without `Drop`'s wait — and reports whether
+a possibly-active transaction went with the connection, because §10 forbids hiding that (ADR-0002
+R4).
+
 ## 6. Concurrency and threading
 
 - No database or network I/O on the UI thread, ever (`SPEC.md` §11, §19).
@@ -175,6 +185,19 @@ requests were accepted, so a consumer routes by `RequestId` and retires a sessio
 `Terminal`. How much one session can have waiting in that queue is bounded, and the bound is on the
 queue rather than on the worker: a request holds a slot against
 `SessionLimits::max_outstanding_requests` until the consumer has **drained** its reply.
+
+Opening a session has the same two shapes. `SessionManager::open_session` blocks the caller until
+the connection is ready; `SessionRegistry::open` returns a `SessionId` immediately, runs the connect
+on the session's own worker thread, and answers with one `Opened` or `OpenFailed` (ADR-0002 R1).
+The asymmetry that shapes the design is that a `connect` **cannot be interrupted** — the driver
+already has to bound its own on a helper thread (ADR-0002 H1) — so giving up on one cannot mean
+waiting for it. `abandon` answers the open at once with `ErrorKind::Cancelled`, announces the
+session's `Terminal`, and **detaches** the worker thread rather than joining it; when the connect
+eventually returns, the worker finds no registration to adopt it and closes the connection on its
+own thread, which is the only thread allowed to touch it. A late success is therefore never adopted
+after its failure has been reported, and never leaves a live database session behind (ADR-0002 R4,
+ADR-0003 A17). The same holds for dropping the registry itself, which must be prompt at application
+exit.
 
 ## 7. FFI and Qt adapter boundary
 

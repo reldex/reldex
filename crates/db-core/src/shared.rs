@@ -189,6 +189,13 @@ pub(crate) struct SessionShared {
     /// path: on the completion path `DatabaseSession::close` sees no worker to
     /// ask, and on the event path this is what says the same thing.
     ended: AtomicBool,
+    /// Set by [`crate::SessionRegistry::abandon`] when it gives up on a connect
+    /// that has not finished. It only ever happens *before* a connection
+    /// exists, so there is no ambiguity about what it describes: the open was
+    /// cancelled, and [`SessionShared::terminal_error`] says so with
+    /// [`ErrorKind::Cancelled`] rather than the generic "this session is
+    /// closed" a deliberate close produces.
+    open_cancelled: AtomicBool,
     /// The slots event-path requests hold: taken when a request is accepted,
     /// given back when the consumer takes its reply **out of** the queue. That
     /// is what makes [`crate::SessionLimits::max_outstanding_requests`] bound
@@ -214,6 +221,7 @@ impl SessionShared {
             events: Mutex::new(None),
             terminal_emitted: AtomicBool::new(false),
             ended: AtomicBool::new(false),
+            open_cancelled: AtomicBool::new(false),
             requests: Arc::new(RequestSlots::default()),
         }
     }
@@ -359,6 +367,20 @@ impl SessionShared {
     /// Whether a close has already ended this session.
     pub(crate) fn has_ended(&self) -> bool {
         self.ended.load(Ordering::Acquire)
+    }
+
+    /// Records that the open was given up on before the connect finished.
+    ///
+    /// Only [`crate::SessionRegistry::abandon`] (and the registry's own
+    /// teardown) calls this, and only while the session is still `Opening`, so
+    /// it describes exactly one thing: nobody is waiting for this connection
+    /// any more. It is what turns the one reply the open owes into
+    /// `OpenFailed { ErrorKind::Cancelled }` — including when that reply is
+    /// produced by [`crate::reply::ReplyTo`]'s `Drop` rather than by an
+    /// explicit answer, which is why the reason lives here rather than at the
+    /// call site.
+    pub(crate) fn mark_open_cancelled(&self) {
+        self.open_cancelled.store(true, Ordering::Release);
     }
 
     /// Emits [`SessionEvent::Terminal`], at most once for this session.
@@ -531,6 +553,27 @@ impl SessionShared {
         self.with_transaction_watch(|state| state.driver_transaction_state = driver_state);
     }
 
+    /// Records the driver's transaction state at connect time, **without**
+    /// announcing it.
+    ///
+    /// [`SessionEvent::TransactionStateChanged`] reports a *flip* of
+    /// [`SessionShared::has_possibly_active_transaction`]
+    /// (`docs/exec-plans/active/phase-1.md` §B2), and a session that did not
+    /// exist a moment ago has not flipped anything: this is its initial value.
+    /// Announcing it would also put an unsolicited event **before** that
+    /// session's [`SessionEvent::Opened`], which is the one thing a consumer
+    /// should be able to treat as a session's first word.
+    ///
+    /// A consumer therefore takes the initial value from
+    /// [`crate::DatabaseSession::has_possibly_active_transaction`] when it sees
+    /// `Opened` — which is authoritative anyway — and the event stream reports
+    /// every change from there. Assuming the conservative default until it
+    /// asks costs at most an extra close prompt, which ADR-0002 K7 already
+    /// accepts; the opposite mistake is a silent commit, which it does not.
+    pub(crate) fn seed_driver_transaction_state(&self, driver_state: TransactionState) {
+        self.lock().driver_transaction_state = driver_state;
+    }
+
     /// Whether a transaction may still be open, combining the driver's own
     /// report (which may be [`TransactionState::Unknown`]) with core-side
     /// tracking, per ADR-0002.
@@ -564,11 +607,20 @@ impl SessionShared {
     ///
     /// For a lost session this keeps the original [`ErrorKind`], native code
     /// and text, statement position and cause, so the UI can show *why* the
-    /// session went away rather than a flattened sentence.
+    /// session went away rather than a flattened sentence. A session whose
+    /// *open* was abandoned reports [`ErrorKind::Cancelled`]: nothing failed
+    /// and nothing was ever connected, so calling it a connection error would
+    /// be wrong in both directions.
     pub(crate) fn terminal_error(&self) -> DbError {
         let state = self.lock();
         match &state.lost_reason {
             Some(reason) => reason.to_error("session is lost; open a new session to reconnect"),
+            None if self.open_cancelled.load(Ordering::Acquire) => DbError::new(
+                ErrorKind::Cancelled,
+                "reldex-db-core: the session was abandoned before its connection was open, so \
+                 nothing was connected and nothing is adopted late",
+            )
+            .with_session_state(SessionState::Lost),
             None => DbError::new(ErrorKind::Connection, "reldex-db-core: session is closed")
                 .with_session_state(SessionState::Lost),
         }

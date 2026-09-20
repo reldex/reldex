@@ -157,13 +157,18 @@ impl DatabaseDriver for MockDriver {
         &self,
         _params: &reldex_db_driver_api::ConnectionParams,
     ) -> DbResult<Box<dyn DatabaseConnection>> {
-        self.scenario.connect_behavior()?;
+        if let Err(error) = self.scenario.connect_behavior() {
+            self.scenario.record_connect_failed();
+            return Err(error);
+        }
         let id = ConnectionId::allocate();
+        let connection = Box::new(MockConnection::new(id, Arc::clone(&self.scenario)));
         self.scenario.record_thread(id);
-        Ok(Box::new(MockConnection::new(
-            id,
-            Arc::clone(&self.scenario),
-        )))
+        // Last, and after the connection exists: a test waiting on
+        // `Counts::connects_finished` must never see the connect counted
+        // before the connection it produced.
+        self.scenario.record_connection_opened();
+        Ok(connection)
     }
 }
 

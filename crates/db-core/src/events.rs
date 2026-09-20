@@ -91,6 +91,14 @@
 //!   [`crate::DatabaseSession::submit_close`]: a session at its limit must
 //!   still be able to end, so a close reserves against one more than the
 //!   limit — once, not repeatedly.
+//!
+//!   [`crate::SessionRegistry::open`] is inside that `R`, not above it: the
+//!   open reserves an ordinary slot, and it does so on a session that has
+//!   nothing outstanding, so it is never refused and never adds to the bound.
+//!   [`crate::SessionRegistry::abandon`] reserves **nothing** — it answers the
+//!   open's already-reserved request and emits a `Terminal`, neither of which
+//!   is a new reply — so it can never be refused for lack of a slot, which is
+//!   what makes it a teardown path rather than another thing that can fail.
 //! * **[`SessionEvent::Executing`]** is bounded by the same number: the worker
 //!   emits at most one per outstanding execute, and it is never dropped.
 //! * **Unsolicited events** ([`SessionEvent::ServerOutput`],
@@ -104,7 +112,8 @@
 //! So one session can hold at most `2 × max_outstanding_requests +
 //! max_unsolicited_per_session + 3` events in the queue — `R + 1` replies, `R`
 //! `Executing`s, `U + 1` unsolicited and one `Terminal` — and no producer can
-//! exceed that however fast it runs.
+//! exceed that however fast it runs. M2.6's open and abandon do not change
+//! that arithmetic: the open is one of the `R`, and abandon reserves nothing.
 //!
 //! Dropping the [`EventQueue`] ends the stream: see [`EventQueue`] for what
 //! happens to the events and the slots that were still in it.
@@ -306,8 +315,11 @@ pub enum SessionEvent {
     // --- exactly one of these per accepted request, ever ---
     /// The session's connection is open and usable.
     ///
-    /// Produced by the session registry (M2.6); `db-core` has no other
-    /// non-blocking open today.
+    /// Produced by [`crate::SessionRegistry::open`], on the session's own
+    /// worker thread the moment `connect` returns. It is a session's **first**
+    /// event: nothing else is emitted for a session before the open is
+    /// answered, so a consumer can create its per-session state here and
+    /// retire it on [`SessionEvent::Terminal`].
     Opened {
         /// The session that opened.
         session: SessionId,
@@ -321,13 +333,22 @@ pub enum SessionEvent {
         /// (ADR-0002 W1/W2).
         warnings: Vec<Warning>,
     },
-    /// The connect failed, or was abandoned before it finished (M2.6).
+    /// The connect failed, or was abandoned before it finished.
+    ///
+    /// The session id in it was allocated and is now dead; a reconnect is a
+    /// new [`crate::SessionRegistry::open`] with a new id (`SPEC.md` §18).
+    /// [`SessionEvent::Terminal`] always follows, with
+    /// [`SessionLifecycle::Lost`] when the connect failed and
+    /// [`SessionLifecycle::Closed`] when it was abandoned.
     OpenFailed {
         /// The session id that was allocated and is now dead.
         session: SessionId,
         /// The request that asked for it.
         request: RequestId,
-        /// Why.
+        /// Why. [`reldex_db_driver_api::ErrorKind::Cancelled`] means
+        /// [`crate::SessionRegistry::abandon`] gave up on the connect;
+        /// anything else is the driver's own classification of the failure,
+        /// with its native code and cause chain intact.
         error: DbError,
     },
     /// The reply to [`crate::DatabaseSession::submit_execute`].
@@ -436,12 +457,21 @@ pub enum SessionEvent {
 
     /// The session ended. Exactly once per session, at the transition; never
     /// twice, never absent (ordering rule 3).
+    ///
+    /// "Per session" includes one that never opened: a connect that failed and
+    /// an open that [`crate::SessionRegistry::abandon`] gave up on both
+    /// announce one, after their single [`SessionEvent::OpenFailed`]. Every
+    /// session the registry ever named produces exactly one of these, which is
+    /// what makes "retire per-session state on `Terminal`, never on anything
+    /// else" a complete rule rather than a usually-true one.
     Terminal {
         /// The session.
         session: SessionId,
         /// [`SessionLifecycle::Lost`] or [`SessionLifecycle::Closed`]. `Lost`
         /// wins when both apply, because *why* a session ended matters more
-        /// than that it ended.
+        /// than that it ended. A connect that failed is `Lost` with the
+        /// failure as `cause`; an open that was abandoned is `Closed`, because
+        /// the abandon won and nothing failed.
         lifecycle: SessionLifecycle,
         /// The failure that lost the session, with its original kind, native
         /// code and cause chain. `None` for a deliberate close.

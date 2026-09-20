@@ -8,7 +8,8 @@
 
 This file holds the two things that would have swamped the milestone table: the performance
 numbers either side of the refactor (§2), and the exact `SessionEvent` → `ReldexEvent` mapping
-M2.11 has to write (§3).
+M2.11 has to write (§3). §7 adds the part M2.6 produced — the open events, `abandon`, and what the
+FFI switch does with them.
 
 ---
 
@@ -326,3 +327,61 @@ Decided here, while the reasons are in front of us, so neither task re-litigates
   reuses a live one.
 * Route strictly by `RequestId`; retire a session's state on `Terminal` only. Delivery is production
   order, not acceptance order, so "every earlier request looks answered" is not a fact.
+
+---
+
+## 7. `Opened` / `OpenFailed` / `abandon`, for M2.11 (added by M2.6)
+
+M2.6 landed `SessionRegistry` (`phase-1.md` §B3, ADR-0002 R1–R5) and is the producer of the two
+rows §3 left to it. The C ABI is **still unchanged** — `reldex.h` is byte-identical — because
+M2.11 owns it. What M2.11 has to know:
+
+### 7.1 The two open events
+
+| `SessionEvent` | `ReldexEventKind` | fields to fill |
+| --- | --- | --- |
+| `Opened { session, request, connection, cancel_kind, warnings }` | `OPENED` (1) | `session`, `request`, `connection_id`, `cancel_kind`, `warning_count = warnings.len()`. The warnings themselves stay behind `reldex_session_connect_warnings`, which reads `DatabaseSession::connect_warnings()` — the handle keeps its own copy, so a UI that asks late still gets them |
+| `OpenFailed { session, request, error }` | `OPENED` (1) with `error` | `session`, `request`, `error`, `session_state = LOST` |
+
+`Opened` is a session's **first** event. Nothing else for that session precedes it — M2.6 had to
+silence the connect-time transaction-state seed to keep that true (R5) — so the adapter creates its
+per-session state there and retires it on `TERMINAL`.
+
+### 7.2 Replacing the interim pump's open
+
+`reldex_hub_open_session` currently spawns a pump thread that performs the blocking
+`SessionManager::open_session` and reports through it. It becomes:
+
+* `SessionRegistry::open(driver, params, request)` → return the `SessionId` **immediately**, with
+  `RELDEX_STATUS_OK` and no pump thread. The hub keeps its `RequestId` allocator (`RequestId` is
+  caller-chosen and unchecked by the core).
+* Every "the pump is still inside `open_session`, nothing may be submitted yet" state disappears:
+  `SessionRegistry::get` answers `None` until the session is open, which is the same refusal
+  ADR-0003 A18 already permits (`INVALID_STATE`, nothing accepted, no event follows).
+* `reldex_session_close`/destroy paths that today tear a pump down map onto
+  `SessionRegistry::abandon` + `SessionRegistry::retire`.
+
+### 7.3 `abandon`, and what the adapter must surface
+
+`abandon(id) -> Abandoned` is the teardown path, and the only way to stop a session that is still
+connecting. It never blocks and is never refused.
+
+* `Abandoned::Connecting` — the open gets one `OpenFailed` with `ErrorKind::Cancelled`, then
+  `Terminal { Closed }`. A connection that arrives afterwards is closed on the worker thread; the
+  adapter sees nothing further.
+* `Abandoned::Open { transaction_possibly_lost }` — **this one has to reach the user.** Abandoning
+  an open session never commits, so the server rolls back whatever transaction it held. When the
+  flag is true the worksheet has to say so (`SPEC.md` §10; M4.5/M4.6 own the wording). `Terminal`
+  follows when the worker reaches the abandon, which on a blocked statement is when that statement
+  returns.
+* `Abandoned::Ending` / `Abandoned::Unknown` — idempotent no-ops; nothing is produced.
+
+Exposing `transaction_possibly_lost` across the ABI is M2.11's call: an out-parameter on the
+abandon entry point is the obvious shape, and it is additive.
+
+### 7.4 Retirement
+
+`SessionRegistry::retire(id)` is what lets the registry drop its handle, and `Terminal` is the only
+event that says it may. The adapter's own per-session state and the registry's entry retire
+together, on the same event. A `SessionId` that has been retired answers `Unknown` to a later
+abandon and `None` to `get`, so a double-retire is harmless.
