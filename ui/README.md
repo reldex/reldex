@@ -427,9 +427,54 @@ Building 32-bit instead is not an option: the installed Qt is
 Getting it would mean installing the "C++ AddressSanitizer" component into the
 Visual Studio installation — a machine-level change, which this repository's
 scripts and tasks do not make. Linux ASan/UBSan in CI (ADR-0003 D2/D10) is the
-intended home for this and is being arranged separately (the `ffi-smoke` job in
-`.github/workflows/ui.yml` already runs its ubuntu leg under
-ASan+UBSan with `detect_leaks=1`, on the Qt-free C/C++ harness).
+intended home for this: the `ffi-smoke` job in `.github/workflows/ui.yml`
+already runs its ubuntu leg under ASan+UBSan with `detect_leaks=1` on the
+Qt-free C/C++ harness, and `qt-asan` (below) does the same for this whole Qt
+Quick tree, which is what actually exercises K5.
+
+### Building this whole tree under ASan/UBSan (`--sanitize`, K5)
+
+```bash
+bash ui/build.sh --sanitize --test
+```
+
+`RELDEX_SANITIZE` (`ui/CMakeLists.txt`, implemented in
+`ui/cmake/Sanitizers.cmake`) is a project-wide CMake option, GCC/Clang only:
+it adds `-fsanitize=address,undefined -fno-omit-frame-pointer -g` to
+`reldex_adapter`, `Reldex`, every QTest binary, and (reusing the same option
+name, already declared) the `ffi_smoke` harness. It never recompiles Qt
+itself (found prebuilt via `find_package`) or `reldex-ffi`'s Rust cdylib
+(built by cargo via Corrosion) — but once ASan's runtime is linked into an
+executable, it still intercepts `malloc`/`free` calls that uninstrumented
+code in the same process makes, which is what lets it see across that
+boundary at all. On MSVC the option is accepted, warns once per target, and
+is otherwise ignored (mirroring `ui/tests/ffi_smoke`'s own long-standing
+behaviour) — this is how it degrades on the Windows dev machine described
+above.
+
+`--sanitize` builds into a separate directory (`build/ui-<config>-asan`), and
+with `--test` it also sets three runtime option strings for the `ctest` run
+and passes `ctest -V` (verbose: every test's own output lands in the log, not
+just failing ones — the only way to see `tst_teardown`'s printed iteration
+count and its `reldex_live_counts` assertions as evidence rather than just a
+pass/fail line):
+
+- `ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:strict_string_checks=1`
+- `UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1`
+- `LSAN_OPTIONS=suppressions=ui/tests/lsan.supp`
+
+`ui/tests/lsan.supp` exists because Qt, fontconfig and the GL/offscreen stack
+can report leaks that are not ours; per that file's own header, an entry is
+added there **only** after a CI run's full stack confirms the leak originates
+entirely outside `ui/adapter`, `ui/tests` and `reldex_ffi` — anything in our
+own frames is a finding to fix, never something to suppress.
+
+CI runs this as `qt-asan` in `.github/workflows/ui.yml` (ubuntu-latest only,
+same reasoning as `ffi-smoke`'s ASan leg: GCC/Clang required, one OS is
+enough to prove the boundary sanitizer-clean), keeping `tst_teardown`'s full
+10,000 + 2,000 iteration count (`RELDEX_UI_TEARDOWN_ITERATIONS` /
+`_CONNECT_ITERATIONS` are the lever if a slower runner ever needs it
+reduced — see that variable's row above).
 
 It matters less than it did. ABI 3 added `reldex_live_counts`, which reports
 how many hubs, sessions, batches, errors and arenas the library holds — so K5's

@@ -445,6 +445,24 @@ pattern `ci.yml` already uses.
    moving to the 6.9 minor line is a version-policy decision for the owner,
    not this task. The script fails the job loudly if the installed file's
    text does not match what it expects, rather than silently no-op'ing.
+3. **`qt-asan`** (ubuntu-latest only, `timeout-minutes: 25`) — ADR-0003 kill
+   criterion K5's ASan half: `tst_teardown` and its `reldex_live_counts`
+   assertions already exist and pass on all three OSes, but ASan itself was
+   never available on the Windows dev machine (`ui/README.md`
+   "AddressSanitizer: not available on this machine"), so K5's ASan half had
+   no CI evidence until this job. Shares `qt-build`'s Qt-install steps (same
+   Qt version, same Ubuntu runtime packages), then runs
+   `bash ui/build.sh --sanitize --test` with `QT_QPA_PLATFORM=offscreen`:
+   `RELDEX_SANITIZE=ON` (`ui/CMakeLists.txt` / `ui/cmake/Sanitizers.cmake`)
+   instruments `reldex_adapter`, `Reldex` and every QTest binary with
+   `-fsanitize=address,undefined`, and the script sets
+   `ASAN_OPTIONS`/`UBSAN_OPTIONS`/`LSAN_OPTIONS` (suppressions in
+   `ui/tests/lsan.supp`, third-party frames only, each commented with why)
+   and passes `ctest -V` so `tst_teardown`'s full 10,000 + 2,000 iteration
+   count and its live-count assertions land in the job log as evidence. Qt
+   and `reldex-ffi`'s Rust cdylib are never recompiled by this option, but
+   ASan's runtime, once linked into the executable, still intercepts their
+   `malloc`/`free` calls.
 
 ### Action pins (commit SHA, per repository policy)
 
