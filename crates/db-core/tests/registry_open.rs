@@ -182,7 +182,12 @@ fn an_open_that_fails_reports_the_driver_error_with_its_native_code() {
         registry.get(id).is_none(),
         "a session that never opened is never handed out"
     );
-    assert_eq!(registry.state(id), Some(RegisteredSession::Ended));
+    // An open that failed leaves the registry owning nothing, so it keeps no
+    // entry at all: the `OpenFailed` and `Terminal` above were its last words,
+    // and a tombstone nobody retires is just a leak.
+    assert_eq!(registry.state(id), None);
+    assert!(!registry.retire(id), "there is nothing left to retire");
+    assert!(registry.is_empty());
 }
 
 /// The driver bounds its own connect on a helper thread (ADR-0002 H1, M2.1);
@@ -248,6 +253,12 @@ fn a_driver_that_panics_while_connecting_is_contained_and_reported() {
         0,
         "nothing was opened, so nothing can be left open"
     );
+    // A panicking connect still counts as a connect that finished. Tests wait
+    // on this counter instead of sleeping, so a scenario that never moves it
+    // would hang the test that used it rather than fail it.
+    support::wait_for("the panicking connect is counted as finished", || {
+        scenario.counts().connects_finished == 1
+    });
 }
 
 /// The open is a request like any other: it reserves a slot, and the slot comes
@@ -438,4 +449,50 @@ fn retiring_a_session_releases_the_registrys_hold_on_it() {
     assert_eq!(registry.state(id), None);
     assert!(!registry.retire(id), "and only once");
     assert_eq!(scenario.counts().connections_live(), 0);
+}
+
+/// `Opened` is the session's **first** event, and stays first even for a
+/// consumer that does not wait for it.
+///
+/// The invariant is structural rather than lucky: `complete_open` records the
+/// session under the registry's lock and emits `Opened` after releasing it, and
+/// both happen on the worker thread *before* that worker enters its command
+/// loop. So the worst case a consumer can construct — poll `get()` in a tight
+/// loop and submit the instant a handle appears, which is the window between
+/// the insert and the emit — still cannot get a reply ahead of the `Opened`.
+///
+/// Written as the adversarial probe because the ordinary route (wait for
+/// `Opened`, then submit) cannot fail this and so cannot detect a regression.
+#[test]
+fn a_submit_made_the_instant_the_session_appears_still_follows_its_opened() {
+    const ROUNDS: usize = 40;
+
+    for round in 0..ROUNDS {
+        let scenario = support::scenario();
+        let (registry, queue) = support::registry();
+
+        let id = registry.open(support::driver(&scenario), support::params(), RequestId(1));
+        // Deliberately *not* routed on the event: spin on the handle instead.
+        support::wait_for("the handle appears", || registry.get(id).is_some());
+        let session = registry.get(id).expect("the open succeeded");
+        session
+            .submit_ping(RequestId(2))
+            .expect("a ping on a session that has just opened");
+        drop(session);
+
+        let seen = support::drain_until(&queue, |seen| {
+            seen.iter().filter(|event| event.is_reply()).count() >= 2
+        });
+        let mine = support::of_session(&seen, id);
+        assert!(
+            matches!(mine.first(), Some(SessionEvent::Opened { .. })),
+            "round {round}: the session's first event must be its `Opened`, whatever the \
+             consumer did with the handle: {mine:#?}"
+        );
+
+        registry.retire(id);
+        support::wait_for("the connection is released", || {
+            scenario.counts().connections_live() == 0
+        });
+    }
 }

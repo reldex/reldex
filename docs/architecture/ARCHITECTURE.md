@@ -139,9 +139,17 @@ R2, `phase-1.md` §B3). It registers a session in one of four states — `Openin
 `Ended` — hands out the `Arc<DatabaseSession>` only while it is `Open`, and lets go of it only when
 the consumer retires it on that session's `Terminal`. Nothing there pools or replaces a session: a
 reconnect is a new `open` with a new `SessionId`, exactly as above. Giving up on a session is
-`abandon`, which never commits — it is `Drop`'s abandon without `Drop`'s wait — and reports whether
-a possibly-active transaction went with the connection, because §10 forbids hiding that (ADR-0002
-R4).
+`abandon`, which never commits — it is `Drop`'s abandon without `Drop`'s wait (ADR-0002 R4).
+
+Whether that cost the user anything is reported on the session's `Terminal`, as
+`transaction_possibly_lost`, and §10 forbids hiding it. It is decided **on the worker thread at the
+point the session ends** — after every command queued ahead of the close has run, which is where K4
+already decides for `close` — because any answer a control thread can read is a snapshot that a
+queued statement may still invalidate. That covers every way a session can end: a `close` whose
+disposition succeeded reports no loss (a rollback the user chose is a decision, not a loss), and
+`abandon`, `retire` of an open session, a dropped handle, the registry's teardown and a lost
+connection all report one whenever a transaction may have been open. The value `abandon` itself
+returns is a conservative lower bound for warning the user immediately (ADR-0002 R6).
 
 ## 6. Concurrency and threading
 
@@ -197,7 +205,9 @@ eventually returns, the worker finds no registration to adopt it and closes the 
 own thread, which is the only thread allowed to touch it. A late success is therefore never adopted
 after its failure has been reported, and never leaves a live database session behind (ADR-0002 R4,
 ADR-0003 A17). The same holds for dropping the registry itself, which must be prompt at application
-exit.
+exit: it issues every abandon first and then waits for all of them against **one** shared deadline,
+so shutting down N stuck sessions costs one `DROP_SHUTDOWN_TIMEOUT` in total rather than N of them,
+after which each remaining worker is detached and releases its connection when its call returns.
 
 ## 7. FFI and Qt adapter boundary
 

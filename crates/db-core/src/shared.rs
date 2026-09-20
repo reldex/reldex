@@ -196,6 +196,16 @@ pub(crate) struct SessionShared {
     /// [`ErrorKind::Cancelled`] rather than the generic "this session is
     /// closed" a deliberate close produces.
     open_cancelled: AtomicBool,
+    /// Set on the worker thread when a [`crate::CloseDisposition`] the caller
+    /// chose actually succeeded, as part of the close that ends the session.
+    ///
+    /// This is what separates "the session ended and took an unresolved
+    /// transaction with it" from "the user said commit (or rollback) and it
+    /// worked". Only the second is not a loss, and only an explicit `close`
+    /// can produce it — `Drop` and
+    /// [`crate::SessionRegistry::abandon`] never resolve anything, which is
+    /// exactly why they are lossy (ADR-0002 K5).
+    transaction_resolved_at_end: AtomicBool,
     /// The slots event-path requests hold: taken when a request is accepted,
     /// given back when the consumer takes its reply **out of** the queue. That
     /// is what makes [`crate::SessionLimits::max_outstanding_requests`] bound
@@ -222,6 +232,7 @@ impl SessionShared {
             terminal_emitted: AtomicBool::new(false),
             ended: AtomicBool::new(false),
             open_cancelled: AtomicBool::new(false),
+            transaction_resolved_at_end: AtomicBool::new(false),
             requests: Arc::new(RequestSlots::default()),
         }
     }
@@ -388,7 +399,12 @@ impl SessionShared {
     /// Called at the transition, by whichever path observed it. The lifecycle
     /// reported is whatever the session has reached by then, so a session that
     /// was lost and then closed says `Lost`.
-    pub(crate) fn emit_terminal(&self) {
+    ///
+    /// `transaction_possibly_lost` is the session's final word on whether it
+    /// took an unresolved transaction with it; see
+    /// [`SessionShared::transaction_lost_at_end`] for who may compute it and
+    /// when.
+    pub(crate) fn emit_terminal(&self, transaction_possibly_lost: bool) {
         if self
             .terminal_emitted
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -408,6 +424,7 @@ impl SessionShared {
             session: self.session,
             lifecycle,
             cause,
+            transaction_possibly_lost,
         });
     }
 
@@ -579,6 +596,38 @@ impl SessionShared {
     /// tracking, per ADR-0002.
     pub(crate) fn has_possibly_active_transaction(&self) -> bool {
         self.lock().possibly_active()
+    }
+
+    /// Records that the [`crate::CloseDisposition`] the caller chose succeeded,
+    /// as part of the close that is ending this session.
+    ///
+    /// Only [`crate::worker::Worker::close`] calls this, on the worker thread,
+    /// after the disposition returned `Ok`. It is what makes a deliberate
+    /// `close(Commit)` — or a deliberate `close(Rollback)` — *not* a loss: the
+    /// user said what should happen to the transaction and it happened.
+    pub(crate) fn mark_transaction_resolved_at_end(&self) {
+        self.transaction_resolved_at_end
+            .store(true, Ordering::Release);
+    }
+
+    /// The value [`SessionEvent::Terminal`] carries as
+    /// `transaction_possibly_lost`.
+    ///
+    /// **Only the worker thread may call this, and only at the point the
+    /// session actually ends** — after every command queued ahead of the close
+    /// has run. Anywhere else the answer is a snapshot that a queued statement
+    /// can still invalidate, which is exactly the under-reporting this field
+    /// exists to remove: `abandon` sees "no transaction", the worker then runs
+    /// a queued `INSERT`, and the server rolls it back at close.
+    ///
+    /// Conservative in the only direction that matters (`SPEC.md` §10,
+    /// ADR-0002 K7): a driver that cannot rule a transaction out reports
+    /// [`TransactionState::Unknown`], which reads as "may be open", so the
+    /// answer is `true`. A session that never opened has nothing to lose and is
+    /// reported `false` by its caller rather than here.
+    pub(crate) fn transaction_lost_at_end(&self) -> bool {
+        !self.transaction_resolved_at_end.load(Ordering::Acquire)
+            && self.has_possibly_active_transaction()
     }
 
     /// The worker is about to run a command, so a cancel has something to aim

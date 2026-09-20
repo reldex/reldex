@@ -88,6 +88,19 @@ pub(crate) fn of_session(seen: &[SessionEvent], session: SessionId) -> Vec<&Sess
         .collect()
 }
 
+/// The `transaction_possibly_lost` flag from `session`'s `Terminal`, or `None`
+/// if it has not arrived.
+pub(crate) fn terminal_loss(seen: &[SessionEvent], session: SessionId) -> Option<bool> {
+    seen.iter().find_map(|event| match event {
+        SessionEvent::Terminal {
+            session: named,
+            transaction_possibly_lost,
+            ..
+        } if *named == session => Some(*transaction_possibly_lost),
+        _ => None,
+    })
+}
+
 /// Drains until `session`'s `Terminal` has arrived, keeping everything else.
 pub(crate) fn drain_until_terminal_of(queue: &EventQueue, session: SessionId) -> Vec<SessionEvent> {
     drain_until(queue, |seen| {

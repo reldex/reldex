@@ -106,7 +106,7 @@ pub use events::{
     event_channel,
 };
 pub use ids::{LobHandle, ResultId, SessionId};
-pub use registry::{Abandoned, RegisteredSession, SessionRegistry};
+pub use registry::{Abandoned, RegisteredSession, RegistryCounts, SessionRegistry};
 pub use session::{
     CloseDisposition, CloseError, Completion, DROP_SHUTDOWN_TIMEOUT, DatabaseSession,
     ExecuteOutcome, FetchedBatch, OutValue, OutValues, SessionLimits, SessionManager,

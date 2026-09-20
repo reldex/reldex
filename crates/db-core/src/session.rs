@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reldex_db_driver_api::{
     CancelKind, CancelOutcome, Column, ConnectionId, ConnectionParams, DatabaseDriver, DbError,
@@ -36,6 +36,14 @@ use crate::worker::{self, CloseIntent, Command};
 /// every cursor and every parked large object, and it closes all of them when
 /// the blocked call finally returns. Nothing leaks; the release is just late.
 pub const DROP_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Where the reply to an abandon issued by
+/// [`DatabaseSession::begin_abandon`] arrives.
+///
+/// Split out from the issuing call so that a caller ending *many* sessions can
+/// issue every abandon first and then wait for all of them against one
+/// deadline — see [`crate::SessionRegistry`]'s `Drop`.
+pub(crate) type AbandonReply = mpsc::Receiver<Result<(), CloseError>>;
 
 /// One value a statement wrote back through an output bind.
 ///
@@ -572,7 +580,7 @@ impl DatabaseSession {
         command_tx: mpsc::Sender<Command>,
         join: thread::JoinHandle<()>,
         shared: Arc<SessionShared>,
-        ready: &worker::Ready,
+        ready: worker::Ready,
         limits: SessionLimits,
     ) -> Self {
         Self {
@@ -581,9 +589,9 @@ impl DatabaseSession {
             command_tx: Mutex::new(command_tx),
             worker: Mutex::new(Some(join)),
             shared,
-            cancel_handle: Arc::clone(&ready.cancel_handle),
+            cancel_handle: ready.cancel_handle,
             cancel_kind: ready.cancel_kind,
-            connect_warnings: ready.connect_warnings.clone(),
+            connect_warnings: ready.connect_warnings,
             limits,
         }
     }
@@ -710,12 +718,36 @@ impl DatabaseSession {
     ///
     /// Reflects the state as of the last request this handle has observed
     /// complete; a request submitted concurrently and not yet awaited is not
-    /// reflected yet. That is a reporting limitation only —
+    /// reflected yet. **A `false` from this method is therefore a lower bound,
+    /// not a verdict**: a statement already queued can still open a transaction
+    /// after it is read.
+    ///
+    /// Nothing decides anything irreversible from this answer.
     /// [`DatabaseSession::close`] re-checks on the worker thread once the queue
-    /// has drained, so it cannot act on a stale answer.
+    /// has drained (ADR-0002 K4), and the authoritative report of whether a
+    /// session took an unresolved transaction with it is
+    /// `transaction_possibly_lost` on that session's
+    /// [`crate::SessionEvent::Terminal`], which is likewise computed on the
+    /// worker thread at the point the session ends. Use this to drive a UI
+    /// affordance; use `Terminal` to tell the user what happened.
     #[must_use]
     pub fn has_possibly_active_transaction(&self) -> bool {
         self.shared.has_possibly_active_transaction()
+    }
+
+    /// The conservative, synchronous "might this session be carrying work?"
+    /// hint behind [`crate::Abandoned::Open`].
+    ///
+    /// Deliberately wider than
+    /// [`DatabaseSession::has_possibly_active_transaction`]: it also counts
+    /// requests the consumer has submitted but not drained and a driver call
+    /// the worker is inside, because either can open a transaction *after* the
+    /// snapshot is taken. It is still only a lower bound — the value that
+    /// settles the question arrives on `Terminal`.
+    pub(crate) fn may_be_carrying_work(&self) -> bool {
+        self.shared.has_possibly_active_transaction()
+            || self.shared.outstanding() > 0
+            || self.shared.driver_call_in_flight()
     }
 
     fn send(&self, command: Command) -> bool {
@@ -778,15 +810,71 @@ impl DatabaseSession {
     /// reads, deliberately, because `abandon` is not a request and the caller
     /// did not give it a [`RequestId`].
     pub(crate) fn abandon_now(&self) {
+        drop(self.begin_abandon());
+    }
+
+    /// Issues the abandon and hands back the channel its reply will arrive on,
+    /// so a caller that wants to wait can — without this call itself waiting.
+    ///
+    /// `None` means the command could not be delivered, so there is nothing to
+    /// wait for: the worker has already gone.
+    pub(crate) fn begin_abandon(&self) -> Option<AbandonReply> {
         // Best effort, and honest about it: on a driver that cannot interrupt
         // a running call this does nothing at all, exactly as in `Drop`.
-        let _ = self.cancel();
+        //
+        // Skipped once the session has ended, because by then
+        // `DatabaseConnection::close` has run and the driver's
+        // `CancelHandle` contract says nothing about what `request_cancel`
+        // may do to a closed connection (ADR-0002, amendment R7 makes the
+        // no-op explicit; this does not rely on it).
+        if !self.shared.has_ended() {
+            let _ = self.cancel();
+        }
         let (tx, rx) = mpsc::channel();
-        drop(rx);
-        let _ = self.send(Command::Close {
+        if self.send(Command::Close {
             intent: CloseIntent::Abandon,
             reply: CloseReplyTo::one_shot(tx),
-        });
+        }) {
+            Some(rx)
+        } else {
+            None
+        }
+    }
+
+    /// Waits for an abandon issued by [`DatabaseSession::begin_abandon`] until
+    /// `deadline`, then takes the worker handle so this session's [`Drop`]
+    /// returns immediately.
+    ///
+    /// This is what lets a caller tearing down *many* sessions spend one
+    /// [`DROP_SHUTDOWN_TIMEOUT`] in total rather than one per session: it
+    /// issues nothing, so every abandon can already be in flight, and the
+    /// deadline is the caller's, shared across all of them.
+    ///
+    /// Returns whether the worker finished within the deadline. When it did
+    /// not, the worker is **detached**, exactly as in `Drop`: it still owns its
+    /// connection and closes it when the blocked driver call returns.
+    pub(crate) fn finish_abandon(&self, reply: Option<AbandonReply>, deadline: Instant) -> bool {
+        let finished = match reply {
+            Some(rx) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                rx.recv_timeout(remaining).is_ok()
+            }
+            // Nothing was issued because there was no worker to issue it to.
+            None => true,
+        };
+        let handle = self
+            .worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(handle) = handle {
+            if finished {
+                let _ = handle.join();
+            } else {
+                drop(handle);
+            }
+        }
+        finished
     }
 
     fn check_event_route(&self) -> DbResult<()> {
@@ -1242,32 +1330,22 @@ impl Drop for DatabaseSession {
     /// cannot be interrupted — a `CancelKind::PreArmedDeadline` driver with no
     /// deadline armed, say — delays the release; it never hangs the drop and
     /// never leaks the resources.
+    ///
+    /// A session whose worker handle has already been taken — by
+    /// [`crate::SessionRegistry`]'s own teardown, which waits for every session
+    /// it holds against **one** shared deadline — returns from here
+    /// immediately, because the wait has already happened.
     fn drop(&mut self) {
-        let worker = self
+        if self
             .worker
             .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(handle) = worker.take() else {
-            return;
-        };
-        // Best effort, and honest about it: on a driver that cannot interrupt a
-        // running call this does nothing at all, which is why the wait below is
-        // bounded.
-        let _ = self.cancel();
-        let (tx, rx) = mpsc::channel();
-        if !self.send(Command::Close {
-            intent: CloseIntent::Abandon,
-            reply: CloseReplyTo::one_shot(tx),
-        }) {
-            let _ = handle.join();
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+        {
             return;
         }
-        match rx.recv_timeout(DROP_SHUTDOWN_TIMEOUT) {
-            Ok(_) => {
-                let _ = handle.join();
-            }
-            Err(_) => drop(handle),
-        }
+        let reply = self.begin_abandon();
+        self.finish_abandon(reply, Instant::now() + DROP_SHUTDOWN_TIMEOUT);
     }
 }
 
@@ -1356,7 +1434,7 @@ impl SessionManager {
                 spawned.command_tx,
                 spawned.join,
                 shared,
-                &ready,
+                ready,
                 self.limits,
             )),
             Ok(Err(err)) => {

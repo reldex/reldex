@@ -362,15 +362,35 @@ impl BlockGate {
     /// gate, `false` if `timeout` elapsed first.
     #[must_use]
     pub fn wait_until_blocked(&self, timeout: Duration) -> bool {
+        self.wait_until_parked(1, timeout)
+    }
+
+    /// Blocks until at least `count` statements are parked on this gate, or
+    /// `timeout` elapses.
+    ///
+    /// The many-sessions form of [`BlockGate::wait_until_blocked`]: a test that
+    /// needs *every* worker stuck before it measures something must be able to
+    /// wait for that without sleeping.
+    #[must_use]
+    pub fn wait_until_parked(&self, count: u32, timeout: Duration) -> bool {
         let guard = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_guard, result) = self
             .condvar
-            .wait_timeout_while(guard, timeout, |state| state.parked == 0)
+            .wait_timeout_while(guard, timeout, |state| state.parked < count)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         !result.timed_out()
+    }
+
+    /// How many statements are parked on this gate right now.
+    #[must_use]
+    pub fn parked(&self) -> u32 {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .parked
     }
 
     /// Parks until released, cancelled or `deadline`.
@@ -1063,6 +1083,14 @@ impl Scenario {
             let _ = gate.park(None, false);
         }
         let behavior = self.lock().connect.clone();
+        if matches!(behavior, Behavior::Panic(_)) {
+            // Recorded *before* the panic, because after it there is no code
+            // left on this thread to record anything: a test that waits on
+            // `Counts::connects_finished` — the only way to know every connect
+            // has run without sleeping — would otherwise hang forever on the
+            // `panic_connect` scenario.
+            self.record_connect_failed();
+        }
         behavior.apply()
     }
 

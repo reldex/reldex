@@ -337,6 +337,16 @@ fn worker_main(
         connection_id: connection.id(),
         connect_warnings,
     };
+    // `report` is what records the session and emits its `Opened` — and it runs
+    // **here**, on this worker, *before* the command loop below. That ordering
+    // is the whole reason "`Opened` is a session's first event" is structural:
+    // this thread is the only producer of a reply for this session, and it
+    // cannot produce one until `report` has returned, so nothing this session
+    // ever says can overtake the `Opened`. It holds even for a consumer that
+    // ignores events and polls `SessionRegistry::get` instead, because the
+    // handle it would poll does not exist until `report` has recorded it.
+    // Moving any part of this after the loop starts would break that silently
+    // (see `registry_open.rs`, "a submit made the instant the session appears").
     if matches!(report(Ok(ready)), Adoption::Abandoned) {
         // Nobody is waiting for this session any more: the blocking caller
         // gave up, or `SessionRegistry::abandon` won the race with this
@@ -383,7 +393,11 @@ fn worker_main(
     // Covers the path no command took: the session handle was dropped without
     // an explicit close, so the channel simply ended.
     worker.shared.mark_closed();
-    worker.shared.emit_terminal();
+    // Computed here, on the worker thread, once every command that was queued
+    // ahead of the end has run: this is the only point at which the answer
+    // cannot still be invalidated by work the caller had already submitted.
+    let transaction_possibly_lost = worker.shared.transaction_lost_at_end();
+    worker.shared.emit_terminal(transaction_possibly_lost);
 }
 
 enum Flow {
@@ -512,7 +526,10 @@ impl Worker {
             }
             command.fail(self.shared.terminal_error());
         }
-        self.shared.emit_terminal();
+        // The session was lost rather than closed, so nothing resolved the
+        // transaction: whatever may have been open went with the connection.
+        let transaction_possibly_lost = self.shared.transaction_lost_at_end();
+        self.shared.emit_terminal(transaction_possibly_lost);
         flow
     }
 
@@ -1092,6 +1109,15 @@ impl Worker {
                 return Flow::Continue;
             }
             self.shared.note_commit_or_rollback();
+            // The disposition the caller asked for succeeded, so this session
+            // is about to end with its transaction *resolved*: `Terminal` must
+            // say `transaction_possibly_lost: false` even for a driver that
+            // cannot rule a transaction out on its own
+            // (`TransactionState::Unknown` reads as "may be open" forever).
+            // Recorded as a fact about what happened rather than re-derived
+            // from the driver, which also keeps this path from emitting one
+            // last `TransactionStateChanged` between the reply and `Terminal`.
+            self.shared.mark_transaction_resolved_at_end();
         }
 
         self.release_results();

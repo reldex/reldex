@@ -113,7 +113,9 @@
 //! max_unsolicited_per_session + 3` events in the queue — `R + 1` replies, `R`
 //! `Executing`s, `U + 1` unsolicited and one `Terminal` — and no producer can
 //! exceed that however fast it runs. M2.6's open and abandon do not change
-//! that arithmetic: the open is one of the `R`, and abandon reserves nothing.
+//! that arithmetic: the open is one of the `R`, abandon reserves nothing, and
+//! `Terminal`'s `transaction_possibly_lost` is a field on an event that was
+//! already counted rather than a new event.
 //!
 //! Dropping the [`EventQueue`] ends the stream: see [`EventQueue`] for what
 //! happens to the events and the slots that were still in it.
@@ -320,6 +322,13 @@ pub enum SessionEvent {
     /// event: nothing else is emitted for a session before the open is
     /// answered, so a consumer can create its per-session state here and
     /// retire it on [`SessionEvent::Terminal`].
+    ///
+    /// That is structural, not a convention. The registry records the session
+    /// and emits this from the worker thread *before* that worker enters its
+    /// command loop, so the only producer of any later event for this session
+    /// cannot run until this one is queued — even for a consumer that ignores
+    /// events and polls [`crate::SessionRegistry::get`] to submit the instant a
+    /// handle appears.
     Opened {
         /// The session that opened.
         session: SessionId,
@@ -476,6 +485,34 @@ pub enum SessionEvent {
         /// The failure that lost the session, with its original kind, native
         /// code and cause chain. `None` for a deliberate close.
         cause: Option<DbError>,
+        /// Whether this session ended while it may still have held an
+        /// unresolved transaction — in other words, whether work the user did
+        /// may have been rolled back by the server when the connection went
+        /// away.
+        ///
+        /// **This is the authoritative answer and a consumer must surface it**
+        /// (`SPEC.md` §10: never silently commit or hide transaction loss). It
+        /// is computed on the worker thread at the point the session actually
+        /// ends — after every command queued ahead of the close has run, which
+        /// is where ADR-0002 K4 already decides — so unlike any answer a
+        /// control thread can read, no queued statement can still invalidate
+        /// it.
+        ///
+        /// * `false` for a `close` whose [`crate::CloseDisposition`] succeeded:
+        ///   the user said commit (or rollback) and it happened. A rollback the
+        ///   user chose is not a loss.
+        /// * `false` for a session that never opened. Nothing was connected, so
+        ///   there was no transaction to lose.
+        /// * `true` for [`crate::SessionRegistry::abandon`],
+        ///   `DatabaseSession::drop` and the registry's teardown whenever a
+        ///   transaction may have been open: none of them resolve anything
+        ///   (ADR-0002 K5), so the server rolls back.
+        /// * `true` for a lost connection whenever a transaction may have been
+        ///   open.
+        /// * `true` whenever the driver cannot rule a transaction out
+        ///   ([`reldex_db_driver_api::TransactionState::Unknown`]), because the
+        ///   conservative answer is the only safe one (ADR-0002 K7).
+        transaction_possibly_lost: bool,
     },
 }
 

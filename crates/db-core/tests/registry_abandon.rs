@@ -18,10 +18,11 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
+use std::time::Instant;
 
 use reldex_db_core::{
     Abandoned, CloseDisposition, EventCaps, RegisteredSession, RequestId, SessionEvent, SessionId,
-    SessionLifecycle, SessionLimits, Statement,
+    SessionLifecycle, SessionLimits, SessionRegistry, Statement,
 };
 use reldex_db_driver_api::ErrorKind;
 use reldex_driver_mock::{Action, BlockGate, BlockSpec, ScriptValue, ScriptedError};
@@ -118,6 +119,11 @@ fn abandoning_a_connect_that_succeeds_late_closes_the_connection_it_never_adopte
         "the abandon won, so the session ended deliberately rather than failing"
     );
     assert!(registry.get(id).is_none());
+    assert_eq!(
+        registry.state(id),
+        Some(RegisteredSession::Ended),
+        "with the connect still parked, the tombstone that will refuse it is there"
+    );
 
     // Now let the connect win its race with nothing.
     gate.release();
@@ -135,6 +141,12 @@ fn abandoning_a_connect_that_succeeds_late_closes_the_connection_it_never_adopte
         0,
         "and the late success produced no event at all"
     );
+    // Having refused the late connection, the tombstone has nothing left to
+    // refuse, and the registry lets go of the id on its own.
+    support::wait_for("the resolved tombstone is dropped", || {
+        registry.state(id).is_none()
+    });
+    assert!(registry.is_empty());
 }
 
 /// The same, with the connect *failing* late: the abandon still owns the one
@@ -158,6 +170,11 @@ fn abandoning_a_connect_that_fails_late_still_produces_exactly_one_reply() {
     let out = outcome(&seen, id);
     assert_eq!(out.open_failure_kind, Some(ErrorKind::Cancelled));
     assert_eq!(out.terminal_lifecycle, Some(SessionLifecycle::Closed));
+    assert_eq!(
+        registry.state(id),
+        Some(RegisteredSession::Ended),
+        "the tombstone the abandon leaves is what the late failure will find"
+    );
 
     gate.release();
     support::wait_for("the late connect finishes", || {
@@ -168,11 +185,9 @@ fn abandoning_a_connect_that_fails_late_still_produces_exactly_one_reply() {
         0,
         "it failed, so there was never a connection"
     );
-    assert_eq!(
-        registry.state(id),
-        Some(RegisteredSession::Ended),
-        "the tombstone the abandon left is what the late failure found"
-    );
+    support::wait_for("and it drops the tombstone it found", || {
+        registry.state(id).is_none()
+    });
     assert_eq!(
         queue.len(),
         0,
@@ -284,11 +299,18 @@ fn abandoning_twice_changes_nothing_the_second_time() {
     });
     assert_eq!(queue.len(), 0, "and no extra events came from the repeats");
 
-    assert!(registry.retire(id));
+    // The late connect resolved the tombstone the abandon left, so the registry
+    // has already let go: there is nothing left for `retire` to release, and it
+    // says so rather than pretending.
+    assert!(!registry.retire(id));
+    assert!(
+        registry.is_empty(),
+        "an abandoned open must not outlive its own connect in the map"
+    );
     assert_eq!(
         registry.abandon(id),
         Abandoned::Unknown,
-        "after retiring, the registry has never heard of it"
+        "and the registry has never heard of it afterwards"
     );
 }
 
@@ -415,13 +437,22 @@ fn abandon_racing_the_connect_holds_the_invariants_in_both_orders() {
         // Two threads, started together, racing: one releases the connect, the
         // other abandons. Which wins is genuinely undetermined; the
         // invariants are not.
-        let releaser = {
-            let gate = Arc::clone(&gate);
-            thread::spawn(move || gate.release())
-        };
-        let abandoner = {
-            let registry = Arc::clone(&registry);
-            thread::spawn(move || registry.abandon(id))
+        //
+        // The spawn order alternates because *which* thread starts first is
+        // the only lever the test has over a single-core scheduler, and a run
+        // that only ever produced one of the two orders would be testing half
+        // of what this test claims to test. The floor asserted at the end is
+        // what makes that visible instead of silently passing.
+        let abandon_first = round % 2 == 0;
+        let spawn_releaser = |gate: Arc<BlockGate>| thread::spawn(move || gate.release());
+        let spawn_abandoner =
+            |registry: Arc<_>| thread::spawn(move || SessionRegistry::abandon(&registry, id));
+        let (releaser, abandoner) = if abandon_first {
+            let abandoner = spawn_abandoner(Arc::clone(&registry));
+            (spawn_releaser(Arc::clone(&gate)), abandoner)
+        } else {
+            let releaser = spawn_releaser(Arc::clone(&gate));
+            (releaser, spawn_abandoner(Arc::clone(&registry)))
         };
         releaser.join().expect("the releaser does not panic");
         let verdict = abandoner.join().expect("the abandoner does not panic");
@@ -452,6 +483,16 @@ fn abandon_racing_the_connect_holds_the_invariants_in_both_orders() {
         cancelled + opened,
         ROUNDS,
         "every round resolved into exactly one of the two orders"
+    );
+    // A soft floor, not a distribution: the invariants above are what is being
+    // tested, and they hold for either order. This exists so that a schedule
+    // which *never* produces one of the orders — a degenerate runner, or a
+    // change that accidentally serialises the race — fails loudly instead of
+    // passing while exercising half of the thing.
+    assert!(
+        cancelled >= 1 && opened >= 1,
+        "over {ROUNDS} alternating rounds the race never went both ways \
+         ({cancelled} cancelled, {opened} opened); this run tested only one order"
     );
 }
 
@@ -558,6 +599,105 @@ fn dropping_the_registry_abandons_open_sessions_without_committing() {
     );
 }
 
+/// The registry's teardown costs **one** `DROP_SHUTDOWN_TIMEOUT` in total, not
+/// one per stuck session.
+///
+/// Every session here is parked inside a driver call that ignores the cancel,
+/// so every one of them hits the deadline: the abandon is issued for all of
+/// them first, and the wait is against a single deadline shared by the whole
+/// teardown, after which each worker is detached.
+///
+/// Asserted structurally where it can be — all eight workers are still inside
+/// the driver call when `drop` returns, so all eight waits really did expire
+/// and nothing was joined — plus one deliberately loose wall-clock bound,
+/// because "these waits overlap" is a statement about time and cannot be
+/// checked any other way. The bound is three timeouts for eight sessions:
+/// correct behaviour costs about one (500 ms), the serial behaviour this
+/// replaces measured 500 ms *per session* (4 s for eight), and 1.5 s sits far
+/// enough from both that a loaded CI runner cannot turn a pass into a failure.
+#[test]
+fn dropping_the_registry_waits_once_for_all_of_its_stuck_sessions() {
+    const SESSIONS: usize = 8;
+    const STUCK: &str = "SELECT stuck FROM dual";
+
+    let scenario = support::scenario();
+    let gate = BlockGate::new();
+    scenario.on_sql(
+        STUCK,
+        // Unobserved, so the cancel the teardown issues changes nothing and
+        // every session is still stuck when the deadline arrives — the worst
+        // case, and the one the bound is about.
+        Action::Block(BlockSpec::new(Arc::clone(&gate)).with_unobserved_cancel()),
+    );
+    let (registry, queue) = support::registry();
+
+    let ids: Vec<SessionId> = (0..SESSIONS)
+        .map(|index| {
+            let id = registry.open(
+                support::driver(&scenario),
+                support::params(),
+                RequestId(index as u64 * 10),
+            );
+            support::wait_for("the session opens", || registry.get(id).is_some());
+            let session = registry.get(id).expect("open");
+            session
+                .submit_execute(RequestId(index as u64 * 10 + 1), Statement::new(STUCK))
+                .expect("accepted");
+            id
+        })
+        .collect();
+    assert!(
+        gate.wait_until_parked(SESSIONS as u32, support::short_timeout()),
+        "every worker must be inside the driver before the teardown is timed"
+    );
+
+    let (elapsed_tx, elapsed_rx) = std::sync::mpsc::channel();
+    let teardown = thread::spawn(move || {
+        let started = Instant::now();
+        drop(registry);
+        let _ = elapsed_tx.send(started.elapsed());
+    });
+    let elapsed = elapsed_rx
+        .recv_timeout(support::HANG_GUARD)
+        .expect("the registry teardown never returned");
+    teardown.join().expect("the teardown does not panic");
+
+    // Structural: nothing was joined. All eight are still parked in the driver
+    // call, which is exactly the case in which a per-session wait would have
+    // cost eight timeouts.
+    assert_eq!(
+        gate.parked(),
+        SESSIONS as u32,
+        "every worker was still stuck, so every one of the waits expired"
+    );
+    assert_eq!(
+        scenario.counts().connections_live(),
+        SESSIONS,
+        "a detached worker still owns its connection until its call returns"
+    );
+    assert!(
+        elapsed < 3 * reldex_db_core::DROP_SHUTDOWN_TIMEOUT,
+        "the teardown took {elapsed:?} for {SESSIONS} stuck sessions; one shared deadline \
+         costs about {:?}, one deadline each would cost about {:?}",
+        reldex_db_core::DROP_SHUTDOWN_TIMEOUT,
+        u32::try_from(SESSIONS).expect("fits") * reldex_db_core::DROP_SHUTDOWN_TIMEOUT,
+    );
+
+    // And nothing leaks: the detached workers finish when their call returns.
+    gate.release();
+    let seen = support::drain_until(&queue, |seen| {
+        seen.iter().filter(|event| event.is_terminal()).count() >= SESSIONS
+    });
+    for id in &ids {
+        let out = outcome(&seen, *id);
+        assert_eq!(out.opened, 1);
+        assert_eq!(out.terminal_lifecycle, Some(SessionLifecycle::Closed));
+    }
+    support::wait_for("every detached worker releases its connection", || {
+        scenario.counts().connections_live() == 0
+    });
+}
+
 /// A consumer that walks away mid-connect. Nothing here may panic, and the
 /// slots the discarded events held must come back.
 #[test]
@@ -577,7 +717,9 @@ fn dropping_the_queue_while_a_session_is_connecting_is_survivable() {
         let counts = scenario.counts();
         counts.connects_finished == 1 && counts.connections_live() == 0
     });
-    assert!(registry.retire(id));
+    // Nothing left to retire: the late connect cleared the tombstone itself.
+    assert!(!registry.retire(id));
+    assert!(registry.is_empty());
 }
 
 /// Abandoning a session whose worker is inside an uninterruptible statement
@@ -714,4 +856,60 @@ fn a_close_submitted_after_an_abandoned_open_reports_the_cancellation() {
         counts.connects_finished == 1 && counts.connections_live() == 0
     });
     let _ = CloseDisposition::Rollback;
+}
+
+/// A consumer that abandons and never retires must not make the registry grow
+/// without bound.
+///
+/// The tombstone an abandoned open leaves exists only to refuse the connect
+/// that is still running; once that connect has arrived and been closed, it has
+/// no reader left and the registry drops it itself. Sessions that *did* open
+/// are different — the registry holds a real handle for those — which is why
+/// `counts()` exists and why `retire` is still mandatory.
+#[test]
+fn abandoned_opens_do_not_accumulate_when_nobody_retires_them() {
+    const SESSIONS: usize = 200;
+
+    let scenario = support::scenario();
+    let gate = BlockGate::new();
+    scenario.block_connect(Arc::clone(&gate));
+    let (registry, queue) = support::registry();
+
+    let ids: Vec<SessionId> = (0..SESSIONS)
+        .map(|index| {
+            registry.open(
+                support::driver(&scenario),
+                support::params(),
+                RequestId(index as u64),
+            )
+        })
+        .collect();
+    assert!(gate.wait_until_parked(1, support::short_timeout()));
+    for id in &ids {
+        assert_eq!(registry.abandon(*id), Abandoned::Connecting);
+    }
+    assert_eq!(
+        registry.counts().ended,
+        SESSIONS,
+        "while the connects are still running, every tombstone is needed"
+    );
+
+    gate.release();
+    support::wait_for("every late connection is closed", || {
+        let counts = scenario.counts();
+        counts.connects_finished == SESSIONS && counts.connections_live() == 0
+    });
+    // Nobody retired anything.
+    support::wait_for("and the registry has let go of all of them", || {
+        registry.is_empty()
+    });
+    assert_eq!(registry.counts(), Default::default());
+
+    let seen = support::drain_until(&queue, |seen| {
+        seen.iter().filter(|event| event.is_terminal()).count() >= SESSIONS
+    });
+    for id in &ids {
+        let out = outcome(&seen, *id);
+        assert_eq!(out.open_failure_kind, Some(ErrorKind::Cancelled));
+    }
 }
