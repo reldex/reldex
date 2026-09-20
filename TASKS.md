@@ -94,7 +94,7 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 - [ ] M1.4 C smoke harness (`ui/tests/ffi_smoke`), no Qt, mock driver, ASan on Linux (sonnet)
 - [ ] M1.5 CMake + Corrosion + Qt project skeleton; QML module for the adapter (sonnet)
 - [ ] M1.6 ★ `ResultTableModel` over borrowed batch views; `Bridge` waker→`invokeMethod` drain (opus, review mandatory)
-- [ ] M1.7 Mock driver: 1M-row generator of the S14 shape with controllable latency and a 10 s blocking statement (sonnet)
+- [x] M1.7 Mock driver: 1M-row generator of the S14 shape with controllable latency and a 10 s blocking statement (sonnet) — done 2026-09-20: `Action::GeneratedQuery` / `GeneratedQuerySpec` (lazy, O(batch) memory, `expected_cell` for random-access checks); 1M rows stream in ~0.55 s (release)
 - [ ] M1.8 ★ Spike S15 measurement run + report against kill criteria K1–K7 (opus, review mandatory)
 - [ ] M1.9 Accept or re-open ADR-0003; update `ARCHITECTURE.md` §13 items 2/3/10, `TASKS.md`, `Task.html` (sonnet)
 

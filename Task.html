@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-20T07:09:00+07:00",
+  "updatedAt": "2026-09-20T07:14:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1108,8 +1108,8 @@
               "status": "todo"
             },
             {
-              "title": "M1.7 Mock driver: 1M-row generator of the S14 shape with controllable latency and a 10 s blocking statement (sonnet)",
-              "status": "todo"
+              "title": "M1.7 Mock driver: 1M-row generator of the S14 shape with controllable latency and a 10 s blocking statement (sonnet) — done 2026-09-20: Action::GeneratedQuery / GeneratedQuerySpec (lazy, O(batch) memory, expected_cell for random-access checks); 1M rows stream in ~0.55 s (release)",
+              "status": "done"
             },
             {
               "title": "M1.8 ★ Spike S15 measurement run + report against kill criteria K1–K7 (opus, review mandatory)",
@@ -1618,6 +1618,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-20",
+      "text": "M1.7 done: the mock driver can stream a deterministic 1,000,000-row result lazily (O(batch) memory, any cell checkable by position), with Thai, emoji and NULL cadences and optional latency — the data source for spike S15."
+    },
     {
       "date": "2026-09-20",
       "text": "Driver carry-over merged: connect-time warning channel (C-6, ADR-0002 amendment W1/W2), connect timeout enforced by the driver (C-5: default 15 s, capped at 1 h, unbounded only by explicit extension; ADR-0002 amendment H1/H2), and the CREATE TRIGGER auto-rewrite (U-18: on by default, off switch, always reported). Independent review: no injection, no late adoption, no transaction-tracking regression. Residual U-18 limits: 32767-byte trigger text; syntax-error positions refer to the wrapper block. A latent db-core defect (contained panics lost their message) was fixed on the way."
