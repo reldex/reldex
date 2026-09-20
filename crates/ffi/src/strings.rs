@@ -7,51 +7,59 @@ use crate::status::entry_value;
 
 /// A borrowed UTF-8 string: pointer plus length in **bytes**.
 ///
-/// Always NUL-terminated at `ptr[len]` as a convenience for C, but `len` is
-/// authoritative — a string that contains a NUL byte is still `len` bytes
-/// long. Never owned by the caller: it borrows from whatever produced it (an
-/// error, a batch, an arena) and dies with it.
+/// The promise depends on which way it is going, and the difference is the
+/// contract, not an accident:
+///
+/// * **Out of Reldex** — every `ReldexStr` this library hands back (an error's
+///   message, a column's name, a mock statement) is **NUL-terminated at
+///   `ptr[len]`**, so `printf("%s")` and `QString::fromUtf8(s.ptr)` are both
+///   safe. `len` is still authoritative: a string that *contains* a NUL byte
+///   is `len` bytes long regardless.
+/// * **Into Reldex** — a `ReldexStr` the caller builds needs only `len`
+///   readable bytes. Nothing here reads `ptr[len]`, so a pointer into the
+///   middle of a larger buffer is fine.
+///
+/// Never owned by the caller: an outbound one borrows from whatever produced
+/// it (an error, a batch, an arena) and dies with it.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ReldexStr {
-    /// First byte. Never null: an empty string points at a NUL byte.
+    /// First byte. Never null on the way out: an empty string points at a NUL
+    /// byte.
     pub ptr: *const u8,
     /// Length in bytes, excluding the trailing NUL.
     pub len: usize,
 }
 
-static EMPTY: &[u8] = b"\0";
+/// One readable NUL byte, so an empty outbound string still has something to
+/// point at and `ptr[0] == 0` holds.
+pub(crate) static EMPTY_NUL: &[u8] = b"\0";
 
 impl ReldexStr {
     /// The empty string.
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            ptr: EMPTY.as_ptr(),
+            ptr: EMPTY_NUL.as_ptr(),
             len: 0,
         }
     }
 
     /// Borrows `text`, which must already be NUL-terminated at `text[len]`.
+    ///
+    /// This is the **only** constructor for an outbound string, so the
+    /// NUL-termination promise above cannot be broken by accident: anything
+    /// that is not already terminated has to be copied into an [`OwnedStr`]
+    /// first, and that is a visible decision at the call site.
     pub(crate) fn borrow_nul_terminated(text: &str, len: usize) -> Self {
+        debug_assert_eq!(
+            text.as_bytes().get(len).copied(),
+            Some(0),
+            "an outbound ReldexStr must be NUL-terminated at ptr[len]"
+        );
         Self {
             ptr: text.as_ptr(),
             len,
-        }
-    }
-
-    /// Borrows `bytes` without a NUL-termination promise.
-    ///
-    /// Used only for views into a batch's own buffers, where the consumer is
-    /// told to use `len` (a cell in the middle of a column buffer is followed
-    /// by the next cell, not by a NUL).
-    pub(crate) fn borrow_bytes(bytes: &[u8]) -> Self {
-        if bytes.is_empty() {
-            return Self::empty();
-        }
-        Self {
-            ptr: bytes.as_ptr(),
-            len: bytes.len(),
         }
     }
 
@@ -93,7 +101,14 @@ impl ReldexStr {
 }
 
 /// An owned string kept for as long as the object that carries it, stored with
-/// a trailing NUL so a [`ReldexStr`] into it is usable from C either way.
+/// a trailing NUL so a [`ReldexStr`] into it keeps the outbound promise.
+///
+/// Copying is the point. Rust's `String`/`Box<str>` are *not* NUL-terminated,
+/// and `ptr[len]` on one is a byte past the allocation — reading it is
+/// undefined behaviour no matter what it happens to contain. Anything Reldex
+/// hands to C as a string therefore gets copied here once, at a point where
+/// the copy is amortised over many reads (per error, per result set), never
+/// per cell.
 #[derive(Debug)]
 pub(crate) struct OwnedStr {
     text: String,
@@ -157,6 +172,29 @@ pub(crate) unsafe fn read_in_struct<T: CStruct>(ptr: *const T) -> Option<T> {
     // SAFETY: every byte is now either copied from the caller or zero, and
     // `T: CStruct` promises an all-zero `T` is a valid value.
     Some(unsafe { value.assume_init() })
+}
+
+/// Checks that a caller-supplied **output** struct is one this build can fill,
+/// **without writing to it**.
+///
+/// Used where a refusal must leave `*ptr` untouched — [`crate::
+/// reldex_hub_next_event`] validates before it pops an event, so a mis-sized
+/// struct neither consumes the event nor scribbles on the caller's memory.
+/// Writability itself cannot be checked from here; reading the leading `u32`
+/// is the most this can prove, and the caller's contract covers the rest.
+///
+/// # Safety
+///
+/// `ptr` must be null, or aligned for `T` with its leading `u32` initialized
+/// and readable.
+pub(crate) unsafe fn check_out_struct<T: CStruct>(ptr: *const T) -> bool {
+    if ptr.is_null() || !ptr.is_aligned() {
+        return false;
+    }
+    // SAFETY: non-null and aligned; the caller promises the leading `u32` is
+    // initialized, which the prefix rule puts inside every valid `struct_size`.
+    let declared = unsafe { ptr.cast::<u32>().read() } as usize;
+    declared >= T::MIN_SIZE
 }
 
 /// Fills a caller-supplied **output** struct, writing only as many bytes as

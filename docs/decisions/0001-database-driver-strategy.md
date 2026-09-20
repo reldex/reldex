@@ -1,19 +1,19 @@
 # 0001 — Database Driver Strategy
 
-**Status:** Accepted — owner decision 2026-09-20: stay on oracledb; pre-armed deadline + honest UI; upstream issues pending — upstream issues #21–#25 filed 2026-09-20
+**Status:** Accepted — owner decision 2026-09-19: stay on oracledb; pre-armed deadline + honest UI; upstream issues pending — upstream issues #21–#25 filed 2026-09-19
 **Date:** 2026-09-19
 **Amended:** 2026-09-19 — **C1 revised and spike S4 widened.** The ADR-0002 API review re-read
 `oracledb`'s source and established that `set_call_timeout` locks the same `Arc<Mutex<Client>>` that
 `execute` holds for the whole round trip. The "cancel = short call timeout on demand" fallback this
 ADR originally recommended therefore does not exist. See C1 and the S4 row.
-**Amended:** 2026-09-20 — **Spike outcome recorded; ADR re-opened.** Spikes S1–S5, S7 and S9 ran
+**Amended:** 2026-09-19 — **Spike outcome recorded; ADR re-opened.** Spikes S1–S5, S7 and S9 ran
 against the live Phase 0 test database on 2026-09-19. S4's kill criterion fired: no mechanism stops a
 running statement and keeps the session in the general case. Per this ADR's own rule ("If a kill
 criterion in the spike plan fires, this ADR is re-opened rather than silently worked around"), it is
-now re-opened for the owner. See "Spike outcome (2026-09-20)" below. The owner has not changed
+now re-opened for the owner. See "Spike outcome (2026-09-19)" below. The owner has not changed
 drivers — `oracledb` remains the chosen driver — only the cancellation mechanism is undecided.
-**Amended:** 2026-09-20 — **Owner decision recorded; ADR re-closed.** See "Owner decision
-(2026-09-20)" below.
+**Amended:** 2026-09-19 — **Owner decision recorded; ADR re-closed.** See "Owner decision
+(2026-09-19)" below.
 **Decided by:** project owner, 2026-09-19 — the primary driver is Oracle's official
 [`oracle/rust-oracledb`](https://github.com/oracle/rust-oracledb) (crate `oracledb`). If a kill
 criterion in the spike plan fires, this ADR is re-opened rather than silently worked around.
@@ -21,7 +21,7 @@ criterion in the spike plan fires, this ADR is re-opened rather than silently wo
 All external facts below were checked on **2026-09-19**. Claims that could not be verified from a
 primary source are labelled **Unverified**.
 
-## Spike outcome (2026-09-20)
+## Spike outcome (2026-09-19)
 
 Spikes S1–S5, S7 and S9 ran against the live Phase 0 test database (Oracle 19.3 EE, container
 `reldex-oracle19c`) on **2026-09-19**; S6 (mobile cross-compile) ran in CI on 2026-09-19 (PR #3); the
@@ -41,8 +41,8 @@ what follows is the verdict summary only — read those files for the numbers be
 | S5 PL/SQL | **Pass** (REF CURSOR included, after contract fix C-1) |
 | S7 LOB streaming | **Pass** |
 | S9 concurrency | **Pass** |
-| S8 | **Pass with limits** (2026-09-20): pure-Rust TCPS session with certificate and host-name verification on, TLS 1.2 `ECDHE-RSA-AES256-GCM-SHA384`, confirmed server-side (`NETWORK_PROTOCOL = tcps`); trust via a user-supplied PEM only — no mTLS combined with a private CA (U-13), no `ewallet.p12`/OS trust store (U-12), `SSL_SERVER_DN_MATCH` and `SSL_SERVER_CERT_DN` ignored upstream (U-14 — since 2026-09-19 the driver refuses the second and warns about the first rather than forwarding either silently; neither is implemented), no revocation — kill criterion did NOT fire |
-| S6 mobile cross-compile | **Pass** (2026-09-20, PR #3): `aarch64-linux-android`, `aarch64-apple-ios` and `aarch64-apple-ios-sim` all compile and link in CI, no extra tools for `aws-lc-sys`, provider swap to `ring` impossible without forking — kill criterion did NOT fire. Cross-compile evidence only, not mobile support; physical-device validation is still open (`phase-0-s6-mobile-cross-compile.md`) |
+| S8 | **Pass with limits** (2026-09-19): pure-Rust TCPS session with certificate and host-name verification on, TLS 1.2 `ECDHE-RSA-AES256-GCM-SHA384`, confirmed server-side (`NETWORK_PROTOCOL = tcps`); trust via a user-supplied PEM only — no mTLS combined with a private CA (U-13), no `ewallet.p12`/OS trust store (U-12), `SSL_SERVER_DN_MATCH` and `SSL_SERVER_CERT_DN` ignored upstream (U-14 — since 2026-09-19 the driver refuses the second and warns about the first rather than forwarding either silently; neither is implemented), no revocation — kill criterion did NOT fire |
+| S6 mobile cross-compile | **Pass** (2026-09-19, PR #3): `aarch64-linux-android`, `aarch64-apple-ios` and `aarch64-apple-ios-sim` all compile and link in CI, no extra tools for `aws-lc-sys`, provider swap to `ring` impossible without forking — kill criterion did NOT fire. Cross-compile evidence only, not mobile support; physical-device validation is still open (`phase-0-s6-mobile-cross-compile.md`) |
 | S10 network loss / reconnect | **Pass, two upstream gaps** (2026-09-19, evidence-gap spike, no kill criterion of its own): a dead socket is detected in microseconds and reported `Lost`; nothing reconnects by itself; an in-doubt commit is surfaced, not guessed. A black-holed link never returns without a deadline (U-17), a connect cannot be bounded at all (U-15), and a dead client's row lock blocked a second session for the full 20 s measured |
 | S11 NCLOB | **Pass** (2026-09-19) — Thai and non-BMP text byte-exact through the lazy stream at six buffer sizes; `NULL`/`EMPTY_CLOB()` stay distinguishable |
 | S12 developer features | **Pass, one upstream blocker** (2026-09-19) — EXPLAIN PLAN, both `DBMS_XPLAN` entry points, `V$`, ten dictionary views, `LONG`/`LONG RAW` and `DBMS_METADATA.GET_DDL` all work; `CREATE TRIGGER` with `:NEW` does not (U-18) |
@@ -63,7 +63,7 @@ upstream crate (assessed, not built; see the results file §4 candidate 4). Per 
    reports `CancelKind::PreArmedDeadline` and the UI says plainly that a running statement can only be
    stopped by a limit set before it starts. **Recommended by the spike author and the lead.**
 2. **Wait for upstream.** Of the seven drafted issues (results file §6), five were submitted
-   2026-09-20 by the owner's account (SupawitNu) — A (public break/interrupt API) →
+   2026-09-19 by the owner's account (SupawitNu) — A (public break/interrupt API) →
    [#24](https://github.com/oracle/rust-oracledb/issues/24), B (NUMBER bind ×10) →
    [#21](https://github.com/oracle/rust-oracledb/issues/21), C (process aborts) →
    [#22](https://github.com/oracle/rust-oracledb/issues/22), D (call-timeout recovery / cancel not
@@ -89,10 +89,10 @@ timeout is misreported as a call timeout, cause discarded), **U-17** (no dead-li
 keepalive, `EXPIRE_TIME` unused), and **U-18** (`CREATE TRIGGER … :NEW` cannot be executed) — drafted
 as issues F and G above.
 
-## Owner decision (2026-09-20)
+## Owner decision (2026-09-19)
 
 The project owner reviewed the lead's summary of the spike outcome above and, in chat on
-2026-09-20, answered "as you recommended" to the open items this ADR was re-opened for:
+2026-09-19, answered "as you recommended" to the open items this ADR was re-opened for:
 
 1. **Stay on `oracledb`.** The 2026-09-19 driver decision stands; the rejected alternatives under
    "Alternatives considered" are not reopened and no fork is pursued.
@@ -101,7 +101,7 @@ The project owner reviewed the lead's summary of the spike outcome above and, in
    `SPEC.md` §10 carries this as an interim note, and §24.8 stays an **unmet target** — marked "not
    yet met — blocked on upstream driver (ADR-0001)" rather than redefined as satisfied.
 3. **Pursue the upstream fixes via the drafted issues** (`phase-0-spike-results.md` §6), Issue B
-   (the silent NUMBER-bind corruption, U-1) first. **Update 2026-09-20:** issues A–E, including B,
+   (the silent NUMBER-bind corruption, U-1) first. **Update 2026-09-19:** issues A–E, including B,
    were submitted by the owner's account — see the links in "Spike outcome" above; F and G (from the
    later evidence-gap spikes) are drafted and await the owner's go-ahead to submit
    (`TASKS.md`).
@@ -120,9 +120,9 @@ if:
 - a new kill criterion fires in a spike run after this decision (S6 and S8 have since passed, S8 with
   limits; S10–S14 carry no ADR-0001 kill criterion of their own).
 
-Everything in "Spike outcome (2026-09-20)" above remains the technical record of what was found; this
+Everything in "Spike outcome (2026-09-19)" above remains the technical record of what was found; this
 section records only what the owner decided to do about it. The "undecided"/"re-opened for the owner"
-language above describes the state as of 2026-09-20 before this decision; it is now decided.
+language above describes the state as of 2026-09-19 before this decision; it is now decided.
 
 ### Addendum — owner decisions on results file §9 items 8–12 (2026-09-19)
 
@@ -511,7 +511,7 @@ Coverage limitations to remember when reading spike results:
 - **19.3 base release, no Release Updates.** Real sites run 19.2x; some fixed bugs will be present.
 - **Non-CDB.** No PDB, no service-per-PDB behaviour — which is what most real 19c sites run. Any
   connect-string or service-name conclusion from this image is not the full story.
-- **TCPS not configured out of the box** — resolved 2026-09-20: `tools/oracle-test-db/startup/` adds a TCPS listener on `127.0.0.1:2484` (test CA, orapki-built wallet) and S8 has been run.
+- **TCPS not configured out of the box** — resolved 2026-09-19: `tools/oracle-test-db/startup/` adds a TCPS listener on `127.0.0.1:2484` (test CA, orapki-built wallet) and S8 has been run.
 - **Community-built and unmaintained** (last updated 2021-03); amd64 only.
 
 Optional later additions, not required for Phase 0: the official

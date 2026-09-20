@@ -60,14 +60,13 @@ fn a_burst_of_completions_produces_exactly_one_wake() {
     }
 
     // Wait for the whole burst to be queued, without taking anything out of
-    // the queue: that is what makes the assertion below exact.
-    loop {
+    // the queue: that is what makes the assertion below exact. Bounded by the
+    // hang guard, so a stuck pump fails the test instead of hanging the suite.
+    support::wait_until("all eight released sessions to queue their replies", || {
         // SAFETY: the hub is live.
-        if unsafe { reldex_hub_pending_events(harness.hub()) } == sessions.len() {
-            break;
-        }
-        std::thread::yield_now();
-    }
+        let pending = unsafe { reldex_hub_pending_events(harness.hub()) };
+        pending == sessions.len()
+    });
     assert_eq!(
         harness.signal.wakes(),
         before + 1,
@@ -135,15 +134,20 @@ fn unregistering_the_waker_under_a_flood_is_safe() {
         );
         let sql = reldex_mock_statement(ReldexMockStatement::GeneratedQuery as i32);
         let flood = 6_u64;
+        // The open always produces one event; each *accepted* execute produces
+        // one more. Counting them here is what lets the drain below finish on
+        // a condition rather than on a spin count.
+        let mut expected_replies = 1_u64;
         for request in 2..2 + flood {
             // SAFETY: the hub is live and `sql` is a `'static` string.
             let status = unsafe { reldex_session_execute(hub, session, request, sql, 0) };
             // The session may still be opening; either answer is fine, and an
             // accepted request is exactly what produces the flood.
-            assert!(
-                status == ReldexStatus::Ok || status == ReldexStatus::InvalidState,
-                "unexpected status {status:?}"
-            );
+            match status {
+                ReldexStatus::Ok => expected_replies += 1,
+                ReldexStatus::InvalidState => {}
+                other => panic!("unexpected status {other:?}"),
+            }
         }
 
         // Unregister in the middle of the flood.
@@ -156,24 +160,28 @@ fn unregistering_the_waker_under_a_flood_is_safe() {
 
         // Let the pumps finish pushing whatever is left; any wake now would be
         // a call into an object the adapter is entitled to have freed.
+        // Drain until every accepted request has been answered. Counting
+        // replies rather than spinning a fixed number of times is what makes
+        // this deterministic: the loop ends when the work is done, and the
+        // deadline only fires if it never is.
         let mut drained = 0_u64;
-        let mut idle = 0_u32;
-        while idle < 10_000 {
-            let mut event = ReldexEvent::default();
-            // SAFETY: the hub is live and `event` is a real local.
-            if unsafe { reldex_hub_next_event(hub, std::ptr::from_mut(&mut event)) } {
-                support::release_batch(&event);
-                if !event.error.is_null() {
-                    // SAFETY: the error came from the event.
-                    unsafe { reldex_ffi::reldex_error_free(event.error) };
+        support::wait_until(
+            "every accepted request on the flooded session to be answered",
+            || {
+                let mut event = ReldexEvent::default();
+                // SAFETY: the hub is live and `event` is a real local.
+                while unsafe { reldex_hub_next_event(hub, std::ptr::from_mut(&mut event)) } {
+                    support::release_batch(&event);
+                    if !event.error.is_null() {
+                        // SAFETY: the error came from the event.
+                        unsafe { reldex_ffi::reldex_error_free(event.error) };
+                    }
+                    drained += 1;
+                    event = ReldexEvent::default();
                 }
-                drained += 1;
-                idle = 0;
-            } else {
-                idle += 1;
-                std::thread::yield_now();
-            }
-        }
+                drained >= expected_replies
+            },
+        );
         assert!(drained >= 1, "the open alone produces an event");
         assert_eq!(
             signal.violations(),
@@ -268,12 +276,9 @@ fn an_ffi_call_from_inside_the_waker_is_refused_rather_than_deadlocking() {
 
     // The OPENED event's push calls the waker, which calls back in. If the
     // guard were missing this test would hang here rather than fail.
-    let mut idle = 0_u32;
-    while state.calls.load(Ordering::SeqCst) == 0 && idle < 100_000 {
-        idle += 1;
-        std::thread::yield_now();
-    }
-    assert!(state.calls.load(Ordering::SeqCst) >= 1, "the waker ran");
+    support::wait_until("the waker to run at least once", || {
+        state.calls.load(Ordering::SeqCst) >= 1
+    });
     assert_eq!(
         state.execute_status.load(Ordering::SeqCst),
         ReldexStatus::Reentrant as i32,

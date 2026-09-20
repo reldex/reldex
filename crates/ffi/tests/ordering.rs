@@ -148,3 +148,78 @@ fn a_request_that_races_a_close_still_gets_its_one_reply() {
     );
     assert!(harness.poll_event().is_none());
 }
+
+#[test]
+fn a_panic_in_the_pump_answers_every_request_behind_it_instead_of_stranding_them() {
+    // The pump runs on a thread of ours, so the `catch_unwind` on every
+    // `extern "C"` body cannot reach it. Without containment here, a panic
+    // would leave every outstanding request unanswered and the adapter's
+    // spinner would never stop — the worst kind of failure, because nothing
+    // reports it.
+    //
+    // `ReldexMockStatement::PumpPanic` is a reserved statement text that makes
+    // the pump panic when it reaches that request. It changes no ABI and is
+    // compiled in only with the mock driver.
+    let harness = Harness::new();
+    let session = harness.open(config(50_000));
+    assert_eq!(
+        harness.execute(session, 1, ReldexMockStatement::GeneratedQuery),
+        ReldexStatus::Ok
+    );
+    let executed = harness.next_event();
+    assert_eq!(executed.request, 1);
+    let result = executed.result;
+
+    // The panic, then more work queued behind it. All are accepted, so all
+    // must be answered — rule 5 does not have an exception for "the library
+    // broke".
+    assert_eq!(
+        harness.execute(session, 2, ReldexMockStatement::PumpPanic),
+        ReldexStatus::Ok
+    );
+    let mut expected = vec![2_u64];
+    for request in 3..7_u64 {
+        // A request may be refused if the pump has already torn the session
+        // down; only the accepted ones are owed a reply.
+        if harness.fetch(session, request, result, 1_000) == ReldexStatus::Ok {
+            expected.push(request);
+        }
+    }
+
+    let mut answered: Vec<u64> = Vec::new();
+    let mut lost = 0_u32;
+    while answered.len() < expected.len() {
+        let event: ReldexEvent = harness.next_event();
+        assert_eq!(event.session, session);
+        OwnedBatch(event.batch);
+        if !event.error.is_null() {
+            if event.session_state == reldex_ffi::ReldexSessionState::Lost as i32 {
+                lost += 1;
+            }
+            // SAFETY: the error came from the event and is freed once.
+            unsafe { reldex_ffi::reldex_error_free(event.error) };
+        }
+        answered.push(event.request);
+    }
+
+    assert_eq!(
+        answered, expected,
+        "every accepted request must be answered exactly once, in order, even after a panic"
+    );
+    assert!(
+        lost >= 1,
+        "the session must be reported lost, not merely failed"
+    );
+    assert!(
+        harness.poll_event().is_none(),
+        "and nothing is answered twice"
+    );
+
+    // The session is gone: nothing further is accepted, so nothing further is
+    // owed.
+    assert_eq!(
+        harness.execute(session, 99, ReldexMockStatement::GeneratedQuery),
+        ReldexStatus::InvalidState
+    );
+    support::free_error(reldex_ffi::reldex_last_error_take());
+}

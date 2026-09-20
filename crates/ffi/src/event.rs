@@ -108,6 +108,19 @@ pub enum ReldexCloseOutcome {
 /// (`ReldexEvent ev = { .struct_size = sizeof ev };`) and **owns** `error` and
 /// `batch` when they come back non-null: release them with
 /// [`crate::reldex_error_free`] and [`crate::reldex_batch_release`].
+///
+/// # Integer widths, so the rule is not guessed at
+///
+/// * A **count of things in this process** — rows, columns, warnings — is
+///   `size_t`, because that is what the caller will loop with and what
+///   `reldex_batch_row_count` / `reldex_batch_column_count` already return.
+///   Mixing `uint32_t` and `size_t` counts in one struct is how a `-Wsign-
+///   compare` warning gets silenced with a cast that is wrong on one platform.
+/// * A **quantity the database reported** — `rows_affected` — is `uint64_t`,
+///   deliberately *not* `size_t`: an `UPDATE` can change more rows than a
+///   32-bit host can address, and the number must not change meaning when the
+///   adapter is built for one.
+/// * An **id** is `uint64_t`, and an **enum** is `int32_t` (ADR-0003 D6/D7).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ReldexEvent {
@@ -145,10 +158,10 @@ pub struct ReldexEvent {
     pub close_outcome: i32,
     /// `Executed`: how many columns the result has; read their names with
     /// `reldex_batch_column_info` on any batch from it.
-    pub column_count: u32,
+    pub column_count: usize,
     /// `Opened`: how many connect-time warnings the session reported. Read
     /// them with [`crate::reldex_session_connect_warnings`].
-    pub warning_count: u32,
+    pub warning_count: usize,
     /// `Executed`: whether the statement produced a result set.
     pub has_result: bool,
     /// `Executed`: whether `rows_affected` is meaningful.
@@ -216,8 +229,8 @@ pub(crate) struct QueuedEvent {
     pub(crate) statement_kind: ReldexStatementKind,
     pub(crate) cancel_kind: crate::ReldexCancelKind,
     pub(crate) close_outcome: ReldexCloseOutcome,
-    pub(crate) column_count: u32,
-    pub(crate) warning_count: u32,
+    pub(crate) column_count: usize,
+    pub(crate) warning_count: usize,
     pub(crate) committed_implicitly: bool,
     pub(crate) session_still_open: bool,
 }
@@ -266,16 +279,21 @@ impl QueuedEvent {
         self
     }
 
+    /// `column_count` is passed in rather than read from `outcome`: the
+    /// columns themselves are *moved* out of the outcome into the result's
+    /// shared [`crate::batch::ResultColumns`] before this is called, so
+    /// `outcome.columns` is empty by now.
     pub(crate) fn with_execute_outcome(
         mut self,
         outcome: &ExecuteOutcome,
         result: Option<u64>,
+        column_count: usize,
     ) -> Self {
         self.result = result;
         self.rows_affected = outcome.rows_affected;
         self.statement_kind = outcome.statement_kind.into();
         self.committed_implicitly = outcome.committed_implicitly;
-        self.column_count = u32::try_from(outcome.columns.len()).unwrap_or(u32::MAX);
+        self.column_count = column_count;
         self
     }
 

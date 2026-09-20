@@ -112,7 +112,12 @@ impl OutValues {
 /// thread — the cursor itself never leaves it (ADR-0002 D1/D2). A nested
 /// `REF CURSOR` or a large object returned through an output bind is handled
 /// the same way; see [`OutValue`].
+/// `#[non_exhaustive]` so a later field — M2.5's event queue will want at
+/// least one — is an additive change rather than a breaking one. Nothing
+/// outside `db-core` constructs an `ExecuteOutcome`; the worker thread is its
+/// only producer, so the attribute costs nothing today.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct ExecuteOutcome {
     /// The result set's id, if the statement produced one. Pass this to
     /// [`DatabaseSession::fetch_batch`] and, once done,

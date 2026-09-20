@@ -35,14 +35,23 @@ pub enum ReldexStatus {
     /// did nothing useful; the panic message is in the thread-local last
     /// error. This is a bug in Reldex, not an expected outcome.
     Panic = 6,
-    /// The call was made from inside a waker callback, which the D5 contract
-    /// forbids. Nothing was done — the alternative is a deadlock.
+    /// The call was made from inside a waker callback. Nothing was done — the
+    /// alternative is a deadlock.
+    ///
+    /// The rule is **per thread, not per hub**: a waker may not call *any*
+    /// `reldex_*` function, on its own hub or on any other. The guard is a
+    /// thread-local flag, so it could not distinguish hubs even if the
+    /// contract wanted it to — and a waker that needs to touch a second hub is
+    /// doing work that belongs on the adapter's event loop anyway (ADR-0003
+    /// D5 rule 1).
     Reentrant = 7,
 }
 
 thread_local! {
     /// Set while this thread is inside a waker callback. See
     /// [`WakerGuard`].
+    ///
+    /// Per thread, deliberately: see [`ReldexStatus::Reentrant`].
     static IN_WAKER: Cell<bool> = const { Cell::new(false) };
 }
 

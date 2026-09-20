@@ -1,6 +1,6 @@
 # Reldex — Product & Technical Specification
 
-**Status:** Initial architecture specification — amended 2026-09-20 after Phase 0 spikes (owner-approved)  
+**Status:** Initial architecture specification — amended 2026-09-19 after Phase 0 spikes (owner-approved)  
 **Product:** Reldex  
 **Category:** High-performance cross-platform database development environment  
 **Primary platform:** Desktop  
@@ -286,7 +286,7 @@ Auto-commit = OFF
 Every worksheet must expose Execute, Cancel, Commit, and Rollback. On-demand Cancel remains the
 product requirement — Reldex competes on correct cancellation.
 
-> **Interim limitation (owner decision, 2026-09-20).** With the current primary driver version
+> **Interim limitation (owner decision, 2026-09-19).** With the current primary driver version
 > (`oracledb` 26.0.0-beta.3, [ADR-0001](docs/decisions/0001-database-driver-strategy.md)), on-demand
 > Cancel is not available: no mechanism stops a running statement and keeps the session usable in the
 > general case. Until the driver exposes a break/cancel mechanism, Reldex offers a per-statement time

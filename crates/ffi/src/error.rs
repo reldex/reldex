@@ -320,6 +320,15 @@ pub(crate) fn take_last_error() -> Option<Box<ReldexError>> {
 /// Returns `NULL` when there is none. Release the result with
 /// [`reldex_error_free`]. Calling this twice returns `NULL` the second time:
 /// the error exists once.
+///
+/// **Thread-local, and that is the whole contract.** The error belongs to the
+/// thread that made the failing call. A `reldex_session_request_cancel` that
+/// fails on a worker thread records its error *there*; the Qt main thread will
+/// not see it, and will instead see whatever it recorded itself. Take the
+/// error on the thread that got the status.
+///
+/// Every function that returns a non-`RELDEX_STATUS_OK` status sets this
+/// first, so a take immediately after a failure always describes that failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn reldex_last_error_take() -> *mut ReldexError {
     entry_value(std::ptr::null_mut(), || {

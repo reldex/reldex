@@ -25,7 +25,7 @@ use crate::error::set_last_argument_error;
 use crate::event::{QueuedEvent, ReldexEvent};
 use crate::session::SessionEntry;
 use crate::status::{ReldexStatus, WakerGuard, entry, entry_value};
-use crate::strings::write_out_struct;
+use crate::strings::{check_out_struct, write_out_struct};
 
 /// Called when the hub's event queue goes from empty to non-empty.
 ///
@@ -167,9 +167,21 @@ pub(crate) unsafe fn with_hub<T>(
     Some(body(&arc))
 }
 
+/// Records why a hub call was refused, so `reldex_last_error_take()` after a
+/// non-OK status always describes *that* call.
+fn set_last_hub_error(message: &str) -> ReldexStatus {
+    crate::error::set_last_error(reldex_db_core::DbError::internal(format!(
+        "reldex-ffi: {message}"
+    )));
+    ReldexStatus::InvalidState
+}
+
 /// Creates the hub. Returns `NULL` only if allocation failed.
 ///
-/// One per application is the intended shape; nothing here forbids more.
+/// One per application is the intended shape; nothing here forbids more — but
+/// note that the re-entrancy guard is per **thread**, not per hub, so a waker
+/// belonging to one hub may not call into a *different* hub either (see
+/// [`reldex_hub_set_waker`]).
 #[unsafe(no_mangle)]
 pub extern "C" fn reldex_hub_create() -> *mut ReldexHub {
     entry_value(std::ptr::null_mut(), || {
@@ -184,9 +196,29 @@ pub extern "C" fn reldex_hub_create() -> *mut ReldexHub {
 /// that cannot be interrupted. In order: the waker is unregistered (which
 /// waits for any wake already in flight, D5 rule 2), every session is marked
 /// closed and asked to cancel whatever it is running, and the hub's own
-/// reference is dropped. A session thread still finishing keeps the hub alive
-/// a moment longer and then releases it; events queued in the meantime are
-/// freed unread, along with any batch they carry.
+/// reference is dropped.
+///
+/// # What "promptly" costs when a statement cannot be interrupted
+///
+/// Prompt is not the same as finished, and the difference is worth stating
+/// plainly. A session parked inside an uninterruptible driver call — which is
+/// the *normal* case on `oracledb` 26.0.0-beta.3, whose cancel cannot reach a
+/// running statement (ADR-0002 D2, spike S4) — cannot be stopped by this
+/// call. Its cancel is best-effort and does nothing there. So until that
+/// statement returns on its own, or the process exits:
+///
+/// * the session's pump thread stays alive, blocked;
+/// * `db-core`'s worker thread for that session and the connection it owns
+///   stay alive with it;
+/// * the hub's own allocation stays alive, because the pump holds a reference;
+/// * every event already queued stays queued, **including any `ReldexBatch`
+///   it carries**, and is freed only when the last pump finally exits.
+///
+/// None of that is reachable by the caller any more, so it is a leak for as
+/// long as it lasts. It is the price of never blocking the UI thread on a
+/// 10-second statement (spike criterion K6), and it is bounded by the
+/// statement, not by Reldex. A caller that needs the memory back before then
+/// has no option through this ABI, because the driver offers none.
 ///
 /// Like dropping a `DatabaseSession`, this **never commits**: a transaction
 /// still open when the hub is destroyed is rolled back by the server, exactly
@@ -195,8 +227,14 @@ pub extern "C" fn reldex_hub_create() -> *mut ReldexHub {
 /// # Safety
 ///
 /// `hub` must be null, or a pointer [`reldex_hub_create`] returned that has
-/// not already been destroyed. No other thread may be inside a `reldex_*` call
-/// on this hub.
+/// not already been destroyed.
+///
+/// No other thread may be inside *any* `reldex_*` call on this hub — and that
+/// includes [`crate::reldex_session_request_cancel`], the one function this
+/// ABI otherwise lets any thread call. Sequencing the two is the caller's
+/// job: this library has no internal synchronisation for it, and a cancel
+/// racing this call dereferences freed memory. See
+/// [`crate::reldex_session_request_cancel`] for the rule in full.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reldex_hub_destroy(hub: *mut ReldexHub) {
     entry_value((), || {
@@ -236,6 +274,33 @@ pub unsafe extern "C" fn reldex_hub_destroy(hub: *mut ReldexHub) {
 /// can destroy the object `user_data` points at immediately afterwards
 /// (ADR-0003 D5 rule 2; spike criterion K5).
 ///
+/// # What the callback may not do
+///
+/// * **It may not call any `reldex_*` function — on any hub.** The
+///   re-entrancy guard is per *thread*, not per hub, and that is the contract,
+///   not an implementation detail: a wake runs on a Reldex thread and holds
+///   the lock that keeps the waker alive, so a call back in would deadlock or
+///   re-enter the queue it is being told about. Any entry from inside a waker
+///   reports `RELDEX_STATUS_REENTRANT` (or `false`/`0` from the functions that
+///   return no status) and does nothing.
+/// * **It may not let a C++ exception escape.** Unwinding a C++ exception
+///   through this `extern "C"` frame into Rust is undefined behaviour, and
+///   the `catch_unwind` on every Reldex entry point does **not** contain it —
+///   that catches Rust panics, which are a different mechanism. A waker that
+///   can throw must wrap its own body in `try { … } catch (...) { }`.
+/// * **It may not block.** It is called on a session's pump thread, and
+///   blocking there stalls that session's events. One
+///   `QMetaObject::invokeMethod(..., Qt::QueuedConnection)` and nothing else.
+///
+/// # When it fires
+///
+/// Only on the queue's transition from **empty to non-empty**. It is not
+/// level-triggered: a caller that stops draining while
+/// [`reldex_hub_next_event`] is still returning `true` gets **no further
+/// wake**, because the queue never became empty. Such a caller must re-post
+/// its own drain — ADR-0003 D5's budgeted `drain()` does exactly that, and
+/// [`reldex_hub_pending_events`] is how it can report what it left behind.
+///
 /// # Safety
 ///
 /// `hub` must be a live hub. `user_data` is opaque to this library and is only
@@ -252,7 +317,7 @@ pub unsafe extern "C" fn reldex_hub_set_waker(
         let status = unsafe {
             with_hub(hub, |hub| {
                 if hub.is_destroyed() {
-                    return ReldexStatus::InvalidState;
+                    return set_last_hub_error("reldex_hub_set_waker: the hub has been destroyed");
                 }
                 hub.set_waker(func, user_data);
                 ReldexStatus::Ok
@@ -287,11 +352,27 @@ pub unsafe extern "C" fn reldex_hub_pending_events(hub: *const ReldexHub) -> usi
 /// Returns `true` when `out` was filled. The caller then **owns** `out->error`
 /// and `out->batch` when they are non-null. Drain in a loop until this returns
 /// `false`, budgeting the loop so a flood cannot starve rendering (ADR-0003 D5
-/// suggests 256 events / 4 ms, then re-post).
+/// suggests 256 events / 4 ms, then re-post) — and see
+/// [`reldex_hub_set_waker`] for why a caller that stops early must re-post
+/// itself rather than wait for another wake.
 ///
-/// Returns `false` if `out` is null, unaligned, or its `struct_size` is too
-/// small — the event is **not** consumed in that case, so a mis-sized struct
-/// cannot silently lose a batch.
+/// **`false` means `*out` was not touched**, whether the queue was empty or
+/// the argument was rejected (null, unaligned, or a `struct_size` this build
+/// cannot fill). The event is never consumed in the rejected case either, so a
+/// mis-sized struct cannot silently lose a batch. Only the `struct_size` field
+/// is read on the way in; nothing is written unless an event is being
+/// delivered.
+///
+/// # The event queue is unbounded
+///
+/// Nothing here applies back-pressure. Every accepted request eventually
+/// queues exactly one event, and a `FETCHED` event holds a `ReldexBatch` whose
+/// rows are **the caller's memory** from the moment it is handed out. A
+/// caller that keeps fetching without draining, or drains without releasing,
+/// grows that queue without limit. The bound has to come from the adapter:
+/// keep a small number of fetches in flight per result, release each batch
+/// when the model is done with it, and use [`reldex_hub_pending_events`] as
+/// the only signal this ABI gives about the backlog.
 ///
 /// # Safety
 ///
@@ -300,26 +381,25 @@ pub unsafe extern "C" fn reldex_hub_pending_events(hub: *const ReldexHub) -> usi
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reldex_hub_next_event(hub: *mut ReldexHub, out: *mut ReldexEvent) -> bool {
     entry_value(false, || {
-        if out.is_null() || !out.is_aligned() {
-            set_last_argument_error("reldex_hub_next_event: `out` is null or unaligned");
-            return false;
-        }
-        // Validate the out struct *before* taking an event off the queue: a
-        // refused write must not consume the event (and leak its batch).
-        // SAFETY: `out` is non-null and aligned per the check above, and the
-        // caller promises its leading `u32` is initialized.
-        let probe = unsafe { write_out_struct(out, ReldexEvent::default()) };
-        if !probe {
-            set_last_argument_error("reldex_hub_next_event: `out` has too small a struct_size");
+        // Validate the out struct *before* taking an event off the queue, and
+        // without writing to it: a refused call must neither consume the event
+        // (leaking its batch) nor scribble on the caller's memory.
+        // SAFETY: the caller promises `out` is null or points at a
+        // `ReldexEvent` whose leading `u32` is initialized.
+        if !unsafe { check_out_struct(out.cast_const()) } {
+            set_last_argument_error(
+                "reldex_hub_next_event: `out` is null, unaligned, or has too small a struct_size",
+            );
             return false;
         }
         let take = |hub: &Arc<ReldexHub>| {
             let Some(event) = hub.next_event() else {
                 return false;
             };
-            // SAFETY: `out` was just proven writable and large enough by the
-            // probe above, and nothing between then and now can have changed
-            // it — the caller is single-threaded per D5 rule 3.
+            // SAFETY: `out` was just checked non-null, aligned and large
+            // enough, and the caller promises it is writable. Nothing between
+            // then and now can have changed it: D5 rule 3 keeps every call but
+            // cancel on one thread, and cancel does not touch `out`.
             unsafe { write_out_struct(out, event.into_c()) }
         };
         // SAFETY: delegated to this function's contract for `hub`.
