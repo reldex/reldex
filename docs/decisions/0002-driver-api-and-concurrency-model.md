@@ -1006,6 +1006,103 @@ Nothing outside `db-core` constructs an `ExecuteOutcome` — the worker thread i
 so the attribute costs nothing today and makes the next field an additive change rather than a
 breaking one.
 
+## Amendment: the event reply path (2026-09-20, task M2.5)
+
+The "Deferred, and deliberately not built now" section above promised that a per-session outbound
+queue for the FFI adapter was additive: "both shapes coexist — the adapter would drain one queue
+instead of holding many `Completion`s". This amendment is that work, built to
+`docs/exec-plans/active/phase-1.md` §B2. **Nothing about the driver contract changes**; what changes
+is where a `db-core` request's answer goes. Numbering: `E` = event path.
+
+### E1 — a request's answer is a `ReplyTo`, and `Completion` is one of its two arms
+
+The worker's per-request `Sender<DbResult<T>>` became `ReplyTo<T>`, which is either that same
+oneshot or `{ session, request, sink }`. Every command, every error path and every resource rule is
+shared between the two arms by construction, which is what stops the paths diverging (§B5's last
+row). `Completion<T>`'s API and behaviour are unchanged, including the `worker_vanished` error a
+dropped worker still produces, and its tests were not touched.
+
+The core's public surface grows by: `RequestId`, `Waker`, `EventCaps`, `EventSink`, `EventQueue`,
+`SessionEvent`, `CompletedOperation`, `event_channel`, `DatabaseSession::bind_events`, eleven
+`DatabaseSession::submit_*` methods, `DatabaseSession::outstanding_requests` and
+`SessionLimits::{with_,}max_outstanding_requests`. `#![forbid(unsafe_code)]` was added to the crate
+root while doing it, because the claim was being made in prose and nowhere else.
+
+### E2 — exactly one reply per accepted request is structural, not bookkept
+
+`ReplyTo::answer` consumes the channel, so "never two" is a type error. "Never zero" is `Drop`: a
+reply channel dropped unanswered emits the session's terminal failure as it goes. That single
+mechanism covers the worker exiting with commands still queued, a submit whose command could not be
+delivered because the worker had already gone, and an unwind through the worker itself — and it
+replaces the "set of requests we still owe" that `crates/ffi`'s interim pump has to maintain by hand
+(ADR-0003 A14). The synthesised failure keeps the *shape* a success would have had, result id and
+large-object handle included, so an adapter routing on those never special-cases failures
+(ADR-0003 A21, applied to the core).
+
+The one thing that can refuse a request is `SessionLimits::max_outstanding_requests` (default
+1,024), checked before the reply channel exists. A refusal accepts nothing and produces no event,
+because an event reporting that the queue is full would be circular. The per-session command channel
+stays unbounded (K9): what is bounded is the reply *events*, and they are bounded by the requests
+that produce them.
+
+### E3 — `Terminal` is emitted at the transition, once, after everything accepted before it
+
+`SessionShared` gained a one-shot flag. The worker emits `SessionEvent::Terminal` when the session
+reaches `Lost` or `Closed`, and before doing so it answers every command already in its queue —
+those requests were accepted before the transition, so rule 3 puts their replies ahead of the
+announcement. A `Close` found in that queue is *run* rather than failed, because failing it would
+leave the worker looping while `DatabaseSession::close` waited to join it.
+
+What this does **not** promise, stated because the difference is real: a request submitted
+concurrently with the transition may be answered after `Terminal`. That is rule 3's second sentence,
+and it is the only honest guarantee available without blocking submission — which `SPEC.md` §11/§19
+forbids. `Lost` wins over `Closed` in the announcement, as K8 already had it.
+
+### E4 — a panic in the consumer's waker is caught, counted and survived
+
+The waker is edge-triggered on empty → non-empty, is invoked with no queue or session lock held, and
+is never invoked from inside a pop. `EventQueue::set_waker` takes the registration lock exclusively,
+so it cannot return while a wake is running — the use-after-free ADR-0003 D5 rule 2 and spike
+criterion K5 are about. That mechanism now lives here, in `db-core`, rather than only in
+`crates/ffi`; M2.11 deletes the FFI's copy and delegates.
+
+A waker that panics is caught and counted (`EventQueue::waker_panics`), and the queue keeps working
+with that waker still registered. The alternatives were rejected: letting it unwind would eventually
+cross an FFI frame, which is undefined behaviour; poisoning the queue would turn a consumer's bug
+into a stalled session; unregistering it silently would leave a UI that never hears about another
+row and cannot tell why.
+
+### E5 — the drop policy, and what may never be dropped
+
+A reply event, `Executing` and `Terminal` are never dropped and never coalesced. Only the
+unsolicited classes are capped, per session, at `EventCaps::max_unsolicited_per_session` (256):
+
+* `TransactionStateChanged` reports a *state*, so an undelivered one for that session is updated in
+  place to the newer value. Nothing is lost and no drop is counted; the cost is that a coalesced
+  value is delivered at the earlier of the two positions. It is advisory — `close` still re-decides
+  on the worker (K4) and `has_possibly_active_transaction()` is authoritative — so paying position
+  to never lose the state is the right way round.
+* `ServerOutput` (whose producer is M2.7) is dropped at the cap, and the drop is reported rather
+  than hidden: the incoming event is the one refused, so what is already queued survives, and its
+  line count is added to that session's pending count and delivered as `dropped` on the next
+  `ServerOutput` that session does get through. `EventQueue::dropped_unsolicited` counts refused
+  events for diagnostics and never resets.
+
+Dropping the *oldest* queued event instead was considered and rejected: it is O(n) in a shared FIFO,
+and it discards the beginning of a PL/SQL run, which is where the error usually is.
+
+### E6 — what the event path costs
+
+Measured on the dev machine, release, against the mock driver; information only, not a claim.
+A `ping` round trip through the event path costs **432–537 ns** with one producer session and
+**351–391 ns/event** with eight, against **2,043–2,215 ns** and **328–410 ns** for the same round
+trip through `Completion` — the single-session case improves because the submitter no longer parks
+on a reply. A counting global allocator in its own test binary
+(`crates/db-core/tests/event_allocations.rs`) measures **0.033 allocations per event** once warm,
+all of it the command channel's own block amortisation: carrying an event through the queue
+allocates nothing beyond the event. The full numbers, and the 1M-row FFI figures either side of the
+refactor, are in `docs/exec-plans/active/phase-1.md` beside M2.5.
+
 ## Notes for driver implementers
 
 Findings from reading `oracle/rust-oracledb` **`=26.0.0-beta.3`** — the version this repository pins

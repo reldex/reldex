@@ -7,11 +7,15 @@
 
 use std::fmt;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use reldex_db_driver_api::{
-    DbError, ErrorKind, NativeError, SessionState, SqlPosition, StatementKind, TransactionState,
+    DbError, DbResult, ErrorKind, NativeError, SessionState, SqlPosition, StatementKind,
+    TransactionState,
 };
+
+use crate::events::{EventSink, SessionEvent};
+use crate::ids::SessionId;
 
 /// Where a session is in its lifecycle.
 ///
@@ -148,19 +152,53 @@ struct State {
     lost_reason: Option<LostReason>,
 }
 
+impl State {
+    /// The same answer [`SessionShared::has_possibly_active_transaction`]
+    /// gives, computed while the lock is already held so that a mutator can
+    /// tell whether it flipped.
+    fn possibly_active(&self) -> bool {
+        self.core_possibly_active || self.driver_transaction_state.may_be_open()
+    }
+}
+
 /// State shared between a [`crate::DatabaseSession`] and its worker thread.
 pub(crate) struct SessionShared {
+    /// This session's id, so the events emitted here can name it without the
+    /// caller having to pass it in.
+    session: SessionId,
     state: Mutex<State>,
     /// How many commands the worker is currently inside. Kept outside the mutex
     /// so [`crate::DatabaseSession::cancel`] — which runs on a control path
     /// while the worker is blocked in driver code — never waits on a lock the
     /// worker might hold.
     in_flight: AtomicUsize,
+    /// Where this session's events go, once a caller has bound a sink.
+    ///
+    /// Held across the push, which is what makes ordering rule 1 structural:
+    /// the worker is one thread, and every *other* producer for this session —
+    /// a submit whose command could not be delivered, an unanswered reply
+    /// channel being dropped, and from M2.6 the registry — passes through this
+    /// same lock. The waker is deliberately called *after* it is released.
+    events: Mutex<Option<EventSink>>,
+    /// Set the first time [`SessionShared::emit_terminal`] runs, so
+    /// [`SessionEvent::Terminal`] is emitted exactly once however many paths
+    /// observe the transition (ordering rule 3).
+    terminal_emitted: AtomicBool,
+    /// Set once the worker has answered a close that actually ended the
+    /// session. A later close is then the documented no-op success, on either
+    /// path: on the completion path `DatabaseSession::close` sees no worker to
+    /// ask, and on the event path this is what says the same thing.
+    ended: AtomicBool,
+    /// How many event-path requests have been accepted and not yet answered.
+    /// Bounded by [`crate::SessionLimits::max_outstanding_requests`], which is
+    /// what bounds the reply events this session can put in the queue.
+    outstanding: AtomicUsize,
 }
 
 impl SessionShared {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(session: SessionId) -> Self {
         Self {
+            session,
             state: Mutex::new(State {
                 lifecycle: SessionLifecycle::Usable,
                 core_possibly_active: false,
@@ -171,6 +209,10 @@ impl SessionShared {
                 lost_reason: None,
             }),
             in_flight: AtomicUsize::new(0),
+            events: Mutex::new(None),
+            terminal_emitted: AtomicBool::new(false),
+            ended: AtomicBool::new(false),
+            outstanding: AtomicUsize::new(0),
         }
     }
 
@@ -178,6 +220,176 @@ impl SessionShared {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // ------------------------------------------------------------- events
+
+    /// Routes this session's events to `sink`.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::DriverInternal`] if a sink is already bound. Rebinding is
+    /// refused rather than silently honoured: replies already in flight are
+    /// addressed to the first queue, so a second bind would split one
+    /// session's stream across two consumers and break ordering rule 1.
+    pub(crate) fn bind_events(&self, sink: EventSink) -> DbResult<()> {
+        let mut slot = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_some() {
+            return Err(DbError::internal(
+                "reldex-db-core: this session already routes its events to a queue; bind once, \
+                 at open",
+            ));
+        }
+        *slot = Some(sink);
+        Ok(())
+    }
+
+    /// Whether a sink is bound, so a submit can refuse rather than accept a
+    /// request whose reply would have nowhere to go.
+    pub(crate) fn has_events(&self) -> bool {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Emits one event, if this session routes events at all.
+    ///
+    /// The queue push happens under the emit lock (ordering rule 1); the
+    /// waker runs after it is released, so no `db-core` lock is ever held
+    /// while a consumer's callback runs.
+    pub(crate) fn emit(&self, event: SessionEvent) {
+        let wake = {
+            let slot = self
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match slot.as_ref() {
+                // Cloned only on the rare empty → non-empty edge, so the
+                // ordinary path costs one uncontended lock and no refcount
+                // traffic.
+                Some(sink) if sink.push(event) => Some(sink.clone()),
+                Some(_) | None => None,
+            }
+        };
+        if let Some(sink) = wake {
+            sink.wake();
+        }
+    }
+
+    /// Emits a request's single reply and releases the slot it reserved.
+    pub(crate) fn emit_reply(&self, event: SessionEvent) {
+        self.outstanding.fetch_sub(1, Ordering::AcqRel);
+        self.emit(event);
+    }
+
+    /// Reserves one outstanding-request slot, or refuses.
+    ///
+    /// The one synchronous failure in the event-path submit API: refusing here
+    /// accepts nothing, so ordering rule 2 ("exactly one reply per accepted
+    /// request") is untouched. Reporting it as an event would be circular —
+    /// the queue is what is full.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::Resource`] when `limit` requests are already outstanding.
+    pub(crate) fn reserve_request(&self, limit: usize) -> DbResult<()> {
+        let mut current = self.outstanding.load(Ordering::Acquire);
+        loop {
+            if current >= limit {
+                return Err(DbError::new(
+                    ErrorKind::Resource,
+                    format!(
+                        "reldex-db-core: this session already has {limit} requests outstanding \
+                         (its configured limit); drain the event queue before submitting more"
+                    ),
+                ));
+            }
+            match self.outstanding.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(seen) => current = seen,
+            }
+        }
+    }
+
+    /// How many event-path requests are accepted and unanswered.
+    pub(crate) fn outstanding(&self) -> usize {
+        self.outstanding.load(Ordering::Acquire)
+    }
+
+    /// Records that a close has ended this session, so a later one is a
+    /// no-op success rather than a failure from a channel nobody reads.
+    pub(crate) fn mark_ended(&self) {
+        self.ended.store(true, Ordering::Release);
+    }
+
+    /// Whether a close has already ended this session.
+    pub(crate) fn has_ended(&self) -> bool {
+        self.ended.load(Ordering::Acquire)
+    }
+
+    /// Emits [`SessionEvent::Terminal`], at most once for this session.
+    ///
+    /// Called at the transition, by whichever path observed it. The lifecycle
+    /// reported is whatever the session has reached by then, so a session that
+    /// was lost and then closed says `Lost`.
+    pub(crate) fn emit_terminal(&self) {
+        if self
+            .terminal_emitted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let (lifecycle, cause) = {
+            let state = self.lock();
+            let cause = state
+                .lost_reason
+                .as_ref()
+                .map(|reason| reason.to_error("the session was lost"));
+            (state.lifecycle, cause)
+        };
+        self.emit(SessionEvent::Terminal {
+            session: self.session,
+            lifecycle,
+            cause,
+        });
+    }
+
+    /// Whether [`SessionShared::emit_terminal`] has already run.
+    pub(crate) fn terminal_emitted(&self) -> bool {
+        self.terminal_emitted.load(Ordering::Acquire)
+    }
+
+    /// Runs `f` on the shared state and emits
+    /// [`SessionEvent::TransactionStateChanged`] if it flipped the answer
+    /// [`SessionShared::has_possibly_active_transaction`] gives.
+    ///
+    /// The comparison happens inside the lock and the emit outside it, so the
+    /// state lock is never held while the queue's is taken.
+    fn with_transaction_watch<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
+        let (out, changed) = {
+            let mut state = self.lock();
+            let before = state.possibly_active();
+            let out = f(&mut state);
+            let after = state.possibly_active();
+            (out, (before != after).then_some(after))
+        };
+        if let Some(possibly_active) = changed {
+            self.emit(SessionEvent::TransactionStateChanged {
+                session: self.session,
+                possibly_active,
+            });
+        }
+        out
     }
 
     /// Where the session is in its lifecycle, as of the last command the worker
@@ -268,37 +480,37 @@ impl SessionShared {
         driver_state: TransactionState,
         exact: bool,
     ) {
-        let mut state = self.lock();
-        state.driver_transaction_state = driver_state;
-        let definitely_inactive = exact && driver_state == TransactionState::Inactive;
-        let opens = match kind {
-            StatementKind::Dml | StatementKind::PlSqlBlock => true,
-            // `StatementKind` is `#[non_exhaustive]`; an unknown kind is
-            // treated like `Other`, which is the conservative arm anyway.
-            _ => !definitely_inactive,
-        };
-        if opens {
-            state.core_possibly_active = true;
-        }
+        self.with_transaction_watch(|state| {
+            state.driver_transaction_state = driver_state;
+            let definitely_inactive = exact && driver_state == TransactionState::Inactive;
+            let opens = match kind {
+                StatementKind::Dml | StatementKind::PlSqlBlock => true,
+                // `StatementKind` is `#[non_exhaustive]`; an unknown kind is
+                // treated like `Other`, which is the conservative arm anyway.
+                _ => !definitely_inactive,
+            };
+            if opens {
+                state.core_possibly_active = true;
+            }
+        });
     }
 
     /// A successful `commit`/`rollback`, or a statement that committed
     /// implicitly (DDL), resolves the transaction.
     pub(crate) fn note_commit_or_rollback(&self) {
-        self.lock().core_possibly_active = false;
+        self.with_transaction_watch(|state| state.core_possibly_active = false);
     }
 
     /// Records the driver's own last-reported transaction state.
-    pub(crate) fn note_driver_transaction_state(&self, state: TransactionState) {
-        self.lock().driver_transaction_state = state;
+    pub(crate) fn note_driver_transaction_state(&self, driver_state: TransactionState) {
+        self.with_transaction_watch(|state| state.driver_transaction_state = driver_state);
     }
 
     /// Whether a transaction may still be open, combining the driver's own
     /// report (which may be [`TransactionState::Unknown`]) with core-side
     /// tracking, per ADR-0002.
     pub(crate) fn has_possibly_active_transaction(&self) -> bool {
-        let state = self.lock();
-        state.core_possibly_active || state.driver_transaction_state.may_be_open()
+        self.lock().possibly_active()
     }
 
     /// The worker is about to run a command, so a cancel has something to aim
@@ -366,7 +578,7 @@ mod tests {
 
     #[test]
     fn starts_usable_with_no_possibly_active_transaction() {
-        let shared = SessionShared::new();
+        let shared = SessionShared::new(SessionId::allocate());
         assert_eq!(shared.lifecycle(), SessionLifecycle::Usable);
         assert!(!shared.is_lost());
         // `TransactionState::default()` is `Unknown`, which `may_be_open()`.
@@ -375,7 +587,7 @@ mod tests {
 
     #[test]
     fn dml_marks_possibly_active_until_commit_or_rollback() {
-        let shared = SessionShared::new();
+        let shared = SessionShared::new(SessionId::allocate());
         shared.note_driver_transaction_state(TransactionState::Inactive);
         assert!(!shared.has_possibly_active_transaction());
         shared.note_statement(StatementKind::Dml, TransactionState::Active, true);
@@ -388,19 +600,19 @@ mod tests {
     #[test]
     fn a_query_is_only_dismissed_when_an_exact_driver_says_inactive() {
         // A plain SELECT on an exact driver: nothing is open.
-        let shared = SessionShared::new();
+        let shared = SessionShared::new(SessionId::allocate());
         shared.note_statement(StatementKind::Query, TransactionState::Inactive, true);
         assert!(!shared.has_possibly_active_transaction());
 
         // `SELECT … FOR UPDATE` on the same driver: the driver reports the lock,
         // and the core must keep the flag.
-        let shared = SessionShared::new();
+        let shared = SessionShared::new(SessionId::allocate());
         shared.note_statement(StatementKind::Query, TransactionState::Active, true);
         assert!(shared.has_possibly_active_transaction());
 
         // The same query on a driver that cannot observe transaction state:
         // conservative, always.
-        let shared = SessionShared::new();
+        let shared = SessionShared::new(SessionId::allocate());
         shared.note_statement(StatementKind::Query, TransactionState::Unknown, false);
         assert!(shared.has_possibly_active_transaction());
         shared.note_commit_or_rollback();
@@ -410,7 +622,7 @@ mod tests {
 
     #[test]
     fn needs_validation_recovers_on_a_successful_ping_but_not_from_lost() {
-        let shared = SessionShared::new();
+        let shared = SessionShared::new(SessionId::allocate());
         shared.note_error(&DbError::new(ErrorKind::Timeout, "slow"));
         assert!(shared.needs_validation());
         shared.mark_validated();
@@ -426,7 +638,7 @@ mod tests {
 
     #[test]
     fn closing_is_a_state_of_its_own_and_is_never_usable() {
-        let shared = SessionShared::new();
+        let shared = SessionShared::new(SessionId::allocate());
         shared.mark_closed();
         assert_eq!(shared.lifecycle(), SessionLifecycle::Closed);
         assert!(!shared.lifecycle().is_usable());
@@ -436,7 +648,7 @@ mod tests {
 
     #[test]
     fn terminal_error_keeps_the_classification_of_the_loss() {
-        let shared = SessionShared::new();
+        let shared = SessionShared::new(SessionId::allocate());
         let closed = shared.terminal_error();
         assert!(closed.to_string().contains("closed"));
         assert_eq!(closed.kind(), ErrorKind::Connection);
@@ -458,7 +670,7 @@ mod tests {
 
     #[test]
     fn in_flight_tracking_is_a_plain_counter() {
-        let shared = SessionShared::new();
+        let shared = SessionShared::new(SessionId::allocate());
         assert!(!shared.driver_call_in_flight());
         shared.enter_driver_call();
         assert!(shared.driver_call_in_flight());

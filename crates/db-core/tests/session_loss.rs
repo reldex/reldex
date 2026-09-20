@@ -18,7 +18,8 @@ fn insert_action(row: &str) -> Action {
 /// Opens a session, runs one DML, then loses the network under it.
 fn session_with_a_lost_transaction(
     scenario: &std::sync::Arc<reldex_driver_mock::Scenario>,
-) -> reldex_db_core::DatabaseSession {
+    path: support::ReplyPath,
+) -> support::Session {
     scenario.on_sql("INSERT INTO t VALUES ('a')", insert_action("a"));
     scenario.on_sql(
         "SELECT 1 FROM dual",
@@ -27,7 +28,7 @@ fn session_with_a_lost_transaction(
                 .with_native(3113, "ORA-03113: end-of-file on communication channel"),
         ),
     );
-    let session = support::open(scenario);
+    let session = support::open_on(scenario, path);
     session
         .execute(Statement::new("INSERT INTO t VALUES ('a')"))
         .wait()
@@ -42,8 +43,9 @@ fn session_with_a_lost_transaction(
     session
 }
 
-#[test]
-fn network_loss_mid_fetch_marks_the_session_lost_and_fails_fast_afterwards() {
+fn network_loss_mid_fetch_marks_the_session_lost_and_fails_fast_afterwards(
+    path: support::ReplyPath,
+) {
     let scenario = support::scenario();
     let columns = vec![ColumnSpec::new("N", reldex_db_driver_api::SqlType::Number)];
     let rows: Vec<Vec<ScriptValue>> = (0..10_i64).map(|v| vec![ScriptValue::from(v)]).collect();
@@ -53,7 +55,7 @@ fn network_loss_mid_fetch_marks_the_session_lost_and_fails_fast_afterwards() {
     );
     scenario.on_sql("SELECT * FROM big", Action::query(QuerySource::Fixed(plan)));
 
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     let outcome = session
         .execute(Statement::new("SELECT * FROM big"))
         .wait()
@@ -117,10 +119,11 @@ fn network_loss_mid_fetch_marks_the_session_lost_and_fails_fast_afterwards() {
 /// is required, the user picks Commit, `close` reports success — and the table
 /// is empty. That is the silent data loss `SPEC.md` §10 exists to prevent, told
 /// backwards: the user was assured their work was saved.
-#[test]
-fn close_with_commit_on_a_lost_session_reports_the_loss_instead_of_succeeding() {
+fn close_with_commit_on_a_lost_session_reports_the_loss_instead_of_succeeding(
+    path: support::ReplyPath,
+) {
     let scenario = support::scenario();
-    let session = session_with_a_lost_transaction(&scenario);
+    let session = session_with_a_lost_transaction(&scenario, path);
 
     let error = session
         .close(Some(CloseDisposition::Commit))
@@ -145,10 +148,9 @@ fn close_with_commit_on_a_lost_session_reports_the_loss_instead_of_succeeding() 
 
 /// `close(None)` on a lost session must report the loss, not ask for a decision
 /// about a transaction that no longer exists.
-#[test]
-fn close_without_a_disposition_on_a_lost_session_reports_the_loss() {
+fn close_without_a_disposition_on_a_lost_session_reports_the_loss(path: support::ReplyPath) {
     let scenario = support::scenario();
-    let session = session_with_a_lost_transaction(&scenario);
+    let session = session_with_a_lost_transaction(&scenario, path);
     assert!(
         session.has_possibly_active_transaction(),
         "core-side tracking still believes a transaction was open"
@@ -167,10 +169,9 @@ fn close_without_a_disposition_on_a_lost_session_reports_the_loss() {
 
 /// The fail-fast error a lost session gives every later command must keep the
 /// original classification, not flatten it into a sentence.
-#[test]
-fn the_terminal_error_keeps_the_kind_and_native_code_of_the_loss() {
+fn the_terminal_error_keeps_the_kind_and_native_code_of_the_loss(path: support::ReplyPath) {
     let scenario = support::scenario();
-    let session = session_with_a_lost_transaction(&scenario);
+    let session = session_with_a_lost_transaction(&scenario, path);
 
     let error = session
         .execute(Statement::new("SELECT 1 FROM dual"))
@@ -193,8 +194,7 @@ fn the_terminal_error_keeps_the_kind_and_native_code_of_the_loss() {
 
 /// A failed revalidation `ping` must fail the command it was validating for,
 /// not let it run anyway.
-#[test]
-fn a_failed_revalidation_ping_fails_the_command_instead_of_running_it() {
+fn a_failed_revalidation_ping_fails_the_command_instead_of_running_it(path: support::ReplyPath) {
     let scenario = support::scenario();
     scenario.on_sql(
         "SELECT slow FROM dual",
@@ -208,7 +208,7 @@ fn a_failed_revalidation_ping_fails_the_command_instead_of_running_it() {
         ))),
     );
 
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     let error = session
         .execute(Statement::new("SELECT slow FROM dual"))
         .wait()
@@ -233,4 +233,12 @@ fn a_failed_revalidation_ping_fails_the_command_instead_of_running_it() {
         SessionLifecycle::Lost,
         "and it must stay there"
     );
+}
+
+support::both_paths! {
+    network_loss_mid_fetch_marks_the_session_lost_and_fails_fast_afterwards,
+    close_with_commit_on_a_lost_session_reports_the_loss_instead_of_succeeding,
+    close_without_a_disposition_on_a_lost_session_reports_the_loss,
+    the_terminal_error_keeps_the_kind_and_native_code_of_the_loss,
+    a_failed_revalidation_ping_fails_the_command_instead_of_running_it,
 }

@@ -58,15 +58,13 @@ use reldex_db_driver_api::{
     RowBatch, SavepointName, SessionState, Statement, TransactionState, Warning,
 };
 
+use crate::events::SessionEvent;
 use crate::ids::{LobHandle, ResultId, SessionId};
+use crate::reply::{CloseReplyTo, ReplyTo};
 use crate::session::{
     CloseDisposition, CloseError, ExecuteOutcome, FetchedBatch, OutValue, OutValues, SessionLimits,
 };
 use crate::shared::SessionShared;
-
-/// One outstanding request's reply channel. A plain [`mpsc::channel`] used
-/// once as a oneshot: see [`crate::Completion`].
-pub(crate) type Reply<T> = Sender<DbResult<T>>;
 
 /// Why the worker is being asked to shut down.
 pub(crate) enum CloseIntent {
@@ -88,61 +86,66 @@ pub(crate) enum Command {
     /// Execute a statement.
     Execute {
         statement: Statement,
-        reply: Reply<ExecuteOutcome>,
+        reply: ReplyTo<ExecuteOutcome>,
     },
     /// Fetch the next batch of an open result.
     FetchBatch {
         result: ResultId,
         max_rows: NonZeroUsize,
-        reply: Reply<FetchedBatch>,
+        reply: ReplyTo<FetchedBatch>,
     },
     /// Release a result's resources.
-    CloseResult { result: ResultId, reply: Reply<()> },
+    CloseResult {
+        result: ResultId,
+        reply: ReplyTo<()>,
+    },
     /// Commit the open transaction.
-    Commit { reply: Reply<()> },
+    Commit { reply: ReplyTo<()> },
     /// Roll the open transaction back.
-    Rollback { reply: Reply<()> },
+    Rollback { reply: ReplyTo<()> },
     /// Establish a savepoint.
     Savepoint {
         name: SavepointName,
-        reply: Reply<()>,
+        reply: ReplyTo<()>,
     },
     /// Roll back to a savepoint, leaving the transaction open.
     RollbackToSavepoint {
         name: SavepointName,
-        reply: Reply<()>,
+        reply: ReplyTo<()>,
     },
     /// Validate that the session is still alive.
-    Ping { reply: Reply<()> },
+    Ping { reply: ReplyTo<()> },
     /// Read the next chunk of a parked large object, on this worker thread.
     /// An empty `Vec` means the object is exhausted.
     ReadLobChunk {
         lob: LobHandle,
         max_bytes: NonZeroUsize,
-        reply: Reply<Vec<u8>>,
+        reply: ReplyTo<Vec<u8>>,
     },
     /// Release a parked large object.
-    CloseLob { lob: LobHandle, reply: Reply<()> },
+    CloseLob { lob: LobHandle, reply: ReplyTo<()> },
     /// Resolve the transaction (if a disposition is given) and close the
     /// connection.
     Close {
         intent: CloseIntent,
-        reply: Sender<Result<(), CloseError>>,
+        reply: CloseReplyTo,
     },
 }
 
 impl Command {
     /// Fails this command with `error` without running it.
     ///
-    /// Used when a revalidating `ping` failed: the session is gone, so the
+    /// Used when a revalidating `ping` failed, and when the session's
+    /// transition to a terminal state has to answer everything already queued
+    /// before [`SessionEvent::Terminal`] goes out: the session is gone, so the
     /// command must be *answered*, not executed (`SPEC.md` §18).
     fn fail(self, error: DbError) {
         match self {
             Self::Execute { reply, .. } => {
-                let _ = reply.send(Err(error));
+                reply.answer(Err(error));
             }
             Self::FetchBatch { reply, .. } => {
-                let _ = reply.send(Err(error));
+                reply.answer(Err(error));
             }
             Self::CloseResult { reply, .. }
             | Self::Commit { reply }
@@ -151,13 +154,13 @@ impl Command {
             | Self::RollbackToSavepoint { reply, .. }
             | Self::Ping { reply }
             | Self::CloseLob { reply, .. } => {
-                let _ = reply.send(Err(error));
+                reply.answer(Err(error));
             }
             Self::ReadLobChunk { reply, .. } => {
-                let _ = reply.send(Err(error));
+                reply.answer(Err(error));
             }
             Self::Close { reply, .. } => {
-                let _ = reply.send(Err(CloseError::Failed(error)));
+                reply.answer(Err(CloseError::Failed(error)));
             }
         }
     }
@@ -222,7 +225,7 @@ pub(crate) fn spawn(
 ) -> DbResult<WorkerHandle> {
     let (command_tx, command_rx) = mpsc::channel::<Command>();
     let (ready_tx, ready_rx) = mpsc::channel::<DbResult<Ready>>();
-    let shared = Arc::new(SessionShared::new());
+    let shared = Arc::new(SessionShared::new(session_id));
     let shared_for_worker = Arc::clone(&shared);
 
     let join = thread::Builder::new()
@@ -337,14 +340,24 @@ fn worker_main(
         torn,
     };
 
-    for command in command_rx {
-        if matches!(worker.dispatch(command), Flow::Exit) {
+    while let Ok(command) = command_rx.recv() {
+        if matches!(worker.dispatch(command, &command_rx), Flow::Exit) {
             break;
         }
     }
 
+    // Whatever is still queued was accepted before the session ended, so it
+    // must be answered *before* `Terminal` (ordering rule 3). Dropping the
+    // receiver is what answers it: an unanswered `ReplyTo` emits the one
+    // failure it owes as it goes (see `crate::reply`), so there is no separate
+    // bookkeeping set of owed replies to keep in step.
+    drop(command_rx);
     worker.release_results();
     let _ = worker.close_connection();
+    // Covers the path no command took: the session handle was dropped without
+    // an explicit close, so the channel simply ended.
+    worker.shared.mark_closed();
+    worker.shared.emit_terminal();
 }
 
 enum Flow {
@@ -397,14 +410,14 @@ impl Worker {
 
     /// Runs one command, revalidating first when the last error asked for it,
     /// and releasing everything once the session becomes terminally lost.
-    fn dispatch(&mut self, command: Command) -> Flow {
+    fn dispatch(&mut self, command: Command, queued: &mpsc::Receiver<Command>) -> Flow {
         self.shared.enter_driver_call();
-        let flow = self.dispatch_inner(command);
+        let flow = self.dispatch_inner(command, queued);
         self.shared.leave_driver_call();
         flow
     }
 
-    fn dispatch_inner(&mut self, command: Command) -> Flow {
+    fn dispatch_inner(&mut self, command: Command, queued: &mpsc::Receiver<Command>) -> Flow {
         if self.shared.needs_validation() && !matches!(command, Command::Close { .. }) {
             match self.with_connection(|connection| connection.ping()) {
                 Some(Ok(())) => self.shared.mark_validated(),
@@ -420,7 +433,7 @@ impl Worker {
                 self.discard_connection();
                 self.release_results();
                 command.fail(self.shared.terminal_error());
-                return Flow::Continue;
+                return self.announce_terminal(Flow::Continue, queued);
             }
         }
 
@@ -431,17 +444,50 @@ impl Worker {
             self.release_results();
         }
 
+        self.announce_terminal(flow, queued)
+    }
+
+    /// Emits [`SessionEvent::Terminal`] once the session has reached a
+    /// terminal state, after answering everything that was already queued.
+    ///
+    /// Ordering rule 3 makes `Terminal` follow the reply of every request
+    /// accepted before the transition, and a request is accepted the moment
+    /// its command is queued — so the queue is drained and failed here, before
+    /// the announcement. A `Close` found in that queue is *run* rather than
+    /// failed: failing it would leave the worker looping while
+    /// [`crate::DatabaseSession::close`] waited to join it.
+    ///
+    /// When the worker is on its way out (`Flow::Exit`) this does nothing:
+    /// `worker_main`'s shutdown drops the command channel first, which answers
+    /// the rest, and announces afterwards.
+    fn announce_terminal(&mut self, flow: Flow, queued: &mpsc::Receiver<Command>) -> Flow {
+        if matches!(flow, Flow::Exit)
+            || self.shared.terminal_emitted()
+            || !self.shared.lifecycle().is_terminal()
+        {
+            return flow;
+        }
+        while let Ok(command) = queued.try_recv() {
+            if matches!(command, Command::Close { .. }) {
+                // Runs the close, which answers it and ends the worker; the
+                // shutdown path then answers whatever is left and announces.
+                let _ = self.run(command);
+                return Flow::Exit;
+            }
+            command.fail(self.shared.terminal_error());
+        }
+        self.shared.emit_terminal();
         flow
     }
 
     fn run(&mut self, command: Command) -> Flow {
         match command {
-            Command::Execute { statement, reply } => self.execute(statement, &reply),
+            Command::Execute { statement, reply } => self.execute(statement, reply),
             Command::FetchBatch {
                 result,
                 max_rows,
                 reply,
-            } => self.fetch_batch(result, max_rows, &reply),
+            } => self.fetch_batch(result, max_rows, reply),
             Command::CloseResult { result, reply } => {
                 let outcome = match self.owned_result(result) {
                     Ok(id) => self.close_result(id),
@@ -450,30 +496,30 @@ impl Worker {
                 if let Err(err) = &outcome {
                     self.shared.note_error(err);
                 }
-                let _ = reply.send(outcome);
+                reply.answer(outcome);
                 Flow::Continue
             }
-            Command::Commit { reply } => self.resolve_transaction(CloseDisposition::Commit, &reply),
+            Command::Commit { reply } => self.resolve_transaction(CloseDisposition::Commit, reply),
             Command::Rollback { reply } => {
-                self.resolve_transaction(CloseDisposition::Rollback, &reply)
+                self.resolve_transaction(CloseDisposition::Rollback, reply)
             }
             Command::Savepoint { name, reply } => {
                 let Some(outcome) = self.with_connection(|connection| connection.savepoint(&name))
                 else {
-                    let _ = reply.send(Err(self.shared.terminal_error()));
+                    reply.answer(Err(self.shared.terminal_error()));
                     return Flow::Continue;
                 };
                 if let Err(err) = &outcome {
                     self.shared.note_error(err);
                 }
-                let _ = reply.send(outcome);
+                reply.answer(outcome);
                 Flow::Continue
             }
             Command::RollbackToSavepoint { name, reply } => {
                 let Some(outcome) =
                     self.with_connection(|connection| connection.rollback_to_savepoint(&name))
                 else {
-                    let _ = reply.send(Err(self.shared.terminal_error()));
+                    reply.answer(Err(self.shared.terminal_error()));
                     return Flow::Continue;
                 };
                 match &outcome {
@@ -485,26 +531,26 @@ impl Worker {
                 }
                 let state = self.transaction_state();
                 self.shared.note_driver_transaction_state(state);
-                let _ = reply.send(outcome);
+                reply.answer(outcome);
                 Flow::Continue
             }
             Command::Ping { reply } => {
                 let Some(outcome) = self.with_connection(|connection| connection.ping()) else {
-                    let _ = reply.send(Err(self.shared.terminal_error()));
+                    reply.answer(Err(self.shared.terminal_error()));
                     return Flow::Continue;
                 };
                 match &outcome {
                     Ok(()) => self.shared.mark_validated(),
                     Err(err) => self.shared.note_error(err),
                 }
-                let _ = reply.send(outcome);
+                reply.answer(outcome);
                 Flow::Continue
             }
             Command::ReadLobChunk {
                 lob,
                 max_bytes,
                 reply,
-            } => self.read_lob_chunk(lob, max_bytes, &reply),
+            } => self.read_lob_chunk(lob, max_bytes, reply),
             Command::CloseLob { lob, reply } => {
                 let outcome = self.owned_lob(lob).map(|handle| {
                     // Dropping the locator *here* is the whole point: it is a
@@ -512,19 +558,33 @@ impl Worker {
                     // released on the thread that owns it.
                     self.lobs.remove(&handle);
                 });
-                let _ = reply.send(outcome);
+                reply.answer(outcome);
                 Flow::Continue
             }
-            Command::Close { intent, reply } => self.close(intent, &reply),
+            Command::Close { intent, reply } => self.close(intent, reply),
         }
     }
 
     // ---------------------------------------------------------------- execute
 
-    fn execute(&mut self, statement: Statement, reply: &Reply<ExecuteOutcome>) -> Flow {
+    fn execute(&mut self, statement: Statement, reply: ReplyTo<ExecuteOutcome>) -> Flow {
+        // Ordering rule 4: the statement has left the queue and this is the
+        // limit actually armed on it, which is what an honest "running" state
+        // shows on a driver that cannot interrupt a running call. Emitted
+        // before the driver call, from the one thread that produces this
+        // session's events, so it always precedes the matching `Executed` and
+        // always follows the previous request's reply.
+        if let Some(request) = reply.request() {
+            self.shared.emit(SessionEvent::Executing {
+                session: self.session,
+                request,
+                deadline: statement.deadline(),
+            });
+        }
+
         let Some(outcome) = self.with_connection(|connection| connection.execute(&statement))
         else {
-            let _ = reply.send(Err(self.shared.terminal_error()));
+            reply.answer(Err(self.shared.terminal_error()));
             return Flow::Continue;
         };
 
@@ -534,7 +594,7 @@ impl Worker {
                 self.shared.note_error(&err);
                 let state = self.transaction_state();
                 self.shared.note_driver_transaction_state(state);
-                let _ = reply.send(Err(err));
+                reply.answer(Err(err));
                 return Flow::Continue;
             }
         };
@@ -575,7 +635,7 @@ impl Worker {
                 }
                 Err(err) => {
                     self.shared.note_error(&err);
-                    let _ = reply.send(Err(err));
+                    reply.answer(Err(err));
                     return Flow::Continue;
                 }
             },
@@ -586,7 +646,7 @@ impl Worker {
             Err(err) => {
                 self.release_registered(registered);
                 self.shared.note_error(&err);
-                let _ = reply.send(Err(err));
+                reply.answer(Err(err));
                 return Flow::Continue;
             }
         };
@@ -608,7 +668,7 @@ impl Worker {
             warnings: outcome.warnings().to_vec(),
             out_values,
         };
-        if reply.send(Ok(value)).is_err() {
+        if !reply.answer(Ok(value)) {
             // The caller dropped its `Completion` before the reply landed.
             // Whatever this command registered is unreachable now, so it must be
             // released here rather than living until the session closes.
@@ -681,17 +741,17 @@ impl Worker {
         &mut self,
         result: ResultId,
         max_rows: NonZeroUsize,
-        reply: &Reply<FetchedBatch>,
+        reply: ReplyTo<FetchedBatch>,
     ) -> Flow {
         let id = match self.owned_result(result) {
             Ok(id) => id,
             Err(err) => {
-                let _ = reply.send(Err(err));
+                reply.answer(Err(err));
                 return Flow::Continue;
             }
         };
         let Some(cursor) = self.cursors.get_mut(&id) else {
-            let _ = reply.send(Err(self.unknown_result_error()));
+            reply.answer(Err(self.unknown_result_error()));
             return Flow::Continue;
         };
         let torn = &self.torn;
@@ -703,12 +763,12 @@ impl Worker {
                     Ok(fetched) => fetched,
                     Err(err) => {
                         self.shared.note_error(&err);
-                        let _ = reply.send(Err(err));
+                        reply.answer(Err(err));
                         return Flow::Continue;
                     }
                 };
                 let handles: Vec<LobHandle> = fetched.lobs().map(|(_, _, lob)| lob).collect();
-                if reply.send(Ok(fetched)).is_err() {
+                if !reply.answer(Ok(fetched)) {
                     // Nobody is listening, so nothing will ever read — or close
                     // — these locators. Drop them here, on the thread that owns
                     // them.
@@ -723,7 +783,7 @@ impl Worker {
                 // cursor is `close()` (ADR-0002 D2). Make it, here, rather than
                 // dropping the cursor and hoping.
                 let _ = self.close_result(id);
-                let _ = reply.send(Err(err));
+                reply.answer(Err(err));
             }
         }
         Flow::Continue
@@ -776,12 +836,12 @@ impl Worker {
         &mut self,
         lob: LobHandle,
         max_bytes: NonZeroUsize,
-        reply: &Reply<Vec<u8>>,
+        reply: ReplyTo<Vec<u8>>,
     ) -> Flow {
         let handle = match self.owned_lob(lob) {
             Ok(handle) => handle,
             Err(err) => {
-                let _ = reply.send(Err(err));
+                reply.answer(Err(err));
                 return Flow::Continue;
             }
         };
@@ -790,7 +850,7 @@ impl Worker {
         // allocation.
         let capacity = max_bytes.get().min(self.limits.max_lob_chunk_bytes().get());
         let Some(parked) = self.lobs.get_mut(&handle) else {
-            let _ = reply.send(Err(Self::closed_lob_error(handle)));
+            reply.answer(Err(Self::closed_lob_error(handle)));
             return Flow::Continue;
         };
         let mut buf = vec![0_u8; capacity];
@@ -799,14 +859,14 @@ impl Worker {
         match outcome {
             Ok(read) => {
                 buf.truncate(read);
-                let _ = reply.send(Ok(buf));
+                reply.answer(Ok(buf));
             }
             Err(err) => {
                 self.shared.note_error(&err);
                 // "After any error from `read_chunk`, the only legal action is
                 // to drop it" (ADR-0002 D2). Drop it here, on the owning thread.
                 self.lobs.remove(&handle);
-                let _ = reply.send(Err(err));
+                reply.answer(Err(err));
             }
         }
         Flow::Continue
@@ -928,12 +988,12 @@ impl Worker {
 
     // ------------------------------------------------------------- lifecycle
 
-    fn resolve_transaction(&mut self, disposition: CloseDisposition, reply: &Reply<()>) -> Flow {
+    fn resolve_transaction(&mut self, disposition: CloseDisposition, reply: ReplyTo<()>) -> Flow {
         let Some(outcome) = self.with_connection(|connection| match disposition {
             CloseDisposition::Commit => connection.commit(),
             CloseDisposition::Rollback => connection.rollback(),
         }) else {
-            let _ = reply.send(Err(self.shared.terminal_error()));
+            reply.answer(Err(self.shared.terminal_error()));
             return Flow::Continue;
         };
         match &outcome {
@@ -945,11 +1005,11 @@ impl Worker {
         }
         let state = self.transaction_state();
         self.shared.note_driver_transaction_state(state);
-        let _ = reply.send(outcome);
+        reply.answer(outcome);
         Flow::Continue
     }
 
-    fn close(&mut self, intent: CloseIntent, reply: &Sender<Result<(), CloseError>>) -> Flow {
+    fn close(&mut self, intent: CloseIntent, reply: CloseReplyTo) -> Flow {
         if self.connection.is_none() {
             // The session is already gone. Closing it is not a silent success:
             // whatever transaction it held went with it, and a `Commit`
@@ -958,7 +1018,8 @@ impl Worker {
             let error = self.shared.lost_transaction_error();
             self.release_results();
             self.shared.mark_closed();
-            let _ = reply.send(Err(CloseError::Failed(error)));
+            self.shared.mark_ended();
+            reply.answer(Err(CloseError::Failed(error)));
             return Flow::Exit;
         }
 
@@ -968,7 +1029,7 @@ impl Worker {
                     // Decided here, on the worker, *after* every command queued
                     // ahead of this one has run — the flag the caller's thread
                     // can see is by definition a snapshot from before them.
-                    let _ = reply.send(Err(CloseError::DecisionRequired));
+                    reply.answer(Err(CloseError::DecisionRequired));
                     return Flow::Continue;
                 }
                 disposition
@@ -991,7 +1052,7 @@ impl Worker {
                     CloseDisposition::Commit => CloseError::CommitFailed(err),
                     CloseDisposition::Rollback => CloseError::RollbackFailed(err),
                 };
-                let _ = reply.send(Err(close_error));
+                reply.answer(Err(close_error));
                 return Flow::Continue;
             }
             self.shared.note_commit_or_rollback();
@@ -1000,7 +1061,8 @@ impl Worker {
         self.release_results();
         let outcome = self.close_connection();
         self.shared.mark_closed();
-        let _ = reply.send(outcome.map_err(CloseError::Failed));
+        self.shared.mark_ended();
+        reply.answer(outcome.map_err(CloseError::Failed));
         Flow::Exit
     }
 

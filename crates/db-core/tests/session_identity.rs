@@ -5,7 +5,7 @@ mod support;
 
 use reldex_driver_mock::{Action, ColumnSpec, QuerySource, ScriptValue};
 
-fn rows_seen(session: &reldex_db_core::DatabaseSession, sql: &str) -> usize {
+fn rows_seen(session: &support::Session, sql: &str) -> usize {
     let outcome = session
         .execute(reldex_db_core::Statement::new(sql))
         .wait()
@@ -23,8 +23,7 @@ fn rows_seen(session: &reldex_db_core::DatabaseSession, sql: &str) -> usize {
     count
 }
 
-#[test]
-fn session_id_is_stable_across_many_commands() {
+fn session_id_is_stable_across_many_commands(path: support::ReplyPath) {
     let scenario = support::scenario();
     scenario.on_sql(
         "SELECT 1 FROM dual",
@@ -33,7 +32,7 @@ fn session_id_is_stable_across_many_commands() {
             vec![vec![ScriptValue::from(1_i64)]],
         ))),
     );
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     let id = session.id();
     let connection_id = session.connection_id();
 
@@ -52,8 +51,7 @@ fn session_id_is_stable_across_many_commands() {
     }
 }
 
-#[test]
-fn uncommitted_state_survives_multiple_statements_on_the_same_session() {
+fn uncommitted_state_survives_multiple_statements_on_the_same_session(path: support::ReplyPath) {
     let scenario = support::scenario();
     let columns = vec![ColumnSpec::new(
         "NAME",
@@ -81,7 +79,7 @@ fn uncommitted_state_survives_multiple_statements_on_the_same_session() {
         }),
     );
 
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     session
         .execute(reldex_db_core::Statement::new("INSERT INTO t VALUES ('a')"))
         .wait()
@@ -99,8 +97,7 @@ fn uncommitted_state_survives_multiple_statements_on_the_same_session() {
     );
 }
 
-#[test]
-fn a_second_session_cannot_see_or_inherit_uncommitted_state() {
+fn a_second_session_cannot_see_or_inherit_uncommitted_state(path: support::ReplyPath) {
     let scenario = support::scenario();
     let columns = vec![ColumnSpec::new(
         "NAME",
@@ -121,8 +118,8 @@ fn a_second_session_cannot_see_or_inherit_uncommitted_state() {
         }),
     );
 
-    let owner = support::open(&scenario);
-    let other = support::open(&scenario);
+    let owner = support::open_on(&scenario, path);
+    let other = support::open_on(&scenario, path);
     assert_ne!(owner.id(), other.id());
     assert_ne!(
         owner.connection_id(),
@@ -149,4 +146,10 @@ fn a_second_session_cannot_see_or_inherit_uncommitted_state() {
         1,
         "once committed, the row becomes visible everywhere"
     );
+}
+
+support::both_paths! {
+    session_id_is_stable_across_many_commands,
+    uncommitted_state_survives_multiple_statements_on_the_same_session,
+    a_second_session_cannot_see_or_inherit_uncommitted_state,
 }

@@ -35,10 +35,9 @@ fn script_a_ref_cursor(rows: i64) -> std::sync::Arc<reldex_driver_mock::Scenario
     scenario
 }
 
-#[test]
-fn a_ref_cursor_out_bind_becomes_a_result_handle_on_the_worker_thread() {
+fn a_ref_cursor_out_bind_becomes_a_result_handle_on_the_worker_thread(path: support::ReplyPath) {
     let scenario = script_a_ref_cursor(5);
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     let connection_id = session.connection_id();
 
     let outcome = session
@@ -101,10 +100,9 @@ fn a_ref_cursor_out_bind_becomes_a_result_handle_on_the_worker_thread() {
     assert_ne!(seen[0], thread::current().id());
 }
 
-#[test]
-fn a_nested_result_is_released_when_the_session_closes() {
+fn a_nested_result_is_released_when_the_session_closes(path: support::ReplyPath) {
     let scenario = script_a_ref_cursor(3);
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     let outcome = session
         .execute(Statement::new(OPEN_CURSOR))
         .wait()
@@ -123,4 +121,9 @@ fn a_nested_result_is_released_when_the_session_closes() {
         .wait()
         .expect_err("the session and everything derived from it are gone");
     assert!(!error.message().is_empty());
+}
+
+support::both_paths! {
+    a_ref_cursor_out_bind_becomes_a_result_handle_on_the_worker_thread,
+    a_nested_result_is_released_when_the_session_closes,
 }

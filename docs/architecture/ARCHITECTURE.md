@@ -159,6 +159,19 @@ at most a bounded timeout, then detaches the worker thread, which still releases
 its resources whenever the blocked call eventually returns (ADR-0002 K5). Explicit `close` remains the
 only path that can commit; `Drop` only abandons.
 
+A request's answer reaches its caller one of two ways, and they are the same worker command with a
+different reply channel (ADR-0002 amendment E1, `phase-1.md` §B2). Either the caller holds that
+request's own `Completion<T>` and waits on it — the blocking shape, for tests, tools and the
+device-check binary — or the session is bound to an `EventSink` and the answer is pushed, as a typed
+`SessionEvent`, into one process-wide `EventQueue` that every session's worker shares. The queue
+consumer is told once, from a worker thread, that the queue stopped being empty (an edge-triggered
+`Waker`, invoked with no core lock held), and drains it; **no thread is parked per outstanding
+request**, which is what the UI needs and what the interim per-session pump in `crates/ffi` exists to
+be replaced by. The guarantees the event path carries — per-session delivery order, exactly one reply
+per accepted request, exactly one `Terminal` per session, `Executing` before its `Executed`, and no
+ordering promised across sessions — are stated in ADR-0002 E1–E5 and each has a test named after it
+in `crates/db-core/tests/event_ordering.rs`.
+
 ## 7. FFI and Qt adapter boundary
 
 ```text

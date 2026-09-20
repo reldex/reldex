@@ -315,6 +315,14 @@ Six milestones. M1 is the de-risking gate and nothing downstream starts until it
 **Parallelism.** M2.1/M2.2 (driver), M2.4 (sql-text), M2.9/M2.10 (settings/secrets) and M2.5/M2.6 (events) are four independent tracks. M2.11 gates on all of them.
 **Mandatory review:** M2.1, M2.3, M2.5, M2.6, M2.7, M2.9, M2.10 — concurrency, contract change, and security.
 
+**M2.5 notes.** The implementation notes for the event queue live in
+[`phase-1-m2-5-event-queue.md`](phase-1-m2-5-event-queue.md): the before/after performance numbers
+(1M rows through `crates/ffi`; per-event cost at 1 and 8 producer sessions; allocations per event),
+the exact `SessionEvent` → `ReldexEvent` mapping M2.11 has to write — the C ABI is **unchanged** by
+M2.5, and `reldex.h` is byte-identical — and every place the implementation had to interpret §B2.
+The decision record is [ADR-0002](../../decisions/0002-driver-api-and-concurrency-model.md)
+amendment E1–E6.
+
 ---
 
 ### M3 — Connect: shell, connection manager, first real session

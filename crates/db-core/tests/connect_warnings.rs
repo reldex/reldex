@@ -22,14 +22,15 @@ fn finding(text: &str) -> Warning {
     Warning::new(WarningKind::Informational, text)
 }
 
-#[test]
-fn a_connect_time_finding_reaches_the_sessions_owner_without_any_statement_being_run() {
+fn a_connect_time_finding_reaches_the_sessions_owner_without_any_statement_being_run(
+    path: support::ReplyPath,
+) {
     let scenario = support::scenario();
     scenario.set_connect_warnings(vec![finding(
         "this endpoint sets a parameter this driver does not use",
     )]);
 
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
 
     let warnings = session.connect_warnings();
     assert_eq!(warnings.len(), 1, "{warnings:?}");
@@ -46,8 +47,7 @@ fn a_connect_time_finding_reaches_the_sessions_owner_without_any_statement_being
     session.close(None).expect("close");
 }
 
-#[test]
-fn a_connect_time_finding_is_reported_once_and_never_on_a_statement() {
+fn a_connect_time_finding_is_reported_once_and_never_on_a_statement(path: support::ReplyPath) {
     const SQL: &str = "SELECT 1 FROM dual";
 
     let scenario = support::scenario();
@@ -60,7 +60,7 @@ fn a_connect_time_finding_is_reported_once_and_never_on_a_statement() {
         },
     );
 
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     assert_eq!(session.connect_warnings().len(), 1);
 
     let outcome = session
@@ -81,10 +81,15 @@ fn a_connect_time_finding_is_reported_once_and_never_on_a_statement() {
         .expect("close");
 }
 
-#[test]
-fn a_driver_with_nothing_to_say_reports_no_connect_warnings() {
+fn a_driver_with_nothing_to_say_reports_no_connect_warnings(path: support::ReplyPath) {
     let scenario = support::scenario();
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     assert!(session.connect_warnings().is_empty());
     session.close(None).expect("close");
+}
+
+support::both_paths! {
+    a_connect_time_finding_reaches_the_sessions_owner_without_any_statement_being_run,
+    a_connect_time_finding_is_reported_once_and_never_on_a_statement,
+    a_driver_with_nothing_to_say_reports_no_connect_warnings,
 }
