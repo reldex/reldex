@@ -1,6 +1,6 @@
 # 0002 — Driver API and Concurrency Model
 
-**Status:** Accepted (owner confirmed 2026-09-20) — implemented; independent API review completed
+**Status:** Accepted (owner confirmed 2026-09-19) — implemented; independent API review completed
 2026-09-19 and its must-fix findings applied, see "Amendments after API review"; amended after the
 ADR-0001 Phase 0 spikes, see "Amendments after the Phase 0 spikes"; amended again after the
 independent review of the `db-core` session layer, see "Amendments after the db-core session review";
@@ -10,7 +10,7 @@ created on a helper thread"; amended again to make a batch's column storage read
 see "Amendment: a batch's column storage is readable, not only indexable"
 **Date:** 2026-09-19
 **Amended:** 2026-09-19 (API review), 2026-09-19 (Phase 0 spikes), 2026-09-19 (db-core session
-review), 2026-09-20 (owner confirmation), 2026-09-20 (connect-time warning channel, C-6),
+review), 2026-09-19 (owner confirmation), 2026-09-20 (connect-time warning channel, C-6),
 2026-09-20 (connection created on a helper thread, C-5), 2026-09-20 (column storage readable, M1.3),
 2026-09-20 (`LobStream: Sync` and `ExecuteOutcome` non-exhaustive, M1.3 review)
 
@@ -382,7 +382,7 @@ are `#[non_exhaustive]`, so either can arrive without a breaking change.
 ## Lead decisions (2026-09-19)
 
 During implementation the implementer raised five open questions. The lead decided each below under
-the owner's delegation. **Confirmed by the owner on 2026-09-20** (owner reviewed the lead's summary
+the owner's delegation. **Confirmed by the owner on 2026-09-19** (owner reviewed the lead's summary
 and answered "as you recommended" to all five).
 
 1. **No auto-commit toggle in the V1 contract (D4).** Accepted.
@@ -414,7 +414,7 @@ table from the user. Added `ColumnData::Unsupported(TextColumn)`, `ColumnKind::U
 still in `native_type_name`. Deliberately a *separate* variant from `Text`, so nothing downstream can
 treat the rendering as character data, edit it, or parse it back.
 
-**Carve-out found by the Phase 0 spikes (2026-09-20): not every unrepresentable type gets a text
+**Carve-out found by the Phase 0 spikes (2026-09-19): not every unrepresentable type gets a text
 rendering.** M1's `ColumnData::Unsupported` path assumes the driver can produce *some* text for the
 value — that is true for `INTERVAL DAY TO SECOND`, `INTERVAL YEAR TO MONTH`, `ROWID` and
 `TIMESTAMP WITH LOCAL TIME ZONE`, which the oracle-thin wrapper renders exactly this way (spike S2).

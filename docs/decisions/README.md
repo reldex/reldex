@@ -24,6 +24,6 @@ Per `AGENTS.md`, create an ADR when a decision:
 
 | ADR | Title | Status | Date |
 | --- | --- | --- | --- |
-| [0001](0001-database-driver-strategy.md) | Database driver strategy — primary driver is Oracle's `oracledb` (rust-oracledb) | Accepted — owner decision 2026-09-20: stay on oracledb; pre-armed deadline + honest UI; upstream issues pending — upstream issues #21–#25 filed 2026-09-20 | 2026-09-19 |
-| [0002](0002-driver-api-and-concurrency-model.md) | Driver API and concurrency model — blocking object-safe contract, per-session worker thread in `db-core` | Accepted (owner confirmed 2026-09-20) — implemented; independently reviewed twice (API review, db-core session review), must-fix findings applied; amended after the Phase 0 spikes | 2026-09-19 |
+| [0001](0001-database-driver-strategy.md) | Database driver strategy — primary driver is Oracle's `oracledb` (rust-oracledb) | Accepted — owner decision 2026-09-19: stay on oracledb; pre-armed deadline + honest UI; upstream issues pending — upstream issues #21–#25 filed 2026-09-19 | 2026-09-19 |
+| [0002](0002-driver-api-and-concurrency-model.md) | Driver API and concurrency model — blocking object-safe contract, per-session worker thread in `db-core` | Accepted (owner confirmed 2026-09-19) — implemented; independently reviewed twice (API review, db-core session review), must-fix findings applied; amended after the Phase 0 spikes | 2026-09-19 |
 | [0003](0003-qt-rust-integration.md) | Qt ↔ Rust integration — hand-written stable C ABI in `crates/ffi`, `cbindgen`-generated header, thin C++/Qt adapter | Proposed — acceptance conditional on spike S15 | 2026-09-20 |

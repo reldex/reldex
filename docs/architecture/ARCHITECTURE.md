@@ -280,7 +280,7 @@ Until then, no code should assume an answer.
    The primary driver is Oracle's official `oracledb` crate (`oracle/rust-oracledb`; pure Rust, thin,
    blocking), pinned to an exact version and wrapped by `crates/drivers/oracle-thin`. Still open:
    statement cancellation (no public cancel API yet; accepted as a Phase 0 limitation, ADR-0001 "Owner
-   decision (2026-09-20)") and beta maturity. TCPS has since passed with limits (spike S8: one-way
+   decision (2026-09-19)") and beta maturity. TCPS has since passed with limits (spike S8: one-way
    TLS 1.2, PEM-supplied trust; no mTLS+private CA, no Oracle wallet files, no revocation — U-12…U-14).
    Android/iOS viability has cross-compile-and-link evidence (spike S6, `phase-0-s6-mobile-cross-compile.md`)
    but still needs physical-device evidence before any mobile-support claim.
@@ -315,9 +315,9 @@ Until then, no code should assume an answer.
    not interrupt promptly. No mechanism it evaluated (pre-armed deadline, a privileged
    `ALTER SYSTEM CANCEL SQL`, a minimal fork) delivers an on-demand cancel that keeps the session
    usable in the general case. `SPEC.md` §10/§24.8 "Cancel" is therefore **not met**; ADR-0001's kill
-   criterion fired and the ADR re-opened, and on 2026-09-20 the owner decided to accept the limitation
+   criterion fired and the ADR re-opened, and on 2026-09-19 the owner decided to accept the limitation
    — stay on `oracledb`, ship the pre-armed deadline with an honest UI, and pursue upstream fixes —
-   rather than change drivers (ADR-0001 "Owner decision (2026-09-20)").
+   rather than change drivers (ADR-0001 "Owner decision (2026-09-19)").
 6. **Result store representation.** What is the in-memory row/batch layout, bounded-memory policy,
    and spill/eviction behavior? Does Arrow earn its place by benchmark (deferred to Phase 3)?
 7. **Error model shape — RESOLVED by [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) D3.**

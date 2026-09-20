@@ -1,7 +1,7 @@
 # Proposed `SPEC.md` changes — for the owner
 
-**Status: APPLIED to SPEC.md on 2026-09-20 with owner approval.** See "How each proposal was
-applied (2026-09-20)" near the end of this file for what changed and where. The proposals below are
+**Status: APPLIED to SPEC.md on 2026-09-19 with owner approval.** See "How each proposal was
+applied (2026-09-19)" near the end of this file for what changed and where. The proposals below are
 kept as written, as the record of what was proposed and why; they are historical from this point on.
 
 **`SPEC.md` is the owner's document and is not edited here or anywhere else in this change.** This
@@ -66,7 +66,7 @@ decision ADR-0001 is re-opened for; a wording change should follow the decision,
 it.
 
 **Evidence:** `phase-0-spike-results.md` §4 ("S4 in full") and §9 ("Go/no-go per kill criterion" —
-"What the owner has to decide", item 1); [ADR-0001 "Spike outcome (2026-09-20)"](../../decisions/0001-database-driver-strategy.md).
+"What the owner has to decide", item 1); [ADR-0001 "Spike outcome (2026-09-19)"](../../decisions/0001-database-driver-strategy.md).
 
 ## 3. §24.14 — compile-error highlighting scoped to PL/SQL
 
@@ -135,7 +135,7 @@ linking to the spike results, so a future reader of §8 does not read "TIMESTAMP
 [ADR-0002](../../decisions/0002-driver-api-and-concurrency-model.md) amendment M1 and its Phase 0
 carve-out.
 
-## How each proposal was applied (2026-09-20)
+## How each proposal was applied (2026-09-19)
 
 1. **§8 matrix limitations.** Applied as proposed: `SPEC.md` §8's "Driver test matrix" now opens with
    a note that it is validated against `oracledb` 26.0.0-beta.3 with named exceptions (cancellation,
