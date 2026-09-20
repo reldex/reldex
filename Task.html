@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-21T02:06:00+07:00",
+  "updatedAt": "2026-09-21T04:04:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1158,8 +1158,8 @@
               "note": "Done 2026-09-20, independently reviewed."
             },
             {
-              "title": "M2.4 crates/sql-text: lexer + statement splitter driven by a SqlDialect descriptor the driver supplies (sonnet)",
-              "status": "todo"
+              "title": "M2.4 crates/sql-text: lexer + statement splitter driven by a SqlDialect descriptor the driver supplies (sonnet) — done 2026-09-21: reldex-sql-text (zero deps, no unsafe) — lexer + statement splitter driven by a driver-supplied SqlDialect; a lone / is authoritative, ambiguity fails safe, every span says how it ended (ended_by); adversarially reviewed three rounds (a panic and several mis-splits fixed); grammar-based differential test, 248,000 scripts; ADR-0002 amendment J",
+              "status": "done"
             },
             {
               "title": "M2.5 ★ EventQueue/EventSink/SessionEvent/Waker + ReplyTo refactor of the worker (opus, review mandatory) — done 2026-09-21: EventQueue/EventSink/SessionEvent/Waker + ReplyTo in db-core (no thread per session); ordering rules 1–5 and exactly-once Terminal tested; back-pressure bound 2R + U + 3 made true (slot released when the consumer pops); 42 session tests run on both reply paths; independently reviewed twice (3 must-fix fixed); FFI pump switch is M2.11 (phase-1-m2-5-event-queue.md)",
@@ -1648,6 +1648,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-21",
+      "text": "M2.4 done: the SQL/PL-SQL lexer and statement splitter (crates/sql-text), driven by a dialect descriptor the Oracle driver supplies, so the core stays vendor-neutral. Three rounds of adversarial review found a panic and several mis-splits (a statement boundary in the wrong place can run the wrong SQL), all fixed; the safety rules are now explicit: a lone '/' line always ends the unit, an ambiguous construct never splits early, and every statement reports how it ended. A grammar-based differential test recovers 248,000 generated scripts exactly. Honest limit: two behaviours (a '/' inside an unterminated plain statement; a directive line inside a block) are not yet verified against SQL*Plus/SQLcl and are recorded for M4.3."
+    },
     {
       "date": "2026-09-21",
       "text": "M2.5 done: db-core event queue, sink and the ReplyTo refactor — replies go either through Completion (unchanged) or as typed SessionEvents into one queue with an edge-triggered waker, no thread per session. Independent review could not break exactly-once (200 x 91 requests racing a close, 300 double closes, 8-session fan-in) but found 3 must-fix: TransactionStateChanged could be dropped behind a ServerOutput burst at the cap, max_outstanding_requests did not bound the queue as four documents claimed (measured 5,000 queued against a limit of 1,024; now a slot rides on the queued reply and is released on pop), and a contention-flaky waker test. Also fixed: 7.7% spurious close errors under concurrent close, bind_events after Terminal, close refused at the cap. The FFI still uses its interim pump; M2.11 switches it (mapping recorded). Per-event cost ~430-640 ns vs ~2,000 ns on the Completion path at one producer."
