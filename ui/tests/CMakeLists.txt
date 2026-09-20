@@ -3,7 +3,10 @@ qt_add_executable(tst_coreinfo
     AdapterTestSupport.h
 )
 # See reldex_add_adapter_test() below for why the console subsystem is forced.
-set_target_properties(tst_coreinfo PROPERTIES WIN32_EXECUTABLE FALSE)
+set_target_properties(tst_coreinfo PROPERTIES
+    WIN32_EXECUTABLE FALSE
+    MACOSX_BUNDLE FALSE
+)
 
 # Re-attaches the *same* ../app/Main.qml file (not a copy) under the same
 # "Reldex.App" URI, for the same reason ui/app/CMakeLists.txt attaches it
@@ -74,7 +77,14 @@ function(reldex_add_adapter_test name)
     # console, so QTest's report and every qInfo() (including K5's iteration
     # count and timing) vanish instead of reaching CTest's log. These are test
     # binaries: force the console subsystem so their output is readable.
-    set_target_properties(${name} PROPERTIES WIN32_EXECUTABLE FALSE)
+    #
+    # MACOSX_BUNDLE FALSE is the same fix on the other platform: qt_add_executable()
+    # also defaults it to TRUE, and a .app bundle puts the binary somewhere
+    # `add_test(COMMAND ${name})` does not look.
+    set_target_properties(${name} PROPERTIES
+        WIN32_EXECUTABLE FALSE
+        MACOSX_BUNDLE FALSE
+    )
     target_link_libraries(${name}
         PRIVATE
             Qt6::Core

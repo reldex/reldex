@@ -24,6 +24,8 @@
 // moc needs a complete type for every pointer parameter it registers.
 #include <QtQuick/QQuickWindow>
 
+#include <atomic>
+
 class Metrics : public QObject
 {
     Q_OBJECT
@@ -36,22 +38,28 @@ public:
     explicit Metrics(QObject *parent = nullptr);
     ~Metrics() override;
 
-    [[nodiscard]] bool isEnabled() const noexcept { return m_enabled; }
+    /// Read from the render thread as well as the GUI thread (`frameSwapped`
+    /// is emitted on the render thread), so the flag is atomic rather than a
+    /// plain `bool` whose torn or stale read would be a data race.
+    [[nodiscard]] bool isEnabled() const noexcept
+    {
+        return m_enabled.load(std::memory_order_relaxed);
+    }
     void setEnabled(bool enabled);
 
     // --- marks on the execute -> first pixels path -------------------------
     // Each is recorded once per run; `reset()` starts a new run.
 
-    void markExecuteSubmitted() { if (m_enabled) { recordMark(m_executeSubmittedNs); } }
-    void markFirstEvent() { if (m_enabled) { recordMark(m_firstEventNs); } }
-    void markFirstRowsInserted() { if (m_enabled) { recordFirstRowsInserted(); } }
-    void markResultComplete(qint64 rows) { if (m_enabled) { recordResultComplete(rows); } }
+    void markExecuteSubmitted() { if (isEnabled()) { recordMark(m_executeSubmittedNs); } }
+    void markFirstEvent() { if (isEnabled()) { recordMark(m_firstEventNs); } }
+    void markFirstRowsInserted() { if (isEnabled()) { recordFirstRowsInserted(); } }
+    void markResultComplete(qint64 rows) { if (isEnabled()) { recordResultComplete(rows); } }
 
     /// One drain of the hub's event queue: how many events it took and how
     /// long it held the UI thread.
     void recordDrain(int events, qint64 nanos)
     {
-        if (m_enabled) {
+        if (isEnabled()) {
             recordDrainImpl(events, nanos);
         }
     }
@@ -74,9 +82,25 @@ public:
     Q_INVOKABLE bool writeCsv(const QString &path) const;
 
     /// Resident set size in bytes, or 0 where this platform is not handled.
+    ///
     /// Static and always available -- K3 is a memory criterion and a test
     /// wants it whether or not metrics are enabled.
+    ///
+    /// Working set is *context*, not the verdict: it is what the OS currently
+    /// keeps in RAM, so it moves with trimming and with pages the process
+    /// shares. Judge K3 on [`privateBytes`].
     [[nodiscard]] Q_INVOKABLE static qint64 residentBytes();
+
+    /// Private (committed, non-shared) bytes, or 0 where this platform is not
+    /// handled.
+    ///
+    /// This is the number K3 should be judged on: it counts what this process
+    /// actually made the system commit, which is what "RSS growth for 1M rows"
+    /// is really asking about. Windows: `PROCESS_MEMORY_COUNTERS_EX::
+    /// PrivateUsage`. Linux: `Private_Clean + Private_Dirty` from
+    /// `/proc/self/smaps_rollup`, falling back to 0 when the kernel does not
+    /// expose it. Elsewhere: 0, and said so rather than guessed.
+    [[nodiscard]] Q_INVOKABLE static qint64 privateBytes();
 
     /// Nanoseconds since this object's clock started. Always available.
     [[nodiscard]] qint64 nowNs() const { return m_clock.nsecsElapsed(); }
@@ -103,7 +127,7 @@ private:
     static constexpr int kMaxSamples = 200000;
 
     QElapsedTimer m_clock;
-    bool m_enabled = false;
+    std::atomic<bool> m_enabled { false };
 
     qint64 m_executeSubmittedNs = -1;
     qint64 m_firstEventNs = -1;

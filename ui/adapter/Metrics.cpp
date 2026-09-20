@@ -41,10 +41,9 @@ Metrics::~Metrics() = default;
 
 void Metrics::setEnabled(bool enabled)
 {
-    if (m_enabled == enabled) {
+    if (m_enabled.exchange(enabled, std::memory_order_relaxed) == enabled) {
         return;
     }
-    m_enabled = enabled;
     Q_EMIT enabledChanged();
 }
 
@@ -108,7 +107,9 @@ void Metrics::recordDrainImpl(int events, qint64 nanos)
 
 void Metrics::onFrameSwapped()
 {
-    if (!m_enabled) {
+    // Runs on the render thread (DirectConnection), which is why `m_enabled`
+    // is atomic and every sample below is taken under `m_frameMutex`.
+    if (!isEnabled()) {
         return;
     }
     const qint64 now = m_clock.nsecsElapsed();
@@ -134,6 +135,7 @@ QVariantMap Metrics::summary() const
     map.insert(QStringLiteral("drainTotalNs"), m_drainTotalNs);
     map.insert(QStringLiteral("drainTotalEvents"), m_drainTotalEvents);
     map.insert(QStringLiteral("residentBytes"), residentBytes());
+    map.insert(QStringLiteral("privateBytes"), privateBytes());
 
     const QMutexLocker locker(&m_frameMutex);
     map.insert(QStringLiteral("firstFrameAfterInsertNs"), m_firstFrameAfterInsertNs);
@@ -156,6 +158,7 @@ bool Metrics::writeCsv(const QString &path) const
     out << "mark,resultCompleteNs," << m_resultCompleteNs << ",\n";
     out << "mark,rowsStreamed," << m_rowsStreamed << ",\n";
     out << "mark,residentBytes," << residentBytes() << ",\n";
+    out << "mark,privateBytes," << privateBytes() << ",\n";
     for (const DrainSample &sample : m_drains) {
         out << "drain," << sample.atNs << ',' << sample.events << ',' << sample.nanos << '\n';
     }
@@ -173,9 +176,12 @@ bool Metrics::writeCsv(const QString &path) const
 qint64 Metrics::residentBytes()
 {
 #ifdef Q_OS_WIN
-    PROCESS_MEMORY_COUNTERS counters {};
+    PROCESS_MEMORY_COUNTERS_EX counters {};
     counters.cb = sizeof counters;
-    if (::K32GetProcessMemoryInfo(::GetCurrentProcess(), &counters, sizeof counters) != 0) {
+    if (::K32GetProcessMemoryInfo(::GetCurrentProcess(),
+                                  reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&counters),
+                                  sizeof counters)
+        != 0) {
         return static_cast<qint64>(counters.WorkingSetSize);
     }
     return 0;
@@ -194,6 +200,53 @@ qint64 Metrics::residentBytes()
 #else
     // Not handled here rather than guessed at; M1.8 measures on the dev
     // machine (Windows) and CI runs the correctness half only (ADR-0003 D10).
+    return 0;
+#endif
+}
+
+qint64 Metrics::privateBytes()
+{
+#ifdef Q_OS_WIN
+    PROCESS_MEMORY_COUNTERS_EX counters {};
+    counters.cb = sizeof counters;
+    if (::K32GetProcessMemoryInfo(::GetCurrentProcess(),
+                                  reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&counters),
+                                  sizeof counters)
+        != 0) {
+        return static_cast<qint64>(counters.PrivateUsage);
+    }
+    return 0;
+#elif defined(Q_OS_LINUX)
+    // smaps_rollup is the cheap whole-process roll-up; it needs a 4.14+
+    // kernel, so a missing file is a documented 0 rather than a slow walk of
+    // /proc/self/smaps.
+    QFile rollup(QStringLiteral("/proc/self/smaps_rollup"));
+    if (!rollup.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return 0;
+    }
+    qint64 privateKb = 0;
+    bool sawAny = false;
+    while (!rollup.atEnd()) {
+        const QByteArray line = rollup.readLine();
+        if (!line.startsWith("Private_Clean:") && !line.startsWith("Private_Dirty:")) {
+            continue;
+        }
+        const QByteArrayList fields = line.simplified().split(' ');
+        if (fields.size() < 2) {
+            continue;
+        }
+        bool ok = false;
+        const qint64 value = fields.at(1).toLongLong(&ok);
+        if (ok) {
+            privateKb += value;
+            sawAny = true;
+        }
+    }
+    return sawAny ? privateKb * 1024 : 0;
+#else
+    // macOS' nearest equivalent is TASK_VM_INFO's phys_footprint, which needs
+    // mach headers and a device nobody here has to verify it on. Reported as
+    // "not available" rather than as a number that might mean something else.
     return 0;
 #endif
 }

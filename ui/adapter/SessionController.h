@@ -9,7 +9,11 @@
 //
 // Back-pressure lives here too, because it lives nowhere else: the hub's event
 // queue is unbounded and a FETCHED event carries a batch that becomes the
-// adapter's memory (A16). `maxFetchesInFlight` is the bound.
+// adapter's memory (A16). `maxFetchesInFlight` is the bound, and it is a bound
+// on *outstanding requests*, not on requests per result: a re-execute leaves
+// the replaced result's fetches in flight (they still hold memory and each
+// still owes exactly one reply), so `m_fetchesInFlight` deliberately survives
+// it and each stale reply hands its slot to the current result.
 
 #include "ReldexHandles.h"
 #include "ResultTableModel.h"

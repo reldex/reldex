@@ -64,10 +64,31 @@ bool autoRunRequested()
 
 } // namespace
 
+bool Bridge::checkThread(const char *what) const
+{
+    // A runtime check, not only a Q_ASSERT: A10's rule is about a release
+    // build as much as a debug one, and a violation here is a use-after-free
+    // rather than a wrong answer.
+    if (thread() == QThread::currentThread()) {
+        return true;
+    }
+    qCritical("Bridge::%s called from the wrong thread; every reldex_* call this adapter "
+              "makes must be on the Bridge's own thread (ADR-0003 D5 rule 3, A10)",
+              what);
+    Q_ASSERT_X(false, "Bridge::checkThread", what);
+    return false;
+}
+
 Bridge::Bridge(QObject *parent)
     : QObject(parent)
-    , m_metrics(new Metrics(this))
 {
+    // Order matters, and the reason is lifetime rather than taste: the waker
+    // is registered LAST, after every member that a wake could reach exists.
+    // Registering it earlier and then throwing (or failing) would leave Rust
+    // holding a callback into storage whose destructor never runs, because a
+    // constructor that does not complete has no destructor call to undo it.
+    m_metrics = new Metrics(this);
+
     const quint32 abi = reldex_abi_version();
     if ((abi >> 16) != static_cast<quint32>(RELDEX_ABI_VERSION_MAJOR)) {
         // ADR-0003 D7: refuse to start, do not guess. `valid` stays false and
@@ -76,27 +97,61 @@ Bridge::Bridge(QObject *parent)
                   abi >> 16, static_cast<quint32>(RELDEX_ABI_VERSION_MAJOR));
         return;
     }
-    m_hub = reldex_hub_create();
-    if (m_hub == nullptr) {
-        qCritical("reldex_hub_create() failed");
+
+    // May throw (it allocates a model and reads the environment). Nothing is
+    // registered with Rust yet, so an unwind here destroys the QObject base,
+    // which deletes m_metrics, and leaves nothing behind.
+    m_session = new SessionController(this, this);
+
+    // Held by a handle from the moment it exists, so every failure path below
+    // -- and any exception -- destroys it exactly once.
+    reldex::HubHandle hub(reldex_hub_create());
+    if (!hub) {
+        qCritical("reldex_hub_create() failed; this Bridge reports itself invalid");
+        delete m_session;
+        m_session = nullptr;
         return;
     }
-    reldex_hub_set_waker(m_hub, &reldexBridgeWake, this);
-    m_session = new SessionController(this, this);
+
+    const ReldexStatus status = reldex_hub_set_waker(hub.get(), &reldexBridgeWake, this);
+    if (status != RELDEX_STATUS_OK) {
+        // Without a waker nothing would ever post a drain, so every request
+        // would be submitted and never answered: a spinner that never stops,
+        // which `SPEC.md` §2 ranks as the worst failure there is. Refuse to
+        // start instead, loudly.
+        const reldex::ErrorHandle error(reldex_last_error_take());
+        qCritical("reldex_hub_set_waker() failed with status %d; this Bridge reports itself "
+                  "invalid rather than never delivering an event",
+                  static_cast<int>(status));
+        delete m_session;
+        m_session = nullptr;
+        hub.reset(); // destroys the hub; no waker was registered
+        return;
+    }
+
+    // Commit. `isValid()` is true from here and nowhere earlier.
+    m_hub = std::move(hub);
 }
 
 Bridge::~Bridge()
 {
-    if (m_hub == nullptr) {
+    if (!m_hub) {
         return;
     }
+
+    // A10, checked BEFORE the calls it guards rather than after them. The
+    // result is deliberately discarded: a destructor that refused to release
+    // the hub would turn a thread bug into a leak on top of it, so this reports
+    // loudly (and asserts in a debug build) and then does the only useful
+    // thing left.
+    static_cast<void>(checkThread("~Bridge"));
 
     // ADR-0003 D5 rule 2, in this order and for these reasons:
     //
     // 1. Unregister the waker. reldex_hub_set_waker(hub, NULL, NULL) does not
     //    return while a wake is in progress, so from here on nothing can call
     //    back into this object -- which is what makes destroying it safe.
-    reldex_hub_set_waker(m_hub, nullptr, nullptr);
+    reldex_hub_set_waker(m_hub.get(), nullptr, nullptr);
 
     // 2. Destroy the session and its model *now*, so every ReldexBatch they
     //    hold is released before the hub is destroyed (reldex_hub_destroy
@@ -113,9 +168,7 @@ Bridge::~Bridge()
     //    call, including reldex_session_request_cancel. This adapter makes
     //    *every* call on this object's thread and never uses the
     //    cancel-from-any-thread allowance, so there is no thread to join.
-    Q_ASSERT(thread() == QThread::currentThread());
-    reldex_hub_destroy(m_hub);
-    m_hub = nullptr;
+    m_hub.reset();
 
     // 5. Any drain this object posted for itself is discarded by ~QObject,
     //    which removes posted events for the object being destroyed.
@@ -153,15 +206,15 @@ void Bridge::unregisterSession(quint64 id)
 
 qint64 Bridge::pendingEvents() const
 {
-    return m_hub == nullptr ? 0 : static_cast<qint64>(reldex_hub_pending_events(m_hub));
+    return m_hub ? static_cast<qint64>(reldex_hub_pending_events(m_hub.get())) : 0;
 }
 
 bool Bridge::releaseMockBlock(quint64 session)
 {
-    if (m_hub == nullptr) {
+    if (!m_hub) {
         return false;
     }
-    return reldex_mock_release_block(m_hub, session) == RELDEX_STATUS_OK;
+    return reldex_mock_release_block(m_hub.get(), session) == RELDEX_STATUS_OK;
 }
 
 bool Bridge::run()
@@ -183,28 +236,57 @@ bool Bridge::autoStart()
 
 void Bridge::postDrain()
 {
-    if (m_drainPosted.fetchAndStoreOrdered(1) != 0) {
-        return;
+    // Mirrors the waker's discipline: the coalescing flag must not be left set
+    // by a post that never happened, or no drain would ever run again.
+    try {
+        if (m_drainPosted.fetchAndStoreOrdered(1) != 0) {
+            return;
+        }
+        QMetaObject::invokeMethod(this, &Bridge::drain, Qt::QueuedConnection);
+    } catch (...) {
+        m_drainPosted.storeRelease(0);
+        throw;
     }
-    QMetaObject::invokeMethod(this, &Bridge::drain, Qt::QueuedConnection);
 }
 
 void Bridge::drain()
 {
-    // Cleared *before* the first event is taken: a wake that arrives during
-    // this drain must be able to post another one, or its events could sit
-    // undrained until something else happened to wake us.
+    // Cleared *before* anything else: a wake that arrives from here on must be
+    // able to post another drain, or its events could sit undrained until
+    // something else happened to wake us.
     m_drainPosted.storeRelease(0);
-    if (m_hub == nullptr) {
+    if (!m_hub) {
         return;
     }
+
+    if (m_draining) {
+        // A nested event loop -- a modal dialog, or a QEventLoop spun inside
+        // something this drain called -- can deliver a posted drain while the
+        // outer one is still walking the queue. Re-entering would dispatch the
+        // same event twice and re-enter the model mid-signal, so: never nest,
+        // re-post instead. The outer drain is still running and will keep
+        // taking events; this one just gets back in line.
+        postDrain();
+        return;
+    }
+
+    // Plain RAII rather than a bool pair: `dispatch()` reaches application
+    // code, which may throw.
+    struct DrainGuard
+    {
+        bool &flag;
+        explicit DrainGuard(bool &target) : flag(target) { flag = true; }
+        ~DrainGuard() { flag = false; }
+        DrainGuard(const DrainGuard &) = delete;
+        DrainGuard &operator=(const DrainGuard &) = delete;
+    } guard(m_draining);
 
     QElapsedTimer timer;
     timer.start();
     int events = 0;
     bool budgetHit = false;
     ReldexEvent raw = reldex::makeEvent();
-    while (reldex_hub_next_event(m_hub, &raw)) {
+    while (reldex_hub_next_event(m_hub.get(), &raw)) {
         dispatch(raw);
         ++events;
         if (m_drainEventBudget > 0 && events >= m_drainEventBudget) {
@@ -253,7 +335,7 @@ void Bridge::dispatch(ReldexEvent &raw)
 void Bridge::drainAndRelease()
 {
     ReldexEvent raw = reldex::makeEvent();
-    while (reldex_hub_next_event(m_hub, &raw)) {
+    while (reldex_hub_next_event(m_hub.get(), &raw)) {
         reldex::BatchHandle batch(raw.batch);
         reldex::ErrorHandle error(raw.error);
         raw = reldex::makeEvent();

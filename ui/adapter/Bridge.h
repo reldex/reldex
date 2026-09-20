@@ -16,6 +16,17 @@
 //  * teardown is D5 rule 2 in order: unregister the waker (which blocks until
 //    an in-flight wake returns), let every batch go, then destroy the hub --
 //    with no other thread anywhere inside a `reldex_*` call (A10).
+//
+// Two rules for anyone writing a slot that a drain can reach:
+//
+//  * `drain()` is never re-entered. A nested event loop (a modal dialog, a
+//    `QEventLoop` spun inside a handler) can deliver a posted drain while an
+//    outer one is still running; that delivery bails out and re-posts instead
+//    of nesting, so no event is dispatched twice and none is lost;
+//  * **destroy the `Bridge` with `deleteLater()`, never `delete`, from inside
+//    anything a drain calls.** `~Bridge` tears the hub down underneath the
+//    loop that is still walking it; `deleteLater()` defers that to the next
+//    return to the event loop, which is after the drain has finished.
 
 #include <QAtomicInt>
 #include <QHash>
@@ -35,8 +46,12 @@ class Bridge : public QObject
     QML_ELEMENT
 
     /// False when the ABI major version does not match the header this was
-    /// built against, or the hub could not be created. ADR-0003 D7: the
-    /// adapter refuses to start on a major mismatch rather than guessing.
+    /// built against, when the hub could not be created, or when the waker
+    /// could not be registered. ADR-0003 D7: the adapter refuses to start on a
+    /// major mismatch rather than guessing -- and a `Bridge` that could not
+    /// register its waker would never drain anything, which shows up as a
+    /// spinner that never stops (the failure `SPEC.md` §2 ranks worst), so it
+    /// reports itself invalid instead.
     Q_PROPERTY(bool valid READ isValid CONSTANT)
     Q_PROPERTY(SessionController *session READ session CONSTANT)
     Q_PROPERTY(Metrics *metrics READ metrics CONSTANT)
@@ -53,7 +68,7 @@ public:
     ~Bridge() override;
 
     [[nodiscard]] bool isValid() const noexcept { return m_hub != nullptr; }
-    [[nodiscard]] ReldexHub *hub() const noexcept { return m_hub; }
+    [[nodiscard]] ReldexHub *hub() const noexcept { return m_hub.get(); }
     [[nodiscard]] SessionController *session() const noexcept { return m_session; }
     [[nodiscard]] Metrics *metrics() const noexcept { return m_metrics; }
 
@@ -109,8 +124,11 @@ private:
     void postDrain();
     void dispatch(ReldexEvent &raw);
     void drainAndRelease();
+    [[nodiscard]] bool checkThread(const char *what) const;
 
-    ReldexHub *m_hub = nullptr;
+    /// Set last, and only when the hub exists *and* its waker was registered:
+    /// `isValid()` is exactly "this Bridge can deliver events".
+    reldex::HubHandle m_hub;
     SessionController *m_session = nullptr;
     Metrics *m_metrics = nullptr;
 
@@ -118,6 +136,11 @@ private:
     /// pump thread (the waker) and from the Qt thread (`drain()`), so it is
     /// atomic; it coalesces the waker's post with the drain's own re-post.
     QAtomicInt m_drainPosted { 0 };
+
+    /// True for the duration of a `drain()` body. Only ever touched on this
+    /// object's thread, so a plain bool is enough -- what it guards against is
+    /// re-entry through a nested event loop, not another thread.
+    bool m_draining = false;
 
     QHash<quint64, QPointer<SessionController>> m_sessions;
 

@@ -27,7 +27,11 @@ private Q_SLOTS:
     void cellsMatchWhatTheMockGenerated();
     void columnHeadersComeFromTheBatch();
     void fetchMoreDrivesTheStreamWhenAutoFetchIsOff();
+    void aLargeBatchIsFormattedOneWindowAtATime();
     void formattedTextIsBoundedByTheCache();
+    void theWindowBeingReadIsNeverEvicted();
+    void rowsPastTheModelsCeilingAreRefused();
+    void reExecutingDuringAStreamRunsTheNewResultToCompletion();
     void zeroRowsMeansTheMocksDocumentedDefault();
     void sanityStreamOfAMillionRows();
 };
@@ -214,41 +218,131 @@ void TstResultModel::fetchMoreDrivesTheStreamWhenAutoFetchIsOff()
     QCOMPARE(model->rowCount(), 300);
 }
 
+void TstResultModel::aLargeBatchIsFormattedOneWindowAtATime()
+{
+    // The reason `hydrate()` is keyed on a window and not on a batch: a batch is
+    // whatever `fetchRows` says, so formatting a whole one puts an unbounded
+    // cost inside the first cell read from it.
+    constexpr int kRows = 50000;
+    constexpr qint64 kSeed = 3;
+
+    Bridge bridge;
+    QVERIFY(bridge.isValid());
+    ResultTableModel *model = bridge.session()->model();
+    model->setTimestampStyle(RELDEX_TIMESTAMP_STYLE_DATE_ONLY);
+
+    QVERIFY(streamGeneratedQuery(bridge, kRows, kRows, 1, kSeed));
+    QCOMPARE(model->rowCount(), kRows);
+    QCOMPARE(model->batchCount(), 1); // one batch, 49 windows in it
+    QCOMPARE(model->formattedWindowCount(), 0);
+
+    const int windowRows = ResultTableModel::formatWindowRows();
+    QVERIFY(windowRows > 0);
+
+    // One cell read renders exactly one window of one column.
+    QCOMPARE(model->data(model->index(0, 0), Qt::DisplayRole).toString(),
+             adapter_test::expectedId(1));
+    QCOMPARE(model->formattedWindowCount(), 1);
+    const qint64 oneWindowBytes = model->formattedBytes();
+    QVERIFY(oneWindowBytes > 0);
+    // Far below what rendering the whole 50,000-row batch would cost. The bound
+    // is what is being asserted, not a timing.
+    QVERIFY2(oneWindowBytes < 100 * 1024,
+             qPrintable(QStringLiteral("one window cost %1 bytes").arg(oneWindowBytes)));
+
+    // A second cell in the same window renders nothing further.
+    QCOMPARE(model->data(model->index(windowRows - 1, 0), Qt::DisplayRole).toString(),
+             adapter_test::expectedId(static_cast<quint64>(windowRows)));
+    QCOMPARE(model->formattedWindowCount(), 1);
+    QCOMPARE(model->formattedBytes(), oneWindowBytes);
+
+    // The same for the DATE column, which is the widest formatted one in the
+    // S14 shape. These two numbers are what ui/README.md's memory bound is
+    // derived from, kept where they are produced rather than only in prose.
+    QVERIFY(!model->data(model->index(0, 2), Qt::DisplayRole).toString().isEmpty());
+    QCOMPARE(model->formattedWindowCount(), 2);
+    qInfo("a %d-row window costs %lld bytes (NUMBER) and %lld bytes (DATE); the default bound is "
+          "%d windows / %lld bytes",
+          windowRows, static_cast<long long>(oneWindowBytes),
+          static_cast<long long>(model->formattedBytes() - oneWindowBytes),
+          model->maxFormattedWindows(), static_cast<long long>(model->maxFormattedBytes()));
+
+    // Cells in *different* windows of the same batch are each correct -- the
+    // failure this guards against is a window's offsets being read with the
+    // wrong base row, which produces neighbouring-but-wrong text.
+    const QList<int> rows { 0,
+                            windowRows - 1,
+                            windowRows,
+                            windowRows + 1,
+                            3 * windowRows + 17,
+                            kRows / 2,
+                            kRows - windowRows,
+                            kRows - 1 };
+    for (const int row : rows) {
+        const auto rowNumber = static_cast<quint64>(row) + 1;
+        QCOMPARE(model->data(model->index(row, 0), Qt::DisplayRole).toString(),
+                 adapter_test::expectedId(rowNumber));
+        QCOMPARE(model->data(model->index(row, 2), Qt::DisplayRole).toString(),
+                 adapter_test::expectedCreatedDateOnly(rowNumber));
+    }
+
+    // The text column still goes down the zero-copy path: no window for it.
+    const int windowsAfterNumbers = model->formattedWindowCount();
+    for (const int row : rows) {
+        QVERIFY(model->data(model->index(row, 1), ResultTableModel::IsNullRole).isValid());
+        QVERIFY(!model->data(model->index(row, 1), Qt::DisplayRole).toString().isEmpty());
+    }
+    QCOMPARE(model->formattedWindowCount(), windowsAfterNumbers);
+}
+
 void TstResultModel::formattedTextIsBoundedByTheCache()
 {
     Bridge bridge;
     QVERIFY(bridge.isValid());
     ResultTableModel *model = bridge.session()->model();
-    model->setMaxCachedBatches(4);
+    model->setMaxFormattedWindows(4);
 
     QVERIFY(streamGeneratedQuery(bridge, 5000, 100, 2));
     QCOMPARE(model->batchCount(), 50);
-    QCOMPARE(model->hydratedColumnCount(), 0);
+    QCOMPARE(model->formattedWindowCount(), 0);
+    QCOMPARE(model->formattedBytes(), qint64(0));
 
-    // Walk every batch, touching both formatted columns (ID and CREATED).
+    // Walk every batch, touching both formatted columns (ID and CREATED). Each
+    // batch is 100 rows, so each (batch, column) is exactly one window.
     for (int batch = 0; batch < 50; ++batch) {
         const int row = batch * 100 + 7;
         QVERIFY(!model->data(model->index(row, 0), Qt::DisplayRole).toString().isEmpty());
         QVERIFY(!model->data(model->index(row, 2), Qt::DisplayRole).toString().isEmpty());
-        // Two formatted columns per cached batch, four batches cached.
-        QVERIFY2(model->hydratedColumnCount() <= 8,
-                 qPrintable(QStringLiteral("hydrated=%1 after batch %2")
-                                    .arg(model->hydratedColumnCount())
+        QVERIFY2(model->formattedWindowCount() <= 4,
+                 qPrintable(QStringLiteral("cached=%1 after batch %2")
+                                    .arg(model->formattedWindowCount())
                                     .arg(batch)));
     }
-    QCOMPARE(model->hydratedColumnCount(), 8);
+    QCOMPARE(model->formattedWindowCount(), 4);
 
-    // An evicted batch re-hydrates on demand and still reads correctly.
+    // An evicted window re-renders on demand and still reads correctly.
     QCOMPARE(model->data(model->index(0, 0), Qt::DisplayRole).toString(), QStringLiteral("1"));
-    QVERIFY(model->hydratedColumnCount() <= 8);
+    QCOMPARE(model->data(model->index(4999, 0), Qt::DisplayRole).toString(),
+             QStringLiteral("5000"));
+    QVERIFY(model->formattedWindowCount() <= 4);
 
-    // Tightening the bound drops formatted text immediately.
-    model->setMaxCachedBatches(1);
-    QVERIFY(model->hydratedColumnCount() <= 2);
+    // Tightening either bound evicts immediately.
+    model->setMaxFormattedWindows(1);
+    QCOMPARE(model->formattedWindowCount(), 1);
+    model->setMaxFormattedBytes(0);
+    QCOMPARE(model->formattedWindowCount(), 0);
+    QCOMPARE(model->formattedBytes(), qint64(0));
 
-    // The text column never hydrates anything: it is read straight out of the
+    // A zero byte-bound does not break reading; it only means every read
+    // renders. (The cache is a bound, not a correctness requirement.)
+    QCOMPARE(model->data(model->index(2500, 0), Qt::DisplayRole).toString(),
+             QStringLiteral("2501"));
+
+    // The text column never renders anything: it is read straight out of the
     // batch's own buffer (ADR-0003 D4's zero-copy path).
-    const int hydratedBefore = model->hydratedColumnCount();
+    model->setMaxFormattedBytes(8LL * 1024 * 1024);
+    model->setMaxFormattedWindows(64);
+    const int cachedBefore = model->formattedWindowCount();
     for (int batch = 0; batch < 50; ++batch) {
         QVERIFY(model->data(model->index(batch * 100 + 3, 1), ResultTableModel::IsNullRole)
                         .isValid());
@@ -256,7 +350,146 @@ void TstResultModel::formattedTextIsBoundedByTheCache()
                          .toString()
                          .isEmpty());
     }
-    QCOMPARE(model->hydratedColumnCount(), hydratedBefore);
+    QCOMPARE(model->formattedWindowCount(), cachedBefore);
+    QVERIFY(!model->formattingFailed());
+}
+
+void TstResultModel::theWindowBeingReadIsNeverEvicted()
+{
+    // The bound is allowed to be exceeded by exactly one window: the one being
+    // read. Evicting it would make the very next cell re-render it, which is
+    // the per-cell FFI call D4 exists to avoid.
+    Bridge bridge;
+    QVERIFY(bridge.isValid());
+    ResultTableModel *model = bridge.session()->model();
+
+    QVERIFY(streamGeneratedQuery(bridge, 4096, 4096, 1));
+    QCOMPARE(model->batchCount(), 1);
+
+    model->setMaxFormattedWindows(1);
+    model->setMaxFormattedBytes(1); // smaller than any real window
+
+    for (int window = 0; window < 4; ++window) {
+        const int row = window * ResultTableModel::formatWindowRows() + 5;
+        QCOMPARE(model->data(model->index(row, 0), Qt::DisplayRole).toString(),
+                 adapter_test::expectedId(static_cast<quint64>(row) + 1));
+        // Exactly one survives: the one just read, kept so the next cell in it
+        // is free.
+        QCOMPARE(model->formattedWindowCount(), 1);
+    }
+
+    // Reading the same window twice in a row must still hit the cache, which is
+    // the whole point of keeping it.
+    const qint64 bytes = model->formattedBytes();
+    QCOMPARE(model->data(model->index(6, 0), Qt::DisplayRole).toString(),
+             adapter_test::expectedId(7));
+    QCOMPARE(model->formattedWindowCount(), 1);
+    QVERIFY(model->formattedBytes() > 0);
+    QVERIFY(bytes > 0);
+}
+
+void TstResultModel::rowsPastTheModelsCeilingAreRefused()
+{
+    // `QAbstractItemModel` counts rows in `int`. A stream longer than that must
+    // stop rather than wrap, and must say so. `maxRows` makes that path
+    // testable without 2^31 rows.
+    Bridge bridge;
+    QVERIFY(bridge.isValid());
+    SessionController *session = bridge.session();
+    ResultTableModel *model = session->model();
+    QAbstractItemModelTester tester(model, QAbstractItemModelTester::FailureReportingMode::QtTest);
+
+    QVERIFY(!model->rowLimitReached());
+    model->setMaxRows(250);
+    // Said once, and said exactly like this: 100 + 100 + 100 rows against a
+    // ceiling of 250 refuses the last 50 of the third batch and every batch
+    // after it. `ignoreMessage()` consumes one occurrence, so a version that
+    // warned per batch would still show up in the log.
+    QTest::ignoreMessage(QtWarningMsg,
+                         "ResultTableModel: row limit 250 reached; 50 further row(s) in this "
+                         "batch and every later batch are refused. What was already fetched "
+                         "stays readable.");
+
+    session->setMockRows(10000);
+    session->setFetchRows(100);
+    session->setMaxFetchesInFlight(1);
+    session->setRunOnOpen(true);
+    QVERIFY(session->open());
+
+    QVERIFY(spinUntil([model] { return model->rowLimitReached(); }));
+
+    // The refusal is announced once and fetching stops; what was fetched stays
+    // readable, and the partial batch is truncated rather than dropped.
+    QVERIFY(spinUntil([session] { return session->fetchesInFlight() == 0; }));
+    QCOMPARE(model->rowCount(), 250);
+    QVERIFY(!model->canFetchMore(QModelIndex()));
+    QVERIFY(!session->canFetchMoreRows());
+    QCOMPARE(model->data(model->index(249, 0), Qt::DisplayRole).toString(),
+             adapter_test::expectedId(250));
+
+    // Nothing arrives afterwards, even though the result has 9,750 rows left.
+    QVERIFY(!spinUntil([model] { return model->rowCount() > 250; }, 200));
+    QCOMPARE(model->rowCount(), 250);
+
+    // A new result clears the flag.
+    QVERIFY(session->executeMockStatement(RELDEX_MOCK_STATEMENT_DML));
+    QVERIFY(spinUntil([session] {
+        return session->state() == SessionController::Ready
+                || session->state() == SessionController::Failed;
+    }));
+    QCOMPARE(session->state(), SessionController::Ready);
+    QVERIFY(!model->rowLimitReached());
+}
+
+void TstResultModel::reExecutingDuringAStreamRunsTheNewResultToCompletion()
+{
+    // The stale-reply path: fetches issued against the replaced result still
+    // get exactly one reply each (A5), and the in-flight slot each one frees
+    // has to be handed to the current result.
+    //
+    // Per-session FIFO (A5) happens to deliver those replies *before* the new
+    // EXECUTED, so the new result finds the slots already free -- but the
+    // adapter must not depend on that ordering, and this test passes either
+    // way only because the stale path re-submits too.
+    // No QAbstractItemModelTester here on purpose: it re-runs its whole suite
+    // on every rowsInserted, and that suite walks the model's rows, so
+    // attaching it to a long stream makes the *test* quadratic rather than the
+    // model. Model consistency is covered by the tests above, which stream a
+    // few thousand rows; this one is about the session's bookkeeping.
+    constexpr int kRows = 20000;
+
+    Bridge bridge;
+    QVERIFY(bridge.isValid());
+    SessionController *session = bridge.session();
+    ResultTableModel *model = session->model();
+
+    session->setMockRows(kRows);
+    session->setFetchRows(200);
+    session->setMaxFetchesInFlight(4);
+    session->setRunOnOpen(true);
+    QVERIFY(session->open());
+    QVERIFY(spinUntil([session] { return session->rowsFetched() >= 1000; }));
+    QVERIFY(session->fetchesInFlight() > 0);
+
+    // Re-execute with every slot busy. The row count is the scenario's, fixed
+    // when the session was opened, so the new result has `kRows` rows too.
+    QVERIFY(session->executeMockStatement(RELDEX_MOCK_STATEMENT_GENERATED_QUERY));
+    QVERIFY(spinUntil([session] {
+        return session->state() == SessionController::ResultComplete
+                || session->state() == SessionController::Failed;
+    }));
+    QCOMPARE(session->state(), SessionController::ResultComplete);
+    QCOMPARE(model->rowCount(), kRows);
+    QCOMPARE(session->rowsFetched(), qint64(kRows));
+    QCOMPARE(session->fetchesInFlight(), 0);
+    QCOMPARE(bridge.orphanEvents(), qint64(0));
+
+    // The rows are the new result's, from its first row to its last -- nothing
+    // of the replaced result's stream was appended to it.
+    QCOMPARE(model->data(model->index(0, 0), Qt::DisplayRole).toString(),
+             adapter_test::expectedId(1));
+    QCOMPARE(model->data(model->index(kRows - 1, 0), Qt::DisplayRole).toString(),
+             adapter_test::expectedId(kRows));
 }
 
 void TstResultModel::zeroRowsMeansTheMocksDocumentedDefault()
@@ -292,11 +525,13 @@ void TstResultModel::sanityStreamOfAMillionRows()
     ResultTableModel *model = bridge.session()->model();
 
     const qint64 rssBefore = Metrics::residentBytes();
+    const qint64 privateBefore = Metrics::privateBytes();
     QElapsedTimer wall;
     wall.start();
     QVERIFY(streamGeneratedQuery(bridge, 1000000, 1000, 2, 0, 600000));
     const qint64 streamMs = wall.elapsed();
     const qint64 rssStreamed = Metrics::residentBytes();
+    const qint64 privateStreamed = Metrics::privateBytes();
 
     QCOMPARE(model->rowCount(), 1000000);
 
@@ -329,17 +564,19 @@ void TstResultModel::sanityStreamOfAMillionRows()
     const qint64 warmNs = window.nsecsElapsed();
     const qint64 rssAfter = Metrics::residentBytes();
 
-    qInfo("1M sanity: streamed in %lld ms; RSS %lld -> %lld (delta %lld bytes, %.1f B/row); "
-          "cold window %lld cells in %lld ns; warm %lld cells in %lld ns (%.1f ns/cell); "
-          "RSS after reads %lld",
-          static_cast<long long>(streamMs), static_cast<long long>(rssBefore),
-          static_cast<long long>(rssStreamed),
+    qInfo("1M sanity: streamed in %lld ms; RSS delta %lld bytes (%.1f B/row); private delta %lld "
+          "bytes (%.1f B/row); cold window %lld cells in %lld ns; warm %lld cells in %lld ns "
+          "(%.1f ns/cell); RSS after reads %lld; formatted cache %d windows / %lld bytes",
+          static_cast<long long>(streamMs),
           static_cast<long long>(rssStreamed - rssBefore),
           static_cast<double>(rssStreamed - rssBefore) / 1000000.0,
+          static_cast<long long>(privateStreamed - privateBefore),
+          static_cast<double>(privateStreamed - privateBefore) / 1000000.0,
           static_cast<long long>(cells), static_cast<long long>(coldNs),
           static_cast<long long>(warmCells), static_cast<long long>(warmNs),
           warmCells > 0 ? static_cast<double>(warmNs) / static_cast<double>(warmCells) : 0.0,
-          static_cast<long long>(rssAfter));
+          static_cast<long long>(rssAfter), model->formattedWindowCount(),
+          static_cast<long long>(model->formattedBytes()));
 }
 
 QTEST_GUILESS_MAIN(TstResultModel)

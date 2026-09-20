@@ -67,8 +67,10 @@ ui/adapter/                   reldex_adapter: thin static lib + QML module (Reld
 ui/app/                       Reldex executable + Main.qml (Reldex.App QML module)
 ui/tests/                     QTest binaries, run via CTest
   tst_coreinfo.cpp             ABI version + Main.qml loads offscreen with no QML warning
-  tst_bridge.cpp               drain budget/re-post, error model, blocked statement, routing
-  tst_resultmodel.cpp          QAbstractItemModelTester, cell content, fetchMore, cache bound
+  tst_bridge.cpp               drain budget/re-post, re-entrancy, deleteLater, error model,
+                               blocked statement, routing
+  tst_resultmodel.cpp          QAbstractItemModelTester, cell content, fetchMore, window cache,
+                               row ceiling, re-execute mid-stream
   tst_teardown.cpp             spike criterion K5: 10,000 teardowns under a flood
   AdapterTestSupport.h         spin helpers + the mock's generated values, restated
 ui/build.sh                   One-command build (bash-first; see AGENTS.md)
@@ -123,9 +125,19 @@ in `tst_coreinfo` found that; reasoning about it had not.
 `BYTES`, `LOB`, `UNSUPPORTED`, and anything a future header adds — it reads
 text the **bulk** formatter produced, through exactly one lazy path:
 `ResultTableModel::hydrate()`, which calls `reldex_text_arena_create`,
-`reldex_batch_format_column` over the whole batch, and `reldex_text_arena_view`
-once, and then caches the resulting `ReldexArenaView` so every later cell in
-that (batch, column) is pointer arithmetic again.
+`reldex_batch_format_column` over one **1,024-row window** of one column, and
+`reldex_text_arena_view` once, and then caches the resulting `ReldexArenaView`
+so every later cell in that (batch, column, window) is pointer arithmetic
+again.
+
+The window, rather than the whole batch, is what makes that cost independent of
+`fetchRows`. D4 asks for "one call per visible window"; formatting a whole
+batch *is* that when a batch is 1,000 rows and emphatically is not when it is
+50,000 — measured during this task's independent review, same machine and
+build, at 2.74 ms (`NUMBER`) and 7.55 ms (`DATE`) for the first cell read out
+of a 50,000-row batch, which is a dropped frame the boundary would have been
+blamed for. A window is also never split across batches, so no cell read ever
+needs two renders.
 
 Grep proof — every `reldex_*` call in `ResultTableModel.cpp`:
 
@@ -133,24 +145,39 @@ Grep proof — every `reldex_*` call in `ResultTableModel.cpp`:
 | --- | --- | --- |
 | `reldex_batch_column` | describe a column once | `applyBatch()` |
 | `reldex_batch_column_count` / `reldex_batch_column_info` | column names | `readColumnHeaders()` |
-| `reldex_text_arena_create` / `reldex_batch_format_column` / `reldex_text_arena_view` | render one (batch, column) | `hydrate()` |
+| `reldex_text_arena_create` / `reldex_batch_format_column` / `reldex_text_arena_view` | render one (batch, column, window) | `hydrate()` |
 | `reldex_batch_release` / `reldex_text_arena_release` | RAII deleters in `ReldexHandles.h` | destruction |
 
 ### Caching and its memory bound
 
-Formatted text is held per **(batch, column)** in its own `ReldexTextArena`,
-and the arenas are kept in a least-recently-used list of at most
-`maxCachedBatches` batches (default 16). Touching a batch moves it to the
-most-recently-used end *before* anything is dropped, so the batch being read is
-never the one evicted; a re-touched batch re-renders on demand.
+Formatted text is held per **(batch, column, 1,024-row window)** in its own
+`ReldexTextArena`. The arenas sit in a least-recently-used list bounded by
+*both* a count (`maxFormattedWindows`, default 64) and a byte total
+(`maxFormattedBytes`, default 8 MiB); whichever bites first evicts from the
+least-recently-used end. Reading a cell moves its window to the front, and the
+window just rendered is never the victim, so the bound can be exceeded by at
+most one window and a cell read is never followed by a re-render of the window
+it was read from.
 
 The bound matters because K3 allows 200 MB of RSS growth for 1,000,000 rows,
 and retaining formatted text for all of them would spend most of that on
-strings nobody is looking at. With the default 16 batches of 1,000 rows and the
-S14 shape (two formatted columns, ~11 and ~10 bytes per cell plus an 8-byte
-offset), the cache is roughly **0.6 MB**, independent of how many rows have
-been fetched. The row data itself *is* retained — ADR-0003 D4 says the MVP
-keeps the fetched prefix, and ADR-0004 (result store) is where that changes.
+strings nobody is looking at. Measured on the S14 shape (`tst_resultmodel`
+reports these): one 1,024-row window costs **11,189 bytes** for `ID`
+(`NUMBER`) and **18,440 bytes** for `CREATED` (`DATE`) — the UTF-8 bytes plus
+one 8-byte offset per row. So the default 64-window bound is about **1.2 MB**
+for this shape, and the 8 MiB byte bound is what actually holds when a column
+is wide (it caps the cache at ~450 windows of 18 KB, or fewer of anything
+wider). Either way it is independent of how many rows have been fetched.
+
+The row data itself *is* retained — ADR-0003 D4 says the MVP keeps the fetched
+prefix, and ADR-0004 (result store) is where that changes.
+
+`ResultTableModel` also has a hard row ceiling (`maxRows`, default `INT_MAX`),
+because `QAbstractItemModel` counts rows in `int` and a stream long enough to
+overflow one has to stop rather than wrap. Reaching it warns once, sets
+`rowLimitReached`, truncates the batch that crossed it rather than dropping it,
+and makes `canFetchMore()` false so nothing further is fetched. What was
+already fetched stays readable.
 
 A `QString` cache per visible cell was considered and rejected: it would add a
 second copy of the same text (a `QString` is 24 bytes plus a heap block) for a
@@ -159,6 +186,19 @@ bound depend on how a view happens to call `data()`. What the current shape
 costs instead is one `QString::fromUtf8` per `data()` call, which is precisely
 the number S15's K4 measures — so it is left visible rather than optimized away
 before it has been measured.
+
+### What `Main.qml` deliberately does not do
+
+The `TableView` uses **constant** `columnWidthProvider` and `rowHeightProvider`
+(220 × 22). Auto-sizing is a different cost class: with no explicit provider a
+`TableView` asks the delegate for an implicit size, and a width derived from
+content has to look at rows the viewport is not showing — which is a
+`data()` call per candidate row, on a model whose whole design is that
+`data()` is only ever asked about visible cells. Column sizing is a real
+feature with its own decisions to make (sample the first N rows? remember the
+user's drag?), and it belongs to the editor milestone, not to a spike about
+the boundary. Fixed providers keep the numbers above measuring the boundary
+rather than a sizing policy nobody has chosen yet.
 
 ### Teardown (ADR-0003 D5 rule 2 and A10)
 
@@ -178,14 +218,38 @@ before it has been measured.
 5. `~QObject` removes any drain this object had posted for itself, so a queued
    invocation can never reach a dead `Bridge`.
 
+Two rules follow for anything a drain can reach, and both are stated in
+`Bridge.h` where they are implemented:
+
+- **`drain()` is never re-entered.** A nested event loop — a modal dialog, or a
+  `QEventLoop` spun inside a handler — delivers the drains posted while an
+  outer drain is still walking the queue. Re-entering would dispatch events
+  inside an outer dispatch, mutating the model mid-signal and applying events
+  in an order the library did not produce. The delivery bails out and re-posts
+  instead. `tst_bridge` proves it: no `drained` signal is emitted while a
+  nested loop runs inside a drain, and the stream still completes with every
+  row and no orphan.
+- **Destroy the `Bridge` with `deleteLater()`, never `delete`, from inside
+  anything a drain calls.** `~Bridge` would tear the hub down underneath the
+  loop still walking it; `deleteLater()` defers that to the next return to the
+  event loop, which is after the drain has finished. Also covered by
+  `tst_bridge`, with fetches still in flight at the moment of destruction.
+
 ## Instrumentation, and how M1.8 runs the S15 measurement
 
 `ui/adapter/Metrics.{h,cpp}` holds every hook, compiled in and **off by
-default**: each recording entry point is an inline `if (!m_enabled) return;` in
-front of an out-of-line implementation. It records monotonic marks
-(execute submitted → first event → first rows inserted → first frame swapped
-after that insert), per-drain event counts and durations, frame intervals from
-`QQuickWindow::frameSwapped`, and resident set size. It draws no conclusions —
+default**: each recording entry point is an inline `if (!isEnabled()) return;`
+in front of an out-of-line implementation. The flag is a
+`std::atomic<bool>` read relaxed, because `frameSwapped` is connected
+`Qt::DirectConnection` and therefore reads it from the render thread while the
+GUI thread may be writing it — a plain `bool` there is a data race whatever it
+would do in practice. It records monotonic marks (execute submitted → first
+event → first rows inserted → first frame swapped after that insert), per-drain
+event counts and durations, frame intervals from `QQuickWindow::frameSwapped`,
+and memory (resident set size *and* private bytes — on Windows the working set
+is shared-page-inflated and K3 is about what this process actually owns, so
+`privateBytes()` is the one to quote and both are recorded). It draws no
+conclusions —
 `writeCsv()` emits `section,a,b,c` rows (`mark`, `drain`, `frame`) and the
 spike report is M1.8's to write.
 
@@ -243,13 +307,16 @@ Dev machine, Windows 11, MSVC 14.44, Qt 6.8.3, `RelWithDebInfo`, mock driver,
 guiless (no scene graph), 1,000,000 rows of the S14 shape, 1,000 rows per
 fetch, 2 fetches in flight:
 
-- streamed into the model in **459–485 ms**;
-- RSS grew by **~177 MB** (~177 B/row) — under K3's 200 MB, but well above the
-  ADR's ~116 B/row estimate, and this is *without* a scene graph. M1.8 should
-  expect K3 to be the tight one;
-- a cold 40-row × 3-column window (which renders two whole 1,000-row columns
-  through the bulk formatter) took ~327 µs; the same window warm averaged
-  **~104 ns/cell**, against K4's 200 ns budget;
+- streamed into the model in **451–485 ms**;
+- RSS grew by **~176–182 MB** (~176–182 B/row; private bytes ~178 B/row) —
+  under K3's 200 MB, but well above the ADR's ~116 B/row estimate, and this is
+  *without* a scene graph. M1.8 should expect K3 to be the tight one (the cause
+  is diagnosed below);
+- a cold 40-row × 3-column viewport (which renders two 1,024-row windows
+  through the bulk formatter) took **~248 µs**; the same viewport warm averaged
+  **~100 ns/cell**, against K4's 200 ns budget. The formatted-text cache held
+  **2 windows / 41 KB** at the end of that — the bound in action on a
+  1,000,000-row result;
 - K5: **10,000 teardowns under a flood in 6.85 s** (0.685 ms each), RSS +2.6 MB
   across the whole loop.
 
@@ -261,17 +328,30 @@ sampled from outside the process:
   **307 MB**, stable out to 40 s — a growth of **~231 MB**.
 
 **This is the number M1.8 should look at first.** K3's threshold is 200 MB of
-RSS growth for 1M rows and both measurements are near or past it (177 MB
+RSS growth for 1M rows and both measurements are near or past it (~180 MB
 headless, ~231 MB with the UI). The formatted-text cache is not the cause — it
-is bounded at well under a megabyte. What costs the memory is the *retained
-fetched prefix*: ADR-0003 D4 has the MVP keep every batch it has fetched, so a
-scrolled-through million-row result holds a million rows of batch memory. At
-~177 B/row against the ADR's own ~116 B/row estimate there is also roughly
-70 B/row unaccounted for, which is worth diagnosing before concluding anything
-— a plausible first suspect is per-batch `Vec` capacity slack on the Rust side,
-which would be a fix in the producer rather than in the boundary. Per the ADR:
-"K1/K3 failure with a *diagnosed* cause in the model (not the boundary) is a
-design fix, not a kill."
+is bounded at about 1.2 MB for this shape. What costs the memory is the
+*retained fetched prefix*: ADR-0003 D4 has the MVP keep every batch it has
+fetched, so a scrolled-through million-row result holds a million rows of batch
+memory.
+
+The gap between the measured ~181 B/row and the ADR's ~116 B/row estimate has
+since been **diagnosed** (independent review of this task, same machine and
+build): it is not `Vec` capacity slack, and it is not on this side of the
+boundary. `applyBatch()` calls `reldex_batch_column` once per column, and for
+`NUMBER` and `TIMESTAMP` columns `crates/ffi` answers by building and then
+**retaining** a `#[repr(C)]` mirror of that column — 46 B/row for `ReldexNumber`
+and 16 B/row for the timestamp — which the adapter never reads, because those
+kinds go through the bulk formatter instead. Measured directly: **111.7 B/row**
+with no column viewed, **183.3 B/row** with all three viewed. The two mirrors
+account for the whole difference.
+
+The fix belongs in `crates/ffi` (do not materialize a mirror a caller has not
+asked for, or drop it once the view is released), and the lead is doing it in a
+separate ABI round; no adapter-side workaround was added here, because working
+around it would mean *not* taking column views, which is the thing the
+zero-copy `isNull`/text path is built on. Per the ADR: "K1/K3 failure with a
+*diagnosed* cause in the model (not the boundary) is a design fix, not a kill."
 
 No frame-time number is claimed: K1 needs a real swapchain and a scrolling
 window driven by a human or a harness, which is M1.8's job on the dev machine,

@@ -35,6 +35,11 @@ struct ArenaDeleter
     void operator()(ReldexTextArena *arena) const noexcept { reldex_text_arena_release(arena); }
 };
 
+struct HubDeleter
+{
+    void operator()(ReldexHub *hub) const noexcept { reldex_hub_destroy(hub); }
+};
+
 /// Owns one fetched batch. Released exactly once, when this goes out of scope.
 using BatchHandle = std::unique_ptr<ReldexBatch, BatchDeleter>;
 
@@ -43,6 +48,15 @@ using ErrorHandle = std::unique_ptr<ReldexError, ErrorDeleter>;
 
 /// Owns one formatting arena. Views taken from it die with it.
 using ArenaHandle = std::unique_ptr<ReldexTextArena, ArenaDeleter>;
+
+/// Owns the hub.
+///
+/// A handle rather than a raw pointer so a `Bridge` constructor that fails
+/// part of the way through -- or unwinds -- cannot leak the hub and the pump
+/// threads behind it. The deleter is only `reldex_hub_destroy`; the ordered
+/// teardown D5 rule 2 requires (unregister the waker, release every batch,
+/// drain) happens in `~Bridge` before this handle is reset.
+using HubHandle = std::unique_ptr<ReldexHub, HubDeleter>;
 
 template<typename T>
 [[nodiscard]] inline T sized() noexcept

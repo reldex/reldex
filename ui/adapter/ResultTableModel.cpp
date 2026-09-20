@@ -142,7 +142,7 @@ QVariant ResultTableModel::headerData(int section, Qt::Orientation orientation, 
 
 bool ResultTableModel::canFetchMore(const QModelIndex &parent) const
 {
-    if (parent.isValid() || m_source == nullptr) {
+    if (parent.isValid() || m_source == nullptr || m_rowLimitReached) {
         return false;
     }
     return m_source->canFetchMoreRows();
@@ -150,7 +150,7 @@ bool ResultTableModel::canFetchMore(const QModelIndex &parent) const
 
 void ResultTableModel::fetchMore(const QModelIndex &parent)
 {
-    if (parent.isValid() || m_source == nullptr) {
+    if (parent.isValid() || m_source == nullptr || m_rowLimitReached) {
         return;
     }
     m_source->fetchMoreRows();
@@ -199,21 +199,43 @@ void ResultTableModel::applyBatch(reldex::BatchHandle batch, int rows)
             readColumnHeaders(batch.get());
         }
     }
+    // Paired with the mutation `readColumnHeaders()` just made, and emitted
+    // *before* any row insertion: a view told about new rows first would read
+    // the new headers without ever having been told they changed.
+    if (namesWereUnknown && m_columnCount > 0) {
+        Q_EMIT headerDataChanged(Qt::Horizontal, 0, m_columnCount - 1);
+        Q_EMIT columnNamesChanged();
+    }
+
     if (rows <= 0) {
         // An exhausted-result marker: its column names have been taken, and it
         // has no rows to keep, so it is released as this handle goes away.
-        if (namesWereUnknown && m_columnCount > 0) {
-            Q_EMIT headerDataChanged(Qt::Horizontal, 0, m_columnCount - 1);
-            Q_EMIT columnNamesChanged();
-        }
         return;
+    }
+
+    // `QAbstractItemModel` counts rows in `int`, so a stream long enough to
+    // overflow one must be refused rather than wrapped. `m_maxRows` is that
+    // ceiling, lowered by a test or by a caller that wants a smaller one.
+    const qint64 room = static_cast<qint64>(m_maxRows) - static_cast<qint64>(m_rowCount);
+    if (room <= 0 || rows > room) {
+        const int accepted = static_cast<int>(std::max<qint64>(0, room));
+        if (!m_rowLimitReached) {
+            m_rowLimitReached = true;
+            qWarning("ResultTableModel: row limit %d reached; %d further row(s) in this batch and "
+                     "every later batch are refused. What was already fetched stays readable.",
+                     m_maxRows, rows - accepted);
+            Q_EMIT rowLimitReachedChanged();
+        }
+        if (accepted == 0) {
+            return; // the handle releases the batch
+        }
+        rows = accepted;
     }
 
     BatchEntry entry;
     entry.firstRow = m_rowCount;
     entry.rows = rows;
     entry.views.resize(static_cast<std::size_t>(m_columnCount));
-    entry.formatted.resize(static_cast<std::size_t>(m_columnCount));
     for (int column = 0; column < m_columnCount; ++column) {
         // Once per column per batch (ADR-0003 D4), never per cell.
         ReldexColumnView view = reldex::makeColumnView();
@@ -231,10 +253,6 @@ void ResultTableModel::applyBatch(reldex::BatchHandle batch, int rows)
     m_rowCount += rows;
     endInsertRows();
 
-    if (namesWereUnknown && m_columnCount > 0) {
-        Q_EMIT headerDataChanged(Qt::Horizontal, 0, m_columnCount - 1);
-        Q_EMIT columnNamesChanged();
-    }
     Q_EMIT batchCountChanged();
 }
 
@@ -292,117 +310,174 @@ int ResultTableModel::batchForRow(int row) const
 
 QString ResultTableModel::formattedCell(int batchIndex, int column, int localRow) const
 {
-    BatchEntry &batch = m_batches[static_cast<std::size_t>(batchIndex)];
-    FormattedColumn &formatted = batch.formatted[static_cast<std::size_t>(column)];
-    if (!formatted.arena) {
-        hydrate(batchIndex, column);
+    const BatchEntry &batch = m_batches[static_cast<std::size_t>(batchIndex)];
+    const WindowKey key { batchIndex, column, localRow / kWindowRows };
+
+    const FormattedWindow *entry = nullptr;
+    const auto cached = m_windows.find(key);
+    if (cached != m_windows.end()) {
+        touch(cached->second);
+        entry = &cached->second->second;
+    } else {
+        entry = hydrate(key, batch.rows, batch.handle.get());
     }
-    // `hydrate()` can evict other batches but never this one: `touch()` moves
-    // it to the most-recently-used end before anything is dropped.
-    return stringFromArena(formatted.view, static_cast<std::size_t>(localRow));
+    if (entry == nullptr || entry->failed) {
+        return {};
+    }
+    // A deep copy out of the arena, so a later eviction cannot dangle behind a
+    // QString the view already handed to QML.
+    return stringFromArena(entry->view, static_cast<std::size_t>(localRow - entry->firstLocalRow));
 }
 
-void ResultTableModel::hydrate(int batchIndex, int column) const
+const ResultTableModel::FormattedWindow *
+ResultTableModel::hydrate(const WindowKey &key, int rowsInBatch, const ReldexBatch *batch) const
 {
-    // THE ONE FFI PATH REACHED FROM data(): ADR-0003 D4's bulk formatter, run
-    // once per (batch, column) while that batch keeps its cache -- "one call
-    // per visible window, not per cell".
-    BatchEntry &batch = m_batches[static_cast<std::size_t>(batchIndex)];
-    FormattedColumn &formatted = batch.formatted[static_cast<std::size_t>(column)];
+    // THE ONE FFI PATH REACHED FROM data(): ADR-0003 D4's bulk formatter, over
+    // one bounded window -- "one call per visible window, not per cell", and
+    // not per *batch* either, because a batch is whatever `fetchRows` says and
+    // a big fetch would otherwise put a whole batch's formatting cost inside
+    // the first cell of it.
+    const int firstLocalRow = key.window * kWindowRows;
+    const int rows = std::min(kWindowRows, rowsInBatch - firstLocalRow);
+    if (rows <= 0) {
+        return nullptr; // not cached: there is nothing to render or to remember
+    }
 
-    touch(batchIndex);
+    FormattedWindow rendered;
+    rendered.firstLocalRow = firstLocalRow;
 
     reldex::ArenaHandle arena(reldex_text_arena_create());
     if (!arena) {
-        return;
+        rendered.failed = true;
+        noteFormatFailure("reldex_text_arena_create");
+    } else if (reldex_batch_format_column(batch, static_cast<std::size_t>(key.column),
+                                          static_cast<std::size_t>(firstLocalRow),
+                                          static_cast<std::size_t>(rows), &m_formatOptions,
+                                          arena.get())
+               != RELDEX_STATUS_OK) {
+        rendered.failed = true;
+        noteFormatFailure("reldex_batch_format_column");
+    } else {
+        ReldexArenaView view = reldex::makeArenaView();
+        if (reldex_text_arena_view(arena.get(), &view) != RELDEX_STATUS_OK) {
+            rendered.failed = true;
+            noteFormatFailure("reldex_text_arena_view");
+        } else {
+            rendered.view = view;
+            rendered.bytes = static_cast<qint64>(view.data_len)
+                    + static_cast<qint64>((view.count + 1) * sizeof(std::size_t));
+            rendered.arena = std::move(arena);
+        }
     }
-    if (reldex_batch_format_column(batch.handle.get(), static_cast<std::size_t>(column), 0,
-                                   static_cast<std::size_t>(batch.rows), &m_formatOptions,
-                                   arena.get())
-        != RELDEX_STATUS_OK) {
-        return;
-    }
-    ReldexArenaView view = reldex::makeArenaView();
-    if (reldex_text_arena_view(arena.get(), &view) != RELDEX_STATUS_OK) {
-        return;
-    }
-    formatted.arena = std::move(arena);
-    formatted.view = view;
 
-    evictIfNeeded();
+    // A failed window is cached too -- with no arena and no bytes -- because
+    // that is what stops `data()` from retrying, and therefore calling FFI, on
+    // every repaint of every cell in it.
+    //
+    // Inserted first and evicted afterwards: reserving an LRU slot before the
+    // render succeeded would evict a live window to make room for one that may
+    // never exist.
+    m_lru.emplace_front(key, std::move(rendered));
+    m_windows.emplace(key, m_lru.begin());
+    m_formattedBytes += m_lru.front().second.bytes;
+
+    evictIfNeeded(key);
+    return &m_lru.front().second;
 }
 
-void ResultTableModel::touch(int batchIndex) const
+void ResultTableModel::touch(WindowList::iterator node) const
 {
-    const auto existing = std::find(m_hydrationOrder.begin(), m_hydrationOrder.end(), batchIndex);
-    if (existing != m_hydrationOrder.end()) {
-        m_hydrationOrder.erase(existing);
-    }
-    m_hydrationOrder.push_back(batchIndex);
+    // Moves the node, not its contents: every iterator the index holds --
+    // including this one -- stays valid.
+    m_lru.splice(m_lru.begin(), m_lru, node);
 }
 
-void ResultTableModel::dropFormattedText(int batchIndex) const
+void ResultTableModel::evictIfNeeded(const WindowKey &keep) const
 {
-    if (batchIndex < 0 || batchIndex >= static_cast<int>(m_batches.size())) {
-        return;
-    }
-    BatchEntry &batch = m_batches[static_cast<std::size_t>(batchIndex)];
-    for (FormattedColumn &formatted : batch.formatted) {
-        formatted.arena.reset();
-        formatted.view = ReldexArenaView {};
+    const int windowLimit = std::max(1, m_maxFormattedWindows);
+    while (!m_lru.empty()
+           && (static_cast<int>(m_lru.size()) > windowLimit
+               || m_formattedBytes > m_maxFormattedBytes)) {
+        const auto victim = std::prev(m_lru.end());
+        if (victim->first == keep) {
+            // The window being read right now is last in the LRU, which means
+            // it is the only one left and is over the byte bound on its own.
+            // Keeping it is the lesser evil: dropping it would make the very
+            // next cell re-render it, which is the per-cell FFI this design
+            // exists to avoid. The bound is a target, not a guarantee, and it
+            // can be exceeded by at most one window.
+            break;
+        }
+        m_formattedBytes -= victim->second.bytes;
+        m_windows.erase(victim->first);
+        m_lru.erase(victim);
     }
 }
 
 void ResultTableModel::dropAllFormattedText() const
 {
-    for (int index = 0; index < static_cast<int>(m_batches.size()); ++index) {
-        dropFormattedText(index);
-    }
-    m_hydrationOrder.clear();
+    m_lru.clear();
+    m_windows.clear();
+    m_formattedBytes = 0;
 }
 
-void ResultTableModel::evictIfNeeded() const
+void ResultTableModel::noteFormatFailure(const char *what) const
 {
-    const int limit = std::max(1, m_maxCachedBatches);
-    while (static_cast<int>(m_hydrationOrder.size()) > limit) {
-        const int victim = m_hydrationOrder.front();
-        m_hydrationOrder.erase(m_hydrationOrder.begin());
-        dropFormattedText(victim);
+    if (m_formattingFailed) {
+        return; // said once, not once per repaint
     }
-}
-
-int ResultTableModel::hydratedColumnCount() const
-{
-    int count = 0;
-    for (const BatchEntry &batch : m_batches) {
-        for (const FormattedColumn &formatted : batch.formatted) {
-            if (formatted.arena) {
-                ++count;
-            }
-        }
-    }
-    return count;
+    m_formattingFailed = true;
+    qWarning("ResultTableModel: %s failed; affected cells render empty. This is reported once.",
+             what);
+    Q_EMIT const_cast<ResultTableModel *>(this)->formattingFailedChanged();
 }
 
 void ResultTableModel::releaseEverything()
 {
-    m_hydrationOrder.clear();
-    m_batches.clear(); // releases every arena, then every batch
+    // Arenas first: a window borrows nothing from its batch once rendered, but
+    // the keys index batches by position, so nothing may outlive `m_batches`.
+    dropAllFormattedText();
+    m_batches.clear(); // releases every batch
     m_firstRows.clear();
     m_columns.clear();
     m_rowCount = 0;
     m_lastBatch = -1;
+    if (m_rowLimitReached) {
+        m_rowLimitReached = false;
+        Q_EMIT rowLimitReachedChanged();
+    }
 }
 
-void ResultTableModel::setMaxCachedBatches(int batches)
+void ResultTableModel::setMaxFormattedWindows(int windows)
 {
-    const int clamped = std::max(1, batches);
-    if (clamped == m_maxCachedBatches) {
+    const int clamped = std::max(1, windows);
+    if (clamped == m_maxFormattedWindows) {
         return;
     }
-    m_maxCachedBatches = clamped;
-    evictIfNeeded();
-    Q_EMIT maxCachedBatchesChanged();
+    m_maxFormattedWindows = clamped;
+    evictIfNeeded(WindowKey { -1, -1, -1 }); // no window is being read here
+    Q_EMIT formattedBoundChanged();
+}
+
+void ResultTableModel::setMaxFormattedBytes(qint64 bytes)
+{
+    const qint64 clamped = std::max<qint64>(0, bytes);
+    if (clamped == m_maxFormattedBytes) {
+        return;
+    }
+    m_maxFormattedBytes = clamped;
+    evictIfNeeded(WindowKey { -1, -1, -1 });
+    Q_EMIT formattedBoundChanged();
+}
+
+void ResultTableModel::setMaxRows(int rows)
+{
+    const int clamped = std::max(0, rows);
+    if (clamped == m_maxRows) {
+        return;
+    }
+    m_maxRows = clamped;
+    Q_EMIT maxRowsChanged();
 }
 
 void ResultTableModel::setNullText(const QString &text)

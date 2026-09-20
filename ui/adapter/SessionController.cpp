@@ -194,6 +194,12 @@ bool SessionController::execute(const QString &sql, qint64 deadlineMs)
     m_exhausted = false;
     m_rowsFetched = 0;
     m_rowsAffected = -1;
+    // Pending requests are the *view's* asks against the result being replaced,
+    // so they go. `m_fetchesInFlight` deliberately does not: those fetches are
+    // genuinely still outstanding, they still hold memory, and each will still
+    // produce exactly one reply (A5). Counting them is what keeps the in-flight
+    // bound a bound across a re-execute; the stale-reply path in `handleEvent`
+    // is what hands each freed slot to the new result.
     m_pendingFetchRequests = 0;
     Q_EMIT rowsFetchedChanged();
 
@@ -258,7 +264,19 @@ bool SessionController::closeSession(int disposition)
 
 bool SessionController::canFetchMoreRows() const
 {
-    return m_hasResult && !m_exhausted && m_sessionId != 0 && m_resultId != 0;
+    // The question `QAbstractItemModel::canFetchMore()` is really asking is
+    // "can more rows still appear for the result being shown".
+    //
+    // In-flight fetches are deliberately *not* a reason to answer no: rows are
+    // on their way, and a view that was told no would stop asking. The bound on
+    // how many requests may be outstanding belongs in `fetchMoreRows()` and
+    // `submitFetches()`, which is where it is.
+    if (!m_hasResult || m_exhausted || m_sessionId == 0 || m_resultId == 0) {
+        return false;
+    }
+    // Past the model's ceiling every further batch would be refused on arrival,
+    // so fetching it would cost a round trip and its memory for nothing.
+    return m_model == nullptr || !m_model->rowLimitReached();
 }
 
 void SessionController::fetchMoreRows()
@@ -266,7 +284,19 @@ void SessionController::fetchMoreRows()
     if (!canFetchMoreRows()) {
         return;
     }
-    ++m_pendingFetchRequests;
+    if (m_autoFetch) {
+        // The stream already keeps `maxFetchesInFlight` requests outstanding,
+        // so a view's `fetchMore()` asks for nothing new. It must *not* queue a
+        // pending request either: `submitFetches()` only consumes the pending
+        // count when auto-fetch is off, so the counter would grow once per
+        // `fetchMore()` for the life of the result and never come back down.
+        submitFetches();
+        return;
+    }
+    // Bounded by the same number as the in-flight limit: a view can ask many
+    // times before the first reply lands, and a queue of requests that outlives
+    // what the pipe can hold is just a number growing in a member.
+    m_pendingFetchRequests = std::min(m_pendingFetchRequests + 1, m_maxFetchesInFlight);
     submitFetches();
 }
 
@@ -275,6 +305,9 @@ void SessionController::submitFetches()
     if (!checkThread() || m_bridge == nullptr || !m_bridge->isValid() || !m_hasResult
         || m_exhausted) {
         return;
+    }
+    if (m_model != nullptr && m_model->rowLimitReached()) {
+        return; // the model would refuse whatever came back
     }
     while (m_fetchesInFlight < m_maxFetchesInFlight
            && (m_autoFetch || m_pendingFetchRequests > 0)) {
@@ -358,6 +391,12 @@ void SessionController::handleEvent(const ReldexEvent &raw, reldex::BatchHandle 
             // The result this fetch was issued against has been closed or
             // replaced. Exactly one reply still arrives for it (A5 rule 5);
             // the batch it carries is released as this handle goes away.
+            //
+            // The slot it just freed belongs to the *current* result, though.
+            // Without this the new result would run permanently short of
+            // in-flight fetches -- or, if every slot was held by the old one,
+            // stall outright with nothing left to wake it.
+            submitFetches();
             return;
         }
         if (error) {
