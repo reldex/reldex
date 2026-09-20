@@ -18,9 +18,9 @@
 mod support;
 
 use reldex_ffi::{
-    ReldexColumnInfo, ReldexColumnKind, ReldexEventKind, ReldexMockScenarioConfig,
-    ReldexMockStatement, ReldexStatus, reldex_batch_column_info, reldex_session_result_column,
-    reldex_session_result_column_count,
+    ReldexColumnInfo, ReldexColumnKind, ReldexColumnView, ReldexEventKind,
+    ReldexMockScenarioConfig, ReldexMockStatement, ReldexStatus, reldex_batch_column_fixed,
+    reldex_batch_column_info, reldex_session_result_column, reldex_session_result_column_count,
 };
 
 use support::{Harness, OwnedBatch};
@@ -254,4 +254,196 @@ fn an_unknown_result_or_column_reports_why() {
 
     // An unknown result has no columns, and says so without failing.
     assert_eq!(column_count(&harness, session, result + 1_000), 0);
+}
+
+/// The documented lifetime lists three invalidators, all caller-initiated.
+/// "A session the pump lost to a panic" is not one of them, and this is the
+/// path that used to break it: the containment called `shut_down`, which
+/// cleared the result map on the **pump** thread and dropped the last claim on
+/// strings the caller was still holding pointers into.
+///
+/// The names are compared against a copy taken before the panic, so a failure
+/// shows up as wrong content rather than only as a sanitizer report — and
+/// nothing here reads memory whose life the contract does not guarantee.
+#[test]
+fn losing_a_session_to_a_pump_panic_does_not_free_its_column_names() {
+    let harness = Harness::new();
+    let session = harness.open(config());
+    assert_eq!(
+        harness.execute(session, 10, ReldexMockStatement::GeneratedQuery),
+        ReldexStatus::Ok
+    );
+    let executed = harness.next_event();
+    assert!(executed.error.is_null());
+    let result = executed.result;
+
+    // The pointers the caller holds across the panic, and an owned copy of
+    // what they must still say afterwards.
+    let mut info = ReldexColumnInfo::default();
+    // SAFETY: the hub is live and `info` is a real local with `struct_size`.
+    let status = unsafe {
+        reldex_session_result_column(
+            harness.hub(),
+            session,
+            result,
+            0,
+            std::ptr::from_mut(&mut info),
+        )
+    };
+    assert_eq!(status, ReldexStatus::Ok);
+    let expected = read(&info);
+    assert_eq!(expected.0, "ID");
+
+    // Lose the session. Nothing is submitted for `result`.
+    assert_eq!(
+        harness.execute(session, 11, ReldexMockStatement::PumpPanic),
+        ReldexStatus::Ok
+    );
+    let mut lost = false;
+    for _ in 0..8 {
+        let event = harness.next_event();
+        support::release_batch(&event);
+        support::take_error(&event);
+        if event.session_state == reldex_ffi::ReldexSessionState::Lost as i32 {
+            lost = true;
+            break;
+        }
+    }
+    assert!(lost, "the panicking statement must report the session lost");
+
+    // The pointers taken before the panic must still read the same. `read`
+    // also checks the NUL at `ptr[len]`, which a freed buffer would not have
+    // reliably kept.
+    assert_eq!(
+        read(&info),
+        expected,
+        "a session lost to an internal panic must not end the documented lifetime of a result's column names"
+    );
+
+    // The result itself is gone — the session is lost and nothing can be
+    // fetched from it — so the accessor reports that rather than pretending.
+    // The two facts are separate on purpose: what was already handed out
+    // stays readable; what was not is not invented.
+    assert_eq!(column_count(&harness, session, result), 0);
+    support::free_error(reldex_ffi::reldex_last_error_take());
+    let mut after = ReldexColumnInfo::default();
+    // SAFETY: the hub is live and `after` is a real local.
+    let refused = unsafe {
+        reldex_session_result_column(
+            harness.hub(),
+            session,
+            result,
+            0,
+            std::ptr::from_mut(&mut after),
+        )
+    };
+    assert_eq!(refused, ReldexStatus::NotFound);
+    support::free_error(reldex_ffi::reldex_last_error_take());
+
+    // And the pointers are still good after that refusal too.
+    assert_eq!(read(&info), expected);
+}
+
+/// The explicit mirror call on a column that has no mirror, and on the
+/// arguments that must be refused rather than dereferenced.
+#[test]
+fn asking_for_a_fixed_array_that_does_not_exist_is_answered_not_invented() {
+    let harness = Harness::new();
+    let session = harness.open(config());
+    assert_eq!(
+        harness.execute(session, 10, ReldexMockStatement::GeneratedQuery),
+        ReldexStatus::Ok
+    );
+    let result = harness.next_event().result;
+    assert_eq!(harness.fetch(session, 20, result, 32), ReldexStatus::Ok);
+    let fetched = harness.next_event();
+    let batch = OwnedBatch(fetched.batch);
+    assert!(!batch.0.is_null());
+
+    let mut view = ReldexColumnView::default();
+    let out = std::ptr::from_mut(&mut view);
+
+    // Column 1 is VARCHAR2: it borrows `data`/`offsets` and has no fixed-width
+    // elements at all. That is an answer, not a failure.
+    // SAFETY: the batch is live and `view` is a local.
+    let text = unsafe { reldex_batch_column_fixed(batch.0, 1, out) };
+    assert_eq!(text, ReldexStatus::Ok);
+    assert!(view.fixed.is_null(), "a text column has no element array");
+    assert_eq!(view.fixed_len, 0);
+    assert_eq!(view.fixed_stride, 0, "and no element width to report");
+    assert_eq!(view.kind, ReldexColumnKind::Text as i32);
+
+    // SAFETY: as above; column 9 does not exist.
+    let out_of_range = unsafe { reldex_batch_column_fixed(batch.0, 9, out) };
+    assert_eq!(out_of_range, ReldexStatus::NotFound);
+    support::free_error(reldex_ffi::reldex_last_error_take());
+
+    // SAFETY: a null batch is exactly what this must refuse.
+    let no_batch = unsafe { reldex_batch_column_fixed(std::ptr::null(), 0, out) };
+    assert_eq!(no_batch, ReldexStatus::InvalidArgument);
+    support::free_error(reldex_ffi::reldex_last_error_take());
+
+    // SAFETY: a null `out` is likewise what this must refuse.
+    let no_out = unsafe { reldex_batch_column_fixed(batch.0, 0, std::ptr::null_mut()) };
+    assert_eq!(no_out, ReldexStatus::InvalidArgument);
+    support::free_error(reldex_ffi::reldex_last_error_take());
+}
+
+/// The terminal batch that reports a result exhausted carries no columns, so
+/// an adapter that reads its headers per batch must skip it — which is the
+/// reason `reldex_session_result_column` exists.
+#[test]
+fn an_exhausted_batch_describes_no_columns() {
+    let harness = Harness::new();
+    let session = harness.open(config());
+    assert_eq!(
+        harness.execute(session, 10, ReldexMockStatement::EmptyQuery),
+        ReldexStatus::Ok
+    );
+    let result = harness.next_event().result;
+    assert_eq!(harness.fetch(session, 20, result, 16), ReldexStatus::Ok);
+    let fetched = harness.next_event();
+    assert_eq!(fetched.row_count, 0);
+    let batch = OwnedBatch(fetched.batch);
+    assert!(!batch.0.is_null());
+
+    // SAFETY: the batch is live.
+    assert_eq!(unsafe { reldex_ffi::reldex_batch_column_count(batch.0) }, 0);
+    let mut info = ReldexColumnInfo::default();
+    // SAFETY: as above.
+    let missing = unsafe { reldex_batch_column_info(batch.0, 0, std::ptr::from_mut(&mut info)) };
+    assert_eq!(missing, ReldexStatus::NotFound);
+    support::free_error(reldex_ffi::reldex_last_error_take());
+
+    // The result itself still knows, which is the point.
+    assert_eq!(column_count(&harness, session, result), 3);
+}
+
+/// A second execute leaves the first result open and describable: nothing is
+/// closed implicitly, which is also why a caller that never closes results
+/// accumulates them.
+#[test]
+fn executing_again_does_not_close_the_previous_result() {
+    let harness = Harness::new();
+    let session = harness.open(config());
+    assert_eq!(
+        harness.execute(session, 10, ReldexMockStatement::GeneratedQuery),
+        ReldexStatus::Ok
+    );
+    let first = harness.next_event().result;
+    assert_eq!(
+        harness.execute(session, 11, ReldexMockStatement::GeneratedQuery),
+        ReldexStatus::Ok
+    );
+    let second = harness.next_event().result;
+    assert_ne!(first, second);
+
+    assert_eq!(column_count(&harness, session, first), 3);
+    assert_eq!(described(&harness, session, first, 0).0, "ID");
+    // And it can still be fetched from.
+    assert_eq!(harness.fetch(session, 20, first, 4), ReldexStatus::Ok);
+    let event = harness.next_event();
+    assert_eq!(event.result, first);
+    assert!(event.row_count > 0);
+    support::release_batch(&event);
 }

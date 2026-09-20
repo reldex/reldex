@@ -63,6 +63,23 @@ static void smoke_sleep_ms(unsigned ms)
 #endif
 }
 
+/* Seconds of WALL-CLOCK time since some fixed point in this process.
+ *
+ * Deliberately not clock(): that is CPU time, and every wait here is spent
+ * sleeping, so a clock()-based guard barely advances and a genuine deadlock
+ * would hang CI instead of failing it. Monotonic, so a clock adjustment
+ * mid-run cannot make a guard fire early or never. */
+static double smoke_now_seconds(void)
+{
+#ifdef _WIN32
+    return (double)GetTickCount64() / 1000.0;
+#else
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (double)now.tv_sec + (double)now.tv_nsec / 1e9;
+#endif
+}
+
 static long g_checks_run = 0;
 static long g_checks_failed = 0;
 
@@ -99,12 +116,23 @@ static void smoke_require(bool condition, const char *what)
 static volatile int g_wake_flag = 0;
 static volatile long g_wake_count = 0;
 
+/* This target is built twice: as C11, and as C++17 from a generated .cpp.
+ * In the C++17 build the header must have given us ReldexWakeFnNoexcept --
+ * including on MSVC, where __cplusplus stays at 199711L unless
+ * /Zc:__cplusplus is passed. Failing to compile is the point: a silent
+ * fallback would leave ADR-0003 A24's claim untested on Windows. */
+#ifdef __cplusplus
+#ifndef RELDEX_HAVE_WAKE_FN_NOEXCEPT
+#error "reldex.h did not define ReldexWakeFnNoexcept; this target is built as C++17 (see ui/tests/ffi_smoke/CMakeLists.txt), so the header's guard is wrong -- most likely it tests __cplusplus without _MSVC_LANG"
+#endif
+#endif
+
 #ifdef __cplusplus
 extern "C"
 #endif
 void
 smoke_wake(void *user_data)
-#if defined(__cplusplus) && __cplusplus >= 201703L
+#if defined(RELDEX_HAVE_WAKE_FN_NOEXCEPT)
 /* Letting an exception out of the trampoline is undefined behaviour and
  * catch_unwind does NOT contain it, so a C++ adapter should say so to the
  * compiler. The header's ReldexWakeFnNoexcept below holds this pointer and
@@ -118,8 +146,13 @@ smoke_wake(void *user_data)
     g_wake_count += 1;
 }
 
-#if defined(__cplusplus) && __cplusplus >= 201703L
+#if defined(RELDEX_HAVE_WAKE_FN_NOEXCEPT)
 static ReldexWakeFnNoexcept smoke_waker = smoke_wake;
+/* Positive proof that the noexcept branch above was really taken, rather
+ * than the whole thing having been preprocessed away: this fails to compile
+ * if smoke_wake lost its noexcept, and it is only reachable at all when the
+ * header defined the alias. */
+static_assert(noexcept(smoke_wake(NULL)), "the waker trampoline must be noexcept");
 #else
 static ReldexWakeFn smoke_waker = smoke_wake;
 #endif
@@ -134,9 +167,9 @@ static ReldexWakeFn smoke_waker = smoke_wake;
  * elapsed first. */
 static bool wait_for_wake(void)
 {
-    clock_t start = clock();
+    double start = smoke_now_seconds();
     while (!g_wake_flag) {
-        double elapsed = (double)(clock() - start) / (double)CLOCKS_PER_SEC;
+        double elapsed = smoke_now_seconds() - start;
         if (elapsed > HANG_GUARD_SECONDS) {
             return false;
         }
@@ -753,14 +786,14 @@ int main(void)
      * the call returns -- waited for under the same hang guard as everything
      * else, which asserts no upper bound on how fast it happens. */
     {
-        clock_t counts_started = clock();
+        double counts_started = smoke_now_seconds();
         ReldexLiveCounts final_counts = live_counts();
         while (final_counts.hubs != baseline.hubs
                || final_counts.sessions != baseline.sessions
                || final_counts.batches != baseline.batches
                || final_counts.errors != baseline.errors
                || final_counts.arenas != baseline.arenas) {
-            double elapsed = (double)(clock() - counts_started) / (double)CLOCKS_PER_SEC;
+            double elapsed = smoke_now_seconds() - counts_started;
             if (elapsed > HANG_GUARD_SECONDS) {
                 break;
             }

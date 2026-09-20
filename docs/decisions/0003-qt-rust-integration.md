@@ -369,10 +369,11 @@ cast that is wrong on one platform. The rule, now stated on the struct:
 * an **id** is `uint64_t`; an **enum** is `int32_t`.
 
 That changes `ReldexEvent`'s layout, which D7 says is a **major** bump, so
-`RELDEX_ABI_VERSION_MAJOR` is `2`. Version 1 was never accepted and never shipped — this ADR is
-still Proposed — so the number moves once, here, together with the other review changes, rather
-than pretending a recompiled adapter would still be compatible. `ReldexMockStatement` also gained
-`PUMP_PANIC = 6`, which would only have been a minor bump on its own.
+`RELDEX_ABI_VERSION_MAJOR` moved to `2` here. (A19 moved it again, to `3`; `2` is what this
+amendment set.) Version 1 was never accepted and never shipped — this ADR is still Proposed — so
+the number moves rather than pretending a recompiled adapter would still be compatible.
+`ReldexMockStatement` also gained `PUMP_PANIC = 6`, which would only have been a minor bump on its
+own.
 
 ### A12 — what is thread-safe about a fetched batch, and what that cost
 
@@ -531,7 +532,7 @@ column per batch — and never reads `fixed`. It renders cells through the bulk 
 design) or, for `TEXT`/`JSON`, straight out of the borrowed UTF-8. So every mirror was pure waste,
 and it was not small:
 
-| 1,000,000 rows of the S14 shape, every batch retained | retained bytes | per row |
+| 1,000,000 rows of the S14 shape, every batch retained | live bytes | per row |
 | --- | --- | --- |
 | every column described, no mirror | 123,313,892 | 123.3 B |
 | every column viewed *with* its fixed mirror | 185,301,203 | 185.3 B |
@@ -539,10 +540,18 @@ and it was not small:
 (`cargo test --release -p reldex-ffi --test allocations -- --ignored --nocapture
 measure_the_bytes`, counting `#[global_allocator]`; three columns: `NUMBER`, `VARCHAR2`, `DATE`.)
 
-The difference is 62.0 B/row — exactly 46 + 16 — for arrays nobody read. Spike S15's kill criterion
-**K3 is 200 MB of RSS growth for 1M rows of this shape**, and the in-app figure with mirrors was
-231 MB. The mirrors alone are 59 MB of that, bought by a call whose documented purpose is to
-*describe* a column.
+**Read the delta, not the absolutes.** Those totals are whole-process live bytes — they include the
+mock driver's generation buffers and whatever the pump thread held at the sampling instant — and
+they are not RSS. What is solid is the **62.0 B/row difference**, exactly 46 + 16, because the two
+runs differ in exactly one thing. That is about **59 MiB per million rows, roughly 30% of spike
+S15's 200 MB K3 budget, spent on arrays no consumer read.** It is not by itself a breach of K3, and
+nothing here claims it is: K3 is an RSS measurement that S15 and M1.8 will make properly.
+
+For context only, and not as evidence: while building M1.6 the adapter worker measured Windows
+working-set growth after 1M rows of about +177 MB headless and +231 MB in the real app, with the
+mirrors in place. That is an informal number from an unmerged branch (recorded in `ui/README.md`
+there), taken with a different method on one machine. It is the reason this was looked at, not the
+reason it was changed — the reason it was changed is that 59 MiB was being spent on nothing.
 
 **Decision.** `reldex_batch_column` allocates nothing, ever. For `NUMBER` and `TIMESTAMP` it leaves
 `fixed` NULL and `fixed_len` 0, and still reports `fixed_stride` so a caller can size its own
@@ -602,6 +611,20 @@ truth about the bytes, and the header says a cell reader must use the batch's `k
 `reldex_batch_column_info` is unchanged and keeps working on a batch held past the close, because
 the batch holds its own claim on the same shared description.
 
+**Making the documented lifetime true in every path (from the round-2 review).** The three
+invalidators are all things the *caller* does, so no path of ours may free those strings. Two did.
+The pump's panic containment (A14) tore the session down by clearing its result map on the **pump**
+thread, and the accessor's own `Arc` clone could be the last one alive if the map was cleared while
+it was returning — in both cases the caller was left holding freed pointers, with nothing
+caller-initiated behind it. Both are fixed the same way: **the pump retires, it never frees.**
+Columns removed because the caller submitted a close go to a `released` holder that the caller's own
+thread empties on its next call into that session; columns of results that were still open when the
+session was *lost* go to a `lost` holder that only a submitted `reldex_session_close` or
+`reldex_hub_destroy` empties — and `reldex_hub_destroy` empties it synchronously, on the thread that
+called it. What that does **not** promise is that the result is still there: on a lost session the
+accessor reports `NOT_FOUND`, because the result really is gone. What was handed out stays readable;
+what was not is not invented.
+
 ### A21 — `FETCHED` and `RESULT_CLOSED` carry the result id
 
 `ReldexEvent::result` was set only on `EXECUTED`. A `FETCHED` event therefore said which *request*
@@ -611,6 +634,13 @@ looked every reply up in it — pure bookkeeping for something this library alre
 `result`/`has_result` are now set on `FETCHED` and `RESULT_CLOSED` too, including on a failure:
 which result failed to fetch is exactly what an error report needs. On `RESULT_CLOSED` the id names
 what **ended** — it is no longer valid by the time the event is drained, and the header says so.
+
+That has to hold for *synthesised* replies as well, which the round-2 review caught it not doing: a
+fetch queued behind a pump panic came back with `has_result == false`, because the containment built
+its reply from a shape that carried only the kind and the request id. The shape now carries the
+result id too, so a contained panic answers with the same-shaped event a success would have. An
+adapter that routes a `FETCHED` by `event.result` never has to special-case the failure path —
+which is the only reason the field is worth having.
 
 ### A22 — an empty result set is reachable in the mock
 
@@ -649,6 +679,13 @@ two identically; the standard makes them different types. A header whose entire 
 portable should not depend on that indulgence, so the typedef is now written by hand in
 `cbindgen.toml`'s `after_includes`, inside its own `extern "C"` guard, and excluded from
 generation.
+
+The guard for that alias is `_MSVC_LANG`-aware. MSVC reports `__cplusplus == 199711L` unless
+`/Zc:__cplusplus` is passed, so a plain `__cplusplus >= 201703L` test silently dropped the alias on
+the compiler most likely to build the adapter — the code still compiled, and the rule simply stopped
+being enforced. The header now derives `RELDEX_CPLUSPLUS` from `_MSVC_LANG` where it exists, defines
+`RELDEX_HAVE_WAKE_FN_NOEXCEPT` when the alias is present, and the C++17 smoke target `#error`s if a
+C++17 build does not get it, so the claim below cannot quietly become false again.
 
 The same block adds, under C++17 only, a `noexcept`-qualified alias `ReldexWakeFnNoexcept`. A18
 records that letting an exception escape the trampoline is undefined behaviour and that

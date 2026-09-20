@@ -30,8 +30,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use reldex_ffi::{
     ReldexColumnView, ReldexEventKind, ReldexFormatOptions, ReldexMockScenarioConfig,
     ReldexMockStatement, ReldexStatus, reldex_batch_column, reldex_batch_column_fixed,
-    reldex_batch_format_column, reldex_text_arena_clear, reldex_text_arena_count,
-    reldex_text_arena_create, reldex_text_arena_release,
+    reldex_batch_format_column, reldex_hub_pending_events, reldex_text_arena_clear,
+    reldex_text_arena_count, reldex_text_arena_create, reldex_text_arena_release,
 };
 
 use support::{Harness, OwnedBatch};
@@ -100,6 +100,27 @@ fn exclusively() -> std::sync::MutexGuard<'static, ()> {
     ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Asserts the only other thread that could allocate into this count is idle.
+///
+/// The counter is process-wide, and a session's pump thread allocates while it
+/// turns a completion into an event. Arming while one is still working would
+/// measure it too — a flaky non-zero that has nothing to do with the call
+/// under test. Every request this file submits has been answered and drained
+/// by the time it measures, so the pump is parked in `recv`; this states that
+/// precondition instead of assuming it.
+fn assert_the_pump_is_parked(harness: &Harness) {
+    // SAFETY: the hub is live for the harness's lifetime.
+    let pending = unsafe { reldex_hub_pending_events(harness.hub()) };
+    assert_eq!(
+        pending, 0,
+        "an undrained event means the pump has been working; nothing may be measured until it is          parked"
+    );
+    assert!(
+        harness.poll_event().is_none(),
+        "the queue must be empty before the allocation counter is armed"
+    );
 }
 
 /// Runs `body` with the counter armed and reports what it cost.
@@ -182,6 +203,7 @@ fn formatting_a_warm_window_allocates_nothing() {
     // Warm-up: this one is allowed to allocate, because the arena starts with
     // no capacity and the offsets vector has to grow. Amortised growth is
     // exactly what this pass excludes.
+    assert_the_pump_is_parked(&harness);
     let warm_up = allocations_during(format_window);
     // SAFETY: the arena is live.
     assert_eq!(
@@ -326,6 +348,7 @@ fn describing_every_column_allocates_nothing() {
     // test.
     describe_all();
 
+    assert_the_pump_is_parked(&harness);
     let first = allocations_during(describe_all);
     assert_eq!(
         first, 0,
@@ -366,8 +389,18 @@ fn describing_every_column_allocates_nothing() {
 /// fixed-element mirrors. Ignored by default: it is a measurement, and it
 /// holds a million rows in memory while it runs.
 ///
-/// This is the number behind spike S15's K3 (200 MB of RSS growth for 1M rows
-/// of the S14 shape). Run it with
+/// **What the absolute numbers are, exactly.** They are whole-process live
+/// bytes — everything allocated and not yet freed, including the mock driver's
+/// generation buffers and whatever the pump thread happens to be holding — so
+/// they are an upper bound on the boundary's own retention, not a measurement
+/// of it, and they are not RSS either. The robust figure is the **difference**
+/// between the two runs: the two differ in exactly one thing, so the delta is
+/// the mirrors and nothing else. Quote the delta; treat the absolutes as
+/// context.
+///
+/// This is the measurement behind spike S15's K3 (200 MB of RSS growth for 1M
+/// rows of the S14 shape), which S15 itself will measure properly, as RSS. Run
+/// it with
 /// `cargo test --release -p reldex-ffi --test allocations -- --ignored
 /// --nocapture measure_the_bytes`.
 #[test]

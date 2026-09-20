@@ -52,13 +52,27 @@ header = """
  *     leaves `fixed` NULL and reports only `fixed_stride`: ask for the
  *     element array with reldex_batch_column_fixed, and only if you will read
  *     it. That array costs 46 bytes per NUMBER row and 16 per TIMESTAMP row,
- *     retained until the batch is released — enough to decide a 1M-row result
- *     on its own.
+ *     retained until the batch is released — a measured 62.0 B/row on the
+ *     three-column S14 shape, about 59 MiB per million rows.
+ *   - A terminal, zero-row batch has NO columns: column_count is 0 and every
+ *     per-column call reports NOT_FOUND. Read headers with
+ *     reldex_session_result_column instead, which answers from EXECUTED.
  *   - A grid that renders cells as text should use reldex_batch_format_column
  *     instead; it writes into an arena you clear per screenful.
  *   - reldex_live_counts() reports how many hubs, sessions, batches, errors
  *     and arenas this library currently holds. It is for tests and
  *     diagnostics: a lifecycle that leaks nothing returns to its baseline.
+ *
+ * RESULT SETS
+ *   - A result's column names and types are available as soon as its EXECUTED
+ *     event is drained, from reldex_session_result_column. The strings it
+ *     hands out stay valid until YOU submit close_result for that result,
+ *     submit close for the session, or call reldex_hub_destroy — and nothing
+ *     else ends them, not a failed statement and not a session lost to an
+ *     internal panic. hub_destroy frees them on the calling thread before it
+ *     returns.
+ *   - Executing again does NOT close the previous result. Results stay open,
+ *     and keep their server-side cursor, until you close them.
  *
  * THE WAKER
  *   - Fires only on the event queue's transition from empty to non-empty. A
@@ -124,7 +138,22 @@ extern "C" {
  */
 typedef void (*ReldexWakeFn)(void *user_data);
 
-#if defined(__cplusplus) && __cplusplus >= 201703L
+/* The C++ standard level, as MSVC also reports it.
+ *
+ * MSVC leaves __cplusplus at 199711L unless /Zc:__cplusplus is passed, and
+ * puts the real value in _MSVC_LANG. A guard that tests __cplusplus alone
+ * silently drops the alias below on the compiler most likely to build the
+ * adapter, which is worse than not offering it: the code still compiles and
+ * the rule it exists to enforce quietly stops being enforced. */
+#ifdef __cplusplus
+#ifdef _MSVC_LANG
+#define RELDEX_CPLUSPLUS _MSVC_LANG
+#else
+#define RELDEX_CPLUSPLUS __cplusplus
+#endif
+#endif  // __cplusplus
+
+#if defined(RELDEX_CPLUSPLUS) && RELDEX_CPLUSPLUS >= 201703L
 /**
  * `ReldexWakeFn` with the no-exceptions rule made compiler-visible.
  *
@@ -135,8 +164,12 @@ typedef void (*ReldexWakeFn)(void *user_data);
  * `reldex_hub_set_waker` takes it unchanged; the day someone removes the
  * `noexcept`, the assignment stops compiling instead of the process stopping
  * at run time.
+ *
+ * Defined only under C++17 or later. `RELDEX_CPLUSPLUS` above is the level to
+ * test against if you need to know whether you got it.
  */
 using ReldexWakeFnNoexcept = void (*)(void *user_data) noexcept;
+#define RELDEX_HAVE_WAKE_FN_NOEXCEPT 1
 #endif  // C++17
 
 #ifdef __cplusplus

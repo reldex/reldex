@@ -255,12 +255,20 @@ pub struct ReldexColumnView {
     /// *is* a C array: `BOOLEAN` (`bool[]`), `FLOAT` (`float[]`), `DOUBLE`
     /// (`double[]`). Borrowed, zero-copy, no allocation.
     ///
-    /// **NULL for `NUMBER` and `TIMESTAMP`**, whose Rust storage is not
-    /// C-compatible and has to be mirrored. Describing a column never builds
-    /// that mirror; ask for it explicitly with
-    /// [`reldex_batch_column_fixed`], which says what it costs (ADR-0003
-    /// A19). Most callers should not: the bulk formatter reads the *source*
-    /// column and needs no mirror at all.
+    /// **Always test `fixed != NULL` before indexing it.** It is NULL for
+    /// `NUMBER` and `TIMESTAMP`, whose Rust storage is not C-compatible and
+    /// has to be mirrored: describing a column never builds that mirror. Ask
+    /// for it explicitly with [`reldex_batch_column_fixed`], which says what
+    /// it costs (ADR-0003 A19). Most callers should not — the bulk formatter
+    /// reads the *source* column and needs no mirror at all. It is NULL for
+    /// every variable-width kind too, which uses `data`/`offsets`.
+    ///
+    /// Element widths, so a cast is never guessed at: `BOOLEAN` is **one byte
+    /// per element and strictly 0 or 1** — never another non-zero value, so a
+    /// byte compare is as valid as a truth test — `FLOAT` is four, `DOUBLE`
+    /// eight, and the two mirrored kinds report `sizeof(ReldexNumber)` and
+    /// `sizeof(ReldexTimestamp)`. `fixed_stride` says the same thing at run
+    /// time, and is set even when `fixed` is NULL.
     pub fixed: *const std::ffi::c_void,
     /// The size of one element of `fixed`. Reported for `NUMBER` and
     /// `TIMESTAMP` too, even though `fixed` is NULL there, so a caller can
@@ -686,6 +694,16 @@ pub unsafe extern "C" fn reldex_batch_row_count(batch: *const ReldexBatch) -> us
 
 /// How many columns the batch holds.
 ///
+/// **A terminal, zero-row batch holds none.** The batch that reports a result
+/// exhausted carries no column storage, so this returns `0` and
+/// [`reldex_batch_column`], [`reldex_batch_column_info`] and
+/// [`reldex_batch_column_fixed`] all report `RELDEX_STATUS_NOT_FOUND` on it. A
+/// caller that reads its headers from "whichever batch it has" must skip that
+/// one — or, better, not read headers from batches at all and use
+/// [`crate::reldex_session_result_column`], which answers from the `EXECUTED`
+/// event and reports the same description every non-empty batch of the result
+/// does.
+///
 /// # Safety
 ///
 /// `batch` must be null (reported as 0) or a live batch.
@@ -748,9 +766,10 @@ pub unsafe extern "C" fn reldex_batch_column_info(
 /// already existed inside the batch. `NUMBER` and `TIMESTAMP` therefore come
 /// back with `fixed == NULL`: their C mirror is built only by
 /// [`reldex_batch_column_fixed`], which is where its cost is stated. Viewing
-/// every column of every batch used to build those mirrors and keep them, at
-/// 62 bytes a row nobody read — enough on its own to breach spike criterion
-/// K3's 200 MB budget for a million rows (ADR-0003 A19).
+/// every column of every batch used to build those mirrors and keep them, at a
+/// measured 62.0 bytes per row that no consumer read — about 59 MiB for a
+/// million rows, roughly 30% of spike criterion K3's 200 MB budget, spent on
+/// nothing (ADR-0003 A19).
 ///
 /// # Safety
 ///

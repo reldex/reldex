@@ -80,7 +80,15 @@ pub(crate) fn created(kind: Kind) {
 
 /// Records that one object of `kind` has been destroyed.
 pub(crate) fn destroyed(kind: Kind) {
-    kind.counter().fetch_sub(1, Ordering::Relaxed);
+    let previous = kind.counter().fetch_sub(1, Ordering::Relaxed);
+    // A release that was not paired with a create would wrap the count to
+    // `SIZE_MAX` and leave every later reading nonsense — a leak check that
+    // reports an absurd number instead of the bug that caused it. In a debug
+    // build, name it where it happens.
+    debug_assert!(
+        previous > 0,
+        "reldex-ffi: an object was destroyed more times than it was created"
+    );
 }
 
 /// How many objects of each kind this process currently holds.
@@ -88,6 +96,11 @@ pub(crate) fn destroyed(kind: Kind) {
 /// **A diagnostic, not part of the working API.** It exists so tests and a
 /// leak check can assert that everything handed out has come back; an adapter
 /// has no reason to call it outside its own test suite.
+///
+/// Like every other exported function, it is refused from inside a waker
+/// callback (ADR-0003 D5 rule 1): it reports `RELDEX_STATUS_REENTRANT`, writes
+/// nothing to `out`, and records the usual last error. A diagnostic is no
+/// reason to make an exception to the rule it would be used to debug.
 ///
 /// Counts are process-wide and include objects that are not the caller's yet:
 /// a `ReldexBatch` sitting inside an event nobody has drained is **live**,

@@ -250,3 +250,52 @@ fn which(program: &str) -> Option<PathBuf> {
     }
     None
 }
+
+/// `ReldexWakeFn` is the one declaration cbindgen does **not** generate: it is
+/// hand-written in `cbindgen.toml`'s `after_includes` so that it sits inside
+/// the header's `extern "C"` block (ADR-0003 A24). Nothing else ties it to the
+/// Rust type alias, so a change to `hub.rs`'s `ReldexWakeFn` would compile
+/// happily while the header kept describing the old signature.
+///
+/// This is that tie: the exact text the header must contain, and the exact
+/// Rust alias it mirrors.
+#[test]
+fn the_hand_written_waker_typedef_matches_the_rust_alias() {
+    let header = header();
+    for needle in [
+        "typedef void (*ReldexWakeFn)(void *user_data);",
+        "using ReldexWakeFnNoexcept = void (*)(void *user_data) noexcept;",
+        // The MSVC-aware guard: `__cplusplus` alone is 199711L there unless
+        // `/Zc:__cplusplus` is passed, which would silently drop the alias.
+        "#define RELDEX_CPLUSPLUS _MSVC_LANG",
+        "#if defined(RELDEX_CPLUSPLUS) && RELDEX_CPLUSPLUS >= 201703L",
+        "#define RELDEX_HAVE_WAKE_FN_NOEXCEPT 1",
+    ] {
+        assert!(
+            header.contains(needle),
+            "include/reldex.h no longer contains the hand-written line {needle:?}; it lives in \
+             crates/ffi/cbindgen.toml under `after_includes`"
+        );
+    }
+
+    let hub = fs::read_to_string(crate_dir().join("src/hub.rs")).expect("hub.rs is readable");
+    assert!(
+        hub.contains("pub type ReldexWakeFn = Option<extern \"C\" fn(user_data: *mut c_void)>;"),
+        "the Rust `ReldexWakeFn` alias changed. The header's typedef is hand-written and does \
+         not follow it: update `after_includes` in crates/ffi/cbindgen.toml, regenerate, and \
+         update this test."
+    );
+
+    // And cbindgen must still be told not to generate a second one.
+    let config =
+        fs::read_to_string(crate_dir().join("cbindgen.toml")).expect("cbindgen.toml is readable");
+    assert!(
+        config.contains("exclude = [\"ReldexWakeFn\"]"),
+        "cbindgen must keep excluding ReldexWakeFn, or the header defines it twice"
+    );
+    assert_eq!(
+        header.matches("(*ReldexWakeFn)").count(),
+        1,
+        "ReldexWakeFn must be declared exactly once"
+    );
+}

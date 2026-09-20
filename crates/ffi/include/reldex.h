@@ -31,13 +31,27 @@
  *     leaves `fixed` NULL and reports only `fixed_stride`: ask for the
  *     element array with reldex_batch_column_fixed, and only if you will read
  *     it. That array costs 46 bytes per NUMBER row and 16 per TIMESTAMP row,
- *     retained until the batch is released — enough to decide a 1M-row result
- *     on its own.
+ *     retained until the batch is released — a measured 62.0 B/row on the
+ *     three-column S14 shape, about 59 MiB per million rows.
+ *   - A terminal, zero-row batch has NO columns: column_count is 0 and every
+ *     per-column call reports NOT_FOUND. Read headers with
+ *     reldex_session_result_column instead, which answers from EXECUTED.
  *   - A grid that renders cells as text should use reldex_batch_format_column
  *     instead; it writes into an arena you clear per screenful.
  *   - reldex_live_counts() reports how many hubs, sessions, batches, errors
  *     and arenas this library currently holds. It is for tests and
  *     diagnostics: a lifecycle that leaks nothing returns to its baseline.
+ *
+ * RESULT SETS
+ *   - A result's column names and types are available as soon as its EXECUTED
+ *     event is drained, from reldex_session_result_column. The strings it
+ *     hands out stay valid until YOU submit close_result for that result,
+ *     submit close for the session, or call reldex_hub_destroy — and nothing
+ *     else ends them, not a failed statement and not a session lost to an
+ *     internal panic. hub_destroy frees them on the calling thread before it
+ *     returns.
+ *   - Executing again does NOT close the previous result. Results stay open,
+ *     and keep their server-side cursor, until you close them.
  *
  * THE WAKER
  *   - Fires only on the event queue's transition from empty to non-empty. A
@@ -85,7 +99,22 @@ extern "C" {
  */
 typedef void (*ReldexWakeFn)(void *user_data);
 
-#if defined(__cplusplus) && __cplusplus >= 201703L
+/* The C++ standard level, as MSVC also reports it.
+ *
+ * MSVC leaves __cplusplus at 199711L unless /Zc:__cplusplus is passed, and
+ * puts the real value in _MSVC_LANG. A guard that tests __cplusplus alone
+ * silently drops the alias below on the compiler most likely to build the
+ * adapter, which is worse than not offering it: the code still compiles and
+ * the rule it exists to enforce quietly stops being enforced. */
+#ifdef __cplusplus
+#ifdef _MSVC_LANG
+#define RELDEX_CPLUSPLUS _MSVC_LANG
+#else
+#define RELDEX_CPLUSPLUS __cplusplus
+#endif
+#endif  // __cplusplus
+
+#if defined(RELDEX_CPLUSPLUS) && RELDEX_CPLUSPLUS >= 201703L
 /**
  * `ReldexWakeFn` with the no-exceptions rule made compiler-visible.
  *
@@ -96,8 +125,12 @@ typedef void (*ReldexWakeFn)(void *user_data);
  * `reldex_hub_set_waker` takes it unchanged; the day someone removes the
  * `noexcept`, the assignment stops compiling instead of the process stopping
  * at run time.
+ *
+ * Defined only under C++17 or later. `RELDEX_CPLUSPLUS` above is the level to
+ * test against if you need to know whether you got it.
  */
 using ReldexWakeFnNoexcept = void (*)(void *user_data) noexcept;
+#define RELDEX_HAVE_WAKE_FN_NOEXCEPT 1
 #endif  // C++17
 
 #ifdef __cplusplus
@@ -1066,12 +1099,20 @@ typedef struct ReldexColumnView {
    * *is* a C array: `BOOLEAN` (`bool[]`), `FLOAT` (`float[]`), `DOUBLE`
    * (`double[]`). Borrowed, zero-copy, no allocation.
    *
-   * **NULL for `NUMBER` and `TIMESTAMP`**, whose Rust storage is not
-   * C-compatible and has to be mirrored. Describing a column never builds
-   * that mirror; ask for it explicitly with
-   * [`reldex_batch_column_fixed`], which says what it costs (ADR-0003
-   * A19). Most callers should not: the bulk formatter reads the *source*
-   * column and needs no mirror at all.
+   * **Always test `fixed != NULL` before indexing it.** It is NULL for
+   * `NUMBER` and `TIMESTAMP`, whose Rust storage is not C-compatible and
+   * has to be mirrored: describing a column never builds that mirror. Ask
+   * for it explicitly with [`reldex_batch_column_fixed`], which says what
+   * it costs (ADR-0003 A19). Most callers should not — the bulk formatter
+   * reads the *source* column and needs no mirror at all. It is NULL for
+   * every variable-width kind too, which uses `data`/`offsets`.
+   *
+   * Element widths, so a cast is never guessed at: `BOOLEAN` is **one byte
+   * per element and strictly 0 or 1** — never another non-zero value, so a
+   * byte compare is as valid as a truth test — `FLOAT` is four, `DOUBLE`
+   * eight, and the two mirrored kinds report `sizeof(ReldexNumber)` and
+   * `sizeof(ReldexTimestamp)`. `fixed_stride` says the same thing at run
+   * time, and is set even when `fixed` is NULL.
    */
   const void *fixed;
   /**
@@ -1584,6 +1625,16 @@ size_t reldex_batch_row_count(const struct ReldexBatch *batch);
 /**
  * How many columns the batch holds.
  *
+ * **A terminal, zero-row batch holds none.** The batch that reports a result
+ * exhausted carries no column storage, so this returns `0` and
+ * [`reldex_batch_column`], [`reldex_batch_column_info`] and
+ * [`reldex_batch_column_fixed`] all report `RELDEX_STATUS_NOT_FOUND` on it. A
+ * caller that reads its headers from "whichever batch it has" must skip that
+ * one — or, better, not read headers from batches at all and use
+ * [`crate::reldex_session_result_column`], which answers from the `EXECUTED`
+ * event and reports the same description every non-empty batch of the result
+ * does.
+ *
  * # Safety
  *
  * `batch` must be null (reported as 0) or a live batch.
@@ -1618,9 +1669,10 @@ ReldexStatus reldex_batch_column_info(const struct ReldexBatch *batch,
  * already existed inside the batch. `NUMBER` and `TIMESTAMP` therefore come
  * back with `fixed == NULL`: their C mirror is built only by
  * [`reldex_batch_column_fixed`], which is where its cost is stated. Viewing
- * every column of every batch used to build those mirrors and keep them, at
- * 62 bytes a row nobody read — enough on its own to breach spike criterion
- * K3's 200 MB budget for a million rows (ADR-0003 A19).
+ * every column of every batch used to build those mirrors and keep them, at a
+ * measured 62.0 bytes per row that no consumer read — about 59 MiB for a
+ * million rows, roughly 30% of spike criterion K3's 200 MB budget, spent on
+ * nothing (ADR-0003 A19).
  *
  * # Safety
  *
@@ -1694,6 +1746,11 @@ void reldex_batch_release(struct ReldexBatch *batch);
  * **A diagnostic, not part of the working API.** It exists so tests and a
  * leak check can assert that everything handed out has come back; an adapter
  * has no reason to call it outside its own test suite.
+ *
+ * Like every other exported function, it is refused from inside a waker
+ * callback (ADR-0003 D5 rule 1): it reports `RELDEX_STATUS_REENTRANT`, writes
+ * nothing to `out`, and records the usual last error. A diagnostic is no
+ * reason to make an exception to the rule it would be used to debug.
  *
  * Counts are process-wide and include objects that are not the caller's yet:
  * a `ReldexBatch` sitting inside an event nobody has drained is **live**,
@@ -2095,11 +2152,27 @@ ReldexStatus reldex_session_fetch(struct ReldexHub *hub,
                                   uint32_t max_rows);
 
 /**
- * How many columns the open result `result` has, or `0` if this session has
- * no such result.
+ * How many columns the open result `result` has.
  *
  * The same number the `EXECUTED` event reported in `column_count`, available
  * again for as long as the result is open.
+ *
+ * # When it returns 0
+ *
+ * Three cases, and **each one records a thread-local last error** you can take
+ * with `reldex_last_error_take()` — this call has no status of its own to
+ * report them with:
+ *
+ * * `hub` is null or unaligned, or `session` is not open on it;
+ * * `result` is not an open result of that session — it was never opened, it
+ *   belongs to another session, or it has been closed;
+ * * the call came from inside a waker callback, which the ADR-0003 D5
+ *   contract forbids (the same refusal `RELDEX_STATUS_REENTRANT` reports
+ *   elsewhere).
+ *
+ * A result that genuinely has no columns is not one of them: a statement that
+ * produces no result set produces no result id either, so there is nothing to
+ * ask about.
  *
  * # Safety
  *
@@ -2144,14 +2217,46 @@ size_t reldex_session_result_column_count(struct ReldexHub *hub,
  * * the caller submits `reldex_session_close` for this session;
  * * the caller calls `reldex_hub_destroy`.
  *
- * Each of those may free the storage from another thread as soon as it is
- * submitted, so a caller that wants the names past that point must copy them
- * — which is what a Qt model does anyway, building its header `QString`s once
- * with `QString::fromUtf8(info.name.ptr, info.name.len)`.
+ * **Only those three.** Nothing Reldex does on its own ends the lifetime: a
+ * statement that fails, a fetch that fails, a cancel, and a session *lost* to
+ * an internal panic all leave the strings readable, because the caller — who
+ * may still be holding the pointers — did nothing to say otherwise. That is a
+ * guarantee, not an accident of timing: a result the caller never closed has
+ * its description retired rather than freed.
+ *
+ * Note what that does **not** promise. On a lost session the result itself is
+ * gone — nothing can be fetched from it — so this call reports
+ * `RELDEX_STATUS_NOT_FOUND` for it. The two are separate on purpose: what was
+ * already handed out stays readable, and what was not is not invented.
+ *
+ * A caller that wants the names past those three points must copy them, which
+ * is what a Qt model does anyway, building its header `QString`s once with
+ * `QString::fromUtf8(info.name.ptr, info.name.len)`.
+ *
+ * Two consequences worth stating, because both are easy to get wrong:
+ *
+ * * The rule is "valid **at least** until you submit", not "invalid from the
+ *   moment you submit". Right after `reldex_session_close_result` this call
+ *   may still succeed for a while; that is not a signal that the close has
+ *   not landed, and the `RESULT_CLOSED` event remains the only such signal.
+ *   Do not read the strings after submitting — but do not treat a successful
+ *   read as meaning anything either.
+ * * `reldex_hub_destroy` frees them **synchronously, on the thread that
+ *   called it**, before it returns. There is no window after it during which
+ *   a stale pointer still happens to work.
  *
  * A batch held past the close keeps its own claim on the description alive,
  * so `reldex_batch_column_info` on that batch keeps working. These are not
  * the same pointers.
+ *
+ * # A second execute does not close the first result
+ *
+ * Submitting another statement on this session leaves every earlier result
+ * **open and describable**. Nothing is closed implicitly, because closing a
+ * result the caller might still be paging through is not a decision this
+ * library may take on its own. A caller that re-runs a query without calling
+ * `reldex_session_close_result` therefore accumulates open results — each
+ * holding its cursor and its rows on the server — until the session closes.
  *
  * # Safety
  *

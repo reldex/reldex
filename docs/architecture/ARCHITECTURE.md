@@ -250,9 +250,9 @@ and summarised at its top.
 
 Being still Proposed is what makes the boundary cheap to correct, and it has been corrected once
 already: the first two consumers (the Qt adapter, M1.6, and the C smoke harness, M1.4) found the
-batch view building per-column `NUMBER`/`TIMESTAMP` mirrors nobody read — 62 bytes per row retained,
-enough on its own to put a 1M-row result over spike S15's 200 MB memory gate — and found result
-column names unavailable until the first batch arrived. ADR-0003 amendments A19–A25 record what
+batch view building per-column `NUMBER`/`TIMESTAMP` mirrors nobody read — a measured 62.0 bytes per
+row retained, about 59 MiB per million rows, roughly 30% of spike S15's 200 MB memory gate spent on
+nothing — and found result column names unavailable until the first batch arrived. ADR-0003 amendments A19–A25 record what
 changed. The rule the amendment leaves behind is the one to keep: **the boundary allocates only
 when a caller asks for something that does not already exist**, and every such call says in the
 header what it costs per element.

@@ -273,6 +273,12 @@ pub unsafe extern "C" fn reldex_hub_destroy(hub: *mut ReldexHub) {
                 };
                 for entry in entries {
                     entry.shut_down();
+                    // Destroying the hub is the last of the three documented
+                    // invalidators for a result's column descriptions, and it
+                    // is the caller's own call — so the strings are freed
+                    // here, synchronously, on this thread, rather than
+                    // whenever the pump thread happens to exit.
+                    drop(entry.take_lost_columns());
                 }
             });
         }
