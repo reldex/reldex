@@ -823,10 +823,13 @@ impl DatabaseSession {
         // a running call this does nothing at all, exactly as in `Drop`.
         //
         // Skipped once the session has ended, because by then
-        // `DatabaseConnection::close` has run and the driver's
-        // `CancelHandle` contract says nothing about what `request_cancel`
-        // may do to a closed connection (ADR-0002, amendment R7 makes the
-        // no-op explicit; this does not rely on it).
+        // `DatabaseConnection::close` has run. That check narrows the window;
+        // it does not close it — a session whose connection was *lost* has had
+        // its connection discarded without `has_ended()` being set, and a close
+        // can complete between this read and the call below. What makes those
+        // cases safe is the driver contract, which requires `request_cancel`
+        // after a close to be a harmless no-op (`CancelHandle` rule 9,
+        // ADR-0002 amendment R7); this skip is the cheap half.
         if !self.shared.has_ended() {
             let _ = self.cancel();
         }

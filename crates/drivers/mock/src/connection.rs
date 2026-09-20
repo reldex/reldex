@@ -524,6 +524,7 @@ impl DatabaseConnection for MockConnection {
         if !self.capabilities.savepoints() {
             return Err(DbError::unsupported("savepoints"));
         }
+        self.scenario.savepoint_behavior()?;
         self.overlay.savepoint(name.as_str());
         Ok(())
     }
@@ -533,6 +534,7 @@ impl DatabaseConnection for MockConnection {
         if !self.capabilities.savepoints() {
             return Err(DbError::unsupported("savepoints"));
         }
+        self.scenario.savepoint_behavior()?;
         self.overlay.rollback_to_savepoint(name.as_str())?;
         // The transaction stays open, but handles opened before the savepoint
         // can still be invalidated; that is what a real rollback does.

@@ -758,6 +758,7 @@ struct Inner {
     cancel: Behavior,
     commit: Behavior,
     rollback: Behavior,
+    savepoint: Behavior,
     close: Behavior,
     invalidate_handles_on_transaction_end: bool,
     late_cancel_lands_on_next_statement: bool,
@@ -797,6 +798,7 @@ impl Default for Scenario {
                 cancel: Behavior::Succeed,
                 commit: Behavior::Succeed,
                 rollback: Behavior::Succeed,
+                savepoint: Behavior::Succeed,
                 close: Behavior::Succeed,
                 invalidate_handles_on_transaction_end: false,
                 late_cancel_lands_on_next_statement: false,
@@ -932,6 +934,23 @@ impl Scenario {
     /// Makes every future `commit` succeed again.
     pub fn allow_commit(&self) {
         self.lock().commit = Behavior::Succeed;
+    }
+
+    /// Makes every future `savepoint` **and** `rollback to savepoint` fail with
+    /// `error`.
+    ///
+    /// Both go through one behaviour because they are the same driver call arm
+    /// in `db-core` (`Command::Savepoint` / `Command::RollbackToSavepoint`), and
+    /// what a test needs from here is to make that arm fail — most usefully
+    /// with `SessionState::Lost`, which is the case where the core must stop
+    /// trusting the driver's cached transaction state.
+    pub fn fail_savepoint(&self, error: ScriptedError) {
+        self.lock().savepoint = Behavior::Fail(error);
+    }
+
+    /// Makes every future savepoint call succeed again.
+    pub fn allow_savepoint(&self) {
+        self.lock().savepoint = Behavior::Succeed;
     }
 
     /// Makes every future `rollback` fail with `error`, leaving the
@@ -1108,6 +1127,10 @@ impl Scenario {
 
     pub(crate) fn rollback_behavior(&self) -> Result<(), DbError> {
         self.lock().rollback.apply()
+    }
+
+    pub(crate) fn savepoint_behavior(&self) -> Result<(), DbError> {
+        self.lock().savepoint.apply()
     }
 
     pub(crate) fn close_behavior(&self) -> Result<(), DbError> {

@@ -404,6 +404,12 @@ an open session, `retire` of an open session, the registry's teardown, `Database
 a connection that was lost. A `close` whose disposition succeeded — commit *or* a rollback the user
 chose — is `false`, and so is a session that never opened.
 
+For a lost connection the answer is finer than "lost, therefore warn": a session lost **by** a
+driver call reports `true`, because the statement that died may have reached the server (the core
+records `TransactionState::Unknown` rather than trusting the driver's pre-call cache); a session
+lost while **idle**, with nothing open, reports `false`. So the adapter can show the warning
+whenever the flag is set without training the user to ignore it on every dropped connection.
+
 ### 7.4 Retirement
 
 `SessionRegistry::retire(id)` is what lets the registry drop its handle, and `Terminal` is the only

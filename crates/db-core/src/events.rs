@@ -507,8 +507,13 @@ pub enum SessionEvent {
         ///   `DatabaseSession::drop` and the registry's teardown whenever a
         ///   transaction may have been open: none of them resolve anything
         ///   (ADR-0002 K5), so the server rolls back.
-        /// * `true` for a lost connection whenever a transaction may have been
-        ///   open.
+        /// * For a lost connection, `true` whenever a transaction may have been
+        ///   open — which includes the case where the call that *died* is the
+        ///   one that may have opened it: the driver's cached transaction state
+        ///   describes the world before that call, so it is not trusted and
+        ///   [`reldex_db_driver_api::TransactionState::Unknown`] is recorded
+        ///   instead. A session lost while **idle** with nothing open still
+        ///   reports `false`; losing a connection is not by itself a loss.
         /// * `true` whenever the driver cannot rule a transaction out
         ///   ([`reldex_db_driver_api::TransactionState::Unknown`]), because the
         ///   conservative answer is the only safe one (ADR-0002 K7).

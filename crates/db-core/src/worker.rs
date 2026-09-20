@@ -448,6 +448,34 @@ impl Worker {
         )
     }
 
+    /// Records the driver's transaction state after a command that may have
+    /// failed, **refusing to trust a connection the core has just declared
+    /// lost**.
+    ///
+    /// `DatabaseConnection::transaction_state` is a cached value the driver
+    /// last refreshed on a call that *returned*. When the call that just failed
+    /// is the one that died, that cache describes the world before the
+    /// statement the server may well have applied: an `INSERT` that reached the
+    /// server and then lost its connection leaves an exact driver still
+    /// reporting `Inactive`, and reading it here would let `Terminal` report
+    /// `transaction_possibly_lost: false` for work the server then rolled back.
+    /// `Unknown` is the honest answer, and it reads as "may be open" (K7).
+    ///
+    /// Deliberately **not** "lost implies a lost transaction": a session lost
+    /// while idle — the common dropped-connection case, discovered by the
+    /// revalidating ping, which does not touch the driver's transaction state —
+    /// still reports `false`, so a UI does not warn about work that never
+    /// existed. And deliberately not classified by statement kind either: the
+    /// kind lives on the `ExecuteOutcome` a failed call never produced, so the
+    /// core does not have it here.
+    fn note_transaction_state_after(&self, error: Option<&DbError>) {
+        let state = match error {
+            Some(err) if err.session_state() == SessionState::Lost => TransactionState::Unknown,
+            _ => self.transaction_state(),
+        };
+        self.shared.note_driver_transaction_state(state);
+    }
+
     /// Runs one command, revalidating first when the last error asked for it,
     /// and releasing everything once the session becomes terminally lost.
     fn dispatch(&mut self, command: Command, queued: &mpsc::Receiver<Command>) -> Flow {
@@ -582,8 +610,7 @@ impl Worker {
                     Ok(()) => self.release_results(),
                     Err(err) => self.shared.note_error(err),
                 }
-                let state = self.transaction_state();
-                self.shared.note_driver_transaction_state(state);
+                self.note_transaction_state_after(outcome.as_ref().err());
                 reply.answer(outcome);
                 Flow::Continue
             }
@@ -645,8 +672,7 @@ impl Worker {
             Ok(outcome) => outcome,
             Err(err) => {
                 self.shared.note_error(&err);
-                let state = self.transaction_state();
-                self.shared.note_driver_transaction_state(state);
+                self.note_transaction_state_after(Some(&err));
                 reply.answer(Err(err));
                 return Flow::Continue;
             }
@@ -1056,8 +1082,7 @@ impl Worker {
             }
             Err(err) => self.shared.note_error(err),
         }
-        let state = self.transaction_state();
-        self.shared.note_driver_transaction_state(state);
+        self.note_transaction_state_after(outcome.as_ref().err());
         reply.answer(outcome);
         Flow::Continue
     }

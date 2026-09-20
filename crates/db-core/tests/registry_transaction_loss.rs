@@ -19,7 +19,8 @@ mod support;
 use std::sync::Arc;
 
 use reldex_db_core::{
-    Abandoned, CloseDisposition, CloseError, RequestId, SessionEvent, SessionLifecycle, Statement,
+    Abandoned, CloseDisposition, CloseError, RequestId, SavepointName, SessionEvent,
+    SessionLifecycle, Statement,
 };
 use reldex_db_driver_api::{Capabilities, ErrorKind, SessionState};
 use reldex_driver_mock::{Action, BlockGate, BlockSpec, ScriptValue, ScriptedError};
@@ -410,4 +411,135 @@ fn an_exact_driver_with_nothing_running_reports_no_loss() {
 
     let seen = support::drain_until_terminal_of(&queue, id);
     assert_eq!(support::terminal_loss(&seen, id), Some(false));
+}
+
+/// The killing statement **is** the DML, with no successful statement before
+/// it.
+///
+/// The nastiest shape, and the one the delta review found: an exact-state
+/// driver caches `transaction_state` from the last call that *returned*, so
+/// after an `INSERT` that reached the server and then lost its connection the
+/// cache still says `Inactive`. Re-reading it would let `Terminal` report "no
+/// loss" for work the server rolled back. The core refuses to trust a
+/// connection it has just declared lost, and records `Unknown` instead.
+#[test]
+fn a_dml_that_dies_reports_the_loss_even_though_it_never_succeeded() {
+    let scenario = support::scenario();
+    scenario.on_sql(
+        INSERT,
+        Action::Fail(
+            ScriptedError::new(ErrorKind::NetworkLost, "the network went away mid-INSERT")
+                .with_session_state(SessionState::Lost),
+        ),
+    );
+    let (session, queue) = support::open_events(&scenario);
+    let id = session.id();
+    assert!(
+        !session.has_possibly_active_transaction(),
+        "nothing has run: an exact driver says the session is clean"
+    );
+
+    session
+        .submit_execute(RequestId(1), Statement::new(INSERT))
+        .expect("the INSERT is accepted");
+
+    let seen = support::drain_until_terminal_of(&queue, id);
+    assert_eq!(
+        support::terminal_loss(&seen, id),
+        Some(true),
+        "the statement that died may have reached the server; `Unknown` is the honest answer"
+    );
+    drop(session);
+}
+
+/// The same for the other two driver-call arms that refresh the cached state:
+/// rollback-to-savepoint, and an explicit commit or rollback.
+///
+/// A plain `SAVEPOINT` is deliberately not here: that arm never reads the
+/// driver's cached transaction state at all, so there is nothing to distrust,
+/// and a `SAVEPOINT` that died before succeeding established nothing — the same
+/// reasoning that keeps a session lost while idle at `false`.
+#[test]
+fn a_savepoint_or_a_commit_that_dies_reports_the_loss() {
+    #[derive(Debug, Clone, Copy)]
+    enum Killer {
+        RollbackToSavepoint,
+        Commit,
+        Rollback,
+    }
+
+    for killer in [
+        Killer::RollbackToSavepoint,
+        Killer::Commit,
+        Killer::Rollback,
+    ] {
+        let scenario = support::scenario();
+        let lost = || {
+            ScriptedError::new(ErrorKind::NetworkLost, "the network went away")
+                .with_session_state(SessionState::Lost)
+        };
+        scenario.fail_savepoint(lost());
+        scenario.fail_commit(lost());
+        scenario.fail_rollback(lost());
+        let session = support::open_on(&scenario, support::ReplyPath::Events);
+        let id = session.id();
+        assert!(
+            !session.has_possibly_active_transaction(),
+            "{killer:?}: an exact driver starts clean, so this cannot pass vacuously"
+        );
+
+        let name = SavepointName::new("sp").expect("a valid savepoint name");
+        let _ = match killer {
+            Killer::RollbackToSavepoint => session.rollback_to_savepoint(name).wait(),
+            Killer::Commit => session.commit().wait(),
+            Killer::Rollback => session.rollback().wait(),
+        };
+        session.await_terminal();
+
+        let seen = session.stashed();
+        assert_eq!(
+            support::terminal_loss(&seen, id),
+            Some(true),
+            "{killer:?}: the call that died may have left a transaction behind"
+        );
+    }
+}
+
+/// And the case the fix deliberately does **not** widen: a session lost while
+/// idle, discovered by the revalidating ping, with nothing open.
+///
+/// That path never touches the driver's transaction state, so an exact driver's
+/// honest "nothing is open" survives and the user is not warned about work that
+/// never existed. This is the common dropped-connection case.
+#[test]
+fn a_session_lost_while_idle_reports_no_loss() {
+    let scenario = support::scenario();
+    scenario.on_sql(
+        "SELECT dead FROM dual",
+        Action::Fail(
+            ScriptedError::new(ErrorKind::NetworkLost, "the network went away")
+                .with_session_state(SessionState::NeedsValidation),
+        ),
+    );
+    scenario.fail_ping(
+        ScriptedError::new(ErrorKind::NetworkLost, "and the revalidation confirms it")
+            .with_session_state(SessionState::Lost),
+    );
+    let session = support::open_on(&scenario, support::ReplyPath::Events);
+    let id = session.id();
+
+    // A read-only statement fails in a way that asks for revalidation; the
+    // revalidating ping then finds the session gone.
+    let _ = session
+        .execute(Statement::new("SELECT dead FROM dual"))
+        .wait();
+    let _ = session.ping().wait();
+    session.await_terminal();
+
+    let seen = session.stashed();
+    assert_eq!(
+        support::terminal_loss(&seen, id),
+        Some(false),
+        "nothing was ever open, and a dropped idle connection must not invent a loss"
+    );
 }

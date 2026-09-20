@@ -1331,14 +1331,28 @@ The value, at the point the session ends:
 | `abandon` of an open session | `true` if a transaction may be open when the worker reaches it |
 | `retire` of an open session, and `DatabaseSession::drop` | same — they are the same lossy drop (K5) |
 | the registry's teardown | same |
-| connection lost | `true` if a transaction may have been open |
+| connection lost while idle (found by the revalidating ping) | `false` when nothing was open — the common dropped connection must not invent a loss |
+| connection lost **by** a driver call (execute, rollback-to-savepoint, commit, rollback) | `true`: the statement may have reached the server, so the driver's cached state is not trusted and `Unknown` is recorded instead |
 | any of the above on a driver with `exact_transaction_state == false` | `true`, because `Unknown` reads as "may be open" (K7) |
 | a session that never opened (connect failed, spawn failed, open abandoned) | `false` — nothing was connected |
 
+Two asymmetries hold this together, and both are deliberate.
+
 "The disposition succeeded" is recorded as a fact on the worker when it happens, not re-derived from
 the driver afterwards: a driver that reports `Unknown` would otherwise say "may be open" forever,
-and turn a clean `close(Commit)` into a reported loss. The conservative default stands everywhere
-else — an extra warning costs a sentence, a missed one costs the user's work.
+and turn a clean `close(Commit)` into a reported loss.
+
+And `DatabaseConnection::transaction_state` is a cache the driver last refreshed on a call that
+*returned*, so the three arms that re-read it after a failure must not trust it when the failure
+carries `SessionState::Lost`: an `INSERT` that reached the server and then lost its connection
+leaves an exact driver still reporting `Inactive`, which would report "no loss" for work the server
+rolled back (found by the 2026-09-21 delta review). Those arms record `TransactionState::Unknown`
+instead. This is **not** "lost implies a lost transaction": the revalidating-ping path never touches
+the driver's transaction state, so a session lost while idle with nothing open still reports
+`false`. Nor is it classified by statement kind — the kind lives on an `ExecuteOutcome` a failed
+call never produced, so `Unknown` is the honest answer the core actually has. The conservative
+default stands everywhere else: an extra warning costs a sentence, a missed one costs the user's
+work.
 
 ### R7 — `request_cancel` after `close` must be a harmless no-op
 
