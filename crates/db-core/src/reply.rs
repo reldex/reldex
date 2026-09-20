@@ -278,11 +278,22 @@ impl Drop for CloseReplyTo {
             request,
         }) = self.channel.take()
         {
-            let error = shared.terminal_error();
+            // A close is idempotent, and it stays idempotent when it loses a
+            // race. Reaching here means the command never ran — the worker had
+            // already gone — so the question is only *why* it had gone. If a
+            // close had already ended this session cleanly, this one asked for
+            // something that is already true and the honest answer is success,
+            // exactly as `DatabaseSession::close` reports on the completion
+            // path. A session that is `Lost` really did fail, and says so.
+            let result = if shared.has_ended() && !shared.is_lost() {
+                Ok(())
+            } else {
+                Err(CloseError::Failed(shared.terminal_error()))
+            };
             shared.emit_reply(SessionEvent::SessionClosed {
                 session,
                 request,
-                result: Err(CloseError::Failed(error)),
+                result,
             });
         }
     }

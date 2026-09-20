@@ -169,8 +169,12 @@ consumer is told once, from a worker thread, that the queue stopped being empty 
 request**, which is what the UI needs and what the interim per-session pump in `crates/ffi` exists to
 be replaced by. The guarantees the event path carries — per-session delivery order, exactly one reply
 per accepted request, exactly one `Terminal` per session, `Executing` before its `Executed`, and no
-ordering promised across sessions — are stated in ADR-0002 E1–E5 and each has a test named after it
-in `crates/db-core/tests/event_ordering.rs`.
+ordering promised across sessions — are stated in ADR-0002 E1–E6 and each has a test named after it
+in `crates/db-core/tests/event_ordering.rs`. Delivery order is *production* order, not the order
+requests were accepted, so a consumer routes by `RequestId` and retires a session's state only on
+`Terminal`. How much one session can have waiting in that queue is bounded, and the bound is on the
+queue rather than on the worker: a request holds a slot against
+`SessionLimits::max_outstanding_requests` until the consumer has **drained** its reply.
 
 ## 7. FFI and Qt adapter boundary
 

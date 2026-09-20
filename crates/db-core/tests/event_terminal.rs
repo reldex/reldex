@@ -238,7 +238,8 @@ fn a_dropped_queue_does_not_wedge_the_worker() {
 
     support::with_timeout_guard(support::short_timeout(), move || {
         // Submitting into a queue nobody reads is still accepted and still
-        // answered; the events simply pile up until the last sink goes.
+        // answered; the events are discarded on arrival rather than piling up,
+        // and each one releases the slot its request held.
         for request in 2..=50 {
             session.submit_ping(RequestId(request)).expect("accepted");
         }
@@ -251,4 +252,135 @@ fn a_dropped_queue_does_not_wedge_the_worker() {
             .close(Some(CloseDisposition::Rollback))
             .expect("closing a session whose consumer went away must not hang");
     });
+}
+
+/// Closing is idempotent, and it stays idempotent when closes race.
+///
+/// Only one of them finds a worker to run; the others reach a session that has
+/// already ended and are answered by their reply channel's `Drop`. That is the
+/// same question with the same true answer — the session is closed — so every
+/// one of them must report success. Reporting a failure because a close lost a
+/// race would have a UI tell the user their session could not be closed when
+/// it demonstrably was.
+#[test]
+fn concurrent_closes_all_report_success_on_a_cleanly_closed_session() {
+    const CLOSERS: u64 = 16;
+    const ROUNDS: usize = 40;
+
+    let scenario = support::scenario();
+    support::with_timeout_guard(support::short_timeout() * 6, move || {
+        for _ in 0..ROUNDS {
+            let (session, queue) = support::open_events(&scenario);
+            let session = Arc::new(session);
+            let threads: Vec<_> = (1..=CLOSERS)
+                .map(|request| {
+                    let session = Arc::clone(&session);
+                    std::thread::spawn(move || {
+                        session.submit_close(RequestId(request), Some(CloseDisposition::Rollback))
+                    })
+                })
+                .collect();
+            for thread in threads {
+                thread
+                    .join()
+                    .expect("a closer must not panic")
+                    .expect("accepted");
+            }
+
+            let seen = support::drain_until(&queue, |seen| {
+                support::reply_requests(seen).len() >= CLOSERS as usize
+            });
+            let mut requests = support::reply_requests(&seen);
+            requests.sort_unstable();
+            assert_eq!(
+                requests,
+                (1..=CLOSERS).collect::<Vec<_>>(),
+                "every close is answered exactly once"
+            );
+            for event in &seen {
+                match event {
+                    SessionEvent::SessionClosed { result: Ok(()), .. } => {}
+                    SessionEvent::SessionClosed {
+                        result: Err(error),
+                        request,
+                        ..
+                    } => panic!(
+                        "close {request} lost a race and reported failure on a session that \
+                         closed cleanly: {error:?}"
+                    ),
+                    SessionEvent::Terminal { .. } => {}
+                    other => panic!("only closes were submitted, got {other:?}"),
+                }
+            }
+        }
+    });
+}
+
+/// The other half of the same rule: a close that finds a genuinely **lost**
+/// session still reports the failure. Idempotency is not a licence to claim a
+/// clean close that never happened (`SPEC.md` §10).
+#[test]
+fn a_close_after_a_lost_session_still_reports_the_loss() {
+    let scenario = support::scenario();
+    scenario.on_sql(
+        "SELECT 1 FROM dual",
+        Action::Fail(ScriptedError::new(
+            ErrorKind::NetworkLost,
+            "connection reset",
+        )),
+    );
+    let (session, queue) = support::open_events(&scenario);
+
+    session
+        .submit_execute(RequestId(1), Statement::new("SELECT 1 FROM dual"))
+        .expect("accepted");
+    let _ = support::drain_to_terminal(&queue);
+
+    for request in 2..=5 {
+        session
+            .submit_close(RequestId(request), Some(CloseDisposition::Commit))
+            .expect("accepted");
+    }
+    let seen = support::drain_until(&queue, |seen| support::reply_requests(seen).len() >= 4);
+    for event in &seen {
+        match event {
+            SessionEvent::SessionClosed { result: Err(_), .. } => {}
+            other => panic!("a lost session never closes cleanly, got {other:?}"),
+        }
+    }
+}
+
+/// Binding a queue to a session that has already announced its end is refused.
+///
+/// `Terminal` is emitted once, at the transition. A sink bound afterwards would
+/// receive a stream that never terminates — every submit failing one by one
+/// with nothing to say the session is gone — so the bind fails instead, and the
+/// caller is told why.
+#[test]
+fn binding_a_queue_after_the_session_ended_is_refused() {
+    let scenario = support::scenario();
+    // A session that ran on the completion path and was closed: its end was
+    // announced to nobody, and there is no second announcement to give a
+    // consumer that turns up now.
+    let session = support::open(&scenario);
+    session
+        .close(Some(CloseDisposition::Rollback))
+        .expect("closes cleanly");
+
+    let (sink, queue) = reldex_db_core::event_channel(reldex_db_core::EventCaps::new());
+    let error = session
+        .bind_events(sink)
+        .expect_err("a session that has ended cannot start a new stream");
+    assert_eq!(error.kind(), ErrorKind::Resource);
+    assert!(queue.is_empty(), "and nothing was routed to it");
+
+    // The refusal is what keeps a caller from waiting forever: submitting is
+    // refused too, rather than accepting work that could never be announced.
+    assert_eq!(
+        session
+            .submit_ping(RequestId(1))
+            .expect_err("no queue is bound")
+            .kind(),
+        ErrorKind::DriverInternal
+    );
 }

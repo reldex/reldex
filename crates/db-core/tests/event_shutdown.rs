@@ -103,8 +103,15 @@ fn a_worker_outliving_its_queue_keeps_working_and_closes() {
     });
 }
 
-/// A registered waker is called exactly once when a burst fills an empty
-/// queue, and not again until the queue has drained.
+/// A registered waker is called when a burst fills an empty queue.
+///
+/// The wait matters: the producer pushes under the queue's lock and calls the
+/// waker only after letting go of every lock it holds — which is the contract,
+/// because a waker must never run with a `db-core` lock held. A consumer
+/// therefore returns from its drain *before* the waker has necessarily been
+/// called, and asserting the count the instant the drain returns is a race the
+/// implementation is allowed to lose. Wait for it instead, under the hang
+/// guard; there is no timing assertion here either way.
 #[test]
 fn a_registered_waker_is_called_on_the_empty_to_non_empty_edge() {
     let scenario = support::scenario();
@@ -114,10 +121,9 @@ fn a_registered_waker_is_called_on_the_empty_to_non_empty_edge() {
 
     session.submit_ping(RequestId(1)).expect("accepted");
     let _ = support::drain_until(&queue, |seen| !seen.is_empty());
-    assert!(
-        waker.0.load(Ordering::SeqCst) >= 1,
-        "filling an empty queue must wake the consumer"
-    );
+    support::wait_for("filling an empty queue wakes the consumer", || {
+        waker.0.load(Ordering::SeqCst) >= 1
+    });
 
     queue.set_waker(None);
     let _ = session.close(Some(CloseDisposition::Rollback));

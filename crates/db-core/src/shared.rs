@@ -6,15 +6,15 @@
 //! and a plain [`std::sync::Mutex`] is enough — this is not a hot path.
 
 use std::fmt;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use reldex_db_driver_api::{
     DbError, DbResult, ErrorKind, NativeError, SessionState, SqlPosition, StatementKind,
     TransactionState,
 };
 
-use crate::events::{EventSink, SessionEvent};
+use crate::events::{EventSink, RequestSlots, SessionEvent};
 use crate::ids::SessionId;
 
 /// Where a session is in its lifecycle.
@@ -189,10 +189,12 @@ pub(crate) struct SessionShared {
     /// path: on the completion path `DatabaseSession::close` sees no worker to
     /// ask, and on the event path this is what says the same thing.
     ended: AtomicBool,
-    /// How many event-path requests have been accepted and not yet answered.
-    /// Bounded by [`crate::SessionLimits::max_outstanding_requests`], which is
-    /// what bounds the reply events this session can put in the queue.
-    outstanding: AtomicUsize,
+    /// The slots event-path requests hold: taken when a request is accepted,
+    /// given back when the consumer takes its reply **out of** the queue. That
+    /// is what makes [`crate::SessionLimits::max_outstanding_requests`] bound
+    /// the queue itself and not merely what is in flight on the worker, so the
+    /// counter is shared with the queue rather than owned here.
+    requests: Arc<RequestSlots>,
 }
 
 impl SessionShared {
@@ -212,7 +214,7 @@ impl SessionShared {
             events: Mutex::new(None),
             terminal_emitted: AtomicBool::new(false),
             ended: AtomicBool::new(false),
-            outstanding: AtomicUsize::new(0),
+            requests: Arc::new(RequestSlots::default()),
         }
     }
 
@@ -232,6 +234,13 @@ impl SessionShared {
     /// refused rather than silently honoured: replies already in flight are
     /// addressed to the first queue, so a second bind would split one
     /// session's stream across two consumers and break ordering rule 1.
+    ///
+    /// [`ErrorKind::Resource`] if this session has already announced its end.
+    /// [`SessionEvent::Terminal`] is emitted once, at the transition, so a
+    /// sink bound after it would receive a stream that never terminates —
+    /// every later submit failing one by one with no event to say the session
+    /// is gone. Refusing is the honest answer, and the caller already has
+    /// [`SessionShared::lifecycle`] to see why.
     pub(crate) fn bind_events(&self, sink: EventSink) -> DbResult<()> {
         let mut slot = self
             .events
@@ -241,6 +250,14 @@ impl SessionShared {
             return Err(DbError::internal(
                 "reldex-db-core: this session already routes its events to a queue; bind once, \
                  at open",
+            ));
+        }
+        if self.terminal_emitted() {
+            return Err(DbError::new(
+                ErrorKind::Resource,
+                "reldex-db-core: this session has already ended; its Terminal event was emitted \
+                 before this queue was bound, so binding now would produce a stream that never \
+                 terminates",
             ));
         }
         *slot = Some(sink);
@@ -280,10 +297,37 @@ impl SessionShared {
         }
     }
 
-    /// Emits a request's single reply and releases the slot it reserved.
+    /// Emits a request's single reply.
+    ///
+    /// The slot the request reserved is handed to the queue along with the
+    /// event, and released when the consumer takes it out again — that is what
+    /// makes [`crate::SessionLimits::max_outstanding_requests`] bound the
+    /// queue's contents. The slot is released **here** only when the queue did
+    /// not take the event: there is no sink, or the consumer is gone.
+    ///
+    /// Every reply event goes through here, including the failures
+    /// [`crate::reply::ReplyTo`]'s `Drop` synthesises; nothing else may emit a
+    /// [`SessionEvent::is_reply`] event, or the accounting would drift.
     pub(crate) fn emit_reply(&self, event: SessionEvent) {
-        self.outstanding.fetch_sub(1, Ordering::AcqRel);
-        self.emit(event);
+        let (release, wake) = {
+            let slot = self
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match slot.as_ref() {
+                Some(sink) => {
+                    let pushed = sink.push_reply(event, &self.requests);
+                    (!pushed.kept, pushed.wake.then(|| sink.clone()))
+                }
+                None => (true, None),
+            }
+        };
+        if release {
+            self.requests.release();
+        }
+        if let Some(sink) = wake {
+            sink.wake();
+        }
     }
 
     /// Reserves one outstanding-request slot, or refuses.
@@ -297,32 +341,13 @@ impl SessionShared {
     ///
     /// [`ErrorKind::Resource`] when `limit` requests are already outstanding.
     pub(crate) fn reserve_request(&self, limit: usize) -> DbResult<()> {
-        let mut current = self.outstanding.load(Ordering::Acquire);
-        loop {
-            if current >= limit {
-                return Err(DbError::new(
-                    ErrorKind::Resource,
-                    format!(
-                        "reldex-db-core: this session already has {limit} requests outstanding \
-                         (its configured limit); drain the event queue before submitting more"
-                    ),
-                ));
-            }
-            match self.outstanding.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(seen) => current = seen,
-            }
-        }
+        self.requests.reserve(limit)
     }
 
-    /// How many event-path requests are accepted and unanswered.
+    /// How many event-path requests are accepted and whose reply the consumer
+    /// has not yet taken out of the queue.
     pub(crate) fn outstanding(&self) -> usize {
-        self.outstanding.load(Ordering::Acquire)
+        self.requests.outstanding()
     }
 
     /// Records that a close has ended this session, so a later one is a

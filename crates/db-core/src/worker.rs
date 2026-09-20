@@ -471,8 +471,18 @@ impl Worker {
             if matches!(command, Command::Close { .. }) {
                 // Runs the close, which answers it and ends the worker; the
                 // shutdown path then answers whatever is left and announces.
-                let _ = self.run(command);
-                return Flow::Exit;
+                let close = self.run(command);
+                debug_assert!(
+                    matches!(close, Flow::Exit),
+                    "a close reached at the terminal transition always ends the worker: the \
+                     session is terminal, so its connection has already been discarded and \
+                     `Worker::close` takes the `connection.is_none()` branch"
+                );
+                // Propagated rather than assumed: were a close ever to leave
+                // the session open here, the loop would carry on and the next
+                // command would drain and announce again, instead of exiting
+                // with `Terminal` unsent.
+                return close;
             }
             command.fail(self.shared.terminal_error());
         }

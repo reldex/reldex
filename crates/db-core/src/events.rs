@@ -41,6 +41,17 @@
 //!    — the registry) takes the same per-session emit lock before touching the
 //!    queue. The queue itself is a single FIFO under one mutex, so a session's
 //!    subsequence of it is exactly its production order.
+//!
+//!    **Production order is not acceptance order.** Requests are accepted on
+//!    caller threads and answered by the worker, and at a terminal transition
+//!    a submit can synthesise its own failure (its command could not be
+//!    delivered) while the worker is draining and failing the commands it
+//!    already had. Those failures interleave. A consumer must therefore route
+//!    strictly by [`RequestId`] and must **not** infer "every earlier request
+//!    of this session has been answered" from a reply it just took; the only
+//!    event that means a session will produce nothing further is
+//!    [`SessionEvent::Terminal`], which is where per-session state should be
+//!    retired.
 //! 2. **Every accepted request produces exactly one reply event** — never
 //!    zero, never two. The reply channel is consumed by answering it, and if
 //!    it is *dropped* unanswered (the worker exited, the command could not be
@@ -60,19 +71,33 @@
 //!
 //! # Back-pressure
 //!
-//! The queue is unbounded, and what bounds it is stated rather than hoped for:
+//! The queue itself has no length limit, and what bounds it is stated rather
+//! than hoped for. Per session, at any instant:
 //!
-//! * **Reply events** are bounded by the number of outstanding requests, which
-//!   is bounded by [`crate::SessionLimits::max_outstanding_requests`]. Going
-//!   over it is the one synchronous failure the submit API has
-//!   ([`reldex_db_driver_api::ErrorKind::Resource`]) — reporting it as an
-//!   event would be circular.
+//! * **Reply events** are bounded by
+//!   [`crate::SessionLimits::max_outstanding_requests`]. A request reserves a
+//!   slot when it is accepted and releases it when the **consumer takes its
+//!   reply out of the queue** — not when the worker produces it — so a consumer
+//!   that stops draining stops the submitter too. Going over the limit is the
+//!   one synchronous failure the submit API has
+//!   ([`reldex_db_driver_api::ErrorKind::Resource`]); reporting it as an event
+//!   would be circular.
+//! * **[`SessionEvent::Executing`]** is bounded by the same number: the worker
+//!   emits at most one per outstanding execute, and it is never dropped.
 //! * **Unsolicited events** ([`SessionEvent::ServerOutput`],
-//!   [`SessionEvent::TransactionStateChanged`]) are bounded per session by
-//!   [`EventCaps::max_unsolicited_per_session`]. A terminal reply is never
-//!   dropped, and neither is [`SessionEvent::Terminal`] or
-//!   [`SessionEvent::Executing`] — see [`EventCaps`] for the exact policy and
-//!   for how a drop is reported rather than hidden.
+//!   [`SessionEvent::TransactionStateChanged`]) are bounded by
+//!   [`EventCaps::max_unsolicited_per_session`] plus one — a transaction state
+//!   is never dropped; see [`EventCaps`] for the exact policy and for how a
+//!   drop is reported rather than hidden.
+//! * **[`SessionEvent::Terminal`]** is one per session, ever, and is never
+//!   dropped.
+//!
+//! So one session can hold at most `2 × max_outstanding_requests +
+//! max_unsolicited_per_session + 2` events in the queue, and no producer can
+//! exceed that however fast it runs.
+//!
+//! Dropping the [`EventQueue`] ends the stream: see [`EventQueue`] for what
+//! happens to the events and the slots that were still in it.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -81,11 +106,11 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
-use reldex_db_driver_api::{CancelKind, ConnectionId, DbError, DbResult, Warning};
+use reldex_db_driver_api::{CancelKind, ConnectionId, DbError, DbResult, ErrorKind, Warning};
 
 use crate::ids::{LobHandle, ResultId, SessionId};
 use crate::session::{CloseError, ExecuteOutcome, FetchedBatch};
@@ -113,8 +138,18 @@ impl fmt::Display for RequestId {
 ///   queue's empty → non-empty transition, so a burst produces one call. A
 ///   consumer that stops draining while [`EventQueue::next`] is still
 ///   returning `Some` gets no further wake and must re-post its own drain.
-/// * **It must return promptly and must not block.** It is called on a
-///   session's worker thread, and blocking there stalls that session.
+/// * **It must return promptly and must not block.** It is usually called on a
+///   session's worker thread, and blocking there stalls that session. It can
+///   also run **on the thread that submitted a request**: a submit whose
+///   command cannot be delivered synthesises its own failure event (ordering
+///   rule 2), and if that fills an empty queue the submitting thread is the one
+///   that wakes the consumer. A consumer whose waker posts to its own event
+///   loop must therefore tolerate being called from a thread it does not own,
+///   including — once an adapter is on the other side of an FFI frame — the UI
+///   thread itself.
+/// * **It must not call [`EventQueue::set_waker`].** That would take the
+///   registration lock for writing while this call holds it for reading, which
+///   self-deadlocks.
 /// * **It must not call back into `db-core`.** Nothing here is re-entrant; a
 ///   wake is never issued from inside [`EventQueue::next`] or
 ///   [`EventQueue::drain_into`], and the wake runs while the waker
@@ -148,21 +183,27 @@ pub trait Waker: Send + Sync {
 /// Per session, at most [`EventCaps::max_unsolicited_per_session`] unsolicited
 /// events may be waiting in the queue at once. At the cap:
 ///
-/// * [`SessionEvent::TransactionStateChanged`] is **coalesced, never dropped**:
-///   it reports a *state*, not an occurrence, so an undelivered one for that
-///   session is updated in place to the newer value. Nothing is lost — the
-///   consumer always ends up with the most recent value the worker computed —
-///   and this class therefore cannot reach the cap at all. The one thing it
-///   costs is position: a coalesced value is delivered at the earlier of the
-///   two slots. It is advisory (`close` re-decides on the worker, ADR-0002 K4),
-///   and [`crate::DatabaseSession::has_possibly_active_transaction`] is always
+/// * [`SessionEvent::TransactionStateChanged`] is **coalesced, never dropped**,
+///   and the cap does not apply to it: it reports a *state*, not an
+///   occurrence, so an undelivered one for that session is updated in place to
+///   the newer value, and when the session has none queued the new one is
+///   admitted even at the cap. Both halves are needed — coalescing alone would
+///   still lose the first change after a burst of `ServerOutput` filled the
+///   session's allowance, and "the transaction is open" is exactly the fact
+///   that must not be lost. The class therefore adds at most **one** event per
+///   session over the cap. What it costs is position: a coalesced value is
+///   delivered at the earlier of the two slots. It is advisory (`close`
+///   re-decides on the worker, ADR-0002 K4), and
+///   [`crate::DatabaseSession::has_possibly_active_transaction`] is always
 ///   authoritative.
 /// * [`SessionEvent::ServerOutput`] is **dropped, and the drop is counted**.
 ///   The incoming event is the one dropped, so what is already queued — where
 ///   a PL/SQL error usually is — survives. Its line count is added to that
 ///   session's pending drop count and reported as `dropped` on the next
 ///   `ServerOutput` that session actually delivers, so the UI can say "output
-///   truncated" instead of silently lying. [`EventQueue::dropped_unsolicited`]
+///   truncated" instead of silently lying. A count that has no later
+///   `ServerOutput` to ride on stays readable through
+///   [`EventQueue::pending_dropped_lines`]. [`EventQueue::dropped_unsolicited`]
 ///   counts the refused *events* for diagnostics, and never resets.
 ///
 /// A reply event, [`SessionEvent::Executing`] and [`SessionEvent::Terminal`]
@@ -467,6 +508,89 @@ impl SessionEvent {
     }
 }
 
+/// One session's reply slots: reserved when a request is accepted, released
+/// when the consumer takes that request's reply **out of** the queue.
+///
+/// Shared, so that both ends can reach it: the session reserves and reads it,
+/// and the queue — which carries an `Arc` of it on the queued reply itself —
+/// releases from inside [`EventQueue::next`] / [`EventQueue::drain_into`].
+/// That is what makes [`crate::SessionLimits::max_outstanding_requests`] bound
+/// the *queue* and not merely the number of requests in flight on the worker.
+///
+/// Every operation is a single atomic, so the release can run under the queue's
+/// mutex without introducing a second lock or a lock-order edge.
+#[derive(Debug, Default)]
+pub(crate) struct RequestSlots {
+    outstanding: AtomicUsize,
+}
+
+impl RequestSlots {
+    /// Takes one slot, or refuses because `limit` are already taken.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::Resource`] at the limit. Refusing accepts nothing, so
+    /// ordering rule 2 is untouched.
+    pub(crate) fn reserve(&self, limit: usize) -> DbResult<()> {
+        let mut current = self.outstanding.load(Ordering::Acquire);
+        loop {
+            if current >= limit {
+                return Err(DbError::new(
+                    ErrorKind::Resource,
+                    format!(
+                        "reldex-db-core: this session already has {limit} requests outstanding \
+                         (its configured limit); drain the event queue before submitting more"
+                    ),
+                ));
+            }
+            match self.outstanding.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(seen) => current = seen,
+            }
+        }
+    }
+
+    /// Gives one slot back. Saturating: releasing more than was reserved is a
+    /// core bug, and leaving the count at zero is the harmless way to be wrong.
+    pub(crate) fn release(&self) {
+        let _ = self
+            .outstanding
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |taken| {
+                if taken == 0 { None } else { Some(taken - 1) }
+            });
+    }
+
+    /// How many slots are taken right now.
+    pub(crate) fn outstanding(&self) -> usize {
+        self.outstanding.load(Ordering::Acquire)
+    }
+}
+
+/// What one [`Shared::push`] did with an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Pushed {
+    /// The queue went empty → non-empty: call the waker, after releasing every
+    /// lock.
+    pub(crate) wake: bool,
+    /// The queue took the event, and with it responsibility for the reply slot
+    /// it holds. `false` means the caller still owns that slot and must
+    /// release it — the event was coalesced, refused by the cap, or pushed
+    /// into a queue whose consumer is gone.
+    pub(crate) kept: bool,
+}
+
+impl Pushed {
+    const DISCARDED: Self = Self {
+        wake: false,
+        kept: false,
+    };
+}
+
 /// Per-session bookkeeping for the drop policy in [`EventCaps`].
 #[derive(Default)]
 struct SessionQueueState {
@@ -485,8 +609,32 @@ impl SessionQueueState {
     }
 }
 
+/// One queued event, with the reply slot it is carrying.
+///
+/// The slot travels **with** its own event rather than in a per-session
+/// tally, which is both cheaper — the reply path, the hot one, touches no hash
+/// map at either end — and harder to get wrong: a reply cannot release a slot
+/// it was not holding, and a slot cannot outlive the event that owns it
+/// whichever way the queue ends.
+struct Queued {
+    event: SessionEvent,
+    /// `Some` for a request's single reply: released the moment a consumer
+    /// takes this event out, or the queue is dropped.
+    slot: Option<Arc<RequestSlots>>,
+}
+
+impl Queued {
+    /// Takes the event out, releasing the slot it held.
+    fn take(self) -> SessionEvent {
+        if let Some(slot) = self.slot {
+            slot.release();
+        }
+        self.event
+    }
+}
+
 struct Inner {
-    queue: VecDeque<SessionEvent>,
+    queue: VecDeque<Queued>,
     /// The sequence number of `queue.front()`. Sequence numbers exist only so
     /// that a coalescing target can be found in O(1): the queue is popped only
     /// from the front, so `index = seq - front_seq`.
@@ -498,6 +646,10 @@ struct Inner {
     /// under the same lock a push holds, so the notify below cannot be lost,
     /// and checked so the ordinary path never touches the condvar at all.
     waiters: usize,
+    /// Set by `Drop for EventQueue`: there is no consumer any more, so events
+    /// are discarded on arrival instead of accumulating in a queue nobody can
+    /// read.
+    closed: bool,
 }
 
 struct Shared {
@@ -519,31 +671,45 @@ impl Shared {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Enqueues one event. Returns whether the queue went empty → non-empty,
-    /// which is the caller's cue to [`Shared::wake`] — **after** it has let go
-    /// of every lock it holds.
-    fn push(&self, event: SessionEvent) -> bool {
+    /// Enqueues one event and says what became of it; see [`Pushed`].
+    ///
+    /// `slots` is `Some` exactly when the event is a request's single reply,
+    /// and carries the counter whose slot that request reserved: the queue
+    /// takes ownership of the slot when it keeps the event, and releases it
+    /// again in [`Shared::pop`].
+    fn push(&self, event: SessionEvent, slots: Option<&Arc<RequestSlots>>) -> Pushed {
         let mut inner = self.lock();
+        if inner.closed {
+            // Nobody will ever read this. Keeping it would grow without bound
+            // and hold the submitter's slot for a reply it can never see.
+            return Pushed::DISCARDED;
+        }
         let was_empty = inner.queue.is_empty();
         if event.is_unsolicited() {
             match inner.admit_unsolicited(&event, self.caps) {
                 Admission::Enqueue => {}
-                Admission::Coalesced => return false,
+                Admission::Coalesced => return Pushed::DISCARDED,
                 Admission::Dropped => {
                     self.dropped_unsolicited.fetch_add(1, Ordering::Relaxed);
-                    return false;
+                    return Pushed::DISCARDED;
                 }
             }
         }
         let event = inner.stamp_unsolicited(event);
-        inner.queue.push_back(event);
+        inner.queue.push_back(Queued {
+            event,
+            slot: slots.map(Arc::clone),
+        });
         inner.next_seq += 1;
         if inner.waiters > 0 {
             // Held across the notify on purpose: a waiter registered itself
             // under this same lock, so no wakeup can be lost.
             self.ready.notify_one();
         }
-        was_empty
+        Pushed {
+            wake: was_empty,
+            kept: true,
+        }
     }
 
     /// Calls the waker, if one is registered, with no queue lock held.
@@ -563,8 +729,11 @@ impl Shared {
         }
     }
 
+    /// Takes the front event, releasing the reply slot it carried — the bound
+    /// is on what this queue holds, so a slot is freed here and not when the
+    /// worker produced the reply.
     fn pop(&self, inner: &mut Inner) -> Option<SessionEvent> {
-        let event = inner.queue.pop_front()?;
+        let event = inner.queue.pop_front()?.take();
         let seq = inner.front_seq;
         inner.front_seq += 1;
         if event.is_unsolicited() {
@@ -602,17 +771,32 @@ impl Inner {
                 && let Some(SessionEvent::TransactionStateChanged {
                     possibly_active: queued,
                     ..
-                }) = self.queue.get_mut(slot)
+                }) = self.queue.get_mut(slot).map(|queued| &mut queued.event)
             {
                 *queued = *possibly_active;
                 return Admission::Coalesced;
             }
-        }
-        let state = self.sessions.entry(session).or_default();
-        if state.unsolicited < caps.max_unsolicited_per_session().get() {
+            // There is nothing to fold into, so the cap does not apply: this
+            // class is what tells a UI whether a transaction is open, and
+            // dropping it because a `ServerOutput` burst used up the session's
+            // allowance would leave the user looking at a stale answer with a
+            // transaction still on the connection. Admitting it costs one
+            // event per session, because the next one coalesces into it.
             return Admission::Enqueue;
         }
-        if let SessionEvent::ServerOutput { lines, .. } = event {
+        let at_cap = self
+            .sessions
+            .get(&session)
+            .is_some_and(|state| state.unsolicited >= caps.max_unsolicited_per_session().get());
+        if !at_cap {
+            // Deliberately no `entry().or_default()` here: a session that is
+            // not at its cap needs no bookkeeping until `stamp_unsolicited`
+            // creates it, and a refused event must not leave one behind.
+            return Admission::Enqueue;
+        }
+        if let SessionEvent::ServerOutput { lines, .. } = event
+            && let Some(state) = self.sessions.get_mut(&session)
+        {
             let lost = u32::try_from(lines.len()).unwrap_or(u32::MAX);
             state.dropped_lines = state.dropped_lines.saturating_add(lost);
         }
@@ -677,8 +861,8 @@ impl Inner {
 ///
 /// Dropping every sink does **not** close the queue: a consumer can still
 /// drain what is already in it. Dropping the [`EventQueue`] does not stop the
-/// producers either — they keep pushing into a queue nobody will read, which
-/// is bounded by the same caps as ever and freed when the last sink goes.
+/// producers either — their sessions keep working — but from then on every
+/// event they push is discarded rather than accumulated; see [`EventQueue`].
 #[derive(Clone)]
 pub struct EventSink {
     shared: Arc<Shared>,
@@ -691,13 +875,25 @@ impl fmt::Debug for EventSink {
 }
 
 impl EventSink {
-    /// Queues one event and returns whether the consumer must be woken.
+    /// Queues one event that holds no reply slot, and returns whether the
+    /// consumer must be woken.
     ///
     /// Split from [`EventSink::wake`] so that a caller holding a per-session
     /// lock — which is what makes ordering rule 1 true — can release it before
     /// the waker runs. The waker is never called with a `db-core` lock held.
     pub(crate) fn push(&self, event: SessionEvent) -> bool {
-        self.shared.push(event)
+        self.shared.push(event, None).wake
+    }
+
+    /// Queues a request's single reply, handing the queue the slot that
+    /// request reserved. See [`Pushed`] for what the caller must do with a
+    /// reply the queue did not keep.
+    pub(crate) fn push_reply(&self, event: SessionEvent, slots: &Arc<RequestSlots>) -> Pushed {
+        debug_assert!(
+            event.is_reply(),
+            "only a request's reply carries a slot; {event:?} is not one"
+        );
+        self.shared.push(event, Some(slots))
     }
 
     /// Calls the registered waker. Only ever called after
@@ -712,6 +908,22 @@ impl EventSink {
 /// `Send` but deliberately not `Sync` — there is exactly one consumer, and
 /// [`EventQueue::next`] is a *take*, so a second concurrent drainer would be a
 /// race the type system can rule out for free.
+///
+/// # Dropping it ends the stream
+///
+/// Sessions bound to this queue keep working when it is dropped — they must,
+/// because one of them may be in the middle of a close — but the stream is
+/// over:
+///
+/// * every event still in the queue is discarded, and every reply slot those
+///   events held is released;
+/// * every later event is discarded on arrival, and a reply's slot is released
+///   immediately instead of being handed to the queue.
+///
+/// So [`crate::DatabaseSession::outstanding_requests`] falls back to zero, no
+/// submit is refused because a consumer that no longer exists is not draining,
+/// and nothing accumulates in memory nobody can reach. What a consumer wanted
+/// to see, it must drain **before** dropping the queue.
 pub struct EventQueue {
     shared: Arc<Shared>,
     /// Makes the type `!Sync` without making it `!Send`.
@@ -737,6 +949,13 @@ impl EventQueue {
     /// Registering does not wake anything for events already queued — the
     /// waker is edge-triggered on empty → non-empty. A consumer that registers
     /// late drains once itself.
+    ///
+    /// # Panics
+    ///
+    /// Never, but calling this **from inside a [`Waker::wake`] call** is a
+    /// self-deadlock, not a panic: the wake holds the registration lock for
+    /// reading and this takes it for writing. A waker that wants to unregister
+    /// itself must post that to its own loop.
     pub fn set_waker(&self, waker: Option<Arc<dyn Waker>>) {
         let mut slot = self
             .shared
@@ -776,25 +995,43 @@ impl EventQueue {
     ///
     /// For headless tests and command-line tools. A UI registers a
     /// [`Waker`] instead and never blocks at all.
+    ///
+    /// A `timeout` the monotonic clock cannot represent — [`Duration::MAX`] —
+    /// means "no deadline": this then blocks until an event arrives, rather
+    /// than giving up immediately on an arithmetic overflow.
     #[must_use]
     pub fn wait_timeout(&self, timeout: Duration) -> Option<SessionEvent> {
-        let deadline = std::time::Instant::now().checked_add(timeout)?;
+        let deadline = std::time::Instant::now().checked_add(timeout);
         let mut inner = self.shared.lock();
         loop {
             if let Some(event) = self.shared.pop(&mut inner) {
                 return Some(event);
             }
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return None;
-            }
+            let remaining = match deadline {
+                Some(deadline) => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return None;
+                    }
+                    Some(deadline - now)
+                }
+                None => None,
+            };
             inner.waiters += 1;
-            let (guard, _) = self
-                .shared
-                .ready
-                .wait_timeout(inner, deadline - now)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            inner = guard;
+            inner = match remaining {
+                Some(remaining) => {
+                    self.shared
+                        .ready
+                        .wait_timeout(inner, remaining)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .0
+                }
+                None => self
+                    .shared
+                    .ready
+                    .wait(inner)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            };
             inner.waiters -= 1;
         }
     }
@@ -809,7 +1046,7 @@ impl EventQueue {
     /// Whether nothing is waiting, as a snapshot.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.shared.lock().queue.is_empty()
     }
 
     /// How many unsolicited events this queue has refused, over its whole
@@ -836,10 +1073,41 @@ impl EventQueue {
         self.shared.waker_panics.load(Ordering::Relaxed)
     }
 
+    /// How many [`SessionEvent::ServerOutput`] lines this session has lost
+    /// that have not yet been reported on a delivered event.
+    ///
+    /// The count normally rides out on the next `ServerOutput` that session
+    /// delivers, which is where a UI reads it. This is the accessor for the
+    /// case where there is no next one — the session went quiet, or ended,
+    /// with lines still owed — so that "output truncated" can still be shown.
+    /// Zero for a session that has lost nothing, including one this queue has
+    /// never heard of.
+    #[must_use]
+    pub fn pending_dropped_lines(&self, session: SessionId) -> u32 {
+        self.shared
+            .lock()
+            .sessions
+            .get(&session)
+            .map_or(0, |state| state.dropped_lines)
+    }
+
     /// The caps this queue was built with.
     #[must_use]
     pub fn caps(&self) -> EventCaps {
         self.shared.caps
+    }
+}
+
+impl Drop for EventQueue {
+    /// Ends the stream: see [`EventQueue`]. Everything still queued is
+    /// discarded and every reply slot it held is released, so a session whose
+    /// consumer went away is not left unable to submit.
+    fn drop(&mut self) {
+        let mut inner = self.shared.lock();
+        inner.closed = true;
+        while self.shared.pop(&mut inner).is_some() {}
+        // Only `dropped_lines` can be left, and nobody can read it now.
+        inner.sessions.clear();
     }
 }
 
@@ -857,6 +1125,7 @@ pub fn event_channel(caps: EventCaps) -> (EventSink, EventQueue) {
             next_seq: 0,
             sessions: HashMap::new(),
             waiters: 0,
+            closed: false,
         }),
         ready: Condvar::new(),
         waker: RwLock::new(None),
@@ -1074,6 +1343,94 @@ mod tests {
             ),
             other => panic!("expected TransactionStateChanged, got {other:?}"),
         }
+    }
+
+    /// The case the two single-class tests above each miss: one session, at
+    /// its cap on `ServerOutput`, with **no** transaction state queued to
+    /// coalesce into. The cap must not swallow the state change — a UI that
+    /// misses it shows Commit and Rollback disabled while a transaction is
+    /// open on the connection, which is exactly the silent transaction loss
+    /// `SPEC.md` §10 forbids.
+    #[test]
+    fn a_transaction_state_change_is_never_lost_to_a_server_output_burst() {
+        let (sink, queue) = event_channel(caps(4));
+        let session = SessionId::allocate();
+        for _ in 0..4 {
+            emit(&sink, output(session, 1));
+        }
+        emit(&sink, output(session, 3));
+        assert_eq!(queue.len(), 4, "the fifth output is over the cap");
+        assert_eq!(queue.dropped_unsolicited(), 1);
+
+        emit(
+            &sink,
+            SessionEvent::TransactionStateChanged {
+                session,
+                possibly_active: true,
+            },
+        );
+        assert_eq!(
+            queue.len(),
+            5,
+            "a transaction state is admitted over the cap when there is none to fold into"
+        );
+        assert_eq!(
+            queue.dropped_unsolicited(),
+            1,
+            "and admitting it is not a drop"
+        );
+
+        // A second one folds into the first, so the class costs one event.
+        emit(
+            &sink,
+            SessionEvent::TransactionStateChanged {
+                session,
+                possibly_active: false,
+            },
+        );
+        assert_eq!(queue.len(), 5, "the class is bounded at one over the cap");
+
+        let states: Vec<bool> = std::iter::from_fn(|| queue.next())
+            .filter_map(|event| match event {
+                SessionEvent::TransactionStateChanged {
+                    possibly_active, ..
+                } => Some(possibly_active),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(states, vec![false], "with the newest value it computed");
+    }
+
+    /// Lines lost with no later `ServerOutput` to ride out on stay readable,
+    /// so a consumer can still say "output truncated" for a session that went
+    /// quiet or ended.
+    #[test]
+    fn dropped_lines_with_no_later_output_stay_readable_per_session() {
+        let (sink, queue) = event_channel(caps(1));
+        let session = SessionId::allocate();
+        emit(&sink, output(session, 2));
+        emit(&sink, output(session, 5));
+        emit(&sink, output(session, 4));
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.pending_dropped_lines(session), 9);
+        assert_eq!(
+            queue.pending_dropped_lines(SessionId::allocate()),
+            0,
+            "a session this queue has never heard of has lost nothing"
+        );
+
+        // Draining the survivor does not clear the debt: it was recorded after
+        // that event was already stamped.
+        let _ = queue.next();
+        assert_eq!(queue.pending_dropped_lines(session), 9);
+
+        emit(&sink, output(session, 1));
+        match queue.next().expect("the next delivered output") {
+            SessionEvent::ServerOutput { dropped, .. } => assert_eq!(dropped, 9),
+            other => panic!("expected ServerOutput, got {other:?}"),
+        }
+        assert_eq!(queue.pending_dropped_lines(session), 0);
     }
 
     #[test]

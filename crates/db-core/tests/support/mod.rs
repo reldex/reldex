@@ -22,6 +22,7 @@
 #![allow(dead_code)]
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -173,6 +174,25 @@ pub(crate) fn drain_n(queue: &EventQueue, count: usize) -> Vec<SessionEvent> {
     drain_until(queue, |seen| seen.len() >= count)
 }
 
+/// Waits until `ready` says so, under [`HANG_GUARD`].
+///
+/// For a side effect that is produced by *another* thread and is therefore
+/// not observable the instant the effect that triggered it is: a waker call
+/// happens after the producer has let go of the lock the consumer was woken
+/// from, so asserting on its count straight after a drain returns is a race.
+/// This is never a timing assertion — a correct implementation gets here in
+/// microseconds and the guard only stops a hang from blocking the suite.
+pub(crate) fn wait_for(what: &str, ready: impl Fn() -> bool) {
+    let deadline = Instant::now() + HANG_GUARD;
+    while !ready() {
+        assert!(
+            Instant::now() < deadline,
+            "{what} did not happen within the hang guard"
+        );
+        thread::yield_now();
+    }
+}
+
 /// Drains until this session's `Terminal` has been delivered.
 pub(crate) fn drain_to_terminal(queue: &EventQueue) -> Vec<SessionEvent> {
     drain_until(queue, |seen| seen.iter().any(SessionEvent::is_terminal))
@@ -223,6 +243,10 @@ pub(crate) struct Session {
     next_request: Cell<u64>,
     /// Events taken off the queue while looking for a particular reply.
     stashed: RefCell<Vec<SessionEvent>>,
+    /// How many replies each request has produced. The shim checks ordering
+    /// rule 2 for every test that uses it, so a duplicate reply fails the
+    /// suite instead of being quietly stashed and ignored.
+    replies_seen: RefCell<HashMap<u64, usize>>,
     terminal_seen: Cell<bool>,
 }
 
@@ -231,6 +255,29 @@ impl Deref for Session {
 
     fn deref(&self) -> &Self::Target {
         &self.inner
+    }
+}
+
+impl Drop for Session {
+    /// Nothing may be left over. Every reply this shim took off the queue was
+    /// taken because a test asked for it, so a reply still sitting in `stashed`
+    /// is one nobody asked for — a second answer to some request, or an answer
+    /// to a request that was never submitted. Either breaks ordering rule 2,
+    /// and without this the 40-odd shared tests would never notice.
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // The test is already failing; a second panic here would abort.
+            return;
+        }
+        let stashed = self.stashed.borrow();
+        let leftover: Vec<&SessionEvent> = stashed
+            .iter()
+            .filter(|event| event.is_reply())
+            .collect::<Vec<_>>();
+        assert!(
+            leftover.is_empty(),
+            "replies nobody asked for were left on the queue: {leftover:#?}"
+        );
     }
 }
 
@@ -266,6 +313,7 @@ impl Session {
             queue,
             next_request: Cell::new(1),
             stashed: RefCell::new(Vec::new()),
+            replies_seen: RefCell::new(HashMap::new()),
             terminal_seen: Cell::new(false),
         }
     }
@@ -293,12 +341,44 @@ impl Session {
         RequestId(id)
     }
 
+    /// Records one event taken off the queue, checking ordering rule 2 as it
+    /// goes: a request that is answered twice fails here rather than leaving a
+    /// second reply sitting unnoticed in `stashed`.
+    fn stash(&self, event: SessionEvent) {
+        if event.is_terminal() {
+            self.terminal_seen.set(true);
+        }
+        if event.is_reply()
+            && let Some(request) = event.request()
+        {
+            let mut seen = self.replies_seen.borrow_mut();
+            let times = seen
+                .entry(request.0)
+                .and_modify(|times| *times += 1)
+                .or_insert(1);
+            assert_eq!(
+                *times, 1,
+                "{request} was answered more than once; ordering rule 2 says exactly one reply \
+                 per accepted request"
+            );
+        }
+        self.stashed.borrow_mut().push(event);
+    }
+
     fn take_stashed_reply(&self, request: RequestId) -> Option<SessionEvent> {
         let mut stashed = self.stashed.borrow_mut();
-        let found = stashed
+        let found: Vec<usize> = stashed
             .iter()
-            .position(|event| event.is_reply() && event.request() == Some(request))?;
-        Some(stashed.remove(found))
+            .enumerate()
+            .filter(|(_, event)| event.is_reply() && event.request() == Some(request))
+            .map(|(index, _)| index)
+            .collect();
+        assert!(
+            found.len() <= 1,
+            "{request} has {} replies waiting; exactly one was promised",
+            found.len()
+        );
+        Some(stashed.remove(*found.first()?))
     }
 
     /// Drains until `request`'s single reply arrives, keeping everything else
@@ -316,10 +396,7 @@ impl Session {
                 "no reply for {request} arrived within the hang guard"
             );
             if let Some(event) = queue.wait_timeout(remaining) {
-                if event.is_terminal() {
-                    self.terminal_seen.set(true);
-                }
-                self.stashed.borrow_mut().push(event);
+                self.stash(event);
             }
         }
     }
@@ -335,10 +412,7 @@ impl Session {
                 "no Terminal arrived within the hang guard"
             );
             if let Some(event) = queue.wait_timeout(remaining) {
-                if event.is_terminal() {
-                    self.terminal_seen.set(true);
-                }
-                self.stashed.borrow_mut().push(event);
+                self.stash(event);
             }
         }
     }

@@ -439,15 +439,17 @@ impl SessionLimits {
     };
 
     /// How many event-path requests one session may have accepted and
-    /// unanswered before [`DatabaseSession::submit_execute`] and its siblings
-    /// refuse another.
+    /// **undrained** before [`DatabaseSession::submit_execute`] and its
+    /// siblings refuse another.
     ///
     /// This is what bounds the reply events one session can put in an
-    /// [`crate::EventQueue`]: every accepted request produces exactly one, so
-    /// capping the requests caps the queue. 1,024 is far more than a worksheet
-    /// ever has in flight (a handful of fetches, at most) and small enough
-    /// that a runaway submitter is reported rather than allowed to grow the
-    /// queue without limit.
+    /// [`crate::EventQueue`]: a request takes a slot when it is accepted and
+    /// gives it back when the consumer takes its reply *out of* the queue, so
+    /// a consumer that stops draining stops the submitter rather than letting
+    /// the queue grow. 1,024 is far more than a worksheet ever has in flight
+    /// (a handful of fetches, at most) and small enough that a runaway
+    /// submitter is reported rather than allowed to grow the queue without
+    /// limit.
     ///
     /// It does **not** apply to [`Completion`]-path calls: those hold their
     /// reply in the caller's own `Completion`, so they are bounded by the
@@ -753,12 +755,25 @@ impl DatabaseSession {
     /// already routes its events somewhere: a second queue would split one
     /// session's event stream in two and break the per-session ordering the
     /// first consumer was promised.
+    ///
+    /// [`reldex_db_driver_api::ErrorKind::Resource`] if this session has
+    /// already announced its end. [`crate::SessionEvent::Terminal`] is emitted
+    /// once, at the transition; a queue bound afterwards would never receive
+    /// one, so the bind is refused instead of handing back a stream that can
+    /// only fail request by request.
     pub fn bind_events(&self, sink: EventSink) -> DbResult<()> {
         self.shared.bind_events(sink)
     }
 
-    /// How many event-path requests this session has accepted and not yet
-    /// answered, against [`SessionLimits::max_outstanding_requests`].
+    /// How many event-path requests this session has accepted and whose reply
+    /// the consumer has not yet taken out of the queue, against
+    /// [`SessionLimits::max_outstanding_requests`].
+    ///
+    /// A request still counts once the worker has answered it and until the
+    /// reply is drained — that is what makes the limit bound the queue — so
+    /// this is "work this session has in the consumer's hands", not "work the
+    /// worker is busy with". Dropping the [`crate::EventQueue`] releases every
+    /// slot it held, so this falls back to zero.
     ///
     /// A snapshot, for diagnostics and for a caller that wants to throttle
     /// before it is refused.
@@ -770,6 +785,13 @@ impl DatabaseSession {
     /// Submits a statement; its reply is one
     /// [`crate::SessionEvent::Executed`] carrying `request`, preceded by one
     /// [`crate::SessionEvent::Executing`] when the worker starts it.
+    ///
+    /// Returns as soon as the command is queued; the reply is produced on the
+    /// worker thread. One exception is worth knowing about for a consumer with
+    /// a [`crate::Waker`]: when the command cannot be delivered at all — the
+    /// session has already ended — the failure event is produced *here*, on
+    /// the calling thread, and if it fills an empty queue this call also runs
+    /// the waker before returning. See [`crate::Waker`].
     ///
     /// # Errors
     ///

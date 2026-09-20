@@ -1,7 +1,7 @@
 # M2.5 — `EventQueue` / `EventSink` / `SessionEvent` / `Waker` + the `ReplyTo` refactor
 
-**Status:** implemented in `db-core`, pending review
-**Date:** 2026-09-20
+**Status:** implemented in `db-core`; independent review round 1 done, must-fixes applied (§5)
+**Date:** 2026-09-20, revised 2026-09-21
 **Spec:** [`phase-1.md`](phase-1.md) §B2 · **Decision record:**
 [ADR-0002](../../decisions/0002-driver-api-and-concurrency-model.md) amendment E1–E6 ·
 **Architecture:** [`ARCHITECTURE.md`](../../architecture/ARCHITECTURE.md) §6
@@ -125,7 +125,7 @@ event was produced. A `SessionEvent` variant the header does not know maps to `R
 | `retire_results` / `released` / `lost` holders, so the pump never frees a caller's strings | unchanged, and still `crates/ffi`'s job: the core hands out owned `ColumnMetadata` in `ExecuteOutcome`, not borrowed pointers | `event_payloads.rs::an_executed_event_describes_the_result_columns_…` |
 | result id carried on synthesised failures | `Fetched.result`, `Completed(CloseResult)`, `LobChunk.lob` — all set on the failure path | `event_payloads.rs::a_fetch_and_a_result_close_name_their_result_…` |
 | session-lost detection read off `session.session_state()` per event | `SessionEvent::Terminal`, once, with the cause | `event_terminal.rs::a_lost_session_yields_exactly_one_terminal_…` |
-| `shut_down()` on hub destroy | `EventQueue` drop; the worker is never joined (ADR-0003 A17 holds) | `event_shutdown.rs` |
+| `shut_down()` on hub destroy | `EventQueue` drop: the stream ends, everything queued is discarded and every reply slot released; the worker is never joined (ADR-0003 A17 holds) | `event_shutdown.rs`, `event_backpressure.rs::dropping_the_queue_releases_every_slot_it_was_holding` |
 
 M2.11 keeps `crates/ffi`'s registry, its arena, its batch and error ownership and its re-entrancy
 guard unchanged; what it deletes is `pump_main`, `pump_body`, `run_command`, `PumpCommand`,
@@ -138,7 +138,7 @@ guard unchanged; what it deletes is `pump_main`, `pump_body`, `run_command`, `Pu
 ## 4. Deviations from §B2, and interpretations
 
 Recorded here so a reviewer does not have to diff the spec by eye. Each one is argued in ADR-0002
-E1–E5.
+E1–E6, and all eight were upheld at review round 1.
 
 1. **`Fetched`, `LobChunk` and `Completed` carry what they are *about*.** §B2 writes
    `Fetched { session, request, batch }` and `Completed { session, request, result }`. They now also
@@ -157,25 +157,148 @@ E1–E5.
    ordered before `Terminal` without blocking submission, which `SPEC.md` §11/§19 forbids. The
    implemented guarantee is the deterministic one — everything in the queue at the transition — and
    the concurrent case falls under rule 3's own "may follow `Terminal`".
-4. **`TransactionStateChanged` coalesces rather than ever dropping.** §B2 says unsolicited events
-   *"use a bounded per-session ring with coalescing"*. Applied to a *state*, coalescing in place is
-   strictly better than dropping, and it means this class can never reach the cap; the price is
-   that a coalesced value is delivered at the earlier of the two positions. `ServerOutput` is the
-   only class that can be dropped, and it is the only one carrying `dropped`.
+4. **`TransactionStateChanged` is exempt from the cap, not merely coalesced.** §B2 says unsolicited
+   events *"use a bounded per-session ring with coalescing"*. Applied to a *state*, coalescing in
+   place is strictly better than dropping; the price is that a coalesced value is delivered at the
+   earlier of the two positions. Coalescing **alone was not enough**, and review round 1 found the
+   hole: with no state change queued to fold into, a session at its cap on `ServerOutput` had its
+   next `TransactionStateChanged` dropped, so a UI could show Commit and Rollback disabled over a
+   live transaction. The class is now admitted over the cap when there is nothing to fold into,
+   which bounds it at one event per session. `ServerOutput` is the only class that can be dropped,
+   and it is the only one carrying `dropped`.
 5. **A drop refuses the incoming event, not the oldest queued one.** §B2 says "ring", which
    conventionally evicts the oldest. In a shared FIFO that is O(n) and it discards the *start* of a
    PL/SQL run, which is where the error usually is. The conservative reading — keep what is already
    promised, refuse the new one, report the loss on the next event that gets through — is what is
    implemented.
-6. **`bind_events` returns `DbResult<()>` and refuses a second bind.** §B3 sketches
-   `fn bind_events(&self, sink: EventSink)` returning unit. §B3 is M2.6's section; a silent rebind
-   would split one session's stream across two consumers and make rule 1 unenforceable, so it is a
-   reported failure.
-7. **`max_outstanding_requests` bounds the event path only.** §B2 introduces it to bound *reply
-   events*. Applying it to `Completion` calls would change behaviour ADR-0002 K9 fixed on purpose
-   (the command queue is unbounded so `execute` never blocks the caller), and no reply event is
-   produced for those.
+6. **`bind_events` returns `DbResult<()>`, and refuses both a second bind and a session that has
+   already ended.** §B3 sketches `fn bind_events(&self, sink: EventSink)` returning unit. §B3 is
+   M2.6's section; a silent rebind would split one session's stream across two consumers and make
+   rule 1 unenforceable. The second refusal came out of review round 1: `Terminal` is emitted once,
+   at the transition, so a queue bound after it would never receive one and the consumer would see
+   a stream that only ever fails, request by request.
+7. **`max_outstanding_requests` bounds the event path only, and counts *undrained* replies.** §B2
+   introduces it to bound *reply events*. Applying it to `Completion` calls would change behaviour
+   ADR-0002 K9 fixed on purpose (the command queue is unbounded so `execute` never blocks the
+   caller), and no reply event is produced for those. Review round 1 showed the original release
+   point — when the worker produced the reply — bounded nothing measurable, so the slot is now held
+   until the consumer drains that reply; see §5.
 8. **The drop-count tests are unit tests, not integration tests.** `ServerOutput`'s producer is
    M2.7, so the only way to reach the drop policy today is from inside the crate. The tests live in
    `crates/db-core/src/events.rs`; `crates/db-core/tests/event_backpressure.rs` covers the
    integration-visible half (a reply is never dropped, whatever the cap).
+
+---
+
+## 5. Review round 1: what changed
+
+The independent review could not break exactly-once empirically (200 × 91 concurrent requests
+racing a close, 300 concurrent double-closes, eight-session fan-in, a panicking waker on an
+unwinding worker), found lock ordering clean and reproduced the numbers in §2. It found three
+must-fixes and a list of should-fixes; all are applied.
+
+**Must-fix.**
+
+1. **`TransactionStateChanged` could still be dropped.** Coalescing only ran when one was already
+   queued for that session; otherwise the generic cap check refused it. Reachable once M2.7 lands:
+   256 undrained `ServerOutput` events, then an `INSERT`, and the "a transaction is open" event is
+   gone. It is now admitted over the cap when there is nothing to fold into, bounding the class at
+   one event per session. Test:
+   `events.rs::a_transaction_state_change_is_never_lost_to_a_server_output_burst` — the mixed case
+   neither single-class test covered.
+2. **`max_outstanding_requests` bounded nothing.** The slot was released when the worker *produced*
+   the reply, so a never-draining consumer plus a retry-on-`Resource` submitter reached
+   `queue.len() = 5000` with the counter at zero, while four documents claimed the queue was
+   bounded. The counter is now shared between the session and the queue, which carries an `Arc` of
+   it on the queued reply itself, and it is released on the **pop**, under the queue's own mutex (a
+   single atomic — no new lock, no ordering edge). New semantics, exactly: a slot is taken when a submit returns `Ok` and given back when
+   the consumer takes that request's reply out of the queue — the slot rides on the queued event
+   itself, so the reply path touches no per-session map; `outstanding_requests()` means
+   "accepted and not yet drained"; dropping the `EventQueue` discards everything in it, releases
+   every slot it held, and discards later events on arrival, so a session that outlives its
+   consumer keeps working and is bounded from then on by what its worker has not yet reached.
+   Tests: `event_backpressure.rs::a_consumer_that_never_drains_stops_the_submitter_rather_than_the_queue_growing`,
+   `…::dropping_the_queue_releases_every_slot_it_was_holding`,
+   `…::a_session_that_ends_with_undrained_replies_frees_its_slots_when_they_are_drained`.
+3. **A flaky waker test.** The consumer returns from `wait_timeout` on the condvar notify issued
+   inside the push, while the producer calls the waker only after releasing the emit lock — which
+   is the contract — so asserting the count the instant the drain returned was a race (reproduced
+   1 in 40 under contention). It now waits on the counter under the hang guard
+   (`support::wait_for`). The audit found no other test asserting a cross-thread side-effect count
+   straight after a drain; the assertions on `outstanding_requests()` that followed a drain became
+   *more* deterministic under fix 2, because the release now happens on the draining thread.
+
+**Should-fix.** A close that lost a race reported `CloseError::Failed` on a session that had closed
+cleanly (measured at 7.7% of 300 concurrent double-closes); `CloseReplyTo`'s `Drop` now answers
+`Ok(())` when the session has ended and is not `Lost`
+(`event_terminal.rs::concurrent_closes_all_report_success_on_a_cleanly_closed_session`,
+`…::a_close_after_a_lost_session_still_reports_the_loss`). `bind_events` after the terminal
+transition is refused (`…::binding_a_queue_after_the_session_ended_is_refused`). Rule 1 is
+documented as *production* order, with the consequence spelled out for consumers (§B2, `events.rs`,
+ADR-0002 E3, and §6 below). A pending `ServerOutput` drop count with no later output to ride on is
+readable through `EventQueue::pending_dropped_lines(session)`. The `both_paths!` test shim now fails
+on a duplicate reply or a leftover one instead of stashing it silently. The waker's possible
+execution on a *submitting* thread, and the self-deadlock of calling `set_waker` from inside a wake,
+are on the `Waker` contract. `announce_terminal` propagates the inner close's `Flow` behind a
+`debug_assert!` instead of hard-coding `Flow::Exit`. Nits: no empty per-session entry is left behind
+by a refused event, `wait_timeout(Duration::MAX)` blocks instead of returning immediately, and
+`is_empty` takes one lock.
+
+**Re-measured, with a caveat that matters.** The accounting now runs on the pop path, so §2.2 was
+re-taken: **606 / 629 / 643 ns** per event with one producer and **431 / 442 / 456 ns** with eight.
+Those are *not* comparable to §2.2's columns, because the machine was running an unrelated build
+throughout: the one benchmark M2.5 never touched — the 1M-row FFI stream of §2.1, still on the
+interim pump and `Completion<T>` — measured **3.43 s** against the 1.35 s / 1.61 s recorded there,
+so everything timed in this window is roughly twice its earlier figure. Read the numbers as "the
+same shape, on a machine half as fast", and re-take §2.2 on a quiet machine if the figure is ever
+load-bearing. What is *not* load-dependent is unchanged: **0.033 allocations per event**.
+
+One comparison inside that window is like for like and did drive a change. The first implementation
+of the slot accounting kept a per-session tally in the queue's `sessions` map, which put a hash
+lookup on both the push and the pop of every reply — the hot path — and measured 589 / 594 / 612 ns
+at eight producers. Carrying the slot **on the queued event itself** instead measured 431 / 442 /
+456 ns in the same window, and is also the safer shape: a reply cannot release a slot it was not
+holding, and the slot cannot outlive its event whichever way the queue ends. The map is back to
+serving only the unsolicited drop policy. Net cost of the bound on the reply path: one `Arc` clone
+on push, one `Arc` drop and one `fetch_update` on pop.
+
+---
+
+## 6. Locked in for M2.6 and M2.11
+
+Decided here, while the reasons are in front of us, so neither task re-litigates them.
+
+### M2.6 — registry, non-blocking open, abandon
+
+* `worker::spawn` should take a **pre-built, already-sink-bound `Arc<SessionShared>`** rather than
+  building one itself. The registry can then emit `Opened` / `OpenFailed` through the same
+  per-session emit lock as everything else, before a worker exists, which is what keeps ordering
+  rule 1 true for a session's very first events. `SessionShared::new` already takes the `SessionId`,
+  and `bind_events` is already independent of the worker, so the change is a parameter swap. It was
+  **not** done in M2.5: `spawn` still blocks on its ready channel, and splitting that is M2.6's
+  actual work, so moving the signature now would be a change with no test to hold it.
+* Give the connect reply the `ReplyTo` treatment. `abandon` then yields exactly one
+  `OpenFailed { Cancelled }` from the same `Drop` mechanism as every other request, instead of a
+  second bespoke path — and reserve the open request through `reserve_request` so it is bounded
+  like the rest.
+* Define `Terminal` for a session abandoned **before** it opened. The flag lives on
+  `SessionShared`, so the registry can emit it without a worker; what needs deciding is the
+  `lifecycle` it carries (`Closed` if the abandon won, `Lost` if the connect failed first).
+* Anything that emits a `SessionEvent::is_reply()` event must go through `SessionShared::emit_reply`,
+  or the slot accounting drifts. A `debug_assert!` on `EventSink::push_reply` catches it in tests.
+
+### M2.11 — the FFI switch
+
+* Delete the hub's own waker `RwLock` and delegate to `EventQueue::set_waker`; it is the same
+  mechanism, and one copy cannot drift from the other.
+* **Never call `set_waker` from inside `wake()`** — read lock inside write lock, self-deadlock. It
+  is on the `Waker` contract.
+* A budgeted `drain_into` that stops early gets **no further wake**: the queue is not empty, so
+  there is no edge. The adapter must re-post its own drain, exactly as ADR-0003 D5 says.
+* The waker may fire **on the thread that submitted a request** (a submit that cannot deliver its
+  command synthesises its own failure event). The re-entrancy guard has to tolerate that, including
+  the case where that thread is the UI thread.
+* `RequestId` is caller-chosen and unchecked by the core. The FFI allocates one per hub and never
+  reuses a live one.
+* Route strictly by `RequestId`; retire a session's state on `Terminal` only. Delivery is production
+  order, not acceptance order, so "every earlier request looks answered" is not a fact.
