@@ -71,6 +71,7 @@ template<typename T>
 [[nodiscard]] inline ReldexColumnInfo makeColumnInfo() noexcept { return sized<ReldexColumnInfo>(); }
 [[nodiscard]] inline ReldexErrorView makeErrorView() noexcept { return sized<ReldexErrorView>(); }
 [[nodiscard]] inline ReldexArenaView makeArenaView() noexcept { return sized<ReldexArenaView>(); }
+[[nodiscard]] inline ReldexLiveCounts makeLiveCounts() noexcept { return sized<ReldexLiveCounts>(); }
 [[nodiscard]] inline ReldexOpenOptions makeOpenOptions() noexcept
 {
     ReldexOpenOptions options = sized<ReldexOpenOptions>();

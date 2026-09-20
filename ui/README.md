@@ -72,10 +72,12 @@ ui/tests/                     QTest binaries, run via CTest
   tst_coreinfo.cpp             ABI version + Main.qml loads offscreen with no QML warning
   tst_bridge.cpp               drain budget/re-post, re-entrancy, deleteLater, error model,
                                blocked statement, routing
-  tst_resultmodel.cpp          QAbstractItemModelTester, cell content, fetchMore, window cache,
-                               row ceiling, re-execute mid-stream
-  tst_teardown.cpp             spike criterion K5: 10,000 teardowns under a flood
-  AdapterTestSupport.h         spin helpers + the mock's generated values, restated
+  tst_resultmodel.cpp          QAbstractItemModelTester, cell content, headers before the first
+                               row, empty result, fetchMore, window cache, row ceiling,
+                               re-execute mid-stream, live-count leak checks
+  tst_teardown.cpp             spike criterion K5: 10,000 teardowns under a flood, asserted
+                               with reldex_live_counts
+  AdapterTestSupport.h         spin helpers, live-count baselines, the mock's values restated
 ui/tests/ffi_smoke/           Qt-free C/C++ smoke harness for reldex-ffi (M1.4);
                               see "The ffi_smoke harness" below
 ui/build.sh                   One-command build (bash-first; see AGENTS.md)
@@ -114,13 +116,24 @@ Roles are deliberately two: `display` and `isNull`, because NULL, empty and
 taken are three different states and a grid must visualize the difference
 rather than trust the text.
 
-Column names reach QML through a notifying `columnNames` property rather than
-through `headerData()`. A QML binding on `model.headerData(...)` evaluates
-once — before the first batch has brought the names, because the *count* comes
-from the `EXECUTED` event and the *names* come from a batch (ADR-0003 A6) — and
-never re-evaluates, since `headerDataChanged` is a model signal, not a
-property-change signal. The header showed "1", "2", "3". The headless QML test
-in `tst_coreinfo` found that; reasoning about it had not.
+**Headers come from the result, not from a batch.** ABI 3 added
+`reldex_session_result_column_count` / `reldex_session_result_column`, which
+answer from the moment the `EXECUTED` event is drained. `SessionController`
+reads the whole description there and hands it to `beginResult()`, so the model
+gets its count *and* its names in one step, inside one reset, before a single
+row exists. What that deleted: the two-phase header, the mid-stream reset for
+the case where the event's `column_count` and the first batch disagreed, the
+late `headerDataChanged`, and `m_columnCount` as a second source of truth
+(`columnCount()` is now `m_columns.size()`, so the two cannot disagree). It
+also made a result with **columns and no rows** representable at all — such a
+result never produces a batch to read a header from.
+
+Column names still reach QML through a notifying `columnNames` property rather
+than through `headerData()`, and that part is not a workaround: a QML binding
+on `model.headerData(...)` never re-evaluates, because `headerDataChanged` is a
+model signal and not a property-change signal, so a header row bound that way
+would keep whatever it read on the previous result. The headless QML test in
+`tst_coreinfo` found that; reasoning about it had not.
 
 ### What `data()` is allowed to touch
 
@@ -146,12 +159,25 @@ needs two renders.
 
 Grep proof — every `reldex_*` call in `ResultTableModel.cpp`:
 
-| line | function | called from |
+| function | what for | called from |
 | --- | --- | --- |
-| `reldex_batch_column` | describe a column once | `applyBatch()` |
-| `reldex_batch_column_count` / `reldex_batch_column_info` | column names | `readColumnHeaders()` |
+| `reldex_batch_column` | describe a column once per batch | `applyBatch()`, rows > 0 only |
 | `reldex_text_arena_create` / `reldex_batch_format_column` / `reldex_text_arena_view` | render one (batch, column, window) | `hydrate()` |
 | `reldex_batch_release` / `reldex_text_arena_release` | RAII deleters in `ReldexHandles.h` | destruction |
+
+That is the whole list — `reldex_batch_column_count` and
+`reldex_batch_column_info` are gone from this file, because the header no
+longer comes from a batch. Column descriptions are read once per *result*, in
+`SessionController::readResultColumns()`, with
+`reldex_session_result_column_count` and `reldex_session_result_column`.
+
+**`reldex_batch_column_fixed` is deliberately never called.** ABI 3 made
+`reldex_batch_column` allocation-free: for `NUMBER` and `TIMESTAMP` it leaves
+`fixed` NULL and reports only `fixed_stride`, and the element array is built
+only if someone asks for it — 46 B/row for `NUMBER`, 16 B/row for a timestamp,
+retained until the batch is released. This adapter renders every non-text kind
+through the bulk formatter, so it would never read those arrays. Not calling it
+is what closed the K3 gap measured in round 1 (see the numbers below).
 
 ### Caching and its memory bound
 
@@ -297,6 +323,25 @@ RELDEX_UI_SANITY_1M=1 ./build/ui-RelWithDebInfo/tst_resultmodel.exe \
   sanityStreamOfAMillionRows -o run.txt,txt
 ```
 
+**Two things `QAbstractItemModelTester` does that a test has to plan around.**
+It re-runs its whole suite on every `rowsInserted`, and that suite **walks the
+model's rows** — so attaching it to a long stream makes the *test* quadratic,
+not the model (a 200,000-row stream went from under a second to minutes).
+It also calls `fetchMore()` itself, from `nonDestructiveBasicTest()`, so with a
+tester attached the model drives its own stream no matter what `autoFetch`
+says; a test that needs "no rows have arrived yet" has to sample that from a
+signal emitted before the first fetch, not from a wait. Both were found by
+tests flaking, not by reading Qt's source first.
+
+**K5 iteration count on CI.** `tst_teardown` keeps its full 10,000 + 2,000
+iterations on CI: 6.3 s here, and even an order of magnitude slower on a
+two-core runner leaves the `qt-build` job's 25-minute budget untouched.
+`RELDEX_UI_TEARDOWN_ITERATIONS` / `RELDEX_UI_TEARDOWN_CONNECT_ITERATIONS` are
+the lever if the first real Linux/macOS run says otherwise. The live-count
+waits in that test use a 300-second hang guard for the same reason — it waits
+for up to 10,000 pump threads to finish (A17), and that is a hang guard, not a
+latency bound.
+
 **Reading a test's own output on this machine:** a Qt test binary's stdout does
 not reach a redirected file or a pipe from Git Bash or PowerShell here (the
 same class of problem as `phase-1-toolchain.md` §12 gotcha 4; CTest's
@@ -312,51 +357,56 @@ Dev machine, Windows 11, MSVC 14.44, Qt 6.8.3, `RelWithDebInfo`, mock driver,
 guiless (no scene graph), 1,000,000 rows of the S14 shape, 1,000 rows per
 fetch, 2 fetches in flight:
 
-- streamed into the model in **451–485 ms**;
-- RSS grew by **~176–182 MB** (~176–182 B/row; private bytes ~178 B/row) —
-  under K3's 200 MB, but well above the ADR's ~116 B/row estimate, and this is
-  *without* a scene graph. M1.8 should expect K3 to be the tight one (the cause
-  is diagnosed below);
+- streamed into the model in **453–470 ms**;
+- RSS grew by **113.0–118.1 MB** (113–118 B/row), private bytes by
+  **113.7–119.5 MB** (114–120 B/row) — comfortably under K3's 200 MB and at or
+  below the ADR's own ~116 B/row estimate, and this is *without* a scene graph;
 - a cold 40-row × 3-column viewport (which renders two 1,024-row windows
-  through the bulk formatter) took **~248 µs**; the same viewport warm averaged
-  **~100 ns/cell**, against K4's 200 ns budget. The formatted-text cache held
-  **2 windows / 41 KB** at the end of that — the bound in action on a
-  1,000,000-row result;
-- K5: **10,000 teardowns under a flood in 6.85 s** (0.685 ms each), RSS +2.6 MB
-  across the whole loop.
+  through the bulk formatter) took **~240–261 µs**; the same viewport warm
+  averaged **99.4–100.9 ns/cell**, against K4's 200 ns budget. The
+  formatted-text cache held **2 windows / 41,016 bytes** at the end of that —
+  the bound in action on a 1,000,000-row result;
+- K5: **10,000 teardowns under a flood in 6.34 s** (0.634 ms each), RSS +2.5 MB
+  across the whole loop, and — new in ABI 3 — `reldex_live_counts` back to its
+  baseline of zero hubs, sessions, batches, errors and arenas.
 
 And with the real app (`Reldex.exe`, scene graph, a `TableView` on screen),
 sampled from outside the process:
 
-- idle, nothing executed: **76 MB** working set, flat;
-- after the 1,000,000-row query (CPU flat by ~2 s, working set flat by ~4 s):
-  **307 MB**, stable out to 40 s — a growth of **~231 MB**.
+- idle, nothing executed: **76.2 MB** working set / **82.5 MB** private, flat;
+- after the 1,000,000-row query (flat from ~27 s, stable out to 72 s):
+  **247.5 MB** working set / **224.1 MB** private — a growth of **171.3 MB**
+  working set, **141.5 MB** private.
 
-**This is the number M1.8 should look at first.** K3's threshold is 200 MB of
-RSS growth for 1M rows and both measurements are near or past it (~180 MB
-headless, ~231 MB with the UI). The formatted-text cache is not the cause — it
-is bounded at about 1.2 MB for this shape. What costs the memory is the
-*retained fetched prefix*: ADR-0003 D4 has the MVP keep every batch it has
-fetched, so a scrolled-through million-row result holds a million rows of batch
-memory.
+**K3 went from "the tight one" to "clear with headroom", and the cause is worth
+recording.** Round 1 of this task measured ~181 B/row headless and ~231 MB of
+in-app growth, both near or past K3's 200 MB threshold. The independent review
+diagnosed it — not `Vec` capacity slack, and not on this side of the boundary:
+`applyBatch()` calls `reldex_batch_column` once per column, and under ABI 2 a
+`NUMBER` or `TIMESTAMP` column answered by building and then **retaining** a
+`#[repr(C)]` mirror (46 B/row and 16 B/row) that this adapter never reads,
+because those kinds go through the bulk formatter. Measured directly at the
+time: 111.7 B/row with no column viewed, 183.3 B/row with all three viewed.
 
-The gap between the measured ~181 B/row and the ADR's ~116 B/row estimate has
-since been **diagnosed** (independent review of this task, same machine and
-build): it is not `Vec` capacity slack, and it is not on this side of the
-boundary. `applyBatch()` calls `reldex_batch_column` once per column, and for
-`NUMBER` and `TIMESTAMP` columns `crates/ffi` answers by building and then
-**retaining** a `#[repr(C)]` mirror of that column — 46 B/row for `ReldexNumber`
-and 16 B/row for the timestamp — which the adapter never reads, because those
-kinds go through the bulk formatter instead. Measured directly: **111.7 B/row**
-with no column viewed, **183.3 B/row** with all three viewed. The two mirrors
-account for the whole difference.
+ABI 3 fixed it in the producer (amendment A19): `reldex_batch_column` allocates
+nothing, `fixed` is NULL for those kinds, and the mirror is built only by the
+new `reldex_batch_column_fixed`, which this adapter does not call. The adapter
+needed no change for it, which is the point — the numbers above are the same
+code paths measured against the new boundary. Per the ADR: "K1/K3 failure with
+a *diagnosed* cause in the model (not the boundary) is a design fix, not a
+kill." It was, and it was fixed.
 
-The fix belongs in `crates/ffi` (do not materialize a mirror a caller has not
-asked for, or drop it once the view is released), and the lead is doing it in a
-separate ABI round; no adapter-side workaround was added here, because working
-around it would mean *not* taking column views, which is the thing the
-zero-copy `isNull`/text path is built on. Per the ADR: "K1/K3 failure with a
-*diagnosed* cause in the model (not the boundary) is a design fix, not a kill."
+What remains is still the *retained fetched prefix*: ADR-0003 D4 has the MVP
+keep every batch it has fetched, so a scrolled-through million-row result holds
+a million rows of batch memory. That is ADR-0004 (result store) territory, and
+K3 now passes without it. The formatted-text cache is not a factor either way —
+it is bounded at about 1.2 MB for this shape, and held 41 KB in practice.
+
+One in-app number worth flagging for M1.8: the 1,000,000-row stream takes
+**~25 s with the scene graph running** against ~0.46 s headless. Nothing blocks
+— the window stays responsive throughout — but that is a K1/K2 question
+(how much UI-thread time a drain competes for) rather than a K3 one, and it is
+M1.8's to measure properly with `RELDEX_UI_METRICS=1`.
 
 No frame-time number is claimed: K1 needs a real swapchain and a scrolling
 window driven by a human or a harness, which is M1.8's job on the dev machine,
@@ -377,11 +427,28 @@ Building 32-bit instead is not an option: the installed Qt is
 Getting it would mean installing the "C++ AddressSanitizer" component into the
 Visual Studio installation — a machine-level change, which this repository's
 scripts and tasks do not make. Linux ASan/UBSan in CI (ADR-0003 D2/D10) is the
-intended home for this and is being arranged separately. Until then, the
-evidence for K5 is: the RAII handles in `ReldexHandles.h` (structurally
-exactly-once release), the 12,000-iteration teardown test above, and the flat
-RSS across it. `reldex.h` offers no create/release counter to assert against,
-so nothing stronger is claimed.
+intended home for this and is being arranged separately (the `ffi-smoke` job in
+`.github/workflows/ui.yml` already runs its ubuntu leg under
+ASan+UBSan with `detect_leaks=1`, on the Qt-free C/C++ harness).
+
+It matters less than it did. ABI 3 added `reldex_live_counts`, which reports
+how many hubs, sessions, batches, errors and arenas the library holds — so K5's
+leak claim is now an **assertion** rather than an argument from RSS. Every
+teardown test takes a baseline before it starts and waits for the counts to
+return to it: the 10,000-iteration flood, the connect-window variant, the
+`deleteLater()`-mid-drain teardown, the error path, and the mid-stream result
+reset. Two details the header is explicit about and the tests follow:
+
+- it is always a **wait**, never an immediate compare, because A17 says
+  `reldex_hub_destroy` does not join the session pump threads;
+- the baseline is taken **before** anything is created and after the library
+  has gone quiescent. Taking it while a previous test's pump thread was still
+  finishing made a test fail for having *fewer* live objects than it started
+  with — found that way, not by reasoning.
+
+What the counters cannot see is a leak on our own side of the boundary; the
+RAII handles in `ReldexHandles.h` and the flat RSS across 12,000 teardowns
+remain the evidence for that half.
 
 ### Why `ui/tests` re-attaches `../app/Main.qml` instead of sharing a library
 

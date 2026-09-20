@@ -162,22 +162,17 @@ Q_SIGNALS:
     void failed();
 
 private:
-    /// What one accepted request is still owed.
-    struct Outstanding
-    {
-        /// The `ReldexEventKind` its one reply must carry.
-        int kind = 0;
-        /// For a fetch, the result it was issued against, so a batch that
-        /// arrives after that result was closed or replaced is dropped rather
-        /// than appended to a different result's model.
-        quint64 result = 0;
-    };
-
     void setState(State state);
     void clearError();
     void adoptError(const ReldexError *error);
     void takeThreadLocalError();
     void submitFetches();
+    /// Submits `close_result` for `result`. Used both by `closeResult()` and
+    /// by `execute()`, which must not leave the result it replaces open.
+    bool submitCloseResult(quint64 result);
+    /// Reads the current result's column descriptions straight from the
+    /// result (ABI 3), with no batch involved.
+    [[nodiscard]] QList<ResultTableModel::ColumnDescription> readResultColumns() const;
     [[nodiscard]] quint64 nextRequest(int expectedEventKind);
     [[nodiscard]] bool checkThread() const;
 
@@ -188,10 +183,14 @@ private:
     quint64 m_sessionId = 0;
     quint64 m_resultId = 0;
     quint64 m_nextRequestId = 1;
-    /// Request id -> what it is owed. The library guarantees exactly one reply
-    /// per accepted request, so that part is asserted in debug rather than
-    /// defended against.
-    QHash<quint64, Outstanding> m_outstanding;
+    /// Request id -> the `ReldexEventKind` its one reply must carry. The
+    /// library guarantees exactly one reply per accepted request, so that part
+    /// is asserted in debug rather than defended against.
+    ///
+    /// It no longer records which result a fetch was issued against: ABI 3 has
+    /// `FETCHED` carry `result`/`has_result` itself, so the event says what a
+    /// side map used to have to remember.
+    QHash<quint64, int> m_outstanding;
 
     qint64 m_rowsFetched = 0;
     qint64 m_rowsAffected = -1;

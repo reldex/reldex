@@ -6,7 +6,10 @@
 #include <QTest>
 #include <QTimer>
 
+using adapter_test::liveCounts;
+using adapter_test::settledBaseline;
 using adapter_test::spinUntil;
+using adapter_test::spinUntilLiveCounts;
 
 // M1.6: the waker -> queued drain path (ADR-0003 D5) and the error model
 // (D6), proved without a window.
@@ -83,31 +86,37 @@ void TstBridge::aDrainBudgetOfOneStillDeliversEveryEvent()
 
 void TstBridge::aFailingStatementSurfacesKindNativeCodeAndPosition()
 {
-    Bridge bridge;
-    QVERIFY(bridge.isValid());
-    SessionController *session = bridge.session();
-    QVERIFY(session->open());
-    QVERIFY(spinUntil([session] { return session->state() == SessionController::Ready; }));
+    const auto baseline = settledBaseline();
+    {
+        Bridge bridge;
+        QVERIFY(bridge.isValid());
+        SessionController *session = bridge.session();
+        QVERIFY(session->open());
+        QVERIFY(spinUntil([session] { return session->state() == SessionController::Ready; }));
 
-    QSignalSpy failures(session, &SessionController::failed);
-    QVERIFY(session->executeMockStatement(RELDEX_MOCK_STATEMENT_FAILING));
-    QVERIFY(spinUntil([session] { return session->state() == SessionController::Failed; }));
+        QSignalSpy failures(session, &SessionController::failed);
+        QVERIFY(session->executeMockStatement(RELDEX_MOCK_STATEMENT_FAILING));
+        QVERIFY(spinUntil([session] { return session->state() == SessionController::Failed; }));
 
-    QCOMPARE(failures.count(), 1);
-    QVERIFY(session->hasError());
-    QCOMPARE(session->errorKind(), static_cast<int>(RELDEX_ERROR_KIND_SYNTAX));
-    QCOMPARE(session->errorNativeCode(), 942);
-    QCOMPARE(session->errorLine(), 1);
-    QCOMPARE(session->errorColumn(), 15);
-    QVERIFY2(session->errorMessage().contains(QStringLiteral("does not exist")),
-             qPrintable(session->errorMessage()));
-    QVERIFY2(session->errorNativeMessage().startsWith(QStringLiteral("ORA-00942")),
-             qPrintable(session->errorNativeMessage()));
-
-    // The error object itself was freed exactly once when the event's handle
-    // went out of scope; what survives is this copied-out value data. There is
-    // no counter in reldex.h to assert that with, so the structural guarantee
-    // (reldex::ErrorHandle) plus ASan is the evidence -- see ui/README.md.
+        QCOMPARE(failures.count(), 1);
+        QVERIFY(session->hasError());
+        QCOMPARE(session->errorKind(), static_cast<int>(RELDEX_ERROR_KIND_SYNTAX));
+        QCOMPARE(session->errorNativeCode(), 942);
+        QCOMPARE(session->errorLine(), 1);
+        QCOMPARE(session->errorColumn(), 15);
+        QVERIFY2(session->errorMessage().contains(QStringLiteral("does not exist")),
+                 qPrintable(session->errorMessage()));
+        QVERIFY2(session->errorNativeMessage().startsWith(QStringLiteral("ORA-00942")),
+                 qPrintable(session->errorNativeMessage()));
+    }
+    // The error object was freed exactly once when the event's handle went out
+    // of scope; what survives is the copied-out value data. ABI 3 can assert
+    // that directly now -- `errors` counts objects held by the caller, queued
+    // in an undrained event, *and* sitting in a thread's last-error slot, so a
+    // failed statement that left one behind anywhere shows up here.
+    QVERIFY2(spinUntilLiveCounts(baseline),
+             qPrintable(QStringLiteral("live counts after an error path: %1 (baseline %2)")
+                                .arg(liveCounts().toString(), baseline.toString())));
 }
 
 void TstBridge::aBlockedStatementDoesNotStallTheEventLoop()
@@ -207,6 +216,7 @@ void TstBridge::deleteLaterFromInsideADrainTearsDownCleanly()
     // with `deleteLater()`, never `delete`, from anything a drain can reach.
     // `~Bridge` tears the hub down underneath the loop that is still walking
     // it; `deleteLater()` defers that to after the drain has returned.
+    const auto baseline = settledBaseline();
     auto *bridge = new Bridge;
     QVERIFY(bridge->isValid());
     SessionController *session = bridge->session();
@@ -246,6 +256,14 @@ void TstBridge::deleteLaterFromInsideADrainTearsDownCleanly()
     // call back into the freed object afterwards (D5 rule 2 + A10). Keep the
     // loop turning so a stray wake would have every chance to.
     QTest::qWait(100);
+
+    // And nothing the destroyed Bridge held is still live -- including the
+    // batches that were sitting in undrained events at the moment it died,
+    // which ABI 3 counts until they are released.
+    QVERIFY2(spinUntilLiveCounts(baseline),
+             qPrintable(QStringLiteral("live counts after a deleteLater teardown: %1 "
+                                       "(baseline %2)")
+                                .arg(liveCounts().toString(), baseline.toString())));
 }
 
 void TstBridge::eventsWithNoOwnerAreReleasedAndCounted()

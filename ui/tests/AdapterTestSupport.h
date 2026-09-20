@@ -47,6 +47,89 @@ bool spinUntil(Predicate predicate, int timeoutMs = 60000)
     return true;
 }
 
+// --- ABI 3 live-object counts (reldex_live_counts) -------------------------
+//
+// The leak check this suite could not make before. Counts are process-wide and
+// include what is not the caller's yet: a batch inside an undrained event is
+// live, and so is the error in a thread's last-error slot.
+
+struct LiveCounts
+{
+    qint64 hubs = 0;
+    qint64 sessions = 0;
+    qint64 batches = 0;
+    qint64 errors = 0;
+    qint64 arenas = 0;
+
+    [[nodiscard]] bool operator==(const LiveCounts &other) const noexcept
+    {
+        return hubs == other.hubs && sessions == other.sessions && batches == other.batches
+                && errors == other.errors && arenas == other.arenas;
+    }
+
+    [[nodiscard]] QString toString() const
+    {
+        return QStringLiteral("hubs=%1 sessions=%2 batches=%3 errors=%4 arenas=%5")
+                .arg(hubs)
+                .arg(sessions)
+                .arg(batches)
+                .arg(errors)
+                .arg(arenas);
+    }
+};
+
+inline LiveCounts liveCounts()
+{
+    ReldexLiveCounts raw = reldex::makeLiveCounts();
+    if (reldex_live_counts(&raw) != RELDEX_STATUS_OK) {
+        return {};
+    }
+    return LiveCounts {
+        static_cast<qint64>(raw.hubs),   static_cast<qint64>(raw.sessions),
+        static_cast<qint64>(raw.batches), static_cast<qint64>(raw.errors),
+        static_cast<qint64>(raw.arenas),
+    };
+}
+
+/// Waits for the live counts to come back to `baseline`.
+///
+/// A wait rather than an immediate compare, and deliberately so: A17 says
+/// `reldex_hub_destroy` does **not** join the session pump threads, so a
+/// session stays counted until its thread actually finishes. Asserting the
+/// instant the destructor returns would be testing the scheduler. The deadline
+/// is a hang guard, never a latency bound.
+inline bool spinUntilLiveCounts(const LiveCounts &baseline, int timeoutMs = 60000)
+{
+    return spinUntil([&baseline] { return liveCounts() == baseline; }, timeoutMs);
+}
+
+/// Waits for the library to go quiescent, and returns that as a baseline.
+///
+/// Take a baseline with this rather than with `liveCounts()` directly. The
+/// counts are **process-wide**, and by A17 a previous test's session pump
+/// thread can still be finishing when the next one starts -- a baseline read
+/// in that window records a hub and a session that are on their way out, and
+/// the test then fails at the end for having *fewer* live objects than it
+/// started with. Found exactly that way, not by reasoning.
+///
+/// The calling thread's last-error slot is emptied first. An error sitting
+/// there counts as live exactly like one the caller holds, so a baseline taken
+/// over the top of a previous test's failure is a number the test can only
+/// drop below -- which reads as a leak in reverse.
+inline LiveCounts settledBaseline(int timeoutMs = 60000)
+{
+    const reldex::ErrorHandle stale(reldex_last_error_take());
+    Q_UNUSED(stale);
+    spinUntil(
+            [] {
+                const LiveCounts counts = liveCounts();
+                return counts.hubs == 0 && counts.sessions == 0 && counts.batches == 0
+                        && counts.arenas == 0;
+            },
+            timeoutMs);
+    return liveCounts();
+}
+
 inline qint64 envNumber(const char *name, qint64 fallback)
 {
     const QByteArray value = qgetenv(name);

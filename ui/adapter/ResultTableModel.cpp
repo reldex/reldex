@@ -64,7 +64,7 @@ int ResultTableModel::rowCount(const QModelIndex &parent) const
 
 int ResultTableModel::columnCount(const QModelIndex &parent) const
 {
-    return parent.isValid() ? 0 : m_columnCount;
+    return parent.isValid() ? 0 : static_cast<int>(m_columns.size());
 }
 
 QHash<int, QByteArray> ResultTableModel::roleNames() const
@@ -87,7 +87,7 @@ QVariant ResultTableModel::data(const QModelIndex &index, int role) const
     }
     const int row = index.row();
     const int column = index.column();
-    if (row < 0 || row >= m_rowCount || column < 0 || column >= m_columnCount) {
+    if (row < 0 || row >= m_rowCount || column < 0 || column >= m_columns.size()) {
         return {};
     }
 
@@ -128,16 +128,12 @@ QVariant ResultTableModel::headerData(int section, Qt::Orientation orientation, 
     if (orientation == Qt::Vertical) {
         return section >= 0 && section < m_rowCount ? QVariant(section + 1) : QVariant();
     }
-    if (section < 0 || section >= m_columnCount) {
+    if (section < 0 || section >= m_columns.size()) {
         return {};
     }
-    if (section < m_columns.size()) {
-        return m_columns.at(section).name;
-    }
-    // The column *count* comes from the EXECUTED event and the *names* from
-    // the first batch (ADR-0003 A6), so there is a window where one is known
-    // and the other is not.
-    return QString::number(section + 1);
+    // No fallback branch any more: with ABI 3 the names arrive with the count,
+    // inside the same model reset, so a valid section always has a name.
+    return m_columns.at(section).name;
 }
 
 bool ResultTableModel::canFetchMore(const QModelIndex &parent) const
@@ -156,11 +152,11 @@ void ResultTableModel::fetchMore(const QModelIndex &parent)
     m_source->fetchMoreRows();
 }
 
-void ResultTableModel::beginResult(int columns)
+void ResultTableModel::beginResult(const QList<ColumnDescription> &columns)
 {
     beginResetModel();
     releaseEverything();
-    m_columnCount = std::max(0, columns);
+    m_columns = columns;
     endResetModel();
     Q_EMIT batchCountChanged();
     Q_EMIT columnNamesChanged();
@@ -168,12 +164,7 @@ void ResultTableModel::beginResult(int columns)
 
 void ResultTableModel::reset()
 {
-    beginResetModel();
-    releaseEverything();
-    m_columnCount = 0;
-    endResetModel();
-    Q_EMIT batchCountChanged();
-    Q_EMIT columnNamesChanged();
+    beginResult({});
 }
 
 void ResultTableModel::applyBatch(reldex::BatchHandle batch, int rows)
@@ -181,35 +172,15 @@ void ResultTableModel::applyBatch(reldex::BatchHandle batch, int rows)
     if (!batch) {
         return;
     }
-    const bool namesWereUnknown = m_columns.isEmpty();
-    if (namesWereUnknown) {
-        // The column *count* came from the EXECUTED event; the batch is where
-        // the names are (ADR-0003 A6). If the two ever disagreed, changing
-        // columnCount() outside a reset would be a model-consistency bug, so
-        // that case takes a reset -- which is free here, because names are
-        // only unknown before the result's first row.
-        const auto columns = static_cast<int>(reldex_batch_column_count(batch.get()));
-        if (columns > 0 && columns != m_columnCount) {
-            beginResetModel();
-            releaseEverything();
-            m_columnCount = columns;
-            readColumnHeaders(batch.get());
-            endResetModel();
-        } else {
-            readColumnHeaders(batch.get());
-        }
-    }
-    // Paired with the mutation `readColumnHeaders()` just made, and emitted
-    // *before* any row insertion: a view told about new rows first would read
-    // the new headers without ever having been told they changed.
-    if (namesWereUnknown && m_columnCount > 0) {
-        Q_EMIT headerDataChanged(Qt::Horizontal, 0, m_columnCount - 1);
-        Q_EMIT columnNamesChanged();
-    }
-
     if (rows <= 0) {
-        // An exhausted-result marker: its column names have been taken, and it
-        // has no rows to keep, so it is released as this handle goes away.
+        // The terminal marker. ABI 3 states that such a batch has NO columns
+        // -- `reldex_batch_column_count` is 0 and every per-column call
+        // reports NOT_FOUND on it -- so nothing here asks it anything. It is
+        // released as this handle goes away.
+        //
+        // This is the terminal batch of *every* result, not only of an empty
+        // one, which is why the headers can no longer be read from a batch at
+        // all: they come from the EXECUTED event's result description instead.
         return;
     }
 
@@ -232,12 +203,18 @@ void ResultTableModel::applyBatch(reldex::BatchHandle batch, int rows)
         rows = accepted;
     }
 
+    const int columns = static_cast<int>(m_columns.size());
     BatchEntry entry;
     entry.firstRow = m_rowCount;
     entry.rows = rows;
-    entry.views.resize(static_cast<std::size_t>(m_columnCount));
-    for (int column = 0; column < m_columnCount; ++column) {
-        // Once per column per batch (ADR-0003 D4), never per cell.
+    entry.views.resize(static_cast<std::size_t>(columns));
+    for (int column = 0; column < columns; ++column) {
+        // Once per column per batch (ADR-0003 D4), never per cell -- and as of
+        // ABI 3 this allocates nothing even for NUMBER and TIMESTAMP: `fixed`
+        // comes back NULL and only `reldex_batch_column_fixed` would build the
+        // element array. This adapter never calls that: every non-text kind is
+        // rendered by the bulk formatter, so the mirror would be 62 B/row of
+        // memory nothing ever reads (A19, and the K3 gap it caused).
         ReldexColumnView view = reldex::makeColumnView();
         if (reldex_batch_column(batch.get(), static_cast<std::size_t>(column), &view)
             != RELDEX_STATUS_OK) {
@@ -260,32 +237,10 @@ QStringList ResultTableModel::columnNames() const
 {
     QStringList names;
     names.reserve(m_columns.size());
-    for (const ColumnHeader &column : m_columns) {
+    for (const ColumnDescription &column : m_columns) {
         names.append(column.name);
     }
     return names;
-}
-
-void ResultTableModel::readColumnHeaders(const ReldexBatch *batch)
-{
-    const std::size_t columns = reldex_batch_column_count(batch);
-    if (columns == 0) {
-        return;
-    }
-    m_columns.clear();
-    m_columns.reserve(static_cast<qsizetype>(columns));
-    for (std::size_t column = 0; column < columns; ++column) {
-        ReldexColumnInfo info = reldex::makeColumnInfo();
-        ColumnHeader header;
-        if (reldex_batch_column_info(batch, column, &info) == RELDEX_STATUS_OK) {
-            // A13: every string out of Reldex is NUL-terminated, but `len` is
-            // authoritative, so the length is always passed.
-            header.name = QString::fromUtf8(reinterpret_cast<const char *>(info.name.ptr),
-                                            static_cast<qsizetype>(info.name.len));
-            header.kind = info.kind;
-        }
-        m_columns.append(header);
-    }
 }
 
 int ResultTableModel::batchForRow(int row) const
@@ -504,8 +459,8 @@ void ResultTableModel::reformatEverything()
 {
     rebuildFormatOptions();
     dropAllFormattedText();
-    if (m_rowCount > 0 && m_columnCount > 0) {
-        Q_EMIT dataChanged(index(0, 0), index(m_rowCount - 1, m_columnCount - 1),
+    if (m_rowCount > 0 && !m_columns.isEmpty()) {
+        Q_EMIT dataChanged(index(0, 0), index(m_rowCount - 1, static_cast<int>(m_columns.size()) - 1),
                            { Qt::DisplayRole });
     }
 }

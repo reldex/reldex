@@ -10,6 +10,7 @@
 #include <QtGlobal>
 
 #include <algorithm>
+#include <type_traits>
 
 /// The waker trampoline's body, as a member-accessing free function so the
 /// `extern "C"` entry point below stays three lines long.
@@ -48,11 +49,27 @@ void reldexBridgeWakeImpl(void *userData) noexcept
 }
 
 extern "C" {
-static void reldexBridgeWake(void *userData)
+static void reldexBridgeWake(void *userData) noexcept
 {
     reldexBridgeWakeImpl(userData);
 }
 }
+
+// ABI 3: the header exports a `noexcept` function-pointer alias precisely so
+// this rule stops being a comment. If the `noexcept` above is ever removed,
+// this line fails to compile instead of the process failing at run time --
+// which is what letting an exception cross into Rust would do (A18).
+// `is_convertible` rather than `is_same`: binding is the property that matters,
+// and a plain `void(*)(void*)` does NOT convert to a `noexcept` pointer, so
+// dropping the `noexcept` still fails here -- without depending on whether a
+// given compiler makes C language linkage part of a function type.
+#ifdef RELDEX_HAVE_WAKE_FN_NOEXCEPT
+static_assert(std::is_convertible_v<decltype(&reldexBridgeWake), ReldexWakeFnNoexcept>,
+              "the waker trampoline must be noexcept: an exception escaping it unwinds through "
+              "an extern \"C\" frame into Rust, which catch_unwind does not contain (A18)");
+#else
+#error "reldex.h did not define RELDEX_HAVE_WAKE_FN_NOEXCEPT; this adapter requires C++17 or later"
+#endif
 
 namespace {
 

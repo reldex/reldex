@@ -1,6 +1,10 @@
 #include "Metrics.h"
 
 #include <QByteArray>
+// Explicit, not via QByteArray: the only uses are inside the Linux branches
+// below, so a missing include here would compile on this machine and fail on
+// the first CI run that is not Windows.
+#include <QByteArrayList>
 #include <QFile>
 #include <QMutexLocker>
 #include <QTextStream>

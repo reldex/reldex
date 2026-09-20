@@ -24,7 +24,7 @@
 #include <QHash>
 #include <QString>
 #include <QStringList>
-#include <QVector>
+#include <QList>
 #include <QtQml/qqmlregistration.h>
 
 #include <cstddef>
@@ -87,16 +87,30 @@ class ResultTableModel : public QAbstractTableModel
     Q_PROPERTY(int timestampStyle READ timestampStyle WRITE setTimestampStyle NOTIFY
                        timestampStyleChanged)
     Q_PROPERTY(int batchCount READ batchCount NOTIFY batchCountChanged)
-    /// The column names, once the result's first batch has arrived (the count
-    /// comes from the EXECUTED event, the names from a batch -- ADR-0003 A6).
+    /// The column names of the current result.
     ///
-    /// A notifying property rather than QML calling `headerData()`: a binding
-    /// on `headerData()` would evaluate once, before the names existed, and
-    /// never re-evaluate, because `headerDataChanged` is not a property-change
-    /// signal. Found by the QML test, not by reasoning.
+    /// A notifying property rather than QML calling `headerData()`, because a
+    /// QML binding on `headerData()` never re-evaluates: `headerDataChanged`
+    /// is a model signal, not a property-change signal, so a header row bound
+    /// that way keeps whatever it read on the previous result.
     Q_PROPERTY(QStringList columnNames READ columnNames NOTIFY columnNamesChanged)
 
 public:
+    /// One column of a result, as the statement itself described it.
+    ///
+    /// ABI 3: `SessionController` reads these from
+    /// `reldex_session_result_column` the moment the `EXECUTED` event is
+    /// drained, so the model gets its count *and* its names in one step,
+    /// before any row exists. Before ABI 3 the count came from the event and
+    /// the names from the first batch, which meant a two-phase header, a
+    /// late `headerDataChanged`, a reset if the two ever disagreed -- and no
+    /// headers at all for a result with columns and no rows.
+    struct ColumnDescription
+    {
+        QString name;
+        qint32 kind = RELDEX_COLUMN_KIND_UNKNOWN;
+    };
+
     enum Roles {
         /// `true` when the cell is SQL NULL. NULL, empty and taken are three
         /// different states and only this role distinguishes them.
@@ -121,13 +135,13 @@ public:
 
     void setFetchSource(ResultFetchSource *source);
 
-    /// Starts a new result set with `columns` columns and no rows yet.
-    void beginResult(int columns);
+    /// Starts a new result set with these columns and no rows yet. An empty
+    /// list is "no result": zero rows, zero columns.
+    void beginResult(const QList<ColumnDescription> &columns);
 
-    /// Takes one fetched batch. A batch with no rows is released immediately
-    /// (it only means the result is exhausted); its column names are still
-    /// read first if they are not known yet, so an empty result still has
-    /// headers.
+    /// Takes one fetched batch. A batch with no rows is released immediately:
+    /// it is the terminal marker, it has no rows *and no columns* (ABI 3), so
+    /// there is nothing on it to read.
     void applyBatch(reldex::BatchHandle batch, int rows);
 
     /// Releases every batch and every cached arena, and empties the model.
@@ -230,19 +244,12 @@ private:
         std::vector<ReldexColumnView> views;
     };
 
-    struct ColumnHeader
-    {
-        QString name;
-        qint32 kind = RELDEX_COLUMN_KIND_UNKNOWN;
-    };
-
     /// The LRU list holds the windows; the index maps a key to its node. A
     /// `std::list` because neither eviction nor re-touching may invalidate the
     /// iterators the index stores.
     using WindowList = std::list<std::pair<WindowKey, FormattedWindow>>;
 
     void releaseEverything();
-    void readColumnHeaders(const ReldexBatch *batch);
     [[nodiscard]] int batchForRow(int row) const;
     [[nodiscard]] QString formattedCell(int batchIndex, int column, int localRow) const;
     /// Renders one window; returns the cache entry, or nullptr if the window is
@@ -266,10 +273,13 @@ private:
     /// `m_firstRows[i] == m_batches[i].firstRow`, so a row lookup is one
     /// `upper_bound` -- O(log n) with no per-row object anywhere.
     std::vector<int> m_firstRows;
-    QVector<ColumnHeader> m_columns;
+    /// The whole truth about this result's columns, and the *only* source of
+    /// `columnCount()`: with ABI 3 there is no window in which the count and
+    /// the names can disagree, so there is no longer a second number to keep
+    /// in step with this one.
+    QList<ColumnDescription> m_columns;
 
     int m_rowCount = 0;
-    int m_columnCount = 0;
 
     /// Sequential access (which is what scrolling is) hits this before the
     /// binary search.

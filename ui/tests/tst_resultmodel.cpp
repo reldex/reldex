@@ -5,11 +5,15 @@
 #include <QAbstractItemModelTester>
 #include <QElapsedTimer>
 #include <QRandomGenerator>
+#include <QSignalSpy>
 #include <QTest>
 
 #include <utility>
 
+using adapter_test::liveCounts;
+using adapter_test::settledBaseline;
 using adapter_test::spinUntil;
+using adapter_test::spinUntilLiveCounts;
 using adapter_test::streamGeneratedQuery;
 
 // M1.6: `ResultTableModel` over borrowed batch views (ADR-0003 D4).
@@ -25,7 +29,8 @@ private Q_SLOTS:
     void modelTesterSurvivesAMultiBatchStream();
     void modelTesterSurvivesAResetMidStream();
     void cellsMatchWhatTheMockGenerated();
-    void columnHeadersComeFromTheBatch();
+    void columnHeadersAreKnownBeforeTheFirstRow();
+    void anEmptyResultStillHasHeaders();
     void fetchMoreDrivesTheStreamWhenAutoFetchIsOff();
     void aLargeBatchIsFormattedOneWindowAtATime();
     void formattedTextIsBoundedByTheCache();
@@ -56,40 +61,49 @@ void TstResultModel::modelTesterSurvivesAMultiBatchStream()
 
 void TstResultModel::modelTesterSurvivesAResetMidStream()
 {
-    Bridge bridge;
-    QVERIFY(bridge.isValid());
-    SessionController *session = bridge.session();
-    ResultTableModel *model = session->model();
-    QAbstractItemModelTester tester(model, QAbstractItemModelTester::FailureReportingMode::QtTest);
+    const auto baseline = settledBaseline();
+    {
+        Bridge bridge;
+        QVERIFY(bridge.isValid());
+        SessionController *session = bridge.session();
+        ResultTableModel *model = session->model();
+        QAbstractItemModelTester tester(model, QAbstractItemModelTester::FailureReportingMode::QtTest);
 
-    session->setMockRows(500000);
-    session->setFetchRows(200);
-    session->setMaxFetchesInFlight(4);
-    session->setRunOnOpen(true);
-    QVERIFY(session->open());
+        session->setMockRows(500000);
+        session->setFetchRows(200);
+        session->setMaxFetchesInFlight(4);
+        session->setRunOnOpen(true);
+        QVERIFY(session->open());
 
-    QVERIFY(spinUntil([session] { return session->rowsFetched() >= 2000; }));
-    QVERIFY(session->state() == SessionController::Fetching);
+        QVERIFY(spinUntil([session] { return session->rowsFetched() >= 2000; }));
+        QVERIFY(session->state() == SessionController::Fetching);
 
-    // Close the result while fetches are still in flight. Every one of them
-    // still gets exactly one reply; the model must end up empty and the late
-    // batches must not be appended to it.
-    QVERIFY(session->closeResult());
-    QCOMPARE(model->rowCount(), 0);
+        // Close the result while fetches are still in flight. Every one of them
+        // still gets exactly one reply; the model must end up empty and the late
+        // batches must not be appended to it.
+        QVERIFY(session->closeResult());
+        QCOMPARE(model->rowCount(), 0);
 
-    const qint64 settled = session->rowsFetched();
-    QVERIFY(spinUntil([session] { return session->fetchesInFlight() == 0; }));
-    QCOMPARE(model->rowCount(), 0);
-    QCOMPARE(session->rowsFetched(), settled);
+        const qint64 settled = session->rowsFetched();
+        QVERIFY(spinUntil([session] { return session->fetchesInFlight() == 0; }));
+        QCOMPARE(model->rowCount(), 0);
+        QCOMPARE(session->rowsFetched(), settled);
 
-    // The session survived, so it can run another statement.
-    QVERIFY(session->executeMockStatement(RELDEX_MOCK_STATEMENT_DML));
-    QVERIFY(spinUntil([session] {
-        return session->state() == SessionController::Ready
-                || session->state() == SessionController::Failed;
-    }));
-    QCOMPARE(session->state(), SessionController::Ready);
-    QCOMPARE(session->rowsAffected(), qint64(1));
+        // The session survived, so it can run another statement.
+        QVERIFY(session->executeMockStatement(RELDEX_MOCK_STATEMENT_DML));
+        QVERIFY(spinUntil([session] {
+            return session->state() == SessionController::Ready
+                    || session->state() == SessionController::Failed;
+        }));
+        QCOMPARE(session->state(), SessionController::Ready);
+        QCOMPARE(session->rowsAffected(), qint64(1));
+    }
+
+    // The model released every batch of the abandoned result, and the session
+    // released the result itself: nothing from either is still live.
+    QVERIFY2(spinUntilLiveCounts(baseline),
+             qPrintable(QStringLiteral("live counts after a mid-stream reset: %1 (baseline %2)")
+                                .arg(liveCounts().toString(), baseline.toString())));
 }
 
 void TstResultModel::cellsMatchWhatTheMockGenerated()
@@ -171,21 +185,102 @@ void TstResultModel::cellsMatchWhatTheMockGenerated()
     QVERIFY(!model->data(QModelIndex(), Qt::DisplayRole).isValid());
 }
 
-void TstResultModel::columnHeadersComeFromTheBatch()
+void TstResultModel::columnHeadersAreKnownBeforeTheFirstRow()
 {
+    // ABI 3: the header comes from `reldex_session_result_column`, so it is
+    // complete the moment EXECUTED is drained. Before ABI 3 the count arrived
+    // with the event and the names with the first batch, and this window
+    // showed "1", "2", "3".
     Bridge bridge;
     QVERIFY(bridge.isValid());
-    ResultTableModel *model = bridge.session()->model();
-    QVERIFY(streamGeneratedQuery(bridge, 100, 50, 2));
+    SessionController *session = bridge.session();
+    ResultTableModel *model = session->model();
+    QAbstractItemModelTester tester(model, QAbstractItemModelTester::FailureReportingMode::QtTest);
 
-    QCOMPARE(model->headerData(0, Qt::Horizontal, Qt::DisplayRole).toString(),
-             QStringLiteral("ID"));
-    QCOMPARE(model->headerData(1, Qt::Horizontal, Qt::DisplayRole).toString(),
-             QStringLiteral("NAME"));
-    QCOMPARE(model->headerData(2, Qt::Horizontal, Qt::DisplayRole).toString(),
-             QStringLiteral("CREATED"));
-    QCOMPARE(model->headerData(0, Qt::Vertical, Qt::DisplayRole).toInt(), 1);
+    // Sampled from inside the `executed` signal, which `SessionController`
+    // emits straight after `beginResult()` and before it submits the first
+    // fetch -- the one moment at which "before the first row" is a fact rather
+    // than a race.
+    //
+    // A plain `QCOMPARE(rowCount(), 0)` after waiting for the Fetching state
+    // is NOT that moment, and flaked 2 runs in 20: `QAbstractItemModelTester`
+    // calls `fetchMore()` itself from `nonDestructiveBasicTest()`, and re-runs
+    // that on every `rowsInserted`, so with a tester attached the model drives
+    // its own stream no matter what `autoFetch` says.
+    int rowsAtExecuted = -1;
+    int columnsAtExecuted = -1;
+    QStringList namesAtExecuted;
+    QString firstHeaderAtExecuted;
+    connect(session, &SessionController::executed, this, [&] {
+        rowsAtExecuted = model->rowCount();
+        columnsAtExecuted = model->columnCount();
+        namesAtExecuted = model->columnNames();
+        firstHeaderAtExecuted =
+                model->headerData(0, Qt::Horizontal, Qt::DisplayRole).toString();
+    });
+
+    // Installed before anything runs, so nothing early is missed.
+    QSignalSpy headerChanges(model, &QAbstractItemModel::headerDataChanged);
+    QSignalSpy resets(model, &QAbstractItemModel::modelReset);
+    QSignalSpy names(model, &ResultTableModel::columnNamesChanged);
+
+    QVERIFY(streamGeneratedQuery(bridge, 5000, 100, 2));
+    QCOMPARE(session->state(), SessionController::ResultComplete);
+    QCOMPARE(model->rowCount(), 5000);
+
+    const QStringList expectedNames { QStringLiteral("ID"), QStringLiteral("NAME"),
+                                      QStringLiteral("CREATED") };
+    QCOMPARE(rowsAtExecuted, 0);
+    QCOMPARE(columnsAtExecuted, 3);
+    QCOMPARE(namesAtExecuted, expectedNames);
+    QCOMPARE(firstHeaderAtExecuted, QStringLiteral("ID"));
+
+    // Exactly two resets, both at a point the caller asked for one: the grid
+    // is emptied when the statement is submitted (so a re-run does not leave
+    // the previous result's rows under a new query), and the result's header
+    // is installed when EXECUTED arrives. Rows arriving after that cause
+    // neither a reset nor a `headerDataChanged` -- the late header signal is
+    // exactly what ABI 3 removed the need for.
+    QCOMPARE(model->columnNames(), expectedNames);
     QVERIFY(!model->headerData(3, Qt::Horizontal, Qt::DisplayRole).isValid());
+    QCOMPARE(model->headerData(0, Qt::Vertical, Qt::DisplayRole).toInt(), 1);
+    QCOMPARE(headerChanges.count(), 0);
+    QCOMPARE(resets.count(), 2);
+    QCOMPARE(names.count(), 2);
+}
+
+void TstResultModel::anEmptyResultStillHasHeaders()
+{
+    // Unreachable before ABI 3: a result with columns and no rows never
+    // produces a batch to read a header from, and the terminal batch of any
+    // result now carries no columns at all.
+    Bridge bridge;
+    QVERIFY(bridge.isValid());
+    SessionController *session = bridge.session();
+    ResultTableModel *model = session->model();
+    QAbstractItemModelTester tester(model, QAbstractItemModelTester::FailureReportingMode::QtTest);
+
+    QVERIFY(session->open());
+    QVERIFY(spinUntil([session] { return session->state() == SessionController::Ready; }));
+    QVERIFY(session->executeMockStatement(RELDEX_MOCK_STATEMENT_EMPTY_QUERY));
+    QVERIFY(spinUntil([session] {
+        return session->state() == SessionController::ResultComplete
+                || session->state() == SessionController::Failed;
+    }));
+
+    QCOMPARE(session->state(), SessionController::ResultComplete);
+    QVERIFY(!session->hasError());
+    QCOMPARE(model->rowCount(), 0);
+    QCOMPARE(model->columnCount(), 3);
+    QCOMPARE(model->columnNames(),
+             QStringList({ QStringLiteral("ID"), QStringLiteral("NAME"),
+                           QStringLiteral("CREATED") }));
+    QCOMPARE(model->batchCount(), 0);
+    QVERIFY(!model->canFetchMore(QModelIndex()));
+    QVERIFY(!session->canFetchMoreRows());
+    // Nothing on the terminal batch was asked a question it would refuse.
+    QVERIFY(!model->formattingFailed());
+    QVERIFY(!model->data(model->index(0, 0), Qt::DisplayRole).isValid());
 }
 
 void TstResultModel::fetchMoreDrivesTheStreamWhenAutoFetchIsOff()
@@ -458,6 +553,11 @@ void TstResultModel::reExecutingDuringAStreamRunsTheNewResultToCompletion()
     // few thousand rows; this one is about the session's bookkeeping.
     constexpr int kRows = 20000;
 
+    // Before the Bridge exists: `settledBaseline()` waits for *no* hub to be
+    // live, so taking it after one was created waits out the whole hang guard
+    // and then bakes that hub into the baseline.
+    const auto baseline = settledBaseline();
+
     Bridge bridge;
     QVERIFY(bridge.isValid());
     SessionController *session = bridge.session();
@@ -470,6 +570,11 @@ void TstResultModel::reExecutingDuringAStreamRunsTheNewResultToCompletion()
     QVERIFY(session->open());
     QVERIFY(spinUntil([session] { return session->rowsFetched() >= 1000; }));
     QVERIFY(session->fetchesInFlight() > 0);
+
+    const quint64 replaced = session->resultId();
+    QVERIFY(replaced != 0);
+    QCOMPARE(reldex_session_result_column_count(bridge.hub(), session->sessionId(), replaced),
+             std::size_t(3));
 
     // Re-execute with every slot busy. The row count is the scenario's, fixed
     // when the session was opened, so the new result has `kRows` rows too.
@@ -484,12 +589,42 @@ void TstResultModel::reExecutingDuringAStreamRunsTheNewResultToCompletion()
     QCOMPARE(session->fetchesInFlight(), 0);
     QCOMPARE(bridge.orphanEvents(), qint64(0));
 
+    QVERIFY(session->resultId() != replaced);
+
+    // ABI 3 states that a second execute does NOT close the first result: it
+    // keeps its server-side cursor until someone closes it. So `execute()`
+    // does, or a worksheet that re-runs a query accumulates one open cursor
+    // per run. Once the close has landed the old result is gone.
+    QVERIFY(spinUntil([&bridge, session, replaced] {
+        return reldex_session_result_column_count(bridge.hub(), session->sessionId(), replaced)
+                == 0;
+    }));
+    {
+        // That failed lookup recorded a thread-local error. Take it *and let
+        // it go* -- `reldex_live_counts` counts an error held by the caller
+        // exactly like one still in the slot, so holding the handle past here
+        // would look like the leak this test is about to rule out.
+        const reldex::ErrorHandle expected(reldex_last_error_take());
+        QVERIFY(expected);
+    }
+
     // The rows are the new result's, from its first row to its last -- nothing
     // of the replaced result's stream was appended to it.
     QCOMPARE(model->data(model->index(0, 0), Qt::DisplayRole).toString(),
              adapter_test::expectedId(1));
     QCOMPARE(model->data(model->index(kRows - 1, 0), Qt::DisplayRole).toString(),
              adapter_test::expectedId(kRows));
+
+    // And nothing from either result outlives it: the session and its hub stay
+    // (nobody closed the session), every batch and every arena goes.
+    QVERIFY(session->closeResult());
+    QCOMPARE(model->rowCount(), 0);
+    const adapter_test::LiveCounts expectedCounts { baseline.hubs + 1, baseline.sessions + 1,
+                                                    baseline.batches, baseline.errors,
+                                                    baseline.arenas };
+    QVERIFY2(spinUntilLiveCounts(expectedCounts),
+             qPrintable(QStringLiteral("live counts with only the Bridge left: %1 (expected %2)")
+                                .arg(liveCounts().toString(), expectedCounts.toString())));
 }
 
 void TstResultModel::zeroRowsMeansTheMocksDocumentedDefault()

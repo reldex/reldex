@@ -8,7 +8,10 @@
 #include <memory>
 
 using adapter_test::envNumber;
+using adapter_test::liveCounts;
+using adapter_test::settledBaseline;
 using adapter_test::spinUntil;
+using adapter_test::spinUntilLiveCounts;
 
 // M1.6 / spike criterion K5: destroy the C++ bridge under a flood of
 // completions, 10,000 times, and neither hang, crash, nor leak.
@@ -24,6 +27,16 @@ using adapter_test::spinUntil;
 //      this adapter never uses the cancel-from-any-thread allowance, so there
 //      is no thread to join (A10);
 //   5. ~QObject discards any drain this Bridge had posted for itself.
+//
+// "Nor leak" stopped being an argument from RSS with ABI 3: `reldex_live_counts`
+// reports how many hubs, sessions, batches, errors and arenas the library is
+// holding, so every test here asserts the count comes back to the baseline it
+// started from. The RSS check stays as a gross guard for anything that leaks
+// on OUR side of the boundary, where those counters cannot see.
+//
+// The assertion is always a *wait*: A17 says `reldex_hub_destroy` does not join
+// the session pump threads, so a session stays counted until its thread has
+// actually finished. The deadline is a hang guard; no latency is asserted.
 //
 // Iteration count: `RELDEX_UI_TEARDOWN_ITERATIONS` overrides the default of
 // 10,000 (CI may want fewer; a sanitizer build certainly does).
@@ -41,6 +54,7 @@ void TstTeardown::destroyingTheBridgeUnderAFloodOfCompletions()
     const auto iterations = static_cast<int>(
             qBound<qint64>(1LL, envNumber("RELDEX_UI_TEARDOWN_ITERATIONS", 10000), 1000000LL));
 
+    const auto baseline = settledBaseline();
     const qint64 rssBefore = Metrics::residentBytes();
     QElapsedTimer wall;
     wall.start();
@@ -74,12 +88,25 @@ void TstTeardown::destroyingTheBridgeUnderAFloodOfCompletions()
     }
 
     const qint64 elapsedMs = wall.elapsed();
+
+    // THE leak assertion (ABI 3). 10,000 iterations each holding a hub, a
+    // session, a stream of batches and the arenas the formatter made: if any
+    // of them survived its Bridge, this never comes back to the baseline.
+    // A deliberately generous hang guard, not a latency bound: this waits for
+    // up to `iterations` session pump threads to have finished (A17), and a
+    // two-core CI runner is a long way from this machine.
+    const bool settled = spinUntilLiveCounts(baseline, 300000);
+    QVERIFY2(settled, qPrintable(QStringLiteral("live counts did not return to the baseline: "
+                                                "%1 (baseline %2)")
+                                         .arg(liveCounts().toString(), baseline.toString())));
+
     const qint64 rssAfter = Metrics::residentBytes();
-    qInfo("K5: %d iterations in %lld ms (%.3f ms/iteration); RSS %lld -> %lld bytes (delta %lld)",
+    qInfo("K5: %d iterations in %lld ms (%.3f ms/iteration); RSS %lld -> %lld bytes (delta %lld); "
+          "live counts back to baseline (%s)",
           iterations, static_cast<long long>(elapsedMs),
           iterations > 0 ? static_cast<double>(elapsedMs) / iterations : 0.0,
           static_cast<long long>(rssBefore), static_cast<long long>(rssAfter),
-          static_cast<long long>(rssAfter - rssBefore));
+          static_cast<long long>(rssAfter - rssBefore), qPrintable(baseline.toString()));
 
     // A leaked batch per iteration would be hundreds of megabytes here. This
     // is a gross-leak guard, not a memory budget -- K3 is M1.8's to measure.
@@ -97,6 +124,7 @@ void TstTeardown::destroyingTheBridgeWhileTheSessionIsStillConnecting()
     // so the pump is mid-connect when the waker is unregistered.
     const auto iterations = static_cast<int>(
             qBound<qint64>(1LL, envNumber("RELDEX_UI_TEARDOWN_CONNECT_ITERATIONS", 2000), 1000000LL));
+    const auto baseline = settledBaseline();
     for (int iteration = 0; iteration < iterations; ++iteration) {
         auto bridge = std::make_unique<Bridge>();
         QVERIFY(bridge->isValid());
@@ -106,6 +134,14 @@ void TstTeardown::destroyingTheBridgeWhileTheSessionIsStillConnecting()
         QVERIFY(session->open());
         bridge.reset();
     }
+
+    // The window this test exists for is also the one where a session is most
+    // likely to outlive its hub: the pump is mid-connect when the waker comes
+    // off, and A17 says nothing joins it. Same generous hang guard as above.
+    QVERIFY2(spinUntilLiveCounts(baseline, 300000),
+             qPrintable(QStringLiteral("live counts did not return to the baseline: %1 "
+                                       "(baseline %2)")
+                                .arg(liveCounts().toString(), baseline.toString())));
 }
 
 QTEST_GUILESS_MAIN(TstTeardown)

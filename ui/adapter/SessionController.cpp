@@ -129,8 +129,46 @@ void SessionController::takeThreadLocalError()
 quint64 SessionController::nextRequest(int expectedEventKind)
 {
     const quint64 request = m_nextRequestId++;
-    m_outstanding.insert(request, Outstanding { expectedEventKind, m_resultId });
+    m_outstanding.insert(request, expectedEventKind);
     return request;
+}
+
+QList<ResultTableModel::ColumnDescription> SessionController::readResultColumns() const
+{
+    // ABI 3: the whole header, from the result itself, the moment EXECUTED is
+    // drained -- no batch, no allocation, and an answer even for a result that
+    // has columns and no rows.
+    QList<ResultTableModel::ColumnDescription> columns;
+    if (m_bridge == nullptr || m_sessionId == 0 || m_resultId == 0) {
+        return columns;
+    }
+    const std::size_t count =
+            reldex_session_result_column_count(m_bridge->hub(), m_sessionId, m_resultId);
+    if (count == 0) {
+        // Zero is the only way this call reports a failure, and it records a
+        // thread-local error when it does. Take it so it cannot be mistaken
+        // for the next call's failure -- a result with no columns is not a
+        // case that reaches here (no columns means no result id at all).
+        const reldex::ErrorHandle stale(reldex_last_error_take());
+        Q_UNUSED(stale);
+        return columns;
+    }
+    columns.reserve(static_cast<qsizetype>(count));
+    for (std::size_t column = 0; column < count; ++column) {
+        ReldexColumnInfo info = reldex::makeColumnInfo();
+        ResultTableModel::ColumnDescription described;
+        if (reldex_session_result_column(m_bridge->hub(), m_sessionId, m_resultId, column, &info)
+            == RELDEX_STATUS_OK) {
+            // A13: NUL-terminated, but `len` is authoritative. Deep-copied
+            // here, which is what makes the "valid until you submit a close"
+            // lifetime rule a non-issue for this adapter.
+            described.name = QString::fromUtf8(reinterpret_cast<const char *>(info.name.ptr),
+                                               static_cast<qsizetype>(info.name.len));
+            described.kind = info.kind;
+        }
+        columns.append(described);
+    }
+    return columns;
 }
 
 bool SessionController::open()
@@ -188,7 +226,18 @@ bool SessionController::execute(const QString &sql, qint64 deadlineMs)
         return false;
     }
     clearError();
-    m_model->beginResult(0);
+
+    // ABI 3 is explicit that a second execute does NOT close the first result:
+    // it stays open, holding its server-side cursor and its rows, until the
+    // caller closes it or the session ends. A worksheet that re-runs a query
+    // would otherwise accumulate one open cursor per run, which on a real
+    // database is a resource leak with a server-side limit attached. So the
+    // result being replaced is closed here, explicitly.
+    if (m_resultId != 0) {
+        submitCloseResult(m_resultId);
+    }
+
+    m_model->beginResult({});
     m_resultId = 0;
     m_hasResult = false;
     m_exhausted = false;
@@ -224,18 +273,26 @@ bool SessionController::execute(const QString &sql, qint64 deadlineMs)
     return true;
 }
 
-bool SessionController::closeResult()
+bool SessionController::submitCloseResult(quint64 result)
 {
     if (!checkThread() || m_bridge == nullptr || !m_bridge->isValid() || m_sessionId == 0
-        || m_resultId == 0) {
+        || result == 0) {
         return false;
     }
     const quint64 request = nextRequest(RELDEX_EVENT_KIND_RESULT_CLOSED);
     const ReldexStatus status =
-            reldex_session_close_result(m_bridge->hub(), m_sessionId, request, m_resultId);
+            reldex_session_close_result(m_bridge->hub(), m_sessionId, request, result);
     if (status != RELDEX_STATUS_OK) {
         m_outstanding.remove(request);
         takeThreadLocalError();
+        return false;
+    }
+    return true;
+}
+
+bool SessionController::closeResult()
+{
+    if (m_resultId == 0 || !submitCloseResult(m_resultId)) {
         return false;
     }
     m_resultId = 0;
@@ -338,10 +395,8 @@ void SessionController::handleEvent(const ReldexEvent &raw, reldex::BatchHandle 
     const bool known = entry != m_outstanding.end();
     Q_ASSERT_X(known, "SessionController::handleEvent",
                "an event arrived for a request that was never accepted, or was already replied to");
-    Outstanding outstanding;
     if (known) {
-        outstanding = entry.value();
-        Q_ASSERT_X(outstanding.kind == raw.kind, "SessionController::handleEvent",
+        Q_ASSERT_X(entry.value() == raw.kind, "SessionController::handleEvent",
                    "the reply's kind does not match the request that was submitted");
         m_outstanding.erase(entry);
     }
@@ -375,7 +430,12 @@ void SessionController::handleEvent(const ReldexEvent &raw, reldex::BatchHandle 
         if (raw.has_result) {
             m_resultId = raw.result;
             m_hasResult = true;
-            m_model->beginResult(static_cast<int>(raw.column_count));
+            // Headers first, complete, before a single row exists -- ABI 3's
+            // result description rather than the first batch's.
+            m_model->beginResult(readResultColumns());
+            Q_ASSERT_X(m_model->columnCount() == static_cast<int>(raw.column_count),
+                       "SessionController::handleEvent",
+                       "the result description disagrees with the EXECUTED event's column_count");
             setState(Fetching);
             Q_EMIT executed();
             submitFetches();
@@ -387,7 +447,10 @@ void SessionController::handleEvent(const ReldexEvent &raw, reldex::BatchHandle 
 
     case RELDEX_EVENT_KIND_FETCHED: {
         m_fetchesInFlight = std::max(0, m_fetchesInFlight - 1);
-        if (!m_hasResult || outstanding.result != m_resultId) {
+        // ABI 3: the event names the result the fetch was issued against, so
+        // there is nothing to look up and nothing that can get out of step.
+        const quint64 fetchedResult = raw.has_result ? raw.result : 0;
+        if (!m_hasResult || fetchedResult != m_resultId) {
             // The result this fetch was issued against has been closed or
             // replaced. Exactly one reply still arrives for it (A5 rule 5);
             // the batch it carries is released as this handle goes away.
