@@ -9,13 +9,19 @@
 //! copy exists so `sql-text`'s corpus can be exercised without a driver in
 //! scope at all.
 
-use reldex_sql_text::{BlockStarter, CommentRules, KeywordSlot, Phrase, QuotingRules, SqlDialect};
+use reldex_sql_text::{
+    BlockKind, BlockStarter, CommentRules, KeywordSlot, Phrase, QuotingRules, SqlDialect,
+};
 
 const OR_REPLACE: Phrase = &["OR", "REPLACE"];
 const EDITIONABLE: Phrase = &["EDITIONABLE"];
 const NONEDITIONABLE: Phrase = &["NONEDITIONABLE"];
 const PACKAGE_BODY: Phrase = &["PACKAGE", "BODY"];
 const TYPE_BODY: Phrase = &["TYPE", "BODY"];
+const AND_RESOLVE: Phrase = &["AND", "RESOLVE"];
+const AND_COMPILE: Phrase = &["AND", "COMPILE"];
+const NOFORCE: Phrase = &["NOFORCE"];
+const JAVA_SOURCE: Phrase = &["JAVA", "SOURCE"];
 
 const CREATE_SUBPROGRAM_STARTER: BlockStarter = BlockStarter {
     slots: &[
@@ -24,7 +30,7 @@ const CREATE_SUBPROGRAM_STARTER: BlockStarter = BlockStarter {
         KeywordSlot::Optional(&[EDITIONABLE, NONEDITIONABLE]),
         KeywordSlot::Required(&[&["PROCEDURE"], &["FUNCTION"], &["TRIGGER"]]),
     ],
-    absorbs_body_opener: true,
+    kind: BlockKind::Structured,
 };
 
 const CREATE_COMPOUND_STARTER: BlockStarter = BlockStarter {
@@ -32,26 +38,49 @@ const CREATE_COMPOUND_STARTER: BlockStarter = BlockStarter {
         KeywordSlot::Required(&[&["CREATE"]]),
         KeywordSlot::Optional(&[OR_REPLACE]),
         KeywordSlot::Optional(&[EDITIONABLE, NONEDITIONABLE]),
-        KeywordSlot::Required(&[&["PACKAGE"], PACKAGE_BODY, &["TYPE"], TYPE_BODY]),
+        KeywordSlot::Required(&[&["PACKAGE"], PACKAGE_BODY, TYPE_BODY]),
     ],
-    absorbs_body_opener: false,
+    kind: BlockKind::Structured,
+};
+
+const CREATE_TYPE_SPEC_STARTER: BlockStarter = BlockStarter {
+    slots: &[
+        KeywordSlot::Required(&[&["CREATE"]]),
+        KeywordSlot::Optional(&[OR_REPLACE]),
+        KeywordSlot::Optional(&[EDITIONABLE, NONEDITIONABLE]),
+        KeywordSlot::Required(&[&["TYPE"]]),
+    ],
+    kind: BlockKind::ParenDelimited,
+};
+
+const CREATE_JAVA_SOURCE_STARTER: BlockStarter = BlockStarter {
+    slots: &[
+        KeywordSlot::Required(&[&["CREATE"]]),
+        KeywordSlot::Optional(&[OR_REPLACE]),
+        KeywordSlot::Optional(&[AND_RESOLVE, AND_COMPILE]),
+        KeywordSlot::Optional(&[NOFORCE]),
+        KeywordSlot::Required(&[JAVA_SOURCE]),
+    ],
+    kind: BlockKind::OpaqueSource,
 };
 
 const DECLARE_STARTER: BlockStarter = BlockStarter {
     slots: &[KeywordSlot::Required(&[&["DECLARE"]])],
-    absorbs_body_opener: true,
+    kind: BlockKind::Structured,
 };
 
 const BEGIN_STARTER: BlockStarter = BlockStarter {
     slots: &[KeywordSlot::Required(&[&["BEGIN"]])],
-    absorbs_body_opener: true,
+    kind: BlockKind::Structured,
 };
 
 const BLOCK_STARTERS: &[BlockStarter] = &[
     DECLARE_STARTER,
     BEGIN_STARTER,
+    CREATE_JAVA_SOURCE_STARTER,
     CREATE_SUBPROGRAM_STARTER,
     CREATE_COMPOUND_STARTER,
+    CREATE_TYPE_SPEC_STARTER,
 ];
 
 const KEYWORDS: &[&str] = &[
@@ -102,6 +131,7 @@ const KEYWORDS: &[&str] = &[
     "PACKAGE",
     "BODY",
     "TYPE",
+    "OBJECT",
     "REPLACE",
     "EDITIONABLE",
     "NONEDITIONABLE",
@@ -112,7 +142,19 @@ const KEYWORDS: &[&str] = &[
     "ROW",
     "BEFORE",
     "AFTER",
+    "INSTEAD",
+    "OF",
+    "COMPOUND",
     "CALL",
+    "RESOLVE",
+    "COMPILE",
+    "NOFORCE",
+    "JAVA",
+    "LANGUAGE",
+    "EXTERNAL",
+    "MEMBER",
+    "STATIC",
+    "CONSTRUCTOR",
     "DECLARE",
     "BEGIN",
     "END",
@@ -142,27 +184,37 @@ const KEYWORDS: &[&str] = &[
     "NUMBER",
     "VARCHAR2",
     "DATE",
+    "ROWTYPE",
 ];
 
-/// Oracle-*shaped* dialect: `/` terminates a block, and a block may also end
-/// at its own closing `;` when no `/` follows.
+/// Oracle-*shaped* dialect: `/` terminates a block or plain statement, and a
+/// block may also end at its own closing `;` when no `/` follows.
 pub(crate) fn oracle_like() -> SqlDialect {
     SqlDialect {
         statement_terminators: &[';'],
         slash_terminates_block: true,
+        slash_terminates_plain: true,
         block_may_end_without_slash: true,
         block_starters: BLOCK_STARTERS,
+        label_delimiters: Some(("<<", ">>")),
         block_body_opener: "BEGIN",
         block_nesting_openers: &["CASE", "IF", "LOOP"],
         block_end_keyword: "END",
+        subprogram_header_keywords: &["PROCEDURE", "FUNCTION"],
+        body_intro_keywords: &["IS", "AS"],
+        call_spec_keywords: &["LANGUAGE", "EXTERNAL"],
+        body_less_markers: &["CALL"],
+        compound_trigger_marker: Some(&["COMPOUND", "TRIGGER"]),
+        compound_trigger_timing_starters: &["BEFORE", "AFTER", "INSTEAD"],
+        directive_prefix: Some('$'),
         quoting: QuotingRules {
-            alternative_quoting: true,
-            national_prefix: true,
+            alternative_quote_prefixes: &["Q", "NQ"],
+            national_string_prefixes: &["N"],
         },
         comments: CommentRules {
             line_comment: Some("--"),
             block_comment: Some(("/*", "*/")),
-            sqlplus_rem: false,
+            sqlplus_line_comment_words: &[],
         },
         bind_variables: true,
         substitution_variables: true,
@@ -182,12 +234,13 @@ pub(crate) fn oracle_like_strict_slash() -> SqlDialect {
 
 /// The same dialect, with the SQL\*Plus `REM`/`REMARK` line comment enabled —
 /// used by the one test that exercises
-/// [`reldex_sql_text::CommentRules::sqlplus_rem`], which Oracle's own Phase 1
-/// descriptor leaves off (out of scope per `SPEC.md` §15).
+/// [`reldex_sql_text::CommentRules::sqlplus_line_comment_words`], which
+/// Oracle's own Phase 1 descriptor leaves empty (out of scope per
+/// `SPEC.md` §15).
 pub(crate) fn oracle_like_with_rem_comments() -> SqlDialect {
     SqlDialect {
         comments: CommentRules {
-            sqlplus_rem: true,
+            sqlplus_line_comment_words: &["REM", "REMARK"],
             ..oracle_like().comments
         },
         ..oracle_like()

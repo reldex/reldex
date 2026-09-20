@@ -306,8 +306,14 @@ fn substitution_variable_len(s: &str) -> Option<usize> {
 /// parser); splitting these into two single-character operators instead
 /// would not change anything [`crate::splitter`] does, since it never
 /// inspects [`TokenKind::Operator`] text except for the statement
-/// terminator(s) and `/`, neither of which is a prefix of any entry here.
-const TWO_CHAR_OPERATORS: [&str; 8] = [":=", "<=", ">=", "<>", "!=", "^=", "||", "**"];
+/// terminator(s), `/`, and — via [`SqlDialect::label_delimiters`] — a
+/// dialect's label brackets, none of which is a prefix of any other entry
+/// here. `<<`/`>>` are here (rather than left as two single-`<`/`>` tokens)
+/// specifically so [`crate::splitter`]'s label-skipping can match a
+/// dialect's `label_delimiters` string against exactly one token.
+const TWO_CHAR_OPERATORS: [&str; 11] = [
+    ":=", "<=", ">=", "<>", "!=", "^=", "||", "**", "=>", "<<", ">>",
+];
 
 fn advance_by_chars(cursor: &mut Cursor, count: usize) {
     for _ in 0..count {
@@ -472,16 +478,39 @@ fn next_token_normal(
         );
     }
 
-    if dialect.comments.sqlplus_rem && *at_line_start && ch.is_alphabetic() {
+    if !dialect.comments.sqlplus_line_comment_words.is_empty()
+        && *at_line_start
+        && ch.is_alphabetic()
+    {
         let len = leading_identifier_len(cursor.rest());
         let word = &cursor.rest()[..len];
-        if word.eq_ignore_ascii_case("REM") || word.eq_ignore_ascii_case("REMARK") {
+        if dialect
+            .comments
+            .sqlplus_line_comment_words
+            .iter()
+            .any(|w| w.eq_ignore_ascii_case(word))
+        {
             cursor.pos += len;
             while matches!(cursor.peek(), Some(c) if c != '\n') {
                 cursor.bump();
             }
             *at_line_start = false;
             return (TokenKind::Comment, Mode::Normal);
+        }
+    }
+
+    if let Some(prefix) = dialect.directive_prefix
+        && ch == prefix
+    {
+        let mut len = prefix.len_utf8();
+        if cursor.rest()[len..].starts_with(prefix) {
+            len += prefix.len_utf8();
+        }
+        let ident_len = leading_identifier_len(&cursor.rest()[len..]);
+        if ident_len > 0 {
+            cursor.pos += len + ident_len;
+            *at_line_start = false;
+            return (TokenKind::Directive, Mode::Normal);
         }
     }
 
@@ -519,8 +548,11 @@ fn next_token_normal(
         let after = &cursor.rest()[len..];
 
         if after.starts_with('\'') {
-            if dialect.quoting.alternative_quoting
-                && (word.eq_ignore_ascii_case("Q") || word.eq_ignore_ascii_case("NQ"))
+            if dialect
+                .quoting
+                .alternative_quote_prefixes
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(word))
             {
                 cursor.pos += len; // the "q"/"nq" prefix
                 cursor.bump(); // the opening quote
@@ -549,7 +581,12 @@ fn next_token_normal(
                     }
                 };
             }
-            if dialect.quoting.national_prefix && word.eq_ignore_ascii_case("N") {
+            if dialect
+                .quoting
+                .national_string_prefixes
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(word))
+            {
                 cursor.pos += len;
                 cursor.bump(); // the opening quote
                 let closed = scan_simple_quoted(cursor, '\'');
@@ -635,19 +672,28 @@ mod tests {
         SqlDialect {
             statement_terminators: &[';'],
             slash_terminates_block: true,
+            slash_terminates_plain: true,
             block_may_end_without_slash: true,
             block_starters: &[],
+            label_delimiters: Some(("<<", ">>")),
             block_body_opener: "BEGIN",
             block_nesting_openers: &["CASE", "IF", "LOOP"],
             block_end_keyword: "END",
+            subprogram_header_keywords: &["PROCEDURE", "FUNCTION"],
+            body_intro_keywords: &["IS", "AS"],
+            call_spec_keywords: &["LANGUAGE", "EXTERNAL"],
+            body_less_markers: &["CALL"],
+            compound_trigger_marker: Some(&["COMPOUND", "TRIGGER"]),
+            compound_trigger_timing_starters: &["BEFORE", "AFTER", "INSTEAD"],
+            directive_prefix: Some('$'),
             quoting: QuotingRules {
-                alternative_quoting: true,
-                national_prefix: true,
+                alternative_quote_prefixes: &["Q", "NQ"],
+                national_string_prefixes: &["N"],
             },
             comments: CommentRules {
                 line_comment: Some("--"),
                 block_comment: Some(("/*", "*/")),
-                sqlplus_rem: false,
+                sqlplus_line_comment_words: &[],
             },
             bind_variables: true,
             substitution_variables: true,
@@ -842,7 +888,7 @@ mod tests {
     #[test]
     fn rem_comment_only_fires_at_the_start_of_a_line_and_as_a_whole_word() {
         let mut dialect = test_dialect();
-        dialect.comments.sqlplus_rem = true;
+        dialect.comments.sqlplus_line_comment_words = &["REM", "REMARK"];
         assert_eq!(
             kinds_with(&dialect, "REM a comment\nSELECT 1")[0],
             (TokenKind::Comment, "REM a comment")
@@ -868,5 +914,97 @@ mod tests {
             .into_iter()
             .map(|t| (t.kind, &text[t.start..t.end]))
             .collect()
+    }
+
+    #[test]
+    fn arrow_and_label_bracket_operators_stay_one_token_each() {
+        assert_eq!(
+            kinds("p_x => 1"),
+            [
+                (TokenKind::Identifier, "p_x"),
+                (TokenKind::Whitespace, " "),
+                (TokenKind::Operator, "=>"),
+                (TokenKind::Whitespace, " "),
+                (TokenKind::Number, "1"),
+            ]
+        );
+        assert_eq!(
+            kinds("<<outer>>"),
+            [
+                (TokenKind::Operator, "<<"),
+                (TokenKind::Identifier, "outer"),
+                (TokenKind::Operator, ">>"),
+            ]
+        );
+    }
+
+    #[test]
+    fn directive_prefixed_words_lex_as_one_token_never_as_a_bare_keyword() {
+        // The whole point: "$END" must never present a bare `END` keyword
+        // token to the splitter's depth tracking.
+        assert_eq!(kinds("$END")[0], (TokenKind::Directive, "$END"));
+        assert_eq!(kinds("$IF")[0], (TokenKind::Directive, "$IF"));
+        assert_eq!(
+            kinds("$$PLSQL_UNIT")[0],
+            (TokenKind::Directive, "$$PLSQL_UNIT")
+        );
+        assert_eq!(
+            kinds("$IF $$my_flag $THEN NULL; $ELSE NULL; $END;"),
+            [
+                (TokenKind::Directive, "$IF"),
+                (TokenKind::Whitespace, " "),
+                (TokenKind::Directive, "$$my_flag"),
+                (TokenKind::Whitespace, " "),
+                (TokenKind::Directive, "$THEN"),
+                (TokenKind::Whitespace, " "),
+                (TokenKind::Identifier, "NULL"),
+                (TokenKind::Operator, ";"),
+                (TokenKind::Whitespace, " "),
+                (TokenKind::Directive, "$ELSE"),
+                (TokenKind::Whitespace, " "),
+                (TokenKind::Identifier, "NULL"),
+                (TokenKind::Operator, ";"),
+                (TokenKind::Whitespace, " "),
+                (TokenKind::Directive, "$END"),
+                (TokenKind::Operator, ";"),
+            ]
+        );
+        // A dialect with no directive prefix leaves a leading `$` as an
+        // ordinary single-character operator (unchanged pre-existing
+        // behavior) rather than ever forcing directive lexing.
+        let mut no_directives = test_dialect();
+        no_directives.directive_prefix = None;
+        assert_eq!(
+            kinds_with(&no_directives, "$END"),
+            [(TokenKind::Operator, "$"), (TokenKind::Keyword, "END"),]
+        );
+    }
+
+    #[test]
+    fn percent_type_and_rowtype_lex_as_word_percent_word_deliberately() {
+        // `%` is not given special-cased lexing: `v%TYPE`/`v%ROWTYPE` lex as
+        // three tokens (identifier, a single-character `%` operator,
+        // keyword). Nothing in this crate needs `%TYPE` to be one token —
+        // documented here so the choice is visible rather than accidental.
+        assert_eq!(
+            kinds("v%TYPE"),
+            [
+                (TokenKind::Identifier, "v"),
+                (TokenKind::Operator, "%"),
+                (TokenKind::Identifier, "TYPE"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lone_trailing_dot_after_an_integer_is_not_absorbed_into_the_number() {
+        // `1.` (digit immediately followed by `.` with no digit after it) is
+        // `Number("1")` + `Operator(".")`, the same rule already documented
+        // for `1..10` and `t.c` member access — the `.` is only ever part of
+        // the number when a digit follows it.
+        assert_eq!(
+            kinds("1.")[..2],
+            [(TokenKind::Number, "1"), (TokenKind::Operator, ".")]
+        );
     }
 }

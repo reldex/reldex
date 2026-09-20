@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-20T18:18:00+07:00",
+  "updatedAt": "2026-09-21T10:05:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1618,6 +1618,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-21",
+      "text": "M2.4 (reldex-sql-text) safety fixes: an independent adversarial review of the just-landed splitter (commit e78ab58) found a guaranteed panic (statement_at on a non-char-boundary offset) and several dangerous mis-splits where a valid script would have an executable statement carved out of the middle of a PL/SQL block (labelled blocks, a subprogram nested in another's declare section, compound-trigger timing points, and a package body with an init section after its members). All fixed same-day: statement_at now floors to a char boundary before slicing; the depth-tracking algorithm is unified around one pending_bodies counter (crates/sql-text/src/splitter.rs module docs); a new safety principle makes a lone `/` line authoritative regardless of nesting depth, bounding any undiscovered future bug to one over-large span rather than an executable fragment; StatementSpan::ended_by is new so a caller can tell why a span ended, not only whether it did. Also fixed: two vendor-neutrality leaks (REM/REMARK and Q/NQ hard-coded in the lexer instead of dialect data) and two of the three previously-documented known limitations (CALL-trigger body, CREATE TYPE ... AS OBJECT) no longer need to be limitations at all. Test count: 19 unit + 43 integration (was 21) plus 1 remaining ignored limitation (WITH FUNCTION inline PL/SQL); a new deterministic fuzz test (800,000 generated-script cases, zero panics) and a char-boundary sweep over Thai/emoji/BOM text. ADR-0002 amendment J4 records the review and the fix; docs/exec-plans/active/phase-1.md M4.3's row now says execution must consult ended_by. fmt/clippy/test/doc gates all green. Not yet re-verified against real SQL*Plus/SQLcl behavior for two edge cases the fix relies on reasoning about rather than testing against a live client: whether a body-less CREATE TRIGGER ... CALL ...; or a CREATE TYPE (no BODY) statement conventionally gets its own trailing `/` in practice, and whether `$END` in real scripts is written with or without a following `;`."
+    },
     {
       "date": "2026-09-20",
       "text": "M1.6 done: the Qt adapter (Bridge, SessionController, ResultTableModel, Metrics). Independent review found no use-after-free, lost wake or leak, and 3 must-fix: the adapter made the library build NUMBER/TIMESTAMP mirrors nobody read (the whole K3 overrun — fixed in reldex-ffi ABI 3), whole-batch formatting that cost milliseconds per first cell at large fetch sizes (now 1,024-row windows), and a constructor that registered the waker before it could fail. Informal numbers, Windows dev machine, 1M rows: stream 0.45-0.47 s, 113-118 B/row headless (was ~178), in-app growth 171 MB working set / 142 MB private (was ~231 MB), ~100 ns/cell warm, K5 10,000 teardowns in 6.3 s with live counts back to zero. The formal S15 verdict is M1.8. Not verified: ASan on the adapter (unavailable locally), frame time (K1)."

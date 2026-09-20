@@ -35,6 +35,13 @@ pub enum TokenKind {
     /// A SQL\*Plus substitution variable: `&name`, `&&name`, or either form
     /// with a trailing `.` terminator.
     SubstitutionVariable,
+    /// A conditional-compilation directive or inquiry identifier introduced
+    /// by [`SqlDialect::directive_prefix`](crate::SqlDialect::directive_prefix)
+    /// (Oracle: `$IF`, `$THEN`, `$ELSIF`, `$ELSE`, `$END`, `$$PLSQL_UNIT`, …),
+    /// lexed as one token so the word after the prefix (which may collide
+    /// with a real keyword, e.g. `$END`'s `END`) is never separately visible
+    /// to [`crate::splitter`]'s block-depth tracking.
+    Directive,
     /// A string, quoted identifier, or comment that was still open when the
     /// text truly ended (see [`crate::tokenize`]). Never produced by
     /// [`crate::tokenize_block`] on its own: a block that ends mid-construct

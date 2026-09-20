@@ -61,7 +61,9 @@ pub mod lexer;
 pub mod splitter;
 pub mod token;
 
-pub use dialect::{BlockStarter, CommentRules, KeywordSlot, Phrase, QuotingRules, SqlDialect};
+pub use dialect::{
+    BlockKind, BlockStarter, CommentRules, KeywordSlot, Phrase, QuotingRules, SqlDialect,
+};
 pub use lexer::{tokenize, tokenize_block};
-pub use splitter::{StatementKind, StatementSpan, split_statements, statement_at};
+pub use splitter::{EndedBy, StatementKind, StatementSpan, split_statements, statement_at};
 pub use token::{LexState, Token, TokenKind};

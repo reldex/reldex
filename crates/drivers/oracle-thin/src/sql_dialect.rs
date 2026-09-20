@@ -51,24 +51,25 @@
 //! not a general keyword tokenizer. `reldex_sql_text`'s own lexer is the
 //! general one; nothing here needs `Keywords`' specific behavior.
 
-use reldex_sql_text::{BlockStarter, CommentRules, KeywordSlot, Phrase, QuotingRules, SqlDialect};
+use reldex_sql_text::{
+    BlockKind, BlockStarter, CommentRules, KeywordSlot, Phrase, QuotingRules, SqlDialect,
+};
 
 const OR_REPLACE: Phrase = &["OR", "REPLACE"];
 const EDITIONABLE: Phrase = &["EDITIONABLE"];
 const NONEDITIONABLE: Phrase = &["NONEDITIONABLE"];
 const PACKAGE_BODY: Phrase = &["PACKAGE", "BODY"];
 const TYPE_BODY: Phrase = &["TYPE", "BODY"];
+const AND_RESOLVE: Phrase = &["AND", "RESOLVE"];
+const AND_COMPILE: Phrase = &["AND", "COMPILE"];
+const NOFORCE: Phrase = &["NOFORCE"];
+const JAVA_SOURCE: Phrase = &["JAVA", "SOURCE"];
 
 /// `CREATE [OR REPLACE] [EDITIONABLE|NONEDITIONABLE] {PROCEDURE|FUNCTION|TRIGGER}`:
-/// a single subprogram or trigger, whose (at most one) `BEGIN` is the
-/// statement's own body — see
-/// [`BlockStarter::absorbs_body_opener`](reldex_sql_text::dialect::BlockStarter::absorbs_body_opener).
-///
-/// `CREATE ... JAVA SOURCE` and `CREATE LIBRARY` are **not** included: SPEC
-/// does not mention either, `SPEC.md` §16's object groups do not list Java
-/// sources, and a `LIBRARY` declaration has no PL/SQL body at all (it names
-/// an OS shared object), so it would never need block-terminator handling in
-/// the first place — recorded as out of scope rather than silently omitted.
+/// a single subprogram or trigger. [`BlockKind::Structured`]'s
+/// `pending_bodies` model treats a lone body, a sequence of package/type
+/// members, and any nested subprogram declarations inside a declare section
+/// uniformly — see `reldex_sql_text::splitter`'s module docs.
 const CREATE_SUBPROGRAM_STARTER: BlockStarter = BlockStarter {
     slots: &[
         KeywordSlot::Required(&[&["CREATE"]]),
@@ -76,39 +77,75 @@ const CREATE_SUBPROGRAM_STARTER: BlockStarter = BlockStarter {
         KeywordSlot::Optional(&[EDITIONABLE, NONEDITIONABLE]),
         KeywordSlot::Required(&[&["PROCEDURE"], &["FUNCTION"], &["TRIGGER"]]),
     ],
-    absorbs_body_opener: true,
+    kind: BlockKind::Structured,
 };
 
-/// `CREATE [OR REPLACE] [EDITIONABLE|NONEDITIONABLE] {PACKAGE[ BODY]|TYPE[ BODY]}`:
+/// `CREATE [OR REPLACE] [EDITIONABLE|NONEDITIONABLE] {PACKAGE[ BODY]|TYPE BODY}`:
 /// a sequence of independent members, each of which may carry its own
-/// complete `BEGIN ... END` — see
-/// [`BlockStarter::absorbs_body_opener`](reldex_sql_text::dialect::BlockStarter::absorbs_body_opener),
-/// which is `false` here for exactly that reason.
+/// complete `BEGIN ... END`, plus an optional initialization section.
+/// `CREATE TYPE` *without* `BODY` is a separate, [`BlockKind::ParenDelimited`]
+/// starter below — an object/varray/table type spec has no `BEGIN`/`END` at
+/// all.
 const CREATE_COMPOUND_STARTER: BlockStarter = BlockStarter {
     slots: &[
         KeywordSlot::Required(&[&["CREATE"]]),
         KeywordSlot::Optional(&[OR_REPLACE]),
         KeywordSlot::Optional(&[EDITIONABLE, NONEDITIONABLE]),
-        KeywordSlot::Required(&[&["PACKAGE"], PACKAGE_BODY, &["TYPE"], TYPE_BODY]),
+        KeywordSlot::Required(&[&["PACKAGE"], PACKAGE_BODY, TYPE_BODY]),
     ],
-    absorbs_body_opener: false,
+    kind: BlockKind::Structured,
+};
+
+/// `CREATE [OR REPLACE] [EDITIONABLE|NONEDITIONABLE] TYPE` (without `BODY`):
+/// an object/varray/table-of spec, or the simple `IS <type>` synonym form —
+/// neither has `BEGIN`/`END`. See
+/// [`BlockKind::ParenDelimited`](reldex_sql_text::dialect::BlockKind::ParenDelimited).
+const CREATE_TYPE_SPEC_STARTER: BlockStarter = BlockStarter {
+    slots: &[
+        KeywordSlot::Required(&[&["CREATE"]]),
+        KeywordSlot::Optional(&[OR_REPLACE]),
+        KeywordSlot::Optional(&[EDITIONABLE, NONEDITIONABLE]),
+        KeywordSlot::Required(&[&["TYPE"]]),
+    ],
+    kind: BlockKind::ParenDelimited,
+};
+
+/// `CREATE [OR REPLACE] [AND RESOLVE|AND COMPILE] [NOFORCE] JAVA SOURCE ...`:
+/// the body is Java source text, not PL/SQL, and may itself contain `;` —
+/// only a lone `/` line or end of input ends it. `CREATE LIBRARY` is **not**
+/// included: a `LIBRARY` declaration names an OS shared object and has no
+/// body at all, so it never needs block-terminator handling in the first
+/// place (it is an ordinary plain statement, correctly handled without being
+/// a block starter). `JAVA SOURCE` is the one that *does* need it, and is
+/// the reason this starter exists.
+const CREATE_JAVA_SOURCE_STARTER: BlockStarter = BlockStarter {
+    slots: &[
+        KeywordSlot::Required(&[&["CREATE"]]),
+        KeywordSlot::Optional(&[OR_REPLACE]),
+        KeywordSlot::Optional(&[AND_RESOLVE, AND_COMPILE]),
+        KeywordSlot::Optional(&[NOFORCE]),
+        KeywordSlot::Required(&[JAVA_SOURCE]),
+    ],
+    kind: BlockKind::OpaqueSource,
 };
 
 const DECLARE_STARTER: BlockStarter = BlockStarter {
     slots: &[KeywordSlot::Required(&[&["DECLARE"]])],
-    absorbs_body_opener: true,
+    kind: BlockKind::Structured,
 };
 
 const BEGIN_STARTER: BlockStarter = BlockStarter {
     slots: &[KeywordSlot::Required(&[&["BEGIN"]])],
-    absorbs_body_opener: true,
+    kind: BlockKind::Structured,
 };
 
 const BLOCK_STARTERS: &[BlockStarter] = &[
     DECLARE_STARTER,
     BEGIN_STARTER,
+    CREATE_JAVA_SOURCE_STARTER,
     CREATE_SUBPROGRAM_STARTER,
     CREATE_COMPOUND_STARTER,
+    CREATE_TYPE_SPEC_STARTER,
 ];
 
 /// Not exhaustive of Oracle's reserved-word list — only
@@ -140,7 +177,8 @@ const KEYWORDS: &[&str] = &[
     "TABLESPACE", "MATERIALIZED", "CONSTRAINT", "PRIMARY", "KEY", "FOREIGN",
     "REFERENCES", "CHECK", "DEFAULT", "UNIQUE", "REPLACE", "EDITIONABLE",
     "NONEDITIONABLE", "OR", "REFERENCING", "NEW", "OLD", "EACH", "ROW",
-    "COMPOUND", "INSTEAD", "OF", "BEFORE", "AFTER", "CALL",
+    "COMPOUND", "INSTEAD", "OF", "BEFORE", "AFTER", "CALL", "RESOLVE",
+    "COMPILE", "NOFORCE", "MEMBER", "STATIC", "CONSTRUCTOR", "UNDER",
     // PL/SQL
     "DECLARE", "BEGIN", "END", "IF", "THEN", "ELSE", "ELSIF", "LOOP",
     "WHILE", "EXIT", "CONTINUE", "RETURN", "EXCEPTION", "WHEN", "CASE",
@@ -149,7 +187,7 @@ const KEYWORDS: &[&str] = &[
     "USING", "OUT", "IN", "NOCOPY", "IS", "AS", "CONSTANT", "OTHERS",
     "RAISE_APPLICATION_ERROR", "RESULT_CACHE", "DETERMINISTIC", "PIPELINED",
     "AUTHID", "DEFINER", "CURRENT_USER", "LANGUAGE", "JAVA", "LIBRARY",
-    "EXTERNAL",
+    "EXTERNAL", "ROWTYPE",
     // types
     "NUMBER", "VARCHAR2", "CHAR", "NCHAR", "NVARCHAR2", "DATE", "TIMESTAMP",
     "INTERVAL", "CLOB", "NCLOB", "BLOB", "RAW", "LONG", "ROWID", "UROWID",
@@ -175,25 +213,34 @@ pub const fn sql_dialect() -> SqlDialect {
     SqlDialect {
         statement_terminators: &[';'],
         slash_terminates_block: true,
+        slash_terminates_plain: true,
         block_may_end_without_slash: true,
         block_starters: BLOCK_STARTERS,
+        label_delimiters: Some(("<<", ">>")),
         block_body_opener: "BEGIN",
         block_nesting_openers: &["CASE", "IF", "LOOP"],
         block_end_keyword: "END",
+        subprogram_header_keywords: &["PROCEDURE", "FUNCTION"],
+        body_intro_keywords: &["IS", "AS"],
+        call_spec_keywords: &["LANGUAGE", "EXTERNAL"],
+        body_less_markers: &["CALL"],
+        compound_trigger_marker: Some(&["COMPOUND", "TRIGGER"]),
+        compound_trigger_timing_starters: &["BEFORE", "AFTER", "INSTEAD"],
+        directive_prefix: Some('$'),
         quoting: QuotingRules {
-            alternative_quoting: true,
-            national_prefix: true,
+            alternative_quote_prefixes: &["Q", "NQ"],
+            national_string_prefixes: &["N"],
         },
         comments: CommentRules {
             line_comment: Some("--"),
             block_comment: Some(("/*", "*/")),
             // SQL*Plus client commands are out of scope for Phase 1
             // (`SPEC.md` §15: "Future SQL*Plus-like commands may be added
-            // progressively"); leaving this off means `REM ...` lines are
+            // progressively"); leaving this empty means `REM ...` lines are
             // lexed as ordinary statement text today rather than silently
             // misread. `reldex_sql_text::lexer` implements and tests the
-            // `true` behavior for when that work is scheduled.
-            sqlplus_rem: false,
+            // non-empty behavior for when that work is scheduled.
+            sqlplus_line_comment_words: &[],
         },
         bind_variables: true,
         substitution_variables: true,

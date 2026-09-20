@@ -14,8 +14,8 @@
 //! 5&nbsp;MB script).
 
 use reldex_sql_text::{
-    LexState, SqlDialect, StatementKind, StatementSpan, Token, TokenKind, split_statements,
-    statement_at, tokenize, tokenize_block,
+    EndedBy, LexState, SqlDialect, StatementKind, StatementSpan, Token, TokenKind,
+    split_statements, statement_at, tokenize, tokenize_block,
 };
 
 #[path = "support/mod.rs"]
@@ -27,6 +27,7 @@ const CORPUS_FILES: &[(&str, &str)] = &[
     ("thai", include_str!("corpus/thai.sql")),
     ("qquotes", include_str!("corpus/qquotes.sql")),
     ("no_slash", include_str!("corpus/no_slash.sql")),
+    ("edge_cases", include_str!("corpus/edge_cases.sql")),
 ];
 
 // --------------------------------------------------------------- helpers
@@ -467,29 +468,38 @@ fn statement_at_returns_none_before_the_first_statement() {
 // ------------------------------------------------------- known limitations
 
 #[test]
-#[ignore = "known limitation (M2.4): a CALL-form trigger body has no BEGIN/END \
-            at all, so the depth-based block scan never finds a matching END \
-            and mis-splits the rest of the script. See splitter.rs module docs."]
-fn create_trigger_with_a_call_body_has_no_end_and_is_a_known_limitation() {
+fn create_trigger_with_a_call_body_ends_at_its_own_terminator() {
+    // Formerly a known limitation (M2.4 adversarial review MUST-FIX 3): the
+    // `pending_bodies` model's `body_less_markers` now recognizes `CALL` as
+    // a marker meaning "this statement owes no body at all".
     let dialect = support::oracle_like();
     let text = "CREATE TRIGGER t AFTER INSERT ON x FOR EACH ROW CALL p(:NEW.id);\n\
                 SELECT 1 FROM dual;\n";
     let spans = split_statements(text, &dialect);
-    // What a correct implementation would report: two statements, the
-    // trigger recognized as ending at its own `;` (no BEGIN/END body).
     assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
     assert!(spans[0].terminated);
+    assert_eq!(spans[0].ended_by, EndedBy::InferredBlockEnd);
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
 }
 
 #[test]
-#[ignore = "known limitation (M2.4): a `CREATE TYPE ... AS OBJECT (...);` spec \
-            has no BEGIN/END at all (ADR-0002 D8 scopes object types out), so \
-            the depth-based block scan never finds a matching END. See \
-            splitter.rs module docs."]
-fn create_type_as_object_spec_has_no_end_and_is_a_known_limitation() {
+fn create_type_as_object_spec_ends_at_its_own_terminator() {
+    // Formerly a known limitation: `BlockKind::ParenDelimited` now scans
+    // balanced parens to the first depth-0 terminator instead of ever
+    // looking for a `BEGIN`/`END` that does not exist.
     let dialect = support::oracle_like();
     let text = "CREATE TYPE point_t AS OBJECT (x NUMBER, y NUMBER);\n\
                 SELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated);
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn create_type_simple_synonym_form_with_no_parens_also_ends_at_its_terminator() {
+    let dialect = support::oracle_like();
+    let text = "CREATE TYPE happy_day IS BOOLEAN;\nSELECT 1 FROM dual;\n";
     let spans = split_statements(text, &dialect);
     assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
     assert!(spans[0].terminated);
@@ -499,7 +509,11 @@ fn create_type_as_object_spec_has_no_end_and_is_a_known_limitation() {
 #[ignore = "known limitation (M2.4): `WITH FUNCTION ... SELECT ...` (Oracle 12c \
             inline PL/SQL) is a block-containing statement that does not start \
             with a block-starter keyword; recognizing it needs scanning past \
-            arbitrary WITH-clause syntax, out of scope for this task. See \
+            arbitrary WITH-clause syntax, out of scope for this task. \
+            Failure mode is S3-safe: the inline function's own `;`s are read \
+            as ordinary plain-statement terminators, over-splitting into \
+            several statements that each fail to parse alone — never an \
+            executable fragment carved from the middle of one. See \
             splitter.rs module docs."]
 fn with_function_inline_plsql_is_a_known_limitation() {
     let dialect = support::oracle_like();
@@ -511,4 +525,432 @@ fn with_function_inline_plsql_is_a_known_limitation() {
     // this splitter, not recognizing `WITH FUNCTION` as a block starter,
     // reports several.
     assert_eq!(spans.len(), 1, "{spans:?}");
+}
+
+// ------------------------------------------- adversarial review MUST-FIXes
+
+#[test]
+fn statement_at_never_panics_on_a_non_char_boundary_offset() {
+    // The adversarial review's exact reproducer: byte 2 of `";\u{feff}"`
+    // falls inside the 3-byte BOM starting at byte 1.
+    let dialect = support::oracle_like();
+    let text = ";\u{feff}";
+    let result = statement_at(text, 2, &dialect);
+    // The only requirement is "does not panic"; whatever it resolves to
+    // must itself be a valid, in-bounds, char-boundary span.
+    if let Some(span) = result {
+        assert!(text.is_char_boundary(span.content_start));
+        assert!(text.is_char_boundary(span.content_end));
+        assert!(text.is_char_boundary(span.full_end));
+    }
+}
+
+#[test]
+fn statement_at_never_panics_at_any_byte_offset_of_multibyte_text() {
+    let dialect = support::oracle_like();
+    for text in [
+        ";\u{feff}",
+        "SELECT '\u{1F600}' FROM dual;\nสวัสดี /* ครับ */ 'ข้อความ';\n",
+        include_str!("corpus/thai.sql"),
+    ] {
+        for offset in 0..=(text.len() + 2) {
+            if let Some(span) = statement_at(text, offset, &dialect) {
+                assert!(
+                    text.is_char_boundary(span.content_start),
+                    "text={text:?} offset={offset} span={span:?}"
+                );
+                assert!(
+                    text.is_char_boundary(span.content_end),
+                    "text={text:?} offset={offset} span={span:?}"
+                );
+                assert!(
+                    text.is_char_boundary(span.full_end),
+                    "text={text:?} offset={offset} span={span:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_lone_slash_line_authoritatively_ends_a_plain_statement_mid_buffer() {
+    // Safety principle S1, exactly as SQL*Plus/SQLcl behave: `/` submits
+    // whatever is in the buffer, complete or not. `SELECT 10` runs alone;
+    // `2 FROM dual` is a separate (syntactically invalid on its own, but
+    // that is not this crate's concern) following statement.
+    let dialect = support::oracle_like();
+    let text = "SELECT 10\n/\n2 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Plain, StatementKind::Plain]);
+    assert_eq!(spans[0].content(text), "SELECT 10");
+    assert_eq!(spans[0].ended_by, EndedBy::SlashLine);
+    assert!(spans[0].terminated);
+    assert_eq!(spans[1].content(text), "2 FROM dual");
+    assert_eq!(spans[1].ended_by, EndedBy::Terminator);
+}
+
+#[test]
+fn a_labelled_block_is_recognized_as_a_block_not_split_mid_structure() {
+    let dialect = support::oracle_like();
+    let text = "<<outer>>\nBEGIN\n  NULL;\nEND outer;\n/\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated);
+    assert!(spans[0].content(text).starts_with("<<outer>>"));
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn nested_labelled_blocks_inside_an_outer_block_do_not_confuse_depth() {
+    let dialect = support::oracle_like();
+    let text = "<<outer_block>>\nDECLARE\n  v NUMBER;\nBEGIN\n  <<inner_block>>\n  BEGIN\n    v := 1;\n  END inner_block;\nEND outer_block;\n/\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated);
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn a_nested_subprogram_in_a_declare_section_does_not_confuse_the_outer_close() {
+    let dialect = support::oracle_like();
+    let text = "CREATE PROCEDURE outer_p AS\n\
+                PROCEDURE inner_p IS\n\
+                BEGIN\n\
+                  NULL;\n\
+                END inner_p;\n\
+                BEGIN\n\
+                  DELETE FROM important_table;\n\
+                END outer_p;\n\
+                /\n\
+                SELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated);
+    assert!(spans[0].content(text).trim_end().ends_with("END outer_p"));
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn a_compound_trigger_with_two_timing_points_does_not_swallow_the_next_statement() {
+    let dialect = support::oracle_like();
+    let text = "CREATE OR REPLACE TRIGGER compound_trg\n\
+                FOR INSERT ON some_table\n\
+                COMPOUND TRIGGER\n\
+                  BEFORE STATEMENT IS\n\
+                  BEGIN\n\
+                    NULL;\n\
+                  END BEFORE STATEMENT;\n\
+                  AFTER STATEMENT IS\n\
+                  BEGIN\n\
+                    NULL;\n\
+                  END AFTER STATEMENT;\n\
+                END compound_trg;\n\
+                /\n\
+                DROP TABLE should_still_run;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated);
+    assert_eq!(spans[1].content(text), "DROP TABLE should_still_run");
+}
+
+#[test]
+fn an_ordinary_non_compound_trigger_is_unaffected_by_timing_point_detection() {
+    // Guards against over-eagerly treating BEFORE/AFTER as a header
+    // whenever seen: without a `COMPOUND TRIGGER` marker, this trigger's own
+    // `BEFORE INSERT ON x` timing/event clause is ordinary content.
+    let dialect = support::oracle_like();
+    let text = "CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW BEGIN :NEW.a := 1; END;\n/\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].kind, StatementKind::Block);
+    assert!(spans[0].terminated);
+}
+
+#[test]
+fn a_package_body_with_members_and_an_init_section_closes_at_its_own_end() {
+    let dialect = support::oracle_like();
+    let text = include_str!("corpus/package.sql");
+    let spans = split_statements(text, &dialect);
+    assert_eq!(spans.len(), 2, "{spans:?}");
+    assert!(spans.iter().all(|s| s.terminated), "{spans:?}");
+}
+
+#[test]
+fn java_source_runs_to_the_slash_line_ignoring_embedded_semicolons() {
+    let dialect = support::oracle_like();
+    let text = "CREATE OR REPLACE AND COMPILE JAVA SOURCE NAMED \"Adder\" AS\n\
+                public class Adder {\n\
+                  public static int add(int a, int b) { return a + b; }\n\
+                }\n\
+                /\n\
+                SELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated);
+    assert_eq!(spans[0].ended_by, EndedBy::SlashLine);
+    assert!(spans[0].content(text).contains("public class Adder"));
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn dollar_if_directives_inside_a_block_do_not_confuse_depth_tracking() {
+    // The `$END` reproducer: without directive lexing, its `END` keyword
+    // would close the block early and misread the rest of the script.
+    let dialect = support::oracle_like();
+    let text = "BEGIN\n\
+                  $IF $$my_flag $THEN\n\
+                    NULL;\n\
+                  $ELSE\n\
+                    NULL;\n\
+                  $END;\n\
+                  COMMIT;\n\
+                END;\n\
+                /\n\
+                DROP TABLE should_still_run;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated);
+    assert_eq!(spans[1].content(text), "DROP TABLE should_still_run");
+}
+
+#[test]
+fn forward_declarations_in_a_package_spec_own_no_body() {
+    let dialect = support::oracle_like();
+    let text = "CREATE OR REPLACE PACKAGE forward_decls AS\n\
+                  PROCEDURE go;\n\
+                  FUNCTION calc_it(p_x NUMBER) RETURN NUMBER;\n\
+                END forward_decls;\n\
+                /\n\
+                SELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated);
+}
+
+#[test]
+fn a_call_spec_owns_no_plsql_body() {
+    let dialect = support::oracle_like();
+    let text = "CREATE OR REPLACE FUNCTION native_add(a NUMBER, b NUMBER) RETURN NUMBER\n\
+                  IS LANGUAGE JAVA\n\
+                  NAME 'Adder.add(int, int) return int';\n\
+                SELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated);
+    assert_eq!(spans[0].ended_by, EndedBy::InferredBlockEnd);
+}
+
+#[test]
+fn ended_by_distinguishes_terminator_slash_line_and_inferred_block_end() {
+    let dialect = support::oracle_like();
+
+    let plain = split_statements("SELECT 1 FROM dual;", &dialect);
+    assert_eq!(plain[0].ended_by, EndedBy::Terminator);
+
+    let with_slash = split_statements("BEGIN\n  NULL;\nEND;\n/\n", &dialect);
+    assert_eq!(with_slash[0].ended_by, EndedBy::SlashLine);
+
+    let without_slash = split_statements("BEGIN\n  NULL;\nEND;\n", &dialect);
+    assert_eq!(without_slash[0].ended_by, EndedBy::InferredBlockEnd);
+    assert!(without_slash[0].terminated);
+
+    let strict = support::oracle_like_strict_slash();
+    let strict_without_slash = split_statements("BEGIN\n  NULL;\nEND;\n", &strict);
+    assert_eq!(strict_without_slash[0].ended_by, EndedBy::InferredBlockEnd);
+    assert!(!strict_without_slash[0].terminated);
+
+    let truncated = split_statements("BEGIN\n  NULL;\n-- cut off", &dialect);
+    assert_eq!(truncated[0].ended_by, EndedBy::EndOfInput);
+    assert!(!truncated[0].terminated);
+}
+
+#[test]
+fn consecutive_lone_slash_lines_each_produce_their_own_span() {
+    let dialect = support::oracle_like();
+    let text = "SELECT 1 FROM dual;\n/\n/\nSELECT 2 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_spans_reproduce_text(text, &spans);
+    // The first `/` closes nothing new (statement 1 already ended at `;`);
+    // the plain-statement scan that starts at the first `/` immediately
+    // recognizes it (per S1) as its own zero-content statement, and the
+    // same for the second `/`.
+    assert!(spans.len() >= 3, "{spans:?}");
+}
+
+#[test]
+fn a_quoted_end_identifier_is_never_read_as_the_block_end_keyword() {
+    let dialect = support::oracle_like();
+    let text = "BEGIN\n  SELECT x AS \"END\" INTO v_x FROM t;\nEND;\n/\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].kind, StatementKind::Block);
+    assert!(spans[0].terminated);
+}
+
+#[test]
+fn a_sql_case_expression_with_a_bare_end_inside_a_block_closes_correctly() {
+    let dialect = support::oracle_like();
+    let text = "BEGIN\n  SELECT CASE WHEN 1 = 1 THEN 'a' ELSE 'b' END INTO v FROM dual;\nEND;\n/\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(spans.len(), 1);
+    assert!(spans[0].terminated);
+}
+
+// -------------------------------------------------------------- fuzzing
+
+/// A tiny, dependency-free xorshift32 PRNG — this crate stays at zero
+/// dependencies (`lib.rs`'s "Dependencies: None"), so a fuzz test cannot
+/// reach for the `rand` crate. Deterministic and fast; good enough for
+/// generating structurally-varied but grammar-aware SQL/PL-SQL fragments.
+struct Xorshift32(u32);
+
+impl Xorshift32 {
+    fn new(seed: u32) -> Self {
+        Self(if seed == 0 { 0xDEAD_BEEF } else { seed })
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.0 = x;
+        x
+    }
+
+    fn choose<'a, T>(&mut self, options: &'a [T]) -> &'a T {
+        &options[(self.next_u32() as usize) % options.len()]
+    }
+
+    fn below(&mut self, bound: usize) -> usize {
+        if bound == 0 {
+            0
+        } else {
+            (self.next_u32() as usize) % bound
+        }
+    }
+}
+
+/// Grammar-aware fragments a fuzz case is assembled from — deliberately
+/// including the exact shapes the adversarial review's MUST-FIX items named,
+/// so a regression in any of them is caught by both the named test above
+/// *and* by fuzzing combining it with everything else.
+const FRAGMENTS: &[&str] = &[
+    "SELECT 1 FROM dual;\n",
+    "SELECT 'it''s ก' FROM dual;\n",
+    "INSERT INTO t (a) VALUES (1);\n",
+    "COMMIT;\n",
+    "-- a line comment with a ; in it\n",
+    "/* a block comment with a ; and END in it */\n",
+    "BEGIN\n  NULL;\nEND;\n/\n",
+    "<<lbl>>\nBEGIN\n  NULL;\nEND lbl;\n/\n",
+    "DECLARE\n  v NUMBER;\nBEGIN\n  v := 1;\nEND;\n/\n",
+    "CREATE OR REPLACE PROCEDURE p AS\n  PROCEDURE inner_p IS\n  BEGIN\n    NULL;\n  END inner_p;\nBEGIN\n  NULL;\nEND p;\n/\n",
+    "CREATE OR REPLACE PACKAGE BODY pkg AS\n  PROCEDURE a IS BEGIN NULL; END a;\n  FUNCTION b RETURN NUMBER IS BEGIN RETURN 1; END b;\nBEGIN\n  NULL;\nEND pkg;\n/\n",
+    "CREATE OR REPLACE TRIGGER trg FOR INSERT ON t COMPOUND TRIGGER\n  BEFORE STATEMENT IS BEGIN NULL; END BEFORE STATEMENT;\nEND trg;\n/\n",
+    "CREATE TRIGGER t2 AFTER INSERT ON x FOR EACH ROW CALL p(:NEW.id);\n",
+    "CREATE TYPE point_t AS OBJECT (x NUMBER, y NUMBER);\n",
+    "CREATE TYPE happy_day IS BOOLEAN;\n",
+    "CREATE OR REPLACE PACKAGE fwd AS\n  PROCEDURE go;\nEND fwd;\n/\n",
+    "CREATE OR REPLACE AND COMPILE JAVA SOURCE NAMED \"X\" AS\npublic class X { void m() {} }\n/\n",
+    "BEGIN\n  $IF $$flag $THEN NULL; $ELSE NULL; $END;\nEND;\n/\n",
+    "SELECT q'[a;b]' FROM dual;\n",
+    "SELECT N'nat' FROM dual;\n",
+    "\n",
+    "   \n",
+];
+
+fn assert_split_invariants(text: &str, dialect: &SqlDialect) {
+    let tokens = tokenize(text, dialect);
+    assert_full_coverage(text, &tokens);
+    assert_line_by_line_matches_whole_document(text, dialect);
+
+    let spans = split_statements(text, dialect);
+    assert_spans_reproduce_text(text, &spans);
+    for span in &spans {
+        assert!(text.is_char_boundary(span.content_start), "{text:?}");
+        assert!(text.is_char_boundary(span.content_end), "{text:?}");
+        assert!(text.is_char_boundary(span.full_end), "{text:?}");
+        assert!(span.content_start <= span.content_end, "{text:?}");
+        assert!(span.content_end <= span.full_end, "{text:?}");
+    }
+    for pair in spans.windows(2) {
+        assert!(pair[0].full_end <= pair[1].content_start, "{text:?}");
+    }
+
+    // `statement_at` must never panic, at any offset (including "just past
+    // the end", which callers can legitimately pass).
+    for offset in [
+        0,
+        text.len() / 3,
+        text.len() / 2,
+        text.len(),
+        text.len() + 1,
+    ] {
+        let _ = statement_at(text, offset, dialect);
+    }
+}
+
+#[test]
+fn deterministic_fuzz_split_and_tokenize_invariants_hold_across_many_generated_scripts() {
+    let dialect = support::oracle_like();
+    let cases = if cfg!(debug_assertions) {
+        2_000
+    } else {
+        200_000
+    };
+    let seeds: [u32; 4] = [1, 42, 0xC0FF_EE01, 0x5EED_5EED];
+
+    for seed in seeds {
+        let mut rng = Xorshift32::new(seed);
+        for case in 0..cases {
+            let fragment_count = 1 + rng.below(8);
+            let mut text = String::new();
+            for _ in 0..fragment_count {
+                text.push_str(rng.choose(FRAGMENTS));
+            }
+            assert_split_invariants(&text, &dialect);
+
+            // Also exercise the CRLF form periodically, since CRLF handling
+            // has its own (already-tested) subtleties around line-based
+            // scans like `is_lone_slash_line`.
+            if case % 16 == 0 {
+                let crlf = text.replace('\n', "\r\n");
+                assert_split_invariants(&crlf, &dialect);
+            }
+        }
+    }
+}
+
+#[test]
+fn known_good_blocks_joined_by_slash_round_trip_through_split_and_rejoin() {
+    // A property the adversarial review specifically asked for: take several
+    // independently-valid `/`-terminated blocks/statements, concatenate
+    // them, split the result, and check that re-joining every span's
+    // `full()` text (each of which already ends at its own `/` line)
+    // reproduces the same statements in the same order with nothing lost or
+    // merged across a boundary.
+    let dialect = support::oracle_like();
+    let blocks: &[&str] = &[
+        "BEGIN\n  NULL;\nEND;\n/\n",
+        "SELECT 1 FROM dual;\n",
+        "<<lbl>>\nBEGIN\n  NULL;\nEND lbl;\n/\n",
+        "CREATE OR REPLACE PROCEDURE p AS BEGIN NULL; END p;\n/\n",
+        "COMMIT;\n",
+    ];
+    let mut rng = Xorshift32::new(7);
+    for _ in 0..500 {
+        let chosen: Vec<&str> = (0..(1 + rng.below(6)))
+            .map(|_| *rng.choose(blocks))
+            .collect();
+        let text = chosen.concat();
+        let spans = split_statements(&text, &dialect);
+        assert_spans_reproduce_text(&text, &spans);
+        assert_eq!(
+            spans.len(),
+            chosen.len(),
+            "expected exactly one span per joined block: {text:?} -> {spans:?}"
+        );
+        assert!(spans.iter().all(|s| s.terminated), "{text:?} -> {spans:?}");
+    }
 }

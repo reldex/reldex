@@ -43,10 +43,13 @@
 //! crate's scanner knows how to recognize once enabled. What varies by
 //! dialect — and is therefore a field on [`SqlDialect`], never a literal in
 //! `lexer.rs` or `splitter.rs` — is: whether each of those forms is enabled
-//! at all, what the comment delimiters actually are, which keywords open a
-//! block statement, which keyword closes one, and whether `/` is meaningful.
-//! Nothing in this module or its siblings spells out an Oracle keyword;
-//! Oracle's own descriptor is built by `reldex-driver-oracle-thin`.
+//! at all, what the comment delimiters (and SQL\*Plus-style line-comment
+//! *words*, e.g. Oracle's `REM`/`REMARK`, and alternative-quote/national
+//! string *prefix words*, e.g. Oracle's `Q`/`NQ`/`N`) actually are, which
+//! keywords open a block statement or a nested member header, which keyword
+//! closes one, and whether `/` is meaningful. Nothing in this module or its
+//! siblings spells out an Oracle keyword; Oracle's own descriptor is built by
+//! `reldex-driver-oracle-thin`.
 
 /// A case-insensitive multi-word phrase matched in order, e.g. `&["OR",
 /// "REPLACE"]` or the single-word `&["TRIGGER"]`.
@@ -69,49 +72,56 @@ pub enum KeywordSlot {
     Optional(&'static [Phrase]),
 }
 
-/// A pattern recognizing a statement that opens a "block": a statement whose
-/// body may contain the dialect's own statement terminator(s) without
-/// ending the statement, and whose real end is governed by
-/// [`SqlDialect::slash_terminates_block`] /
-/// [`SqlDialect::block_may_end_without_slash`] rather than by the first
-/// terminator found.
+/// How [`crate::splitter`] scans a statement recognized by a [`BlockStarter`]
+/// once its leading keywords have matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BlockKind {
+    /// PL/SQL block structure: `BEGIN`/`CASE`/`IF`/`LOOP` vs. `END`, plus
+    /// member/subprogram headers that may each owe a body of their own
+    /// (`PROCEDURE`/`FUNCTION … IS|AS`, and — once
+    /// [`SqlDialect::compound_trigger_marker`] has been seen — a compound
+    /// trigger's timing-point sections). One depth-tracking algorithm
+    /// handles a lone `BEGIN…END`, a single subprogram, and a
+    /// `PACKAGE`/`TYPE`/compound-`TRIGGER` body with any number of
+    /// independent members: see the [module documentation](crate::splitter)
+    /// on `splitter.rs` for the full rule.
+    Structured,
+    /// Not PL/SQL at all: the statement's terminator character(s) are
+    /// ordinary content, not a boundary. Ends only at a lone `/` line or end
+    /// of input (Oracle: `CREATE ... JAVA SOURCE ...`, whose body is Java
+    /// source text that may itself contain `;`).
+    OpaqueSource,
+    /// A single balanced-parenthesis declaration with no `BEGIN`/`END` at
+    /// all: scans forward tracking paren depth and ends at the first
+    /// statement terminator found at depth `0` (Oracle: `CREATE [OR REPLACE]
+    /// TYPE name ...` — the object/varray/table-of forms end in a
+    /// parenthesized attribute/method list, and the simple `IS <type>`
+    /// synonym form has no parens at all, which this scan handles the same
+    /// way: the terminator is found immediately since depth never leaves
+    /// `0`).
+    ParenDelimited,
+}
+
+/// A pattern recognizing a statement that opens a block (in the sense of
+/// [`BlockKind`]) — a statement whose real end is governed by
+/// [`kind`](Self::kind) rather than by the first statement terminator found.
 ///
-/// Matching walks a statement's *leading* keywords against `slots` in order.
-/// For Oracle, four shapes are registered by
-/// `reldex_driver_oracle_thin::sql_dialect`: a bare `DECLARE`, a bare
-/// `BEGIN`, `CREATE [OR REPLACE] [EDITIONABLE|NONEDITIONABLE]
-/// {PROCEDURE|FUNCTION|TRIGGER}`, and `CREATE [OR REPLACE]
-/// [EDITIONABLE|NONEDITIONABLE] {PACKAGE[ BODY]|TYPE[ BODY]}` — the last one
-/// distinct from the third because of
-/// [`absorbs_body_opener`](Self::absorbs_body_opener).
+/// Matching walks a statement's *leading* keywords against `slots` in order,
+/// after skipping any [`SqlDialect::label_delimiters`]. For Oracle, six
+/// shapes are registered by `reldex_driver_oracle_thin::sql_dialect`: a bare
+/// `DECLARE`, a bare `BEGIN`, `CREATE [OR REPLACE] [EDITIONABLE|NONEDITIONABLE]
+/// {PROCEDURE|FUNCTION|TRIGGER}`, `CREATE [OR REPLACE]
+/// [EDITIONABLE|NONEDITIONABLE] {PACKAGE[ BODY]|TYPE BODY}`, `CREATE [OR
+/// REPLACE] [EDITIONABLE|NONEDITIONABLE] TYPE` (without `BODY`, since it
+/// needs [`BlockKind::ParenDelimited`] rather than [`BlockKind::Structured`]),
+/// and `CREATE [OR REPLACE] [AND RESOLVE|AND COMPILE] [NOFORCE] JAVA SOURCE`.
 #[derive(Debug, Clone, Copy)]
 pub struct BlockStarter {
     /// The slots tried in order, left to right.
     pub slots: &'static [KeywordSlot],
-    /// Whether this statement's outermost closing
-    /// [`SqlDialect::block_end_keyword`] pairs with a single
-    /// [`SqlDialect::block_body_opener`] found somewhere in its body.
-    ///
-    /// `true` for a `DECLARE`/`BEGIN` block, a single `PROCEDURE`,
-    /// `FUNCTION` or `TRIGGER`: exactly one `BEGIN` (however far into the
-    /// statement it appears, past a declare section) opens the statement's
-    /// own body, and the first `END` found once inside it — after every
-    /// nested `BEGIN`/`CASE`/`IF`/`LOOP` it contains has been balanced back
-    /// out — is that body's own close, which is the statement's close.
-    ///
-    /// `false` for `PACKAGE[ BODY]`/`TYPE[ BODY]`: these are a *sequence* of
-    /// independent member declarations, each of which may be a complete
-    /// subprogram body with its **own**, unrelated `BEGIN ... END` pair (so
-    /// `CREATE PACKAGE BODY p AS PROCEDURE a IS BEGIN … END; FUNCTION b …
-    /// BEGIN … END; END p;` contains *two* fully self-contained blocks
-    /// before the package's own closing `END p;`). Absorbing "the first
-    /// `BEGIN`" here would mistake the first member's `END` for the
-    /// package's own; instead every `BEGIN` (including the first) counts as
-    /// an ordinary nested opener, and the statement's own close is the first
-    /// `END` seen while nothing is open at all (nesting depth `0`) — which
-    /// is only reached once each member's internal block has already
-    /// balanced back out.
-    pub absorbs_body_opener: bool,
+    /// How the statement's body is scanned once these keywords have matched.
+    pub kind: BlockKind,
 }
 
 /// Quoting forms this dialect recognizes, beyond the SQL-standard plain
@@ -119,19 +129,22 @@ pub struct BlockStarter {
 /// this crate's lexer always recognizes.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct QuotingRules {
-    /// Oracle's alternative quoting: `q'[...]'`, `q'{...}'`, `q'<...>'`,
-    /// `q'(...)'`, or `q'X...X'` for any other delimiter character `X`. Also
-    /// gates the `nq'...'` national form (see
-    /// [`national_prefix`](Self::national_prefix)).
-    pub alternative_quoting: bool,
-    /// The national-character-set string prefix: `N'...'` (a plain string)
-    /// and, when [`alternative_quoting`](Self::alternative_quoting) is also
-    /// set, `Nq'...'`/`nq'...'`.
-    pub national_prefix: bool,
+    /// Word prefixes (compared case-insensitively) that introduce an
+    /// alternative-quoted string — `<prefix>'[...]'`, `<prefix>'{...}'`,
+    /// `<prefix>'<...>'`, `<prefix>'(...)'`, or `<prefix>'X...X'` for any
+    /// other delimiter character `X` — when the word is immediately followed
+    /// by `'`. Oracle: `["Q", "NQ"]` (the second doubling as the "national"
+    /// alternative-quoted form). Empty disables the alternative-quoted form
+    /// entirely; nothing in this crate's lexer hard-codes `Q`/`NQ`.
+    pub alternative_quote_prefixes: &'static [&'static str],
+    /// Word prefixes that introduce a plain (non-alternative) national
+    /// string — `<prefix>'...'` — when the word is immediately followed by
+    /// `'`. Oracle: `["N"]`. Empty disables the national-string form.
+    pub national_string_prefixes: &'static [&'static str],
 }
 
 /// Comment forms this dialect recognizes.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct CommentRules {
     /// The line-comment prefix, e.g. `Some("--")`. Runs to end of line.
     pub line_comment: Option<&'static str>,
@@ -139,12 +152,13 @@ pub struct CommentRules {
     /// nest: the first closing delimiter found ends the comment, exactly as
     /// Oracle behaves.
     pub block_comment: Option<(&'static str, &'static str)>,
-    /// Whether a line whose first word (case-insensitive) is `REM` or
-    /// `REMARK` is a SQL\*Plus line comment. `SPEC.md` §15 defers SQL\*Plus
-    /// client commands ("Future SQL\*Plus-like commands may be added
-    /// progressively"), so Oracle's Phase 1 descriptor leaves this `false`
-    /// even though the lexer implements it and is tested against it.
-    pub sqlplus_rem: bool,
+    /// Words (compared case-insensitively) that, as a line's very first
+    /// word, start a SQL\*Plus-style line comment running to end of line —
+    /// Oracle: `["REM", "REMARK"]`. Empty disables this form. `SPEC.md` §15
+    /// defers SQL\*Plus client commands ("Future SQL\*Plus-like commands may
+    /// be added progressively"), so Oracle's Phase 1 descriptor leaves this
+    /// empty even though the lexer implements it and is tested against it.
+    pub sqlplus_line_comment_words: &'static [&'static str],
 }
 
 /// The vendor-specific facts this crate's lexer and splitter need, supplied
@@ -161,8 +175,20 @@ pub struct SqlDialect {
     /// Characters that terminate a plain (non-block) statement. Oracle: `[';']`.
     pub statement_terminators: &'static [char],
     /// Whether a line containing only `/` (surrounding whitespace allowed)
-    /// ends a block statement. Oracle: `true` (SQL\*Plus's own convention).
+    /// authoritatively ends a **block** statement, wherever it appears —
+    /// regardless of nesting depth or any pending member body — the moment
+    /// it is seen. Oracle: `true` (SQL\*Plus's own convention). This is the
+    /// splitter's safety net: even a block-structure miscount can carve out
+    /// at most one over-large statement, never an executable fragment from
+    /// the middle of one, because a lone `/` line always closes whatever is
+    /// currently open. See the [`crate::splitter`] module docs' "Safety"
+    /// section.
     pub slash_terminates_block: bool,
+    /// The same authority, for a **plain** statement: a lone `/` line ends
+    /// it even though no statement terminator was seen (SQL\*Plus itself
+    /// submits whatever is in its buffer when `/` is typed, complete or
+    /// not). Oracle: `true`.
+    pub slash_terminates_plain: bool,
     /// Whether a block statement may end at the statement terminator that
     /// closes its outermost `END`, when no `/` line follows (only
     /// whitespace/comments may separate that terminator from either the next
@@ -174,9 +200,21 @@ pub struct SqlDialect {
     /// Patterns recognizing a statement that opens a block. See
     /// [`BlockStarter`].
     pub block_starters: &'static [BlockStarter],
-    /// The keyword that opens a block's body, matched at most once without
-    /// increasing nesting depth (it is the block's *own* opener, not a
-    /// nested one) — Oracle: `"BEGIN"`. Every later occurrence nests.
+    /// The opening/closing delimiters of a statement label, e.g. Oracle's
+    /// `Some(("<<", ">>"))` for `<<my_label>>`. A label may precede a block
+    /// statement's own leading keywords (`<<outer>> BEGIN ... END outer;`)
+    /// or a `LOOP`; [`crate::splitter`] skips any number of them before
+    /// matching [`block_starters`](Self::block_starters). `None` disables
+    /// label recognition (a leading `<<` is then ordinary content, most
+    /// likely an operator token that simply fails every block-starter
+    /// pattern).
+    pub label_delimiters: Option<(&'static str, &'static str)>,
+    /// The keyword that opens a block's body, matched at most once per
+    /// nesting frame without increasing depth (it is that frame's *own*
+    /// opener, not a nested one) — Oracle: `"BEGIN"`. Every other occurrence
+    /// nests, or — while a member header's [`subprogram_header_keywords`](Self::subprogram_header_keywords)
+    /// scan has left one body owed — fulfills that debt instead. See the
+    /// [`crate::splitter`] module docs for the full rule.
     pub block_body_opener: &'static str,
     /// Keywords that always open a nested construct requiring its own
     /// matching [`block_end_keyword`](Self::block_end_keyword) — Oracle:
@@ -184,8 +222,64 @@ pub struct SqlDialect {
     /// both end in a bare `LOOP ... END LOOP`.
     pub block_nesting_openers: &'static [&'static str],
     /// The keyword that closes one level of nesting, and — at the outermost
-    /// level — the block itself. Oracle: `"END"`.
+    /// level — the block itself. Oracle: `"END"`. Everything between an
+    /// `END` and the next statement terminator is that construct's
+    /// qualifier (a name, `LOOP`, `IF`, `CASE`, or a compound trigger's
+    /// timing-point words) and is skipped as a unit, however many words long.
     pub block_end_keyword: &'static str,
+    /// Keywords that introduce a member/subprogram header which may — but,
+    /// if it turns out to be a forward declaration ending directly at a
+    /// terminator, or a call-spec (see
+    /// [`call_spec_keywords`](Self::call_spec_keywords)), need not — owe a
+    /// body of its own. Oracle: `["PROCEDURE", "FUNCTION"]` (this covers
+    /// `MEMBER FUNCTION`, `STATIC PROCEDURE`, `CONSTRUCTOR FUNCTION`, … too,
+    /// since only the trigger word itself is matched).
+    pub subprogram_header_keywords: &'static [&'static str],
+    /// Keywords that, once a [`subprogram_header_keywords`](Self::subprogram_header_keywords)
+    /// header reaches one of them, mean "the body follows here" (unless
+    /// immediately followed by a [`call_spec_keywords`](Self::call_spec_keywords)
+    /// word). Oracle: `["IS", "AS"]`.
+    pub body_intro_keywords: &'static [&'static str],
+    /// Keywords that, immediately after a
+    /// [`body_intro_keywords`](Self::body_intro_keywords) word, mean the
+    /// header is a call-spec (`LANGUAGE JAVA ...` / `EXTERNAL ...`) with no
+    /// PL/SQL body — it ends at its own next statement terminator instead.
+    /// Oracle: `["LANGUAGE", "EXTERNAL"]`.
+    pub call_spec_keywords: &'static [&'static str],
+    /// Keywords that, seen before any body has been owed or absorbed at the
+    /// outermost level of a [`BlockKind::Structured`] statement, mean the
+    /// whole statement is body-less DDL ending at its own next statement
+    /// terminator (Oracle: `["CALL"]`, for `CREATE TRIGGER t ... CALL
+    /// proc(:NEW.x);` — a trigger whose body is a single `CALL`, never a
+    /// `BEGIN`/`END` block).
+    pub body_less_markers: &'static [&'static str],
+    /// The phrase that marks a compound trigger, e.g. Oracle's
+    /// `Some(&["COMPOUND", "TRIGGER"])`. Once seen anywhere during a
+    /// [`BlockKind::Structured`] scan, [`compound_trigger_timing_starters`](Self::compound_trigger_timing_starters)
+    /// words are treated like [`subprogram_header_keywords`](Self::subprogram_header_keywords)
+    /// for the rest of that statement. Before the marker is seen (or when
+    /// this field is `None`), those words are ordinary content — an
+    /// ordinary (non-compound) trigger's own `BEFORE INSERT ON t` timing
+    /// clause must not be mistaken for a compound trigger's timing-point
+    /// section header.
+    pub compound_trigger_marker: Option<Phrase>,
+    /// Timing-point words that introduce a compound trigger's own
+    /// `<timing-point> IS ... BEGIN ... END <timing-point>;` section, once
+    /// [`compound_trigger_marker`](Self::compound_trigger_marker) has been
+    /// seen. Oracle: `["BEFORE", "AFTER", "INSTEAD"]` (covering `BEFORE
+    /// STATEMENT`, `AFTER STATEMENT`, `BEFORE EACH ROW`, `AFTER EACH ROW`,
+    /// and `INSTEAD OF EACH ROW` — only the first word is matched, the rest
+    /// is skipped the same way a subprogram's name and parameter list are).
+    pub compound_trigger_timing_starters: &'static [&'static str],
+    /// The conditional-compilation directive prefix character, e.g. Oracle's
+    /// `Some('$')` for `$IF`/`$THEN`/`$ELSIF`/`$ELSE`/`$END` and the inquiry
+    /// form `$$name` (`$$PLSQL_UNIT`, …). When set, the lexer reads
+    /// `<prefix>[<prefix>]<identifier>` as one [`crate::TokenKind::Directive`]
+    /// token rather than an operator followed by a keyword — so, critically,
+    /// `$END` never presents a bare `END` keyword token to
+    /// [`crate::splitter`]'s depth tracking. `None` disables directive
+    /// lexing (a lone prefix character is then an ordinary operator).
+    pub directive_prefix: Option<char>,
     /// Which quoting forms beyond plain `'...'`/`"..."` this dialect enables.
     pub quoting: QuotingRules,
     /// Which comment forms this dialect enables.
@@ -202,9 +296,8 @@ pub struct SqlDialect {
     /// [`crate::TokenKind::Identifier`] for an unquoted word — a cosmetic
     /// (highlighting) distinction. **Nothing in [`crate::splitter`] depends
     /// on this list being complete**: block-boundary detection matches
-    /// specific words (`block_body_opener`, `block_nesting_openers`,
-    /// `block_end_keyword`, and the words inside `block_starters`) directly
-    /// against token text, regardless of whether they happen to appear here.
+    /// specific words directly against token text, regardless of whether
+    /// they happen to appear here.
     pub keywords: &'static [&'static str],
 }
 

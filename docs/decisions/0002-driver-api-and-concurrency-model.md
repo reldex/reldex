@@ -8,13 +8,15 @@ amended again by the owner's connect-time-warning decision, see "Amendment: the 
 channel"; amended again to say where a connection is *created*, see "Amendment: a connection is
 created on a helper thread"; amended again to make a batch's column storage readable and shareable,
 see "Amendment: a batch's column storage is readable, not only indexable"; amended again to record
-where the SQL/PL-SQL dialect descriptor lives, see "Amendment: the `SqlDialect` descriptor"
+where the SQL/PL-SQL dialect descriptor lives, see "Amendment: the `SqlDialect` descriptor"; amended
+again after an independent adversarial review of the splitter found a panic and several unsafe
+mis-splits, see "the `SqlDialect` descriptor" §J4
 **Date:** 2026-09-19
 **Amended:** 2026-09-19 (API review), 2026-09-19 (Phase 0 spikes), 2026-09-19 (db-core session
 review), 2026-09-19 (owner confirmation), 2026-09-20 (connect-time warning channel, C-6),
 2026-09-20 (connection created on a helper thread, C-5), 2026-09-20 (column storage readable, M1.3),
 2026-09-20 (`LobStream: Sync` and `ExecuteOutcome` non-exhaustive, M1.3 review),
-2026-09-20 (`SqlDialect` descriptor, M2.4)
+2026-09-20 (`SqlDialect` descriptor, M2.4), 2026-09-21 (`SqlDialect` splitter-safety review, M2.4)
 
 ## Context
 
@@ -1046,6 +1048,10 @@ built entirely from `'static` data (so it is `Copy`, no allocation), consumed by
 built by the driver: `reldex_driver_oracle_thin::sql_dialect() -> SqlDialect`, a plain function (not
 a trait method — see J2), added to that crate without touching `db-driver-api` at all.
 
+**This is the shape as of the original M2.4 implementation.** §J4 below records the fields an
+adversarial review added the same day the type first landed; see that section for the current
+complete field list rather than relying on this snapshot.
+
 Two reasons, not one:
 
 1. **Dependency direction.** `SqlDialect` is the parameter of `reldex-sql-text`'s own public API. A
@@ -1082,26 +1088,117 @@ type, that is the moment to revisit this as a genuine amendment, not before.
 ### J3 — what stays out of scope, and why
 
 Following `AGENTS.md` "Scope discipline" and `SPEC.md` §15's own "Future SQL\*Plus-like commands may
-be added progressively": `reldex-sql-text` implements `CommentRules::sqlplus_rem` (SQL\*Plus's
-`REM`/`REMARK` line comment) as machinery, and `StatementKind` is `#[non_exhaustive]` to leave room
-for a `SqlPlusCommand` variant later, but Oracle's Phase 1 `SqlDialect` leaves `sqlplus_rem` off and
-no `SqlPlusCommand` variant exists yet — there is nothing in Phase 1's scope that needs either.
-Three splitting shapes are documented, `#[ignore]`d-test limitations rather than silently-wrong
-answers: a `CREATE TRIGGER … CALL proc(…);` body with no `BEGIN`/`END` at all; a
-`CREATE TYPE … AS OBJECT (…);` spec with no `BEGIN`/`END` at all (object types are D8/lead-decision-3
-out of scope already); and Oracle 12c's `WITH FUNCTION … SELECT …` inline PL/SQL, which does not
-start with a block-starter keyword at all. None of these silently mis-executes a statement — each
-produces spans that a caller can inspect and, for now, get wrong in a way the test suite names and
-tracks, rather than one that a caller would only discover in production.
+be added progressively": `reldex-sql-text` implements SQL\*Plus's `REM`/`REMARK` line comment as
+machinery (`CommentRules::sqlplus_line_comment_words`, since renamed — see J4), and `StatementKind` is
+`#[non_exhaustive]` to leave room for a `SqlPlusCommand` variant later, but Oracle's Phase 1
+`SqlDialect` leaves that word list empty and no `SqlPlusCommand` variant exists yet — there is nothing
+in Phase 1's scope that needs either.
 
-*Evidence:* `crates/sql-text/tests/corpus.rs` — 21 passing tests plus 3 named, `#[ignore]`d
-limitation tests, run against `tests/corpus/*.sql` (a PL/SQL package with nested `BEGIN`/`CASE`/
-`IF`/`LOOP`, a trigger using the `:NEW`/`:OLD` shape `oracle-thin::rewrite` also recognizes, Thai text
-in strings/comments/quoted identifiers, and every `q'...'` delimiter form) under both LF and CRLF,
-checked against two invariants: line-by-line `tokenize_block` (state carried, as `QSyntaxHighlighter`
-would drive it) equals whole-document `tokenize`; and a script's statement spans plus the gaps
-between them reproduce the input exactly. A 5&nbsp;MB repeated-statement script is included to keep
-the splitter linear (not timed — `AGENTS.md`/this task: "no timing upper bounds in tests").
+One splitting shape remains a documented, `#[ignore]`d-test limitation rather than a silently-wrong
+answer: Oracle 12c's `WITH FUNCTION … SELECT …` inline PL/SQL, which does not start with a
+block-starter keyword at all and would need scanning past arbitrary `WITH`-clause syntax to
+recognize. (Two others originally listed here — a `CREATE TRIGGER … CALL proc(…);` body with no
+`BEGIN`/`END`, and a `CREATE TYPE … AS OBJECT (…);` spec with no `BEGIN`/`END` — were fixed by J4's
+`pending_bodies`/`BlockKind::ParenDelimited` model and are no longer limitations.) This one does not
+silently mis-execute a statement either: `WITH FUNCTION`'s inline body's own `;`s are read as
+ordinary plain-statement terminators, over-splitting the script into several statements that each
+fail to parse alone — never an executable fragment carved out of the middle of one.
+
+*Evidence:* `crates/sql-text/tests/corpus.rs` — see J4 for the post-review test count and the fuzz
+evidence, which supersedes the counts originally recorded here. `tests/corpus/*.sql` (a PL/SQL
+package with nested `BEGIN`/`CASE`/`IF`/`LOOP`, a trigger using the `:NEW`/`:OLD` shape
+`oracle-thin::rewrite` also recognizes, Thai text in strings/comments/quoted identifiers, every
+`q'...'` delimiter form, and — added by J4 — labelled/nested blocks, compound triggers, `JAVA SOURCE`,
+and `$IF` directives) is checked under both LF and CRLF against two invariants: line-by-line
+`tokenize_block` (state carried, as `QSyntaxHighlighter` would drive it) equals whole-document
+`tokenize`; and a script's statement spans plus the gaps between them reproduce the input exactly. A
+5&nbsp;MB repeated-statement script is included to keep the splitter linear (not timed —
+`AGENTS.md`/this task: "no timing upper bounds in tests").
+
+### J4 — adversarial review: a panic, unsafe mis-splits, and the splitter's safety principles
+
+An independent adversarial review of J1's implementation (commit `e78ab58`, the same day it landed)
+approved the architecture but found one guaranteed panic and several mis-splits serious enough to
+require a same-day fix before this ADR could be considered settled, because a `StatementSpan` is not
+a highlighting range — it is what gets executed against a real database. Both classes of defect, and
+the fix, are recorded here rather than in a second ADR because they change no boundary this ADR did
+not already own: `SqlDialect`'s field list and the splitter's algorithm, both introduced by J1.
+
+**The panic.** `statement_at` clamped an out-of-range offset to `text.len()` but never floored it to a
+UTF-8 character boundary, so an offset landing inside a multi-byte character (e.g. a byte-order mark)
+panicked on the first `&text[..offset]` slice. Fixed with a hand-rolled `floor_char_boundary` (the
+standard library's own is not yet stable) applied before any slicing.
+
+**The mis-splits**, all in the depth-tracking algorithm: a labelled block (`<<outer>> BEGIN ... END
+outer;`) was not recognized as a block at all, because leading-keyword matching stopped at the `<`
+operator; a subprogram nested inside another subprogram's declare section could be mistaken for the
+outer's own body opener/closer; a compound trigger's timing-point sections (`BEFORE STATEMENT IS
+BEGIN ... END BEFORE STATEMENT;`) were not understood as owning their own body, so the trigger's
+depth count never returned to the level needed to recognize its own close; and a package/type body
+with an initialization section *after* its members closed at the wrong point. Each of these could
+produce either a `StatementKind::Plain` span carved out of the middle of a block (executable on its
+own, and wrong) or a block that ran unterminated to end of input, silently swallowing every statement
+after it.
+
+**The fix** replaces the single `absorbs_body_opener: bool` per `BlockStarter` with one unified
+model, `crates/sql-text/src/splitter.rs`'s module docs describe in full:
+
+- A `pending_bodies: u32` counter, incremented when a word matching the new
+  `SqlDialect::subprogram_header_keywords` (`PROCEDURE`/`FUNCTION`) or — once
+  `SqlDialect::compound_trigger_marker` (`COMPOUND TRIGGER`) has been seen —
+  `SqlDialect::compound_trigger_timing_starters` (`BEFORE`/`AFTER`/`INSTEAD`) is found to owe a body
+  (i.e. its header reaches `SqlDialect::body_intro_keywords` (`IS`/`AS`) before a statement
+  terminator, and is not immediately followed by a `SqlDialect::call_spec_keywords`
+  (`LANGUAGE`/`EXTERNAL`) call-spec).
+- A `BEGIN` fulfills a pending body if one is owed; otherwise it is absorbed as the *current nesting
+  frame's own* body exactly once (covering a lone `PROCEDURE`/`DECLARE`/`BEGIN` statement and a
+  package/type body's optional init section with the same rule); any other `BEGIN` nests.
+- `SqlDialect::label_delimiters` (`<<`/`>>`) are skipped before leading-keyword matching.
+- `SqlDialect::body_less_markers` (`CALL`) recognizes a trigger whose body is a bare `CALL`, owing no
+  body at all.
+- A new `BlockKind` on `BlockStarter` (`Structured`, `OpaqueSource`, `ParenDelimited`) replaces the
+  boolean: `ParenDelimited` (Oracle: `CREATE [OR REPLACE] TYPE` without `BODY`) tracks balanced
+  parens to the first depth-`0` terminator, with no `BEGIN`/`END` concept at all; `OpaqueSource`
+  (Oracle: `CREATE ... JAVA SOURCE ...`) is not PL/SQL and ends only at a lone `/` line or end of
+  input, its own `;` characters being ordinary body content.
+- `SqlDialect::directive_prefix` (`$`) makes the lexer read `$IF`/`$THEN`/`$ELSIF`/`$ELSE`/`$END` and
+  `$$PLSQL_UNIT`-shaped inquiry directives as one new `TokenKind::Directive` token, so `$END`'s `END`
+  can never be read as the block's own closing keyword.
+
+**The safety principle (new, and the reason a class of *undiscovered* future bugs in the above is
+already bounded):** a lone `/` line is now checked on *every* token of *every* scan in the module,
+overriding nesting depth or any pending body the moment it is seen
+(`SqlDialect::slash_terminates_block`/`slash_terminates_plain`, the latter new — S1 in the module
+docs). SQL\*Plus itself never sends a block to the server until `/` is typed, so this is not a new
+behavior invented for safety's sake; it is the same convention scripts already rely on, now enforced
+by the splitter rather than assumed. Its effect: even a block-structure miscount this review did not
+find can produce at most one over-large statement, never an executable fragment carved from the
+middle of one (S3 in the module docs) — the dangerous failure mode is structurally unreachable, not
+merely untested.
+
+**`StatementSpan::ended_by: EndedBy`** (`#[non_exhaustive]`: `Terminator`, `SlashLine`,
+`InferredBlockEnd`, `EndOfInput`) is new, so a caller — in particular M4.3's script executor — can
+tell *why* a span ended where it did, not only whether `terminated` is `true`. `docs/exec-plans/active/phase-1.md`'s
+M4.3 row is updated to say execution must consult it.
+
+**Vendor-neutrality fixes**, found by the same review: `lexer.rs` had `"REM"`/`"REMARK"`,
+`"Q"`/`"NQ"`, hard-coded as string literals rather than sourced from `SqlDialect` data, contradicting
+this crate's own stated invariant. `CommentRules::sqlplus_rem: bool` is now
+`sqlplus_line_comment_words: &'static [&'static str]`, and `QuotingRules::alternative_quoting`/
+`national_prefix: bool` are now `alternative_quote_prefixes`/`national_string_prefixes: &'static
+[&'static str]` — the words themselves are driver-supplied data, matching how every other keyword in
+this descriptor already worked.
+
+*Evidence:* `crates/sql-text/tests/corpus.rs` grew to 43 passing tests plus 1 remaining `#[ignore]`d
+limitation (`WITH FUNCTION`, J3), including one test per named reproducer above, a
+`statement_at`-never-panics sweep over every byte offset (including out-of-range ones) of Thai/emoji/
+BOM text, and a new deterministic fuzz test (a dependency-free xorshift32 PRNG — this crate stays at
+zero dependencies — combining grammar-aware fragments across 4 fixed seeds, 200,000 cases each in
+release mode, 800,000 total) checking: no panics; every span's boundaries land on a character
+boundary and are non-overlapping; spans plus gaps reproduce the input exactly; the
+line-by-line-vs-whole-document `tokenize` invariant holds under both LF and CRLF; and a new
+"known-good blocks joined by `/`" round-trip property (independently-valid blocks concatenated, split,
+and confirmed to come back as exactly one span each, all terminated).
 
 ## Notes for driver implementers
 
