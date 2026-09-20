@@ -8,6 +8,7 @@ members = [
     "crates/drivers/oracle-thin",
     "crates/reldex-core-poc",
     "crates/mobile-link-check",
+    "crates/sql-text",
 ]
 
 # ---------------------------------------------------------------------------

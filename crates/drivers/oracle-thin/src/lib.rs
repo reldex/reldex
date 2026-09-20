@@ -324,6 +324,7 @@ mod descriptor;
 mod error;
 mod lob;
 mod rewrite;
+mod sql_dialect;
 mod value;
 
 pub use conn::{
@@ -334,3 +335,4 @@ pub use conn::{
 pub use connect_timeout::{
     DEFAULT_CONNECT_TIMEOUT, EXT_CONNECT_TIMEOUT_UNBOUNDED, MAX_CONNECT_TIMEOUT,
 };
+pub use sql_dialect::sql_dialect;

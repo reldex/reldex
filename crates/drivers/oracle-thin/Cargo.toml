@@ -16,6 +16,11 @@ oracle-it = []
 
 [dependencies]
 reldex-db-driver-api = { path = "../../db-driver-api" }
+# The vendor-neutral SQL/PL-SQL lexer and statement splitter (M2.4). This
+# driver supplies Oracle's own `SqlDialect` descriptor (`sql_dialect.rs`);
+# `reldex-sql-text` itself contains no Oracle-specific logic, so depending on
+# it here does not create a cycle or leak an Oracle type upward.
+reldex-sql-text = { path = "../../sql-text" }
 
 # Oracle's own pure-Rust thin driver (`oracle/rust-oracledb`), adopted by
 # ADR-0001 and pinned to an **exact** version because it is pre-GA and its API

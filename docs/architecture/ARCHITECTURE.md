@@ -233,12 +233,21 @@ reviewed against the Phase 0 test database — see §13 item 10 for the still-op
 ```text
 crates/db-driver-api/          vendor-neutral driver contract + DbError
 crates/db-core/                sessions, transactions, query, results, metadata, workspace
+crates/sql-text/               reldex-sql-text: vendor-neutral SQL/PL-SQL lexer + statement splitter (M2.4)
 crates/drivers/oracle-thin/    thin driver: wraps Oracle's `oracledb` crate (ADR-0001); vendor code isolated here
 crates/drivers/mock/           test-support/mock driver for core tests
 crates/ffi/                    reldex-ffi: the stable C ABI (ADR-0003); the only crate allowed `unsafe`
 crates/reldex-core-poc/        Phase 0 validation harness (no full UI)
 docs/architecture/, docs/decisions/, docs/exec-plans/
 ```
+
+`crates/sql-text` (package `reldex-sql-text`, M2.4) sits beside `db-driver-api` rather than inside
+`db-core`: it has no dependency on either, its `SqlDialect` parameter is supplied by a driver
+(`reldex_driver_oracle_thin::sql_dialect()` for Oracle) as plain data, and `db-core`/the FFI layer
+may depend on it directly for the editor's highlighter and statement splitter without a driver in
+scope. See that crate's own `dialect` module doc and the ADR-0002 amendment "The `SqlDialect`
+descriptor" for the full reasoning, including why this differs from the placement
+`docs/exec-plans/active/phase-1.md` §B4 originally sketched.
 
 `crates/ffi` exists, is exercised against the mock driver, and has been independently reviewed
 (M1.3), but ADR-0003 is still **Proposed**: spike S15 is the gate, and until it runs the boundary's
@@ -347,5 +356,14 @@ Until then, no code should assume an answer.
     normalized to an offset, a documented limitation), explicit NULL via variant plus a per-column
     validity mask, and lazy `LobStream` for LOBs. Still open: per-type driver-mapping evidence against
     a real database, pending the Workstream D spikes (`phase-0.md`).
-12. **Script/statement boundary parsing.** Where the SQL/PL/SQL block-boundary parser lives and how
-    it is shared between core and editor (`SPEC.md` §15).
+12. **Script/statement boundary parsing — RESOLVED by M2.4 (ADR-0002 amendment "The `SqlDialect`
+    descriptor").** `crates/sql-text` (`reldex-sql-text`) is the vendor-neutral lexer and statement
+    splitter; it is shared between core and editor by being depended on directly by whichever of
+    them needs it, with no vendor code inside it. The Oracle-specific facts it needs (block-opening
+    keywords, quoting forms, `/`) are supplied as data — `reldex_driver_oracle_thin::sql_dialect()`
+    — rather than compiled into the crate. `tokenize_block(text, state, &dialect) ->
+    (Vec<Token>, LexState)` is shaped for `QSyntaxHighlighter`'s per-block, state-carrying model
+    (M4.1); `split_statements`/`statement_at` back "run statement/script" (M4.3). Known limitations
+    (a body-less `CREATE TRIGGER ... CALL ...;`, a body-less `CREATE TYPE ... AS OBJECT (...);`,
+    and 12c `WITH FUNCTION ... SELECT ...` inline PL/SQL) are documented on `reldex_sql_text::splitter`
+    with a failing-by-design, `#[ignore]`d test each.

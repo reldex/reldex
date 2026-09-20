@@ -7,12 +7,14 @@ independent review of the `db-core` session layer, see "Amendments after the db-
 amended again by the owner's connect-time-warning decision, see "Amendment: the connect-time warning
 channel"; amended again to say where a connection is *created*, see "Amendment: a connection is
 created on a helper thread"; amended again to make a batch's column storage readable and shareable,
-see "Amendment: a batch's column storage is readable, not only indexable"
+see "Amendment: a batch's column storage is readable, not only indexable"; amended again to record
+where the SQL/PL-SQL dialect descriptor lives, see "Amendment: the `SqlDialect` descriptor"
 **Date:** 2026-09-19
 **Amended:** 2026-09-19 (API review), 2026-09-19 (Phase 0 spikes), 2026-09-19 (db-core session
 review), 2026-09-19 (owner confirmation), 2026-09-20 (connect-time warning channel, C-6),
 2026-09-20 (connection created on a helper thread, C-5), 2026-09-20 (column storage readable, M1.3),
-2026-09-20 (`LobStream: Sync` and `ExecuteOutcome` non-exhaustive, M1.3 review)
+2026-09-20 (`LobStream: Sync` and `ExecuteOutcome` non-exhaustive, M1.3 review),
+2026-09-20 (`SqlDialect` descriptor, M2.4)
 
 ## Context
 
@@ -1005,6 +1007,101 @@ M1.3 added a field (`columns`, see ADR-0003 A6) and M2.5's event queue will want
 Nothing outside `db-core` constructs an `ExecuteOutcome` — the worker thread is its only producer —
 so the attribute costs nothing today and makes the next field an additive change rather than a
 breaking one.
+
+## Amendment: the `SqlDialect` descriptor (2026-09-20, M2.4)
+
+Numbering: `J`. `docs/exec-plans/active/phase-1.md` §B4 named this as "additive, in `db-core` rather
+than the contract" ahead of implementation; this amendment records where it actually landed and why,
+which is one crate further out than that sketch, for reasons specific to how M2.4 was carried out
+(see below) and, independently, to dependency direction.
+
+### J1 — `SqlDialect` lives in the new `reldex-sql-text` crate, not in `db-core` or `db-driver-api`
+
+`SPEC.md` §15 forbids splitting a script by every semicolon and requires understanding SQL/PL-SQL
+block boundaries and SQL\*Plus's `/`. That parsing is vendor-neutral logic parameterized by
+vendor-specific facts — which keywords open a block, which quoting forms exist, whether `/` matters
+— and D8 already listed "script/statement-boundary parsing" as out of scope for *this contract*.
+M2.4 keeps it out of the contract and gives it its own crate, `crates/sql-text`
+(`reldex-sql-text`), with:
+
+```rust
+pub struct SqlDialect {
+    pub statement_terminators: &'static [char],
+    pub slash_terminates_block: bool,
+    pub block_may_end_without_slash: bool,
+    pub block_starters: &'static [BlockStarter],
+    pub block_body_opener: &'static str,
+    pub block_nesting_openers: &'static [&'static str],
+    pub block_end_keyword: &'static str,
+    pub quoting: QuotingRules,
+    pub comments: CommentRules,
+    pub bind_variables: bool,
+    pub substitution_variables: bool,
+    pub keywords: &'static [&'static str],
+}
+```
+
+built entirely from `'static` data (so it is `Copy`, no allocation), consumed by
+`reldex_sql_text::{tokenize, tokenize_block, split_statements, statement_at}`. Oracle's own value is
+built by the driver: `reldex_driver_oracle_thin::sql_dialect() -> SqlDialect`, a plain function (not
+a trait method — see J2), added to that crate without touching `db-driver-api` at all.
+
+Two reasons, not one:
+
+1. **Dependency direction.** `SqlDialect` is the parameter of `reldex-sql-text`'s own public API. A
+   type a crate's signature names should not live one layer further down the dependency graph than
+   the crate itself, or every caller of the lexer/splitter — including a future consumer that is
+   neither `db-core` nor a driver, such as a standalone formatter — would have to depend on `db-core`
+   (sessions, transactions, the worker/registry machinery) or on `db-driver-api` (which D8 keeps
+   deliberately small) just to name the parameter type. `reldex-sql-text` depends on nothing; a
+   driver depends on it (as `oracle-thin` already depends on `db-driver-api`) to build its
+   descriptor; `db-core` and the FFI/UI layer may depend on it directly.
+2. **Isolation during implementation.** M2.4 and M2.5/M2.6 (the event-queue and session-registry
+   `db-core` refactor) were carried out concurrently in separate worktrees specifically so neither
+   blocked the other (`docs/exec-plans/active/phase-1.md` §C.2, "Parallelism"). Adding a type to
+   `db-core` from the M2.4 worktree would have collided with that work for no benefit to either side.
+   This constraint made the `db-core` placement impractical regardless of J1's dependency-direction
+   argument, which would have argued against it anyway.
+
+`ARCHITECTURE.md` §13 item 12 is updated from an open question to resolved, pointing here.
+
+### J2 — no change to the `DatabaseDriver`/`DatabaseConnection` traits
+
+Unlike the `take_connect_warnings`, server-output and metadata-catalog amendments above, this one
+adds **no** trait method. `sql_dialect()` is a plain associated function on the concrete
+`OracleThinDriver`-adjacent module, not `DatabaseDriver::sql_dialect()`, because nothing calls it
+through a `Box<dyn DatabaseDriver>`: `db-core`'s worker never needs a script's dialect (it executes
+one statement at a time, handed to it already split), and the UI/FFI layer, which does need it to
+drive the editor, already knows which driver it is talking to and can call the concrete function
+directly. Adding a defaulted trait method for this would be additive and therefore possible, but
+would commit every future driver to "supplying a dialect" as a contract obligation before a second
+driver exists to say whether that shape is right — the same restraint D8 already applies elsewhere.
+If a second driver arrives and the UI needs to select a dialect without knowing the concrete driver
+type, that is the moment to revisit this as a genuine amendment, not before.
+
+### J3 — what stays out of scope, and why
+
+Following `AGENTS.md` "Scope discipline" and `SPEC.md` §15's own "Future SQL\*Plus-like commands may
+be added progressively": `reldex-sql-text` implements `CommentRules::sqlplus_rem` (SQL\*Plus's
+`REM`/`REMARK` line comment) as machinery, and `StatementKind` is `#[non_exhaustive]` to leave room
+for a `SqlPlusCommand` variant later, but Oracle's Phase 1 `SqlDialect` leaves `sqlplus_rem` off and
+no `SqlPlusCommand` variant exists yet — there is nothing in Phase 1's scope that needs either.
+Three splitting shapes are documented, `#[ignore]`d-test limitations rather than silently-wrong
+answers: a `CREATE TRIGGER … CALL proc(…);` body with no `BEGIN`/`END` at all; a
+`CREATE TYPE … AS OBJECT (…);` spec with no `BEGIN`/`END` at all (object types are D8/lead-decision-3
+out of scope already); and Oracle 12c's `WITH FUNCTION … SELECT …` inline PL/SQL, which does not
+start with a block-starter keyword at all. None of these silently mis-executes a statement — each
+produces spans that a caller can inspect and, for now, get wrong in a way the test suite names and
+tracks, rather than one that a caller would only discover in production.
+
+*Evidence:* `crates/sql-text/tests/corpus.rs` — 21 passing tests plus 3 named, `#[ignore]`d
+limitation tests, run against `tests/corpus/*.sql` (a PL/SQL package with nested `BEGIN`/`CASE`/
+`IF`/`LOOP`, a trigger using the `:NEW`/`:OLD` shape `oracle-thin::rewrite` also recognizes, Thai text
+in strings/comments/quoted identifiers, and every `q'...'` delimiter form) under both LF and CRLF,
+checked against two invariants: line-by-line `tokenize_block` (state carried, as `QSyntaxHighlighter`
+would drive it) equals whole-document `tokenize`; and a script's statement spans plus the gaps
+between them reproduce the input exactly. A 5&nbsp;MB repeated-statement script is included to keep
+the splitter linear (not timed — `AGENTS.md`/this task: "no timing upper bounds in tests").
 
 ## Notes for driver implementers
 
