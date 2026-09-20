@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-20T17:35:00+07:00",
+  "updatedAt": "2026-09-20T18:18:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1104,8 +1104,8 @@
               "status": "done"
             },
             {
-              "title": "M1.6 ★ ResultTableModel over borrowed batch views; Bridge waker→invokeMethod drain (opus, review mandatory)",
-              "status": "todo"
+              "title": "M1.6 ★ ResultTableModel over borrowed batch views; Bridge waker→invokeMethod drain (opus, review mandatory) — done 2026-09-20: Bridge (waker → coalesced queued drain, 256 events / 4 ms budget, re-posts itself), SessionController (bounded fetches in flight), ResultTableModel (borrowed batch views; text = pointer reads, other kinds bulk-formatted per 1,024-row window into an LRU cache ≤ 8 MiB), Metrics hooks for S15; independently reviewed (3 must-fix fixed); K5 flood teardown 10,000 iterations with live-handle counts back to zero; ASan not available on the Windows dev machine (x64 runtime missing)",
+              "status": "done"
             },
             {
               "title": "M1.7 Mock driver: 1M-row generator of the S14 shape with controllable latency and a 10 s blocking statement (sonnet) — done 2026-09-20: Action::GeneratedQuery / GeneratedQuerySpec (lazy, O(batch) memory, expected_cell for random-access checks); 1M rows stream in ~0.55 s (release)",
@@ -1618,6 +1618,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-20",
+      "text": "M1.6 done: the Qt adapter (Bridge, SessionController, ResultTableModel, Metrics). Independent review found no use-after-free, lost wake or leak, and 3 must-fix: the adapter made the library build NUMBER/TIMESTAMP mirrors nobody read (the whole K3 overrun — fixed in reldex-ffi ABI 3), whole-batch formatting that cost milliseconds per first cell at large fetch sizes (now 1,024-row windows), and a constructor that registered the waker before it could fail. Informal numbers, Windows dev machine, 1M rows: stream 0.45-0.47 s, 113-118 B/row headless (was ~178), in-app growth 171 MB working set / 142 MB private (was ~231 MB), ~100 ns/cell warm, K5 10,000 teardowns in 6.3 s with live counts back to zero. The formal S15 verdict is M1.8. Not verified: ASan on the adapter (unavailable locally), frame time (K1)."
+    },
     {
       "date": "2026-09-20",
       "text": "reldex-ffi ABI 3: the first consumers (Qt adapter review, C harness) showed that viewing every column made the library build NUMBER/TIMESTAMP mirrors nobody read — 62.0 B/row, about 30% of K3's 200 MB budget. Mirrors are now built only on request; added live-handle counts (K5 can assert 'nothing leaked' without ASan, which is unavailable on the dev machine), column descriptions at EXECUTED, result id on FETCHED, an empty-result mock. Independent review found a use-after-free in the pump-panic path of the new column accessor (fixed: retire, never free) and a missing result id on panic-answered events (fixed). ADR-0003 A19-A25, still Proposed."
