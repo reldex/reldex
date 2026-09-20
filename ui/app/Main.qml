@@ -27,6 +27,9 @@ Window {
 
     Component.onCompleted: {
         bridge.metrics.attachWindow(root);
+        // Spike S15's measurement driver (M1.8). Inert unless the environment
+        // asks for a run; the sequencing lives in C++ so QML has none of it.
+        bridge.scrollDriver.attach(root, table);
         bridge.autoStart();
     }
 

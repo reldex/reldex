@@ -1,8 +1,8 @@
 # 0003 — Qt ↔ Rust Integration
 
-**Status:** Proposed — acceptance conditional on spike S15 (below)
+**Status:** Proposed — spike S15 complete 2026-09-20; owner ruling requested
 **Date:** 2026-09-20
-**Amended:** 2026-09-20 (pre-acceptance, from building `crates/ffi` in M1.3 — see "Amendment (pre-acceptance): what building the boundary changed", items A1–A9; extended the same day with A10–A18 from the independent review of that work. The status is unchanged and S15 is still the gate.)
+**Amended:** 2026-09-20 (pre-acceptance, from building `crates/ffi` in M1.3 — see "Amendment (pre-acceptance): what building the boundary changed", items A1–A9; extended the same day with A10–A18 from the independent review of that work. A19–A25 followed the same day from the first consumers' findings (ABI 3). The status is unchanged and S15 is still the gate.) **Amended again, 2026-09-20:** spike S15 was run and reported (`docs/exec-plans/active/phase-1-s15-ffi-spike.md`) — see "S15 result (2026-09-20)" under Evidence. Status moved from "acceptance conditional on spike S15" to "spike S15 complete; owner ruling requested". The lead does not accept ADR-0003 unilaterally on this evidence; three specific rulings are requested from the owner (see below). Status is still not Accepted.
 **Supersedes/resolves:** `ARCHITECTURE.md` §13 item 2 (FFI mechanism), item 3's remaining FFI half (completion marshalling, thread affinity, reentrancy), and item 10 in part (crate layout for the FFI/UI tier).
 
 ## Context
@@ -177,7 +177,31 @@ Build the thinnest vertical slice that is *the real thing*: real `reldex-ffi`, r
 
 K1/K3 failure with a *diagnosed* cause in the model (not the boundary) is a design fix, not a kill — the kill is "the boundary itself cannot meet it".
 
-As of this writing (2026-09-20) spike S15 has not been run; this ADR's status stays **Proposed** until it is, per the owner-decision facts recorded in `docs/exec-plans/active/phase-1.md` (the owner has not accepted ADR-0003).
+### S15 result (2026-09-20)
+
+Spike S15 was run on 2026-09-20 against the real vertical slice this section asks for: real `reldex-ffi` (ABI 3), the committed cbindgen header, the Corrosion build, the real `QAbstractTableModel`, the real wake → `invokeMethod` path, and the mock driver's 1,000,000-row S14 shape (`NUMBER`, `VARCHAR2(40)`, `DATE`). Full method, environment and every number are in `docs/exec-plans/active/phase-1-s15-ffi-spike.md`; the summarised data behind every table is in `docs/exec-plans/active/phase-1-s15-data/`. Condensed from the report's Summary, in the report's own verdict words:
+
+| # | Criterion | Threshold | Measured headline | Verdict |
+| --- | --- | --- | --- | --- |
+| K1 | Scroll frame time, 1M rows, 100%/150% DPI | p99 > 16.7 ms, or p50 > 8 ms | Cost (pacing artefact removed): worst p50 5.72 ms, worst application CPU 5.24 ms. Budget (vsync on, display awake, 36,008 frames): 8 frames over 33 ms (0.022%), 2 of them in the idle control | **PASS-with-named-gap** — passes the p50 clause on measured cost and the p99 clause on the dropped-frame reading; the literal p99 > 16.7 ms reading fails for an idle window too, so which quantity K1's p99 names needs an owner ruling |
+| K2 | Execute → first row painted, mock driver, in-process | > 150 ms | Warm (2nd..31st execute): 15.85 ms, ~9× under. Cold process, vsync on: 903.55 ms | **FAIL** as the ADR is written (no warm/cold qualifier). Warm passes by ~9×. Cause located outside the boundary (~250 ms D3D11 device creation + one 551 ms delegate-instantiation `polishItems` pass); needs an owner ruling on whether K2 means the warm path |
+| K3 | Retained memory, 1M rows of the S14 shape | > 200 MB RSS growth | Idle, already-drawn baseline: +172.5…172.7 MB RSS, +142.0…142.1 MB private. From process start: +200.3…200.8 MB RSS, +198.4…199.3 MB private | **PASS** on the metric of record (rows' cost, 172.7 MB); the most conservative reading is marginal and crosses 200 × 10⁶ B — disclosed |
+| K4 | Event delivered → batch described and columns viewable; per-cell `data()` | > 200 µs; or per-cell avg > 200 ns | `applyBatch` headless p50 0.90 µs. Boundary's own share of a whole drain: 0.4–2.0 µs, under 1% of the drain's 80–250 µs. Warm per-cell: 99.7–120.4 ns | **PASS** at p50/p90/p99 and per cell; the worst single batch (257.9 µs) exceeds 200 µs and is reported rather than filtered |
+| K5 | Waker teardown, 10,000 iterations, ASan | any use-after-free, race, or hang | Windows (no sanitizer available): 3 runs, no hang/crash, live counts back to baseline. Linux CI, ASan+UBSan+LSan over the whole adapter suite: 10,000 iterations, zero sanitizer reports, live counts back to baseline | **PASS-with-named-gap**: no sanitizer on the measured platform; ASan/UBSan/LSan clean on Linux CI |
+| K6 | UI never stalls under a 10 s-class blocking statement | any frame > 33 ms attributable to the boundary | 1 frame over 33 ms in 9,012, in the phase with nothing blocked. A third hub's 100,000-row stream: 866.3–867.4 ms with another session blocked and without, n = 15 per side, identical | **PASS** on both clauses, plus **NOT MEASURED** for two sessions on one hub (not reachable in this adapter) |
+| K7 | CMake+Corrosion+Qt builds and offscreen tests pass on all three runners | fails on any of the three, or a cold job over 25 min | Cold: windows 3.0 min, ubuntu 2.1 min, macos 1.6 min **FAILED** (build-script race, fixed in M1.4). Every run since green on all three; worst warm job 4.0 min | **PASS**, with the one historical macOS failure named and fixed |
+
+**No criterion's failure is located in the boundary.** The boundary's own share of a whole drain is 0.4–2.0 µs — under 1% of the 80–250 µs the UI thread spends per drain; a batch crossing is 0.9 µs against a 200 µs budget; a warm cell is 100–120 ns against a 200 ns budget; a million rows cost 114–119 B/row headless against the ADR's ~116 B/row estimate. K2's cold reading is Qt-side (D3D11 device creation plus one delegate-instantiation polish), and K7's one historical failure was a build-script race already fixed inside M1.4.
+
+**Three rulings are requested from the owner**, recorded here as open questions with the lead's recommendation labelled as a recommendation, not a decision:
+
+1. **What K1's `p99 > 16.7 ms` clause names.** Measured literally on a 60 Hz vsync-on swap distribution it fails for a window doing nothing (idle-control p99 17.26–17.62 ms), so it cannot be the intended reading. *Recommendation:* judge K1's p50 clause on measured frame cost and its p99 clause on dropped frames (intervals > 33 ms) in a vsync-on run — on that reading K1 passes (8 of 36,008 frames over 33 ms, 0.022%, two of them in the idle control).
+2. **Whether K2 is about the warm path.** As written K2 carries no warm/cold qualifier; the cold-process reading (903.55 ms) fails by ~6×, while the warm reading (15.85 ms) passes by ~9× and the cold cost is apportioned to Qt startup (~250 ms D3D11 device creation, one 551 ms `polishItems` pass identical at 1,000 and 1,000,000 rows and absent at 1 row). *Recommendation:* add the qualifier "warm (window already showing a grid)" to K2, and track the cold first paint as a Phase 1 startup task against `SPEC.md` §19 rather than as a boundary defect (tracked in `docs/exec-plans/active/phase-1.md` M6).
+3. **K3's baseline and metric.** Measured from an idle, already-drawn app the rows cost +172.5…172.7 MB RSS / +142.0…142.1 MB private; measured from process start the whole process costs +200.3…200.8 MB RSS / +198.4…199.3 MB private, which crosses 200 × 10⁶ bytes (though not 200 MiB). *Recommendation:* judge K3 on working-set growth attributable to the rows, measured from an idle, already-drawn app, with private bytes and the from-process-start reading reported alongside.
+
+**Still NOT MEASURED**, per the report's Limitations: two sessions sharing one hub with one of them blocked (not reachable in the M1.6 adapter; belongs with M3's multi-session work); Linux and macOS frame time (CI runs the offscreen correctness half only; no GPU-backed frame time exists for either); a real database or network (everything measured is the mock driver, in-process, zero network latency); true system-DPI 150% (`QT_SCALE_FACTOR=1.5` emulates it; the owner's display scale was not changed); AddressSanitizer on the platform this spike was measured on (Windows — covered on Linux CI instead, a different allocator and threading runtime); mobile (nothing built, run, or measured on Android or iOS); LOB columns (do not cross the boundary yet, per amendment A7).
+
+Full report: `docs/exec-plans/active/phase-1-s15-ffi-spike.md`. Data: `docs/exec-plans/active/phase-1-s15-data/`.
 
 ## Amendment (pre-acceptance): what building the boundary changed (2026-09-20, task M1.3)
 
