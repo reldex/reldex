@@ -113,13 +113,18 @@ pub(crate) fn classify(sql: &str) -> Classification {
 /// non-alphabetic character is skipped, and the word is the first maximal run
 /// of ASCII letters. Subsequent words are ordinary SQL identifiers, which is
 /// what `ALTER SESSION` and `SET TRANSACTION` need.
-struct Keywords<'a> {
+///
+/// Shared with [`crate::rewrite`], which has to recognize
+/// `CREATE [OR REPLACE] [NON]EDITIONABLE TRIGGER` by exactly the same rules —
+/// a second, slightly different keyword scanner is how a statement ends up
+/// classified one way and rewritten another.
+pub(crate) struct Keywords<'a> {
     rest: &'a str,
     at_first: bool,
 }
 
 impl<'a> Keywords<'a> {
-    const fn new(sql: &'a str) -> Self {
+    pub(crate) const fn new(sql: &'a str) -> Self {
         Self {
             rest: sql,
             at_first: true,

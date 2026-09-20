@@ -133,6 +133,36 @@
 //!   still commits server-side, which is reported through
 //!   [`committed_implicitly`](reldex_db_driver_api::ExecutionOutcome::committed_implicitly)
 //!   rather than hidden.
+//! - **`CREATE … TRIGGER` is rewritten so it can run at all.** `oracledb`
+//!   reads `:NEW`, `:OLD` — any `:name` — in a trigger body as a bind
+//!   placeholder and then demands a value for it, so the statement every other
+//!   Oracle client accepts cannot be executed (upstream gap U-18). Such a
+//!   statement is therefore submitted inside
+//!   `BEGIN EXECUTE IMMEDIATE q'…'; END;`, **on by default**, always with a
+//!   [`Warning`](reldex_db_driver_api::Warning) on the outcome carrying the
+//!   exact text sent. It is still reported as
+//!   [`StatementKind::Ddl`](reldex_db_driver_api::StatementKind::Ddl).
+//!   [`EXT_REWRITE_TRIGGER_DDL`] turns it off, and the explanatory refusal
+//!   comes back instead.
+//!
+//!   The same switch also governs one smaller thing: for **every** trigger this
+//!   driver recognises, wrapped or not, the punctuation a SQL\*Plus user types
+//!   for their client is removed — a trailing `/` on a line of its own, and the
+//!   statement terminator after a body that is not a PL/SQL block, such as
+//!   `… FOR EACH ROW CALL p(:NEW.id);`. A PL/SQL body's own `END;` is kept.
+//!   This is not cosmetic: Oracle does not reject a trigger whose text still
+//!   carries its `/` — it **accepts** it and leaves an `INVALID` trigger
+//!   behind, reporting success.
+//! - **A connect is bounded, by this driver rather than by `oracledb`.**
+//!   `oracledb` 26.0.0-beta.3 cannot bound one at all (upstream gap U-15), so
+//!   [`connect`](reldex_db_driver_api::DatabaseDriver::connect) runs its
+//!   blocking call on a helper thread and stops waiting at the limit:
+//!   [`ConnectionParams::connect_timeout`](reldex_db_driver_api::ConnectionParams::connect_timeout)
+//!   when the caller set one, otherwise [`DEFAULT_CONNECT_TIMEOUT`] (15 s), or
+//!   no limit at all with [`EXT_CONNECT_TIMEOUT_UNBOUNDED`]. Nothing can
+//!   *interrupt* the abandoned attempt, so it is left to finish on its own —
+//!   but a session that opens after the limit is closed on that thread and
+//!   **never** handed to the caller.
 //!
 //! # Values
 //!
@@ -244,6 +274,28 @@
 //!   the PL/SQL signature makes `IN OUT` shifts every later slot — silently,
 //!   when the types happen to match — so the two counts are compared and a
 //!   mismatch fails loudly.
+//! - **A rewritten trigger is limited to 32767 bytes, and its error positions
+//!   move.** The rewrite above puts the DDL in a PL/SQL string literal, whose
+//!   limit is 32767 **bytes** of *value* — how long the literal is written out
+//!   does not count (verified against the live database: a 32767-byte value is
+//!   accepted written as 65512 bytes, and 32768 is `PLS-00172: string literal
+//!   too long`). A longer trigger is
+//!   refused with that reason rather than sent to fail obscurely. A trigger
+//!   that compiles with errors is turned back into the success plus
+//!   [`CompiledWithErrors`](reldex_db_driver_api::WarningKind::CompiledWithErrors)
+//!   warning a direct `CREATE` would have produced — the object really is
+//!   created, which is what `ORA-24344` means — and the one row the wrapper
+//!   block reports as affected is dropped, because the DDL affected none. Any
+//!   *syntax* error's position, though, now refers to the wrapper block, and
+//!   that is the one thing the rewrite cannot preserve (`SPEC.md` §24.14).
+//! - **A connect that runs out of time costs a thread until it finishes**
+//!   (U-15). The wait is bounded, the attempt is not: `oracledb` offers no way
+//!   to cancel a connect in progress, so the helper thread that is carrying it
+//!   lives until upstream's own call returns — which, against a link that
+//!   accepts and then says nothing, may be never (U-17). One thread per
+//!   abandoned attempt, so the cost is bounded by how often a user retries. A
+//!   session that arrives after the limit is closed on that thread and never
+//!   adopted, which is what makes the timeout safe rather than merely fast.
 //! - **`Endpoint::HostPort` accepts plain names only.** `Config`'s connect
 //!   string is also where a full TNS descriptor goes, so a host beginning with
 //!   `(` would turn an Easy Connect target into a descriptor pointing elsewhere.
@@ -254,21 +306,31 @@
 //!
 //! Everything here is blocking and single-threaded per connection, as ADR-0002
 //! requires: `reldex-db-core` owns one worker thread per session and every call
-//! on a connection happens on it. The one exception is
+//! on a connection happens on it. There are two exceptions, both deliberate:
 //! [`cancel_handle`](reldex_db_driver_api::DatabaseConnection::cancel_handle),
-//! whose handle is `Send + Sync` and never blocks on the connection's own lock.
+//! whose handle is `Send + Sync` and never blocks on the connection's own lock;
+//! and [`connect`](reldex_db_driver_api::DatabaseDriver::connect), which runs
+//! upstream's blocking connect on a short-lived helper thread so the wait can
+//! be bounded (U-15). That thread touches nothing but the connection it is
+//! opening, and either hands it over or closes it itself, so the "one thread
+//! owns one connection" rule is preserved rather than bent.
 
 mod binds;
 mod classify;
 mod conn;
+mod connect_timeout;
 mod cursor;
 mod descriptor;
 mod error;
 mod lob;
+mod rewrite;
 mod value;
 
 pub use conn::{
     EXT_ALLOW_TIMESTAMP_WITH_TIME_ZONE, EXT_ALLOW_UNENFORCED_SERVER_CERT_DN,
-    EXT_STATEMENT_CACHE_SIZE, EXT_WALLET_DIR, EXT_WALLET_PASSWORD, OracleThinDriver,
-    install_default_crypto_provider,
+    EXT_REWRITE_TRIGGER_DDL, EXT_STATEMENT_CACHE_SIZE, EXT_WALLET_DIR, EXT_WALLET_PASSWORD,
+    OracleThinDriver, install_default_crypto_provider,
+};
+pub use connect_timeout::{
+    DEFAULT_CONNECT_TIMEOUT, EXT_CONNECT_TIMEOUT_UNBOUNDED, MAX_CONNECT_TIMEOUT,
 };

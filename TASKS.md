@@ -73,10 +73,10 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [x] Owner: decide how TCPS support is described to users and whether to refuse descriptors carrying `SSL_SERVER_DN_MATCH` (results file §9 items 6–7)
 - [x] Driver: TCPS descriptor guard (U-14) — refuse `SSL_SERVER_CERT_DN` unless explicitly allowed, warn on `SSL_SERVER_DN_MATCH` — implemented as the lead proposed and independently reviewed (3 must-fix applied); confirmed by the owner and merged 2026-09-19 (pull request #5).
 - [x] S6 Android/iOS cross-compile check — pass, kill criterion did not fire (PR #3: https://github.com/reldex/reldex/pull/3); physical-device validation still needed
-- [~] Driver: honour `connect_timeout` (C-5) — `ConnectionParams::connect_timeout` is accepted and ignored (`phase-0-spike-results.md` §7 C-5); approved 2026-09-19: helper thread, default 15 s, user-configurable per connection profile including "no limit"; in progress on branch `phase-0/driver-carryover`, not yet merged — Phase 1 M2.1 consumes the result
+- [x] Driver: honour `connect_timeout` (C-5) — helper thread, default 15 s, capped at 1 h, "no limit" only through the extension `oracle.connect_timeout_unbounded`; a late success is closed and never adopted — done 2026-09-20 (PR `phase-0/driver-carryover`, independently reviewed)
 - [x] Owner decisions §9 items 8–12 — decided 2026-09-19: default per-statement deadline 600 s (three-level setting), `EXPIRE_TIME` documentation-only recommendation, trigger DDL auto-rewrite with an off switch, default fetch batch size deferred to a Phase 1 benchmark, C-5 helper-thread approach — every one made user-configurable per the owner's requirement (`phase-0-spike-results.md` §9)
-- [~] Driver: `CREATE TRIGGER` auto-rewrite for `:NEW`/`:OLD` (U-18) — rewrite to `BEGIN EXECUTE IMMEDIATE q'[…]'; END;` on by default, always reported to the user as a warning with the statement actually sent available for inspection, off switch at connection level (approved 2026-09-19, `phase-0-spike-results.md` §9 item 11); in progress on branch `phase-0/driver-carryover`, not yet merged — Phase 1 M2.2 consumes the result
-- [~] Contract: connect-time warning channel (C-6) — additive `take_connect_warnings`-style method on `DatabaseConnection`, collected once by `db-core` after connect; approved in principle 2026-09-19, detailed write-up in `phase-0-spike-results.md` §7 C-6; sequenced after pull request #5 (TCPS descriptor guard, merged); record as an ADR-0002 amendment when implemented; in progress on branch `phase-0/driver-carryover`, not yet merged — Phase 1 M2.3 consumes the result
+- [x] Driver: `CREATE TRIGGER` auto-rewrite for `:NEW`/`:OLD` (U-18) — sent as `BEGIN EXECUTE IMMEDIATE q'[…]'; END;`, on by default, off via `oracle.rewrite_trigger_ddl`, always reported with the text sent; trailing SQL*Plus `/` and a `CALL …;` terminator normalised for every trigger; limits: 32767-byte trigger text, syntax-error positions refer to the wrapper — done 2026-09-20 (PR `phase-0/driver-carryover`, independently reviewed)
+- [x] Contract: connect-time warning channel (C-6) — `DatabaseConnection::take_connect_warnings` (additive, defaulted), collected once by `db-core`, read through `DatabaseSession::connect_warnings`; ADR-0002 amendment W1/W2 — done 2026-09-20 (PR `phase-0/driver-carryover`, independently reviewed)
 - [ ] Docs: recommend `SQLNET.EXPIRE_TIME` (e.g. 10 minutes) in user-facing connection troubleshooting docs (owner decision 2026-09-19, `phase-0-spike-results.md` §9 item 10)
 - [ ] Docs: note in `tools/oracle-test-db/README.md` that `SQLNET.EXPIRE_TIME` is left unset on the Phase 0 test database on purpose, so S10's measurements remain valid (follow-up; not edited in this change)
 - [x] Android physical-device harness — `tools/android-device/run-on-device.sh` (bash-first; `.ps1` twin): cross-builds with the local NDK (no cargo-ndk/cmake needed on Windows), pushes, `adb reverse`, runs 7 checks, redacted transcript
@@ -100,9 +100,9 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 
 ### M2 — Core readiness: events, async open, settings, SQL text, driver leftovers
 
-- [~] M2.1 ★ Driver: honour `connect_timeout` on a helper thread (C-5/U-15) (opus, review mandatory) — carried over from Phase 0, in progress on `phase-0/driver-carryover`; M2 consumes the result
-- [~] M2.2 Driver: `CREATE TRIGGER` `:NEW`/`:OLD` auto-rewrite (U-18) (sonnet) — carried over from Phase 0, in progress on `phase-0/driver-carryover`; M2 consumes the result
-- [~] M2.3 ★ Contract: `take_connect_warnings` (C-6) + ADR-0002 amendment (opus, review mandatory) — carried over from Phase 0, in progress on `phase-0/driver-carryover`; M2 consumes the result
+- [x] M2.1 ★ Driver: honour `connect_timeout` on a helper thread (C-5/U-15) (opus, review mandatory) — carried over from Phase 0 and done 2026-09-20; M2 consumes the result
+- [x] M2.2 Driver: `CREATE TRIGGER` `:NEW`/`:OLD` auto-rewrite (U-18) (sonnet) — carried over from Phase 0 and done 2026-09-20; M2 consumes the result
+- [x] M2.3 ★ Contract: `take_connect_warnings` (C-6) + ADR-0002 amendment (opus, review mandatory) — carried over from Phase 0 and done 2026-09-20; M2 consumes the result
 - [ ] M2.4 `crates/sql-text`: lexer + statement splitter driven by a `SqlDialect` descriptor the driver supplies (sonnet)
 - [ ] M2.5 ★ `EventQueue`/`EventSink`/`SessionEvent`/`Waker` + `ReplyTo` refactor of the worker (opus, review mandatory)
 - [ ] M2.6 ★ `SessionRegistry` + non-blocking `open`, `abandon` semantics (opus, review mandatory)
@@ -169,7 +169,7 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 - [x] Owner: telemetry and logging policy — no telemetry, local rotating log, opt-in SQL-text debug logging (decision C.3 #9) — approved 2026-09-20 as recommended
 - [ ] Owner: fetch-batch default sign-off once the M5.6 benchmark produces a number (decision C.3 #10)
 - [ ] Owner: wording sign-off for the no-Cancel UX and "no limit" strings, M4.6 (decision C.3 #11)
-- [x] Owner: Phase-0 leftovers (C-5, U-18, C-6) carried into Phase 1 M2 — confirmed 2026-09-19; in progress on `phase-0/driver-carryover` (decision C.3 #12)
+- [x] Owner: Phase-0 leftovers (C-5, U-18, C-6) carried into Phase 1 M2 — confirmed 2026-09-19; done 2026-09-20 (decision C.3 #12)
 - [x] Owner: upstream issues F and G — decided 2026-09-19 not to submit for now; drafts kept for tracking only, results file §6 (decision C.3 #13)
 - [x] Owner: mobile test hardware — resolved 2026-09-19: Android arm64 phone (OPPO CPH2399) provided, NDK 28.2 installed; physical-device validation itself is separate Phase-0 tail work in progress on `phase-0/android-device`; iOS still needs a Mac + Apple Developer account + device, not provided (decision C.3 #14)
 - [ ] Owner: Community/Pro licensing decision before M6.6 so the notices file and About dialog are right the first time (decision C.3 #15)

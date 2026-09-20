@@ -38,7 +38,9 @@ use common::{
     connect, dsn_address, dsn_service, exec, exec_quietly, measurement, observation, params_at,
     scalar, try_connect, unique, with_watchdog,
 };
-use reldex_db_driver_api::{DatabaseConnection, DbError, ErrorKind, SessionState, Statement};
+use reldex_db_driver_api::{
+    DatabaseConnection, DbError, ErrorKind, ExtensionValue, Extensions, SessionState, Statement,
+};
 
 /// How long a call is given before this file calls it a hang.
 ///
@@ -739,13 +741,18 @@ fn nothing_reconnects_by_itself_and_a_new_connection_is_a_new_session() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_connect_into_a_black_hole_is_not_bounded_by_the_connect_timeout() {
+fn a_connect_into_a_black_hole_is_now_bounded_by_the_connect_timeout() {
     // The TCP handshake succeeds — the proxy accepts — and then nothing moves,
-    // which is what a firewall that drops after the SYN looks like.
+    // which is what a firewall that drops after the SYN looks like. Before the
+    // C-5 fix this was the case with no bound at all: the connect was still
+    // outstanding after 30 s with a 2 s limit asked for (U-15).
     let proxy = proxy();
     proxy.set_mode(Mode::BlackHole);
     let connect_string = proxy.connect_string(&dsn_service());
 
+    // Short on purpose: this file's budget is measured in seconds, and what is
+    // being proven is that the limit is what ends the wait, not what its value
+    // is.
     let asked_for = Duration::from_secs(2);
     let started = Instant::now();
     let outcome = with_watchdog(HANG, move || {
@@ -759,18 +766,10 @@ fn a_connect_into_a_black_hole_is_not_bounded_by_the_connect_timeout() {
     let elapsed = started.elapsed();
 
     match outcome {
-        None => {
-            measurement(
-                "s10.connect_black_hole_with_2s_timeout",
-                format!("did not return within {HANG:?}"),
-            );
-            observation(
-                "FINDING: ConnectionParams::with_connect_timeout(2s) had no effect — the \
-                 connect was still outstanding after the watchdog expired. This driver \
-                 does not read `connect_timeout`, and `oracledb` has no working \
-                 equivalent (see U-15)",
-            );
-        }
+        None => panic!(
+            "connect into a black hole was not bounded by its {asked_for:?} limit: still \
+             outstanding after {HANG:?}"
+        ),
         Some(Ok(text)) => panic!("a black-holed endpoint reported {text}"),
         Some(Err(text)) => {
             measurement(
@@ -778,24 +777,38 @@ fn a_connect_into_a_black_hole_is_not_bounded_by_the_connect_timeout() {
                 format!("{elapsed:.1?}"),
             );
             observation(format!(
-                "connect into a black hole with a 2 s connect timeout asked for returned \
-                 after {elapsed:.1?} -> {text}"
+                "connect into a black hole with a 2 s connect timeout returned after \
+                 {elapsed:.1?} -> {text}"
             ));
             assert!(
-                elapsed > asked_for,
-                "the connect timeout was honoured after all; U-15 needs re-checking"
+                text.contains("kind=Connection"),
+                "a connect that ran out of time is a connection failure, not a fired \
+                 statement deadline: {text}"
+            );
+            assert!(
+                text.contains("connect limit"),
+                "the failure must say the driver's own limit ended it: {text}"
+            );
+            assert!(
+                elapsed < asked_for + Duration::from_secs(5),
+                "the limit did not bound the connect: {elapsed:.1?}"
             );
         }
     }
 }
 
 #[test]
-fn a_connect_to_an_unroutable_address_measures_the_operating_systems_patience() {
-    // RFC 5737 TEST-NET-1: routable nowhere, and discarded rather than
-    // refused on every network this has been run on.
+fn the_default_connect_limit_ends_a_wait_the_operating_system_would_not() {
+    // RFC 5737 TEST-NET-1: routable nowhere, and discarded rather than refused
+    // on every network this has been run on. S10 originally measured the
+    // operating system's own patience here — 22.0 s, a number nothing in
+    // Reldex chose. A short explicit limit now ends it instead, and the
+    // assertion is that the driver's bound, not the OS's, is what returned:
+    // the total live time this test adds is its own limit, not 22 s.
+    let asked_for = Duration::from_secs(2);
     let started = Instant::now();
     let outcome = with_watchdog(HANG, move || {
-        try_connect(&params_at("192.0.2.1:1521/RELDEX"))
+        try_connect(&params_at("192.0.2.1:1521/RELDEX").with_connect_timeout(asked_for))
             .map(|connection| {
                 let _ = connection.close();
                 "connected".to_owned()
@@ -804,30 +817,88 @@ fn a_connect_to_an_unroutable_address_measures_the_operating_systems_patience() 
     });
     let elapsed = started.elapsed();
     match outcome {
-        None => {
-            measurement(
-                "s10.connect_unroutable",
-                format!("did not return within {HANG:?}"),
-            );
-            observation(
-                "connect to an unroutable address had not returned within the watchdog; \
-                 nothing in the driver or in `oracledb` bounds it",
-            );
-        }
+        None => panic!("a {asked_for:?} connect limit did not bound an unroutable address"),
         Some(Ok(text)) => panic!("192.0.2.1:1521 reported {text}"),
         Some(Err(error)) => {
-            measurement("s10.connect_unroutable", format!("{elapsed:.1?}"));
+            measurement(
+                "s10.connect_unroutable_with_2s_limit",
+                format!("{elapsed:.1?}"),
+            );
             observation(format!(
-                "connect to 192.0.2.1:1521 returned after {elapsed:.1?} -> {error}"
+                "connect to 192.0.2.1:1521 with a 2 s connect limit returned after \
+                 {elapsed:.1?} -> {error}"
             ));
-            // Upstream calls this `CallTimeoutExceeded`, which would read as
-            // "the deadline you armed expired" for a connection that never
-            // existed. The wrapper corrects it; this is the guard on that fix.
+            // Two things at once. Upstream calls a socket timeout
+            // `CallTimeoutExceeded`, which would read as "the deadline you
+            // armed expired" for a connection that never existed (U-16); and
+            // the driver's own limit must be a connection failure too, not a
+            // statement deadline. Either route has to be `Connection`.
             assert!(
                 error.contains("kind=Connection"),
-                "a connect that timed out in the socket must be a Connection failure, \
-                 not a fired statement deadline: {error}"
+                "a connect that ran out of time must be a Connection failure, not a fired \
+                 statement deadline: {error}"
+            );
+            assert!(
+                error.contains("connect limit"),
+                "the driver's own limit, not the operating system's 22 s, is what ended \
+                 this: {error}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(10),
+                "this returned in {elapsed:.1?}, which is the operating system's patience \
+                 rather than the limit that was asked for"
             );
         }
+    }
+}
+
+#[test]
+fn a_connect_with_no_limit_at_all_is_still_expressible_and_still_unbounded() {
+    // The owner's decision requires "no limit" to be a thing a profile can say
+    // (`SPEC.md` §8). It is, through the driver's extension bag — and it means
+    // exactly what it says, which is why the UI has to explain it. Proven
+    // against a black hole inside the watchdog rather than waited out: what is
+    // asserted is that the *driver's* limit did not end it.
+    let proxy = proxy();
+    proxy.set_mode(Mode::BlackHole);
+    let connect_string = proxy.connect_string(&dsn_service());
+
+    let mut extensions = Extensions::new();
+    extensions.set(
+        reldex_driver_oracle_thin::EXT_CONNECT_TIMEOUT_UNBOUNDED,
+        ExtensionValue::Flag(true),
+    );
+    // Deliberately also set a short timeout, to show the flag wins.
+    let params = params_at(connect_string)
+        .with_connect_timeout(Duration::from_secs(1))
+        .with_extensions(extensions);
+
+    let watched = Duration::from_secs(6);
+    let outcome = with_watchdog(watched, move || {
+        try_connect(&params)
+            .map(|connection| {
+                let _ = connection.close();
+                "connected".to_owned()
+            })
+            .map_err(|error| describe(&error))
+    });
+    match outcome {
+        None => {
+            measurement(
+                "s10.connect_black_hole_unbounded",
+                format!("still outstanding after {watched:?}"),
+            );
+            observation(
+                "with \"oracle.connect_timeout_unbounded\" set, a black-holed connect is \
+                 still outstanding after the watchdog — the 1 s connect timeout on the same \
+                 profile did not apply, which is what the flag is for. The abandoned thread \
+                 is left to finish on its own (U-15: nothing can interrupt it)",
+            );
+        }
+        Some(Ok(text)) => panic!("a black-holed endpoint reported {text}"),
+        Some(Err(text)) => panic!(
+            "an unbounded connect ended after less than {watched:?} with {text}; the \
+             extension did not remove the bound"
+        ),
     }
 }

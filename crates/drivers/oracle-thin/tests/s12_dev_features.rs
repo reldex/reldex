@@ -40,10 +40,12 @@ use std::num::NonZeroUsize;
 use std::time::Instant;
 
 use common::{
-    connect, exec, exec_quietly, measurement, observation, query, render, scalar, unique,
+    connect, exec, exec_quietly, measurement, observation, params, query, render, scalar,
+    try_connect, unique,
 };
 use reldex_db_driver_api::{
-    DatabaseConnection, DbError, ErrorKind, Statement, StatementKind, ValueRef,
+    DatabaseConnection, DbError, ErrorKind, ExtensionValue, Extensions, Statement, StatementKind,
+    ValueRef,
 };
 
 /// Classifies a failure as a permission finding or a driver finding, and says
@@ -83,12 +85,24 @@ fn stored(name: &str) -> String {
     name.to_uppercase()
 }
 
+/// A session with the automatic `CREATE TRIGGER` rewrite switched off, so the
+/// statements below reach upstream exactly as the spike sent them.
+fn connect_without_the_rewrite() -> Box<dyn DatabaseConnection> {
+    let mut extensions = Extensions::new();
+    extensions.set(
+        reldex_driver_oracle_thin::EXT_REWRITE_TRIGGER_DDL,
+        ExtensionValue::Flag(false),
+    );
+    try_connect(&params().with_extensions(extensions)).expect("the test database accepts us")
+}
+
 /// Submits DDL through a PL/SQL block, so the Oracle crate's bind-placeholder
 /// scan does not see `:NEW` or `:OLD` in the text.
 ///
-/// This is the workaround the driver's own error message names; see
-/// `a_trigger_body_that_mentions_new_is_refused_with_the_reason` for the
-/// finding it works around.
+/// This is the workaround the driver's own error message names, and — since
+/// U-18 — applies for the caller by default; see
+/// `a_trigger_body_that_mentions_new_is_refused_with_the_reason_when_the_rewrite_is_off`
+/// for the finding it works around.
 fn exec_ddl_via_plsql(connection: &mut dyn DatabaseConnection, ddl: &str) {
     exec(
         connection,
@@ -504,13 +518,18 @@ fn the_metadata_dictionary_answers_every_object_group_the_browser_needs() {
 }
 
 #[test]
-fn a_trigger_body_that_mentions_new_is_refused_with_the_reason() {
+fn a_trigger_body_that_mentions_new_is_refused_with_the_reason_when_the_rewrite_is_off() {
     // An Oracle IDE has to be able to create a trigger, and a trigger body
     // without `:NEW` or `:OLD` is rare. `oracledb`'s SQL parser scans every
     // statement — DDL included — for `:name` and turns each hit into a bind
     // placeholder, so the plain `CREATE TRIGGER` that SQL*Plus accepts comes
     // back asking for a bind value the caller never wrote.
-    let mut connection = connect();
+    //
+    // This is what the spike found, and it is still what upstream does. The
+    // driver now works around it by rewriting the statement (U-18,
+    // `s12b_trigger_rewrite.rs`), so reaching the refusal takes switching that
+    // off — which is exactly what this test checks the off switch does.
+    let mut connection = connect_without_the_rewrite();
     let table = unique("s12_trg_t");
     let trigger = unique("s12_trg_x");
     exec(
@@ -562,8 +581,9 @@ fn a_trigger_body_that_mentions_new_is_refused_with_the_reason() {
     assert_eq!(created, "ENABLED");
     observation(
         "the same DDL inside `BEGIN EXECUTE IMMEDIATE q'[…]'; END;` created the trigger; \
-         the parser skips quoted strings, so the workaround is reliable but changes the \
-         statement's reported kind to PL/SQL and moves any error position",
+         the parser skips quoted strings, so the workaround is reliable, and it is what the \
+         driver now applies automatically unless `oracle.rewrite_trigger_ddl` is false — \
+         at the cost of a 32767-byte limit and moved error positions",
     );
 
     exec_quietly(connection.as_mut(), &format!("DROP TRIGGER {trigger}"));

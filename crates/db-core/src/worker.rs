@@ -55,7 +55,7 @@ use std::thread;
 use reldex_db_driver_api::{
     CancelHandle, CancelKind, ColumnKind, ConnectionId, ConnectionParams, Cursor,
     DatabaseConnection, DatabaseDriver, DbError, DbResult, ErrorKind, LobLocator, ResultSetId,
-    RowBatch, SavepointName, SessionState, Statement, TransactionState,
+    RowBatch, SavepointName, SessionState, Statement, TransactionState, Warning,
 };
 
 use crate::ids::{LobHandle, ResultId, SessionId};
@@ -171,12 +171,14 @@ pub(crate) struct WorkerHandle {
     pub(crate) cancel_handle: Arc<dyn CancelHandle>,
     pub(crate) cancel_kind: CancelKind,
     pub(crate) connection_id: ConnectionId,
+    pub(crate) connect_warnings: Vec<Warning>,
 }
 
 struct Ready {
     cancel_handle: Arc<dyn CancelHandle>,
     cancel_kind: CancelKind,
     connection_id: ConnectionId,
+    connect_warnings: Vec<Warning>,
 }
 
 /// Calls into driver code, converting a panic into
@@ -188,7 +190,12 @@ fn call<T>(torn: &Cell<bool>, f: impl FnOnce() -> DbResult<T>) -> DbResult<T> {
         Ok(result) => result,
         Err(payload) => {
             torn.set(true);
-            Err(panic_to_error(&payload))
+            // `payload.as_ref()`, not `&payload`: a `&Box<dyn Any + Send>`
+            // unsizes to `dyn Any + Send` as the *box*, so the downcasts below
+            // never match the panic's own payload and every contained panic
+            // would be reported as "a non-string payload" — throwing away the
+            // one thing that says what went wrong.
+            Err(panic_to_error(payload.as_ref()))
         }
     }
 }
@@ -245,6 +252,7 @@ pub(crate) fn spawn(
             cancel_handle: ready.cancel_handle,
             cancel_kind: ready.cancel_kind,
             connection_id: ready.connection_id,
+            connect_warnings: ready.connect_warnings,
         }),
         Ok(Err(err)) => {
             let _ = join.join();
@@ -271,9 +279,26 @@ fn worker_main(
     limits: SessionLimits,
 ) {
     let torn = Cell::new(false);
-    let connection = match call(&torn, || driver.connect(params)) {
+    let mut connection = match call(&torn, || driver.connect(params)) {
         Ok(connection) => connection,
         Err(err) => {
+            let _ = ready_tx.send(Err(err));
+            return;
+        }
+    };
+
+    // Exactly once, here, where `connect` has just returned: the driver holds
+    // its connect-time findings until somebody asks, and this is the only
+    // moment at which "somebody" is defined (ADR-0002, C-6 amendment). They
+    // travel out with the successful open through `WorkerHandle`, so a session
+    // that never executes a statement still reports them.
+    let connect_warnings = match call(&torn, || Ok(connection.take_connect_warnings())) {
+        Ok(warnings) => warnings,
+        Err(err) => {
+            // A driver that panicked is *torn*: its internal state is unknown,
+            // so it is dropped rather than closed (see the module
+            // documentation), and the session never opens.
+            drop(connection);
             let _ = ready_tx.send(Err(err));
             return;
         }
@@ -291,6 +316,7 @@ fn worker_main(
         cancel_handle: Arc::clone(&cancel_handle),
         cancel_kind: cancel_handle.kind(),
         connection_id: connection.id(),
+        connect_warnings,
     };
     if ready_tx.send(Ok(ready)).is_err() {
         // Nobody is waiting for this session any more (the caller gave up).

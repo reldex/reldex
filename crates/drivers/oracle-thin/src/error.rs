@@ -27,7 +27,9 @@
 
 use std::fmt::Write as _;
 
-use reldex_db_driver_api::{DbError, ErrorKind, NativeError, SessionState, SqlPosition};
+use reldex_db_driver_api::{
+    DbError, ErrorKind, NativeError, SessionState, SqlPosition, Warning, WarningKind,
+};
 
 use oracledb::ErrorKind as OraErrorKind;
 
@@ -157,9 +159,10 @@ pub(crate) fn map_connect(error: &oracledb::Error) -> DbError {
         return DbError::new(
             ErrorKind::Connection,
             "the database could not be reached: the connection attempt timed out in the \
-             network layer. This driver cannot bound that wait — neither it nor \
-             `oracledb` applies a connect timeout — so the delay is the operating \
-             system's, not a deadline Reldex asked for",
+             network layer. The wait was the operating system's own, not a deadline Reldex \
+             asked for — this driver's connect limit reports itself in as many words when \
+             it is what ended the attempt, and the Oracle crate has no connect timeout of \
+             any kind (upstream gap U-15)",
         );
     }
     if mapped.kind() != ErrorKind::NetworkLost {
@@ -196,6 +199,14 @@ pub(crate) fn map_connect(error: &oracledb::Error) -> DbError {
 /// The failure cannot be prevented from here; upstream offers no way to turn
 /// the scan off. What it can do is say what happened and what works instead.
 /// Spike S12 found it on `CREATE TRIGGER`.
+///
+/// **Since the automatic rewrite landed, a trigger no longer reaches this**:
+/// [`crate::rewrite`] applies the workaround itself by default, so this message
+/// is what a caller sees when they have switched that off with
+/// [`crate::EXT_REWRITE_TRIGGER_DDL`] — which is exactly the owner's decision,
+/// "the existing explanatory refusal is returned". It still covers any *other*
+/// statement whose text upstream reads a placeholder into, which is why it is
+/// not narrowed to triggers.
 pub(crate) fn explain_parsed_placeholders(error: DbError) -> DbError {
     if error.kind() != ErrorKind::Configuration
         || !error
@@ -218,6 +229,50 @@ pub(crate) fn explain_parsed_placeholders(error: DbError) -> DbError {
         ),
     )
     .with_session_state(SessionState::Usable)
+}
+
+/// Oracle's "the object was created, and it does not compile".
+///
+/// A plain `CREATE` that compiles with errors **succeeds** and leaves the
+/// diagnosis in `USER_ERRORS`; the driver reports it through
+/// `Connection::last_warning`. The same statement inside `EXECUTE IMMEDIATE`
+/// raises this as a PL/SQL exception instead, because that is how dynamic SQL
+/// reports it.
+const ORA_SUCCESS_WITH_COMPILATION_ERROR: i32 = 24344;
+
+/// Whether this failure is Oracle saying "created, but with compilation
+/// errors".
+pub(crate) fn is_compiled_with_errors(error: &DbError) -> bool {
+    error
+        .native()
+        .is_some_and(|native| native.code() == ORA_SUCCESS_WITH_COMPILATION_ERROR)
+}
+
+/// Turns that exception back into what the user would have seen had the
+/// statement not been rewritten: a success carrying a
+/// [`WarningKind::CompiledWithErrors`] warning.
+///
+/// This is not softening a failure. The object **is** created — that is exactly
+/// what ORA-24344 means — so reporting an error would tell the user nothing
+/// happened when something did, and would hide the object their next statement
+/// is about to find. `SPEC.md` §24.14 needs the compilation errors to reach the
+/// editor, and a warning is the channel the contract has for them
+/// (ADR-0002 D6); the driver's rewrite must not be the reason they arrive as
+/// something else. The native code and the server's own text are preserved, so
+/// nothing about the server's answer is lost.
+pub(crate) fn compiled_with_errors(error: &DbError) -> Warning {
+    let mut warning = Warning::new(
+        WarningKind::CompiledWithErrors,
+        format!(
+            "the object was created but did not compile cleanly: {}. Query USER_ERRORS (or \
+             ALL_ERRORS) for the details",
+            error.message()
+        ),
+    );
+    if let Some(native) = error.native() {
+        warning = warning.with_native(NativeError::new(native.code(), native.message()));
+    }
+    warning
 }
 
 /// Adds the sentence a certificate **name** failure needs when the descriptor

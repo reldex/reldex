@@ -46,7 +46,7 @@ use std::time::Duration;
 use crate::error::DbResult;
 use crate::ids::{ConnectionId, SavepointName};
 use crate::params::ConnectionParams;
-use crate::result::ExecutionOutcome;
+use crate::result::{ExecutionOutcome, Warning};
 use crate::statement::Statement;
 
 /// How a driver implements statement cancellation.
@@ -520,6 +520,34 @@ pub trait DatabaseConnection: Send {
     /// it must not take any lock the running call holds.
     fn cancel_handle(&self) -> Arc<dyn CancelHandle>;
 
+    /// Non-fatal findings produced while this connection was being *opened*.
+    ///
+    /// [`DatabaseDriver::connect`] returns a connection or an error, with
+    /// nothing in between, so a driver that notices something while opening a
+    /// session — a transport parameter it cannot honour, a profile setting that
+    /// does nothing — could previously only refuse the session or stay silent.
+    /// Neither is right for a finding that does not weaken the session but that
+    /// the user still has to be told about, and attaching it to the first
+    /// statement that happens to run loses it entirely for a session that is
+    /// opened, pinged and closed.
+    ///
+    /// **Taken, not borrowed**, so each finding is reported once: the caller
+    /// collects them immediately after `connect` returns and the connection
+    /// keeps nothing. A second call returns an empty vector.
+    ///
+    /// The default is empty, for the many drivers with nothing to say, so
+    /// adding this to the contract costs an existing driver no change. Cheap
+    /// and non-blocking: it reports what `connect` already discovered and must
+    /// not issue a round trip.
+    ///
+    /// Anything that makes the session *worse* than the caller asked for is an
+    /// error from `connect`, not a warning here. This channel is for "you
+    /// configured something that did nothing", not for "your session is less
+    /// safe than you think".
+    fn take_connect_warnings(&mut self) -> Vec<Warning> {
+        Vec::new()
+    }
+
     /// Executes one statement and returns everything it produced.
     ///
     /// There is a single entry point because a worksheet cannot know in advance
@@ -623,7 +651,7 @@ pub trait DatabaseConnection: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::DbError;
+    use crate::error::{DbError, ErrorKind};
     use crate::result::{Cursor, RowBatch};
     use crate::value::Value;
 
@@ -632,6 +660,74 @@ mod tests {
 
     #[allow(clippy::extra_unused_type_parameters)]
     const fn assert_sync<T: Sync>() {}
+
+    /// A connection that implements only what the contract *requires*, so the
+    /// defaulted methods are exercised as a driver author would inherit them.
+    struct StubConnection;
+
+    struct StubCancel;
+
+    impl CancelHandle for StubCancel {
+        fn request_cancel(&self) -> DbResult<CancelOutcome> {
+            Err(DbError::new(ErrorKind::Unsupported, "stub"))
+        }
+
+        fn kind(&self) -> CancelKind {
+            CancelKind::Unsupported
+        }
+    }
+
+    impl StubConnection {
+        fn unsupported<T>() -> DbResult<T> {
+            Err(DbError::new(ErrorKind::Unsupported, "stub"))
+        }
+    }
+
+    impl DatabaseConnection for StubConnection {
+        fn id(&self) -> ConnectionId {
+            ConnectionId::allocate()
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::none()
+        }
+
+        fn cancel_handle(&self) -> Arc<dyn CancelHandle> {
+            Arc::new(StubCancel)
+        }
+
+        fn execute(&mut self, _statement: &Statement) -> DbResult<ExecutionOutcome> {
+            Self::unsupported()
+        }
+
+        fn commit(&mut self) -> DbResult<()> {
+            Self::unsupported()
+        }
+
+        fn rollback(&mut self) -> DbResult<()> {
+            Self::unsupported()
+        }
+
+        fn savepoint(&mut self, _name: &SavepointName) -> DbResult<()> {
+            Self::unsupported()
+        }
+
+        fn rollback_to_savepoint(&mut self, _name: &SavepointName) -> DbResult<()> {
+            Self::unsupported()
+        }
+
+        fn transaction_state(&self) -> TransactionState {
+            TransactionState::Unknown
+        }
+
+        fn ping(&mut self) -> DbResult<()> {
+            Self::unsupported()
+        }
+
+        fn close(self: Box<Self>) -> DbResult<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn contract_types_have_the_intended_thread_bounds() {
@@ -654,6 +750,19 @@ mod tests {
         assert_send::<ConnectionParams>();
         assert_sync::<ConnectionParams>();
         assert_send::<Statement>();
+    }
+
+    #[test]
+    fn a_driver_with_nothing_to_say_about_connecting_needs_no_code_at_all() {
+        // The point of the default body: adding a connect-time warning channel
+        // to the contract must cost a driver that has no findings nothing, and
+        // it must stay usable through `dyn` like every other method.
+        let mut connection: Box<dyn DatabaseConnection> = Box::new(StubConnection);
+        assert!(connection.take_connect_warnings().is_empty());
+        assert!(
+            connection.take_connect_warnings().is_empty(),
+            "taking twice is a no-op, not a repeat"
+        );
     }
 
     #[test]

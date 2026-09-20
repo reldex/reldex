@@ -9,7 +9,7 @@ use std::time::Duration;
 use reldex_db_driver_api::{
     CancelKind, CancelOutcome, Capabilities, ConnectionParams, Credentials, DatabaseConnection,
     DatabaseDriver, Endpoint, ErrorKind, LobKind, SavepointName, SessionState, SqlType, Statement,
-    StatementKind, Timestamp, TransactionState,
+    StatementKind, Timestamp, TransactionState, Warning, WarningKind,
 };
 use reldex_driver_mock::{
     Action, BlockGate, BlockSpec, ColumnSpec, MockDriver, QueryPlan, QuerySource, Scenario,
@@ -46,6 +46,33 @@ fn connect_can_be_scripted_to_fail() {
         Err(error) => error,
     };
     assert_eq!(error.kind(), ErrorKind::Authentication);
+}
+
+#[test]
+fn connect_warnings_are_taken_once_and_default_to_none() {
+    let scenario = Scenario::new();
+    let mut quiet = connect(&scenario);
+    assert!(
+        quiet.take_connect_warnings().is_empty(),
+        "a connection with nothing to report says nothing"
+    );
+
+    scenario.set_connect_warnings(vec![Warning::new(
+        WarningKind::Informational,
+        "the endpoint asks for something this driver does not apply",
+    )]);
+    let mut connection = connect(&scenario);
+    let taken = connection.take_connect_warnings();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].kind(), WarningKind::Informational);
+    assert!(
+        connection.take_connect_warnings().is_empty(),
+        "connect warnings are taken, not borrowed: a second call reports nothing"
+    );
+
+    // Scripted per scenario, so a later connection still gets its own copy.
+    let mut second = connect(&scenario);
+    assert_eq!(second.take_connect_warnings().len(), 1);
 }
 
 #[test]
