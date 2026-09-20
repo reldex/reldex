@@ -23,6 +23,8 @@ qt_add_qml_module(reldex_adapter
         SessionController.cpp
         ResultTableModel.h
         ResultTableModel.cpp
+        ScrollDriver.h
+        ScrollDriver.cpp
 )
 
 target_include_directories(reldex_adapter PUBLIC

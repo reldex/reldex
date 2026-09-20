@@ -1,0 +1,10 @@
+source,run,rows,baseline_taken,rss_growth_bytes,rss_b_per_row,private_growth_bytes,private_b_per_row
+"in-app, scene graph running",k3-app-1.json,1000000,"idle app, already drawn",172732416,172.7,142127104,142.1
+"in-app, scene graph running",k3-app-1.json,1000000,process start,200744960,200.7,198791168,198.8
+"in-app, scene graph running",k3-app-2.json,1000000,"idle app, already drawn",172679168,172.7,142016512,142.0
+"in-app, scene graph running",k3-app-2.json,1000000,process start,200761344,200.8,198418432,198.4
+"in-app, scene graph running",k3-app-3.json,1000000,"idle app, already drawn",172498944,172.5,142028800,142.0
+"in-app, scene graph running",k3-app-3.json,1000000,process start,200269824,200.3,199262208,199.3
+"headless, no scene graph",k4-1.txt,1000000,before the stream,115965952,116.0,117936128,117.9
+"headless, no scene graph",k4-2.txt,1000000,before the stream,118919168,118.9,121659392,121.7
+"headless, no scene graph",k4-3.txt,1000000,before the stream,114106368,114.1,114896896,114.9

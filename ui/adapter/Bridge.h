@@ -36,8 +36,9 @@
 
 #include "Metrics.h"
 #include "ReldexHandles.h"
-// Included rather than forward-declared: both are Q_PROPERTY types, and moc
-// needs a complete type to register a pointer property.
+// Included rather than forward-declared: all three are Q_PROPERTY types, and
+// moc needs a complete type to register a pointer property.
+#include "ScrollDriver.h"
 #include "SessionController.h"
 
 class Bridge : public QObject
@@ -55,6 +56,9 @@ class Bridge : public QObject
     Q_PROPERTY(bool valid READ isValid CONSTANT)
     Q_PROPERTY(SessionController *session READ session CONSTANT)
     Q_PROPERTY(Metrics *metrics READ metrics CONSTANT)
+    /// Spike S15's measurement driver (M1.8). Inert unless the environment
+    /// asks for a measurement run; see `ui/adapter/ScrollDriver.h`.
+    Q_PROPERTY(ScrollDriver *scrollDriver READ scrollDriver CONSTANT)
     /// ADR-0003 D5's budget: at most this many events per drain. 0 removes
     /// the limit. Writable so a test can force 1 and prove the re-post.
     Q_PROPERTY(int drainEventBudget READ drainEventBudget WRITE setDrainEventBudget NOTIFY
@@ -71,6 +75,7 @@ public:
     [[nodiscard]] ReldexHub *hub() const noexcept { return m_hub.get(); }
     [[nodiscard]] SessionController *session() const noexcept { return m_session; }
     [[nodiscard]] Metrics *metrics() const noexcept { return m_metrics; }
+    [[nodiscard]] ScrollDriver *scrollDriver() const noexcept { return m_scrollDriver; }
 
     [[nodiscard]] int drainEventBudget() const noexcept { return m_drainEventBudget; }
     void setDrainEventBudget(int events);
@@ -131,6 +136,7 @@ private:
     reldex::HubHandle m_hub;
     SessionController *m_session = nullptr;
     Metrics *m_metrics = nullptr;
+    ScrollDriver *m_scrollDriver = nullptr;
 
     /// 1 while a drain is posted but has not started. Written from a Reldex
     /// pump thread (the waker) and from the Qt thread (`drain()`), so it is

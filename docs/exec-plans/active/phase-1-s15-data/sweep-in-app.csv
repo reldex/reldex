@@ -1,0 +1,5 @@
+fetch_rows,k2_execute_to_rows_ms,k2_execute_to_frame_ms,full_sweep_p50_ms,full_sweep_p99_ms,full_sweep_max_ms,rss_growth_b_per_row,private_growth_b_per_row,applyBatch_p50_ns,applyBatch_p99_ns
+100,1.46,434.21,7.606,9.776,12.821,196.7,168.8,1600,12200
+1000,1.92,435.26,7.869,10.587,15.009,172.6,142.4,2000,15900
+10000,6.91,8.77,7.893,11.238,13.822,185.2,175.6,12600,29300
+50000,30.64,459.37,7.756,10.22,12.773,173.8,156.0,27900,46400

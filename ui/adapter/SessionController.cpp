@@ -44,6 +44,11 @@ SessionController::SessionController(Bridge *bridge, QObject *parent)
                                                      1000000));
     m_maxFetchesInFlight = static_cast<int>(
             std::clamp<qint64>(envNumber("RELDEX_S15_FETCHES_IN_FLIGHT", 2), 1, 1024));
+    // Spike S15's K2 measures execute -> first row painted, and only the first
+    // batch is part of that. Turning auto-fetch off keeps the rest of the
+    // stream out of the measurement instead of subtracting it afterwards; the
+    // view can still drive its own `fetchMore()`.
+    m_autoFetch = envNumber("RELDEX_S15_AUTOFETCH", 1) != 0;
 }
 
 SessionController::~SessionController()
@@ -469,7 +474,18 @@ void SessionController::handleEvent(const ReldexEvent &raw, reldex::BatchHandle 
         }
         const auto rows = static_cast<int>(raw.row_count);
         if (rows > 0) {
+            // Spike S15's K4 is exactly this call: the batch is "described and
+            // its columns viewable" when `applyBatch` returns, because that is
+            // where `reldex_batch_column` is called once per column. Both
+            // clock reads are behind the same off-by-default flag as the
+            // recorder, so a normal build pays one relaxed atomic load here.
+            Metrics *const metrics = m_bridge->metrics();
+            const bool timing = metrics->isEnabled();
+            const qint64 applyStartNs = timing ? metrics->nowNs() : 0;
             m_model->applyBatch(std::move(batch), rows);
+            if (timing) {
+                metrics->recordApplyBatch(metrics->nowNs() - applyStartNs);
+            }
             m_rowsFetched += rows;
             Q_EMIT rowsFetchedChanged();
             m_bridge->metrics()->markFirstRowsInserted();
