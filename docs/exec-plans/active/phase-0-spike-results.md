@@ -19,7 +19,7 @@ Where something failed, it is written down as a failure.
 > defects came out of them (**U-15** to **U-18**), two drafted as issues **F**
 > and **G**, and one new contract problem (**C-5**). Two driver fixes were made
 > and are covered by tests. Issues F and G have not been posted to GitHub
-> (A–E were submitted on 2026-09-20 — see §6).
+> (A–E were submitted on 2026-09-19 — see §6).
 
 > **Updated 2026-09-19, after the first run.** Two of the problems this
 > document recorded have been fixed and the fixes re-verified against the same
@@ -58,6 +58,17 @@ Where something failed, it is written down as a failure.
 > **not** accepted: the claim that `SELECT 10/3 FROM dual` produces a bindable
 > 40-digit/odd-index NUMBER (it produces 39 digits — see U-2), and the claim
 > that ORA-00942 is mis-classified (see C-4).
+
+> **Corrected 2026-09-20 — date-label errors from an early clock error.** An
+> early clock error caused several dates in this file and elsewhere in the repo
+> to be written as `2026-09-20` for events that actually happened on
+> `2026-09-19` (local time, UTC+7); real work then continued into the genuine
+> `2026-09-20`, so the two dates ended up mixed together. Dates below were
+> corrected against git commit history (`git log`/`git blame
+> --date=iso-local`) rather than by a blanket find-and-replace, since some
+> `2026-09-20` dates (later Phase 1 kickoff, driver carry-over, the Android
+> device run) are genuinely correct. See `Task.html`'s activity log for the
+> same note.
 
 ---
 
@@ -1903,9 +1914,9 @@ is one more independent check that the off switch changes nothing else.
 
 ---
 
-## 6. Drafted upstream issues — **five submitted 2026-09-20; F and G await the owner's go-ahead**
+## 6. Drafted upstream issues — **five submitted 2026-09-19; F and G await the owner's go-ahead**
 
-> **Submitted 2026-09-20 by the owner's account (SupawitNu):** B → [oracle/rust-oracledb#21](https://github.com/oracle/rust-oracledb/issues/21) (NUMBER bind ×10), C → [#22](https://github.com/oracle/rust-oracledb/issues/22) (process aborts: NUMBER index OOB, region TSTZ `todo!()`, poisoned-mutex double panic), D → [#23](https://github.com/oracle/rust-oracledb/issues/23) (call-timeout recovery closes the connection; server-side cancel not observed), A → [#24](https://github.com/oracle/rust-oracledb/issues/24) (public break/interrupt API), E → [#25](https://github.com/oracle/rust-oracledb/issues/25) (TCPS trust / `SSL_SERVER_DN_MATCH`). Issues **F** and **G** below are drafted but **not yet submitted**, pending the owner's go-ahead.
+> **Submitted 2026-09-19 by the owner's account (SupawitNu):** B → [oracle/rust-oracledb#21](https://github.com/oracle/rust-oracledb/issues/21) (NUMBER bind ×10), C → [#22](https://github.com/oracle/rust-oracledb/issues/22) (process aborts: NUMBER index OOB, region TSTZ `todo!()`, poisoned-mutex double panic), D → [#23](https://github.com/oracle/rust-oracledb/issues/23) (call-timeout recovery closes the connection; server-side cancel not observed), A → [#24](https://github.com/oracle/rust-oracledb/issues/24) (public break/interrupt API), E → [#25](https://github.com/oracle/rust-oracledb/issues/25) (TCPS trust / `SSL_SERVER_DN_MATCH`). Issues **F** and **G** below are drafted but **not yet submitted**, pending the owner's go-ahead.
 
 ### Issue A — the one ADR-0001 asks for
 
@@ -2623,7 +2634,7 @@ warnings, and a driver with nothing to say reports none); live,
 > `IDENTIFIED BY "<value>"`, and `.env.example` shipped defaults that worked
 > against the image. Both were throwaway values for a container bound to
 > `127.0.0.1`, and neither is used anywhere else — but they were tracked, so
-> **they remain in git history** and history was not rewritten. On 2026-09-20,
+> **they remain in git history** and history was not rewritten. On 2026-09-19,
 > before this branch was first pushed, the lead **rotated** the SYS/SYSTEM and
 > `RELDEX_TEST` passwords on the running container to random values stored only
 > in the untracked `.env` (S1 re-run green with the new values), so the strings
