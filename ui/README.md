@@ -1,10 +1,14 @@
-# Reldex UI (M1.5 skeleton)
+# Reldex UI
 
-Minimal CMake + Corrosion + Qt Quick project that proves the
-`reldex-ffi` -> thin C++ adapter -> QML path exists end to end. Per
-`AGENTS.md` scope discipline, this is deliberately small: one `CoreInfo`
-singleton exposing `reldex_abi_version()`, one window that prints it,
-one test. No hub, no session, no result grid — that is M1.6 onward.
+CMake + Corrosion + Qt Quick project holding the thin C++/Qt adapter over the
+`reldex-ffi` C ABI, plus the smallest QML surface spike S15 needs.
+
+Scope, per `AGENTS.md`: **M1.5** built the project skeleton (one `CoreInfo`
+singleton exposing `reldex_abi_version()`, one window, one test). **M1.6**
+added the adapter proper — `Bridge`, `SessionController`, `ResultTableModel`
+and `Metrics` — and a `TableView` over the model. There is still no editor, no
+toolbar, no theming and no settings; those are M3 onward, and building them
+here would pre-empt the decision S15 exists to make.
 
 ## Prerequisites
 
@@ -51,14 +55,248 @@ that is the first thing to check.
 ## Layout
 
 ```text
-ui/CMakeLists.txt   Top-level: Qt, Corrosion/reldex-ffi, shared helpers
-ui/cmake/           CompilerWarnings.cmake (the only CMake helper module)
-ui/adapter/         reldex_adapter: thin static lib + QML module
-                     (Reldex.Adapter) — CoreInfo singleton only
-ui/app/             Reldex executable + Main.qml (Reldex.App QML module)
-ui/tests/           tst_coreinfo (QTest), offscreen, run via CTest
-ui/build.sh         One-command build (bash-first; see AGENTS.md)
+ui/CMakeLists.txt             Top-level: Qt, Corrosion/reldex-ffi, shared helpers
+ui/cmake/                     CompilerWarnings.cmake (the only CMake helper module)
+ui/adapter/                   reldex_adapter: thin static lib + QML module (Reldex.Adapter)
+  ReldexHandles.h              RAII wrappers for batch/error/arena + struct_size helpers
+  CoreInfo.{h,cpp}             the ABI-version singleton (M1.5)
+  Bridge.{h,cpp}               owns the ReldexHub, the waker, the budgeted drain, routing
+  SessionController.{h,cpp}    open / execute / fetch / close; state and errors as properties
+  ResultTableModel.{h,cpp}     QAbstractTableModel over borrowed batch views
+  Metrics.{h,cpp}              S15 instrumentation, off by default
+ui/app/                       Reldex executable + Main.qml (Reldex.App QML module)
+ui/tests/                     QTest binaries, run via CTest
+  tst_coreinfo.cpp             ABI version + Main.qml loads offscreen with no QML warning
+  tst_bridge.cpp               drain budget/re-post, error model, blocked statement, routing
+  tst_resultmodel.cpp          QAbstractItemModelTester, cell content, fetchMore, cache bound
+  tst_teardown.cpp             spike criterion K5: 10,000 teardowns under a flood
+  AdapterTestSupport.h         spin helpers + the mock's generated values, restated
+ui/build.sh                   One-command build (bash-first; see AGENTS.md)
 ```
+
+## The adapter (M1.6)
+
+Three classes, one job each, in the shape ADR-0003 D1 fixes.
+
+**`Bridge`** owns the `ReldexHub*`. It registers the waker; the callback runs
+on a Reldex pump thread and does exactly one thing — a coalesced
+`QMetaObject::invokeMethod(bridge, &Bridge::drain, Qt::QueuedConnection)`. It
+calls no `reldex_*` function (the library answers `RELDEX_STATUS_REENTRANT`)
+and lets no C++ exception escape into Rust. `drain()` takes events until the
+queue is empty or the budget is spent (256 events / 4 ms, both writable), and
+**re-posts itself** when it stops early, because the waker is edge-triggered on
+empty → non-empty and no further wake is guaranteed. Events are routed to the
+`SessionController` that owns their session; an event with no live owner has
+its batch and error released and is counted in `orphanEvents()`.
+
+**`SessionController`** sequences open → execute → fetch → close and owns the
+session and result ids. It is where back-pressure lives, because the ABI has
+none: the hub's event queue is unbounded and every `FETCHED` event hands over a
+batch that becomes our memory, so `maxFetchesInFlight` (default 2) is the
+bound. Errors are read out of `ReldexError` into plain properties and the error
+object is freed exactly once by its RAII handle. "Exactly one reply per
+accepted request" is a library guarantee, so it is asserted in debug rather
+than defended against.
+
+**`ResultTableModel`** owns the fetched batches and maps a row to
+(batch, local row) with one binary search plus a last-hit cache — no object per
+row anywhere. Column views are taken **once per column per batch**
+(`reldex_batch_column`) when the batch arrives, never per cell, and
+`rowCount` grows through `beginInsertRows`/`endInsertRows` per appended batch.
+Roles are deliberately two: `display` and `isNull`, because NULL, empty and
+taken are three different states and a grid must visualize the difference
+rather than trust the text.
+
+Column names reach QML through a notifying `columnNames` property rather than
+through `headerData()`. A QML binding on `model.headerData(...)` evaluates
+once — before the first batch has brought the names, because the *count* comes
+from the `EXECUTED` event and the *names* come from a batch (ADR-0003 A6) — and
+never re-evaluates, since `headerDataChanged` is a model signal, not a
+property-change signal. The header showed "1", "2", "3". The headless QML test
+in `tst_coreinfo` found that; reasoning about it had not.
+
+### What `data()` is allowed to touch
+
+`data()` makes **no** FFI call for a text cell: it reads `null_bits`,
+`offsets` and `data` out of the column view it already holds and builds the
+`QString` from those bytes. For every other kind — `NUMBER`, `TIMESTAMP`,
+`BYTES`, `LOB`, `UNSUPPORTED`, and anything a future header adds — it reads
+text the **bulk** formatter produced, through exactly one lazy path:
+`ResultTableModel::hydrate()`, which calls `reldex_text_arena_create`,
+`reldex_batch_format_column` over the whole batch, and `reldex_text_arena_view`
+once, and then caches the resulting `ReldexArenaView` so every later cell in
+that (batch, column) is pointer arithmetic again.
+
+Grep proof — every `reldex_*` call in `ResultTableModel.cpp`:
+
+| line | function | called from |
+| --- | --- | --- |
+| `reldex_batch_column` | describe a column once | `applyBatch()` |
+| `reldex_batch_column_count` / `reldex_batch_column_info` | column names | `readColumnHeaders()` |
+| `reldex_text_arena_create` / `reldex_batch_format_column` / `reldex_text_arena_view` | render one (batch, column) | `hydrate()` |
+| `reldex_batch_release` / `reldex_text_arena_release` | RAII deleters in `ReldexHandles.h` | destruction |
+
+### Caching and its memory bound
+
+Formatted text is held per **(batch, column)** in its own `ReldexTextArena`,
+and the arenas are kept in a least-recently-used list of at most
+`maxCachedBatches` batches (default 16). Touching a batch moves it to the
+most-recently-used end *before* anything is dropped, so the batch being read is
+never the one evicted; a re-touched batch re-renders on demand.
+
+The bound matters because K3 allows 200 MB of RSS growth for 1,000,000 rows,
+and retaining formatted text for all of them would spend most of that on
+strings nobody is looking at. With the default 16 batches of 1,000 rows and the
+S14 shape (two formatted columns, ~11 and ~10 bytes per cell plus an 8-byte
+offset), the cache is roughly **0.6 MB**, independent of how many rows have
+been fetched. The row data itself *is* retained — ADR-0003 D4 says the MVP
+keeps the fetched prefix, and ADR-0004 (result store) is where that changes.
+
+A `QString` cache per visible cell was considered and rejected: it would add a
+second copy of the same text (a `QString` is 24 bytes plus a heap block) for a
+saving only on repeated reads of the same cell, and it would make the memory
+bound depend on how a view happens to call `data()`. What the current shape
+costs instead is one `QString::fromUtf8` per `data()` call, which is precisely
+the number S15's K4 measures — so it is left visible rather than optimized away
+before it has been measured.
+
+### Teardown (ADR-0003 D5 rule 2 and A10)
+
+`~Bridge`, in this order:
+
+1. `reldex_hub_set_waker(hub, NULL, NULL)` — does not return while a wake is in
+   progress, so the trampoline can never see a half-destroyed `Bridge`;
+2. delete the `SessionController` and its model, which releases every
+   `ReldexBatch` they hold — `reldex_hub_destroy` requires that;
+3. drain whatever is still queued and release the batches and errors it
+   carries (the queue is unbounded and an undrained batch is our memory);
+4. `reldex_hub_destroy`. A10 requires that no other thread is inside any
+   `reldex_*` call, *including* `reldex_session_request_cancel`. This adapter
+   makes every call on the `Bridge`'s own thread and never uses the
+   cancel-from-any-thread allowance, so there is no thread to join and nothing
+   to synchronize;
+5. `~QObject` removes any drain this object had posted for itself, so a queued
+   invocation can never reach a dead `Bridge`.
+
+## Instrumentation, and how M1.8 runs the S15 measurement
+
+`ui/adapter/Metrics.{h,cpp}` holds every hook, compiled in and **off by
+default**: each recording entry point is an inline `if (!m_enabled) return;` in
+front of an out-of-line implementation. It records monotonic marks
+(execute submitted → first event → first rows inserted → first frame swapped
+after that insert), per-drain event counts and durations, frame intervals from
+`QQuickWindow::frameSwapped`, and resident set size. It draws no conclusions —
+`writeCsv()` emits `section,a,b,c` rows (`mark`, `drain`, `frame`) and the
+spike report is M1.8's to write.
+
+`frameSwapped` is connected `Qt::DirectConnection` on purpose: it is emitted on
+the render thread, and queueing it to the GUI thread would time the GUI
+thread's backlog rather than the frame. Samples are appended under a mutex and
+capped at 200,000 so the instrument never becomes part of the K3 answer.
+
+### Environment variables
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `RELDEX_UI_METRICS` | off | any value but `0` enables recording |
+| `RELDEX_S15_AUTORUN` | off | any value but `0` makes `Main.qml` run the query on load |
+| `RELDEX_S15_ROWS` | `1000000` | rows the mock generates |
+| `RELDEX_S15_SEED` | `0` | mixed into the generated values |
+| `RELDEX_S15_FETCH_ROWS` | `1000` | `max_rows` per fetch |
+| `RELDEX_S15_FETCHES_IN_FLIGHT` | `2` | the adapter's back-pressure bound |
+| `RELDEX_S15_PER_FETCH_LATENCY_US` | `0` | simulated per-fetch round trip |
+| `RELDEX_S15_FIRST_BATCH_LATENCY_US` | `0` | extra cost before the first batch |
+| `RELDEX_UI_TEARDOWN_ITERATIONS` | `10000` | K5 iterations in `tst_teardown` |
+| `RELDEX_UI_TEARDOWN_CONNECT_ITERATIONS` | `2000` | K5's connect-window variant |
+| `RELDEX_UI_SANITY_1M` | off | enables the skipped 1M-row sanity stream in `tst_resultmodel` |
+
+### Launching for a measurement run
+
+```bash
+source tools/dev-env/env.sh
+RELDEX_UI_METRICS=1 RELDEX_S15_AUTORUN=1 RELDEX_S15_ROWS=1000000 \
+  ./build/ui-RelWithDebInfo/Reldex.exe
+```
+
+`Reldex.exe` is a GUI-subsystem binary, so scroll it by hand and read the
+numbers from `bridge.metrics.summary()` / `bridge.metrics.writeCsv(path)`; the
+`Metrics` object is reachable from QML as `bridge.metrics`. Everything except
+the frame-time half can also be driven headless:
+
+```bash
+RELDEX_UI_SANITY_1M=1 ./build/ui-RelWithDebInfo/tst_resultmodel.exe \
+  sanityStreamOfAMillionRows -o run.txt,txt
+```
+
+**Reading a test's own output on this machine:** a Qt test binary's stdout does
+not reach a redirected file or a pipe from Git Bash or PowerShell here (the
+same class of problem as `phase-1-toolchain.md` §12 gotcha 4; CTest's
+`LastTest.log` records `<end of output>` for a test that demonstrably ran and
+printed). Use QTest's own file logger — `-o <file>,txt` — which does work, and
+is how the numbers below were read. The test targets are forced to the console
+subsystem (`WIN32_EXECUTABLE FALSE`) because `qt_add_executable()` defaults it
+to `TRUE`; that is necessary but, on this machine, not sufficient.
+
+### Numbers seen while building this (information only — M1.8 owns the real ones)
+
+Dev machine, Windows 11, MSVC 14.44, Qt 6.8.3, `RelWithDebInfo`, mock driver,
+guiless (no scene graph), 1,000,000 rows of the S14 shape, 1,000 rows per
+fetch, 2 fetches in flight:
+
+- streamed into the model in **459–485 ms**;
+- RSS grew by **~177 MB** (~177 B/row) — under K3's 200 MB, but well above the
+  ADR's ~116 B/row estimate, and this is *without* a scene graph. M1.8 should
+  expect K3 to be the tight one;
+- a cold 40-row × 3-column window (which renders two whole 1,000-row columns
+  through the bulk formatter) took ~327 µs; the same window warm averaged
+  **~104 ns/cell**, against K4's 200 ns budget;
+- K5: **10,000 teardowns under a flood in 6.85 s** (0.685 ms each), RSS +2.6 MB
+  across the whole loop.
+
+And with the real app (`Reldex.exe`, scene graph, a `TableView` on screen),
+sampled from outside the process:
+
+- idle, nothing executed: **76 MB** working set, flat;
+- after the 1,000,000-row query (CPU flat by ~2 s, working set flat by ~4 s):
+  **307 MB**, stable out to 40 s — a growth of **~231 MB**.
+
+**This is the number M1.8 should look at first.** K3's threshold is 200 MB of
+RSS growth for 1M rows and both measurements are near or past it (177 MB
+headless, ~231 MB with the UI). The formatted-text cache is not the cause — it
+is bounded at well under a megabyte. What costs the memory is the *retained
+fetched prefix*: ADR-0003 D4 has the MVP keep every batch it has fetched, so a
+scrolled-through million-row result holds a million rows of batch memory. At
+~177 B/row against the ADR's own ~116 B/row estimate there is also roughly
+70 B/row unaccounted for, which is worth diagnosing before concluding anything
+— a plausible first suspect is per-batch `Vec` capacity slack on the Rust side,
+which would be a fix in the producer rather than in the boundary. Per the ADR:
+"K1/K3 failure with a *diagnosed* cause in the model (not the boundary) is a
+design fix, not a kill."
+
+No frame-time number is claimed: K1 needs a real swapchain and a scrolling
+window driven by a human or a harness, which is M1.8's job on the dev machine,
+not this task's. The hooks for it are in place and were exercised (the app runs
+with `RELDEX_UI_METRICS=1` and stays responsive throughout the stream).
+
+### AddressSanitizer: not available on this machine
+
+`/fsanitize=address` was attempted in a separate build directory and **cannot**
+be made to work here: this Visual Studio 2022 Community install ships only the
+**32-bit** ASan runtime (`clang_rt.asan_dynamic-i386.lib`,
+`clang_rt.asan_dynamic_runtime_thunk-i386.lib`); there is no x64 counterpart,
+so the link fails with
+`LNK1104: cannot open file 'clang_rt.asan_dynamic_runtime_thunk-x86_64.lib'`.
+Building 32-bit instead is not an option: the installed Qt is
+`msvc2022_64` only and `reldex-ffi` is built for `x86_64-pc-windows-msvc`.
+
+Getting it would mean installing the "C++ AddressSanitizer" component into the
+Visual Studio installation — a machine-level change, which this repository's
+scripts and tasks do not make. Linux ASan/UBSan in CI (ADR-0003 D2/D10) is the
+intended home for this and is being arranged separately. Until then, the
+evidence for K5 is: the RAII handles in `ReldexHandles.h` (structurally
+exactly-once release), the 12,000-iteration teardown test above, and the flat
+RSS across it. `reldex.h` offers no create/release counter to assert against,
+so nothing stronger is claimed.
 
 ### Why `ui/tests` re-attaches `../app/Main.qml` instead of sharing a library
 
@@ -175,10 +413,24 @@ module (`Qt6Charts`, `Qt6WebEngineCore`, etc.) is present.
   this dev environment; a real installer/package needs `windeployqt` (or
   the CMake `qt_generate_deploy_app_script()` equivalent), which is out of
   scope for a build skeleton.
-- **No hub, no session, no result model.** `CoreInfo` only calls
-  `reldex_abi_version()`. Wrapping the hub/session lifecycle into QObjects
-  and building `ResultTableModel` is M1.6, and is explicitly not
-  pre-empted here.
+- **The mock driver is the only driver.** `SessionController::open()` builds a
+  `ReldexOpenOptions` with `RELDEX_DRIVER_KIND_MOCK`, because that is the only
+  kind this build of `reldex-ffi` accepts (ADR-0003 A8). Connection profiles
+  and a real driver are M2/M3.
+- **LOBs do not cross the boundary yet** (ADR-0003 A7). A LOB column reports
+  its kind and the bulk formatter renders it as the "taken" text; there is no
+  handle to read from. That is M2.11.
+- **No cancel affordance.** `reldex_session_request_cancel` is deliberately not
+  called anywhere in this adapter: using it would create the cross-thread
+  sequencing obligation A10 describes, and nothing in M1.6 needs it. The
+  `cancel_kind` an `OPENED` event reports is stored (`cancelKind()`) and
+  otherwise unused.
+- **One session per `Bridge`.** The routing table is a
+  `QHash<sessionId, QPointer<SessionController>>` and handles any number, but
+  the `Bridge` creates exactly one controller, because the spike needs one.
+  Several worksheets are M3.
+- **No AddressSanitizer on this machine** — see the section above for exactly
+  why, and what stands in for it.
 - **The offscreen platform plugin warns about missing fonts**
   (`QFontDatabase: Cannot find font directory .../lib/fonts. ... Qt no
   longer ships fonts.`) every run, since this Qt install has none deployed.
