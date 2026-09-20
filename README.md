@@ -42,9 +42,9 @@ concurrent sessions running independently. Mobile cross-compile (Android/iOS) is
 
 - **No on-demand statement cancel.** Only a pre-armed deadline exists, and it can destroy the session
   if the server does not interrupt promptly (spike S4 fails `SPEC.md` §10/§24.8's requirement). The
-  owner decided on 2026-09-20 to accept this as a limitation — stay on `oracledb`, ship the pre-armed
+  owner decided on 2026-09-19 to accept this as a limitation — stay on `oracledb`, ship the pre-armed
   deadline with an honest UI, and pursue upstream fixes — rather than change drivers; see
-  [ADR-0001](docs/decisions/0001-database-driver-strategy.md) "Owner decision (2026-09-20)".
+  [ADR-0001](docs/decisions/0001-database-driver-strategy.md) "Owner decision (2026-09-19)".
 - **`TIMESTAMP WITH TIME ZONE` columns are refused** at describe time by default, because a
   named-region value aborts the process in the upstream driver; this is containment, not support.
 - **NUMBER bind restrictions**: certain decimal shapes (an odd count of leading zeros below 0.1, or a
@@ -68,12 +68,12 @@ concurrent sessions running independently. Mobile cross-compile (Android/iOS) is
   "Next step toward physical-device validation".
 
 - [ADR-0001](docs/decisions/0001-database-driver-strategy.md) — **Accepted — owner decision
-  2026-09-20: stay on oracledb; pre-armed deadline + honest UI; upstream issues #21–#25 filed
-  2026-09-20**: the primary database driver remains Oracle's official `oracledb` crate
+  2026-09-19: stay on oracledb; pre-armed deadline + honest UI; upstream issues #21–#25 filed
+  2026-09-19**: the primary database driver remains Oracle's official `oracledb` crate
   (`oracle/rust-oracledb`); the owner accepted the cancellation limitation rather than changing
   drivers.
 - [ADR-0002](docs/decisions/0002-driver-api-and-concurrency-model.md) (driver API and concurrency
-  model) — **Accepted (owner confirmed 2026-09-20) — implemented; independently reviewed twice with
+  model) — **Accepted (owner confirmed 2026-09-19) — implemented; independently reviewed twice with
   must-fix findings applied; amended after the Phase 0 spikes**.
 - A Cargo workspace with `crates/db-driver-api`, `crates/db-core` (session/worker-thread layer),
   `crates/drivers/mock`, `crates/drivers/oracle-thin` (wraps `oracledb`) and `crates/reldex-core-poc`
@@ -92,8 +92,8 @@ available).
 
 - **Core:** Rust.
 - **UI:** Qt Quick/QML with a thin C++ adapter over a stable Rust FFI boundary — planned, not started.
-- **Primary database driver:** Oracle's official [`oracledb`](https://github.com/oracle/rust-oracledb) crate (pure Rust, thin, blocking; no Instant Client/OCI required), pinned to an exact pre-GA beta version (`=26.0.0-beta.3`), per [ADR-0001](docs/decisions/0001-database-driver-strategy.md). It is encapsulated behind `db-driver-api` so it can be swapped if a kill criterion in the ADR's spike plan fires. Spike S4's cancellation kill criterion fired, and on 2026-09-20 the owner decided to accept the limitation — ship the pre-armed deadline with an honest UI and pursue upstream fixes — rather than change drivers; see the current limitations above.
-- **Known gaps in the primary driver**, stated honestly: no on-demand statement-cancel API (Phase 0 falls back to a pre-armed deadline; five of seven drafted upstream issues were submitted 2026-09-20, #21–#25; the owner decided 2026-09-19 not to submit F and G for now, keeping the drafts for tracking only); a connect cannot be bounded and there is no dead-link keepalive; `CREATE TRIGGER` with `:NEW`/`:OLD` cannot be executed directly (documented workaround); it is pre-GA/beta software with at least one defect that can abort the whole process if an unhandled input reaches it; Native Network Encryption and 11G password verifiers are unsupported; Android/iOS cross-compile is proven in CI but physical-device evidence is still required before any mobile-support claim.
+- **Primary database driver:** Oracle's official [`oracledb`](https://github.com/oracle/rust-oracledb) crate (pure Rust, thin, blocking; no Instant Client/OCI required), pinned to an exact pre-GA beta version (`=26.0.0-beta.3`), per [ADR-0001](docs/decisions/0001-database-driver-strategy.md). It is encapsulated behind `db-driver-api` so it can be swapped if a kill criterion in the ADR's spike plan fires. Spike S4's cancellation kill criterion fired, and on 2026-09-19 the owner decided to accept the limitation — ship the pre-armed deadline with an honest UI and pursue upstream fixes — rather than change drivers; see the current limitations above.
+- **Known gaps in the primary driver**, stated honestly: no on-demand statement-cancel API (Phase 0 falls back to a pre-armed deadline; five of seven drafted upstream issues were submitted 2026-09-19, #21–#25; the owner decided 2026-09-19 not to submit F and G for now, keeping the drafts for tracking only); a connect cannot be bounded and there is no dead-link keepalive; `CREATE TRIGGER` with `:NEW`/`:OLD` cannot be executed directly (documented workaround); it is pre-GA/beta software with at least one defect that can abort the whole process if an unhandled input reaches it; Native Network Encryption and 11G password verifiers are unsupported; Android/iOS cross-compile is proven in CI but physical-device evidence is still required before any mobile-support claim.
 - **Initial compatibility target:** Oracle Database 19c+.
 
 ## Running the integration suite

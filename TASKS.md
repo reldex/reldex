@@ -33,12 +33,12 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [x] Create `db-core` (session layer implemented: worker-thread-per-session, FIFO queue, out-of-band cancel, conservative transaction tracking incl. locking queries, `CloseDisposition`, terminal `Lost`/`Closed` lifecycle, core-owned `ResultId`/`LobHandle`, bounded `Drop`, `SessionLimits`, panic containment; independently reviewed, 7 must-fix applied, commit `86f79d7`)
 - [x] Create initial database driver implementation — wrap Oracle's official `oracledb` crate (`oracle/rust-oracledb`, pinned exact version `=26.0.0-beta.3`) in `crates/drivers/oracle-thin` (ADR-0001); independently reviewed, 4 must-fix applied, commit `db38c14`
 - [x] Add driver contract tests that detect behaviour changes on `oracledb` upgrades — upstream canary suite (`crates/drivers/oracle-thin/tests/canary_upstream_{offline,live}.rs`): one canary per observable upstream defect, process-abort defects run in a child process, version tripwire on the pin; procedure in `docs/exec-plans/active/oracledb-upgrade-checklist.md`
-- [x] **(S4 critical path)** Draft upstream request to `oracle/rust-oracledb` for a public statement-cancel/break API — plus accessors for `OracleNumber` digits and the connection's transaction-in-progress flag (seven issues drafted in full: `docs/exec-plans/active/phase-0-spike-results.md` §6 — A–E submitted 2026-09-20 (#21–#25); F and G not submitted, owner decision 2026-09-19 — drafts kept for tracking only; see the owner decision task below)
+- [x] **(S4 critical path)** Draft upstream request to `oracle/rust-oracledb` for a public statement-cancel/break API — plus accessors for `OracleNumber` digits and the connection's transaction-in-progress flag (seven issues drafted in full: `docs/exec-plans/active/phase-0-spike-results.md` §6 — A–E submitted 2026-09-19 (#21–#25); F and G not submitted, owner decision 2026-09-19 — drafts kept for tracking only; see the owner decision task below)
 - [x] Add normalized `DbError`
 - [~] Add connection/profile model (driver-level connection params done; user-facing profile model pending)
 - [x] Add session abstraction (`db-core` `DatabaseSession` implemented and hardened; see above)
 - [x] Add transaction abstraction (`db-core` conservative tracking, incl. locking queries, implemented and proven by spike S3)
-- [x] Add cancellation abstraction (contract implemented; driver-level mechanism evaluated in spike S4 and **fails for the requirement** — only a pre-armed per-round-trip deadline exists, no on-demand cancel; owner decision 2026-09-20: accepted as a limitation, see ADR-0001 "Owner decision" section)
+- [x] Add cancellation abstraction (contract implemented; driver-level mechanism evaluated in spike S4 and **fails for the requirement** — only a pre-armed per-round-trip deadline exists, no on-demand cancel; owner decision 2026-09-19: accepted as a limitation, see ADR-0001 "Owner decision" section)
 
 ### Functional POC
 - [x] Connect/disconnect/ping (spike S1 — pass)
@@ -50,20 +50,20 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [x] COMMIT/ROLLBACK/SAVEPOINT (spike S3 — pass)
 - [x] CLOB/NCLOB/BLOB (spike S7 — pass, CLOB/BLOB; 100 MB each streamed, +4.7 MB working set. Spike S11 — pass, NCLOB; Thai/non-BMP text byte-exact, 1.2M characters in 55 bounded chunks)
 - [x] DBMS_OUTPUT (spike S5 — pass, including Thai text)
-- [!] Long-running query cancellation — accepted limitation (owner decision 2026-09-20): pre-armed deadline only; blocked on upstream cancel API (see ADR-0001 "Spike outcome" and "Owner decision" sections and `phase-0-spike-results.md` §4)
-- [x] TCPS (spike S8 — pass with limits, 2026-09-20: one-way TLS 1.2, verification on, PEM-supplied trust; no mTLS + private CA, no Oracle wallet files, no revocation — upstream U-12…U-14)
+- [!] Long-running query cancellation — accepted limitation (owner decision 2026-09-19): pre-armed deadline only; blocked on upstream cancel API (see ADR-0001 "Spike outcome" and "Owner decision" sections and `phase-0-spike-results.md` §4)
+- [x] TCPS (spike S8 — pass with limits, 2026-09-19: one-way TLS 1.2, verification on, PEM-supplied trust; no mTLS + private CA, no Oracle wallet files, no revocation — upstream U-12…U-14)
 - [x] Network-loss behavior (spike S10 — pass, with two upstream gaps: a black-holed link never returns without a caller-set deadline, U-17; a dead client's row lock blocked a second session for the full 20 s measured because `SQLNET.EXPIRE_TIME` is unset and upstream has no keepalive — see `phase-0-spike-results.md` §3 S10)
 - [x] Concurrent independent sessions (spike S9 — pass; 8 sessions, 400 inserts, 283 ms)
 
 ### Platform validation
 - [x] Windows x64 (build, connect, and the full spike matrix all run locally, 2026-09-19)
-- [~] Linux x64 (build + fmt + clippy -D warnings + `cargo test --workspace` green on CI `ubuntu-latest`, PR #1, 2026-09-20 — https://github.com/reldex/reldex/actions/runs/35419377082; no database connect yet)
-- [~] macOS ARM64 (build + fmt + clippy -D warnings + `cargo test --workspace` green on CI `macos-latest` (Apple Silicon), PR #1, 2026-09-20 — https://github.com/reldex/reldex/actions/runs/35419377082; no database connect yet)
+- [~] Linux x64 (build + fmt + clippy -D warnings + `cargo test --workspace` green on CI `ubuntu-latest`, PR #1, 2026-09-19 — https://github.com/reldex/reldex/actions/runs/35419377082; no database connect yet)
+- [~] macOS ARM64 (build + fmt + clippy -D warnings + `cargo test --workspace` green on CI `macos-latest` (Apple Silicon), PR #1, 2026-09-19 — https://github.com/reldex/reldex/actions/runs/35419377082; no database connect yet)
 - [~] Android ARM64 physical device — native-binary evidence on a physical phone, 2026-09-20 (OPPO CPH2399, Android 16, arm64-v8a): connect/ping, exact typed data incl. Thai + emoji, transaction, 100k-row fetch (+0.6 MB RSS), TCPS with verification on, deadline path — 7/7 pass (`docs/exec-plans/active/phase-0-android-device.md`). Still open: the packaged-app path (APK, app sandbox, real Wi-Fi/cellular network) — SPEC §25 stays unmet until then
 - [ ] iOS/iPadOS ARM64 physical device (cross-compile + link proven in CI — spike S6, PR #3; physical-device evidence still needed, needs a Mac + Apple Developer account + device)
 
-- [x] Owner: decide cancellation path (ADR-0001 re-opened) [decision 2026-09-20: stay on `oracledb`; ship the pre-armed per-statement deadline with an honest UI; pursue upstream fixes via the four drafted issues — see ADR-0001 "Owner decision (2026-09-20)"]
-- [x] Owner: submit the drafted upstream issues — five submitted 2026-09-20 (#21–#25) (`docs/exec-plans/active/phase-0-spike-results.md` §6)
+- [x] Owner: decide cancellation path (ADR-0001 re-opened) [decision 2026-09-19: stay on `oracledb`; ship the pre-armed per-statement deadline with an honest UI; pursue upstream fixes via the four drafted issues — see ADR-0001 "Owner decision (2026-09-19)"]
+- [x] Owner: submit the drafted upstream issues — five submitted 2026-09-19 (#21–#25) (`docs/exec-plans/active/phase-0-spike-results.md` §6)
 - [x] Owner decision 2026-09-19: issues F and G are NOT submitted for now; drafts kept for tracking (results file §6)
 - [x] Owner: Phase 0 go/no-go — GO for Phase 1 (2026-09-19)
 - [ ] Track upstream `oracle/rust-oracledb` releases; re-run the integration suite and the ignored abort-repro tests on each new beta

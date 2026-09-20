@@ -36,7 +36,7 @@ Phase 0 is complete when:
 | 1 | **Done.** `db-driver-api` (ADR-0002) and `db-core`'s session/worker layer are implemented and independently reviewed (7 must-fix applied, commit `86f79d7`). |
 | 2 | **Done.** Spike S1 — pass: Easy Connect and a full TNS descriptor both authenticate; 119.5 ms median connect (10 sequential cycles). |
 | 3 | **Done.** Spike S3 — pass. |
-| 4 | **Not met — accepted limitation (owner decision 2026-09-20).** Spike S4 fails for the requirement: only a pre-armed per-round-trip deadline exists, and it destroys the session whenever the server cannot answer promptly. `SPEC.md` §10/§24.8 is not satisfied by `oracledb` 26.0.0-beta.3. The owner reviewed ADR-0001's re-opening and decided to stay on `oracledb`, ship the pre-armed deadline with an honest UI, and pursue upstream fixes rather than change drivers — see ADR-0001 "Owner decision (2026-09-20)". This criterion remains **not met** for the Phase 0 go/no-go decision below; the decision was to accept the gap, not to close it. |
+| 4 | **Not met — accepted limitation (owner decision 2026-09-19).** Spike S4 fails for the requirement: only a pre-armed per-round-trip deadline exists, and it destroys the session whenever the server cannot answer promptly. `SPEC.md` §10/§24.8 is not satisfied by `oracledb` 26.0.0-beta.3. The owner reviewed ADR-0001's re-opening and decided to stay on `oracledb`, ship the pre-armed deadline with an honest UI, and pursue upstream fixes rather than change drivers — see ADR-0001 "Owner decision (2026-09-19)". This criterion remains **not met** for the Phase 0 go/no-go decision below; the decision was to accept the gap, not to close it. |
 | 5 | **Done, with documented limits.** Spikes S2 (conditional go — NUMBER-bind and TIMESTAMP WITH TIME ZONE restrictions contained by refusal, not silent corruption), S5 (pass), S7 (pass) and S11 (NCLOB — pass) all ran against the live database. |
 | 6 | **Partial.** Windows x64 fully validated locally (build, connect, full spike matrix). Linux x64 and macOS ARM64 build in CI (fmt/clippy/test) but this branch has not yet gone through a PR/CI run, and neither has database access in CI. |
 | 7 | **Android has physical-device evidence; iOS does not.** Spike S6 passed 2026-09-19 (PR #3): all three mobile targets compile and link in CI (`phase-0-s6-mobile-cross-compile.md`). On 2026-09-20 the core plus driver then **ran on a physical arm64 phone** (OPPO CPH2399, Android 16) against the live Oracle 19c test database over USB `adb reverse` — connect, ping, typed data, transaction, 100k-row fetch, TCPS with verification on, and the deadline path, 7/7 (`phase-0-android-device.md`). That is a native CLI binary over `adb shell`, **not** an APK, and not a real network. No iOS device has run anything. |
@@ -83,7 +83,7 @@ Proven by spike S3 against the live database, plus `db-core`'s own session-layer
 - [x] REF CURSOR. (spike S5, after contract fix C-1)
 - [x] Multiple concurrent sessions. (spike S9: 8 sessions, 400 inserts, 282.8 ms)
 - [x] Long-running query. (spike S4 drives a 3-way cartesian join over `ALL_OBJECTS` and a 20-second `DBMS_SESSION.SLEEP`; both execute — see below for the cancellation outcome)
-- [ ] Cancellation from another control path. **Ran 2026-09-19; fails for the requirement (ADR-0001 C1 / spike S4). Accepted limitation (owner decision 2026-09-20).** No mechanism stops a running statement and keeps the session in the general case: a pre-armed deadline (the only mechanism `oracledb` 26.0.0-beta.3 offers) stops a long SQL statement with the session intact, but destroys the connection for a PL/SQL block the server will not interrupt promptly (upstream recovery defect U-6); a privileged `ALTER SYSTEM CANCEL SQL` stops the statement server-side but the client is never notified (U-7); a minimal fork was assessed and is not recommended. `SPEC.md` §10/§24.8 is **not met** — the owner decided to stay on `oracledb`, ship the pre-armed deadline with an honest UI, and pursue the upstream fixes rather than change drivers; see ADR-0001 "Spike outcome (2026-09-20)" and "Owner decision (2026-09-20)", and `phase-0-spike-results.md` §4.
+- [ ] Cancellation from another control path. **Ran 2026-09-19; fails for the requirement (ADR-0001 C1 / spike S4). Accepted limitation (owner decision 2026-09-19).** No mechanism stops a running statement and keeps the session in the general case: a pre-armed deadline (the only mechanism `oracledb` 26.0.0-beta.3 offers) stops a long SQL statement with the session intact, but destroys the connection for a PL/SQL block the server will not interrupt promptly (upstream recovery defect U-6); a privileged `ALTER SYSTEM CANCEL SQL` stops the statement server-side but the client is never notified (U-7); a minimal fork was assessed and is not recommended. `SPEC.md` §10/§24.8 is **not met** — the owner decided to stay on `oracledb`, ship the pre-armed deadline with an honest UI, and pursue the upstream fixes rather than change drivers; see ADR-0001 "Spike outcome (2026-09-19)" and "Owner decision (2026-09-19)", and `phase-0-spike-results.md` §4.
 
 ## Workstream D — Data types
 
@@ -149,7 +149,7 @@ For every mapping, document:
 - [x] service name. (spike S1: `127.0.0.1:1521/RELDEX`)
 - [x] connect descriptor. (spike S1: full TNS descriptor with `CONNECT_DATA=(SID=RELDEX)`)
 - [x] TCP. (every Phase 0 connection is plaintext TCP; the test DB has no TLS listener)
-- [x] TCPS. **Pass with limits** (spike S8, 2026-09-20) — one-way TLS 1.2 (`ECDHE-RSA-AES256-GCM-SHA384`)
+- [x] TCPS. **Pass with limits** (spike S8, 2026-09-19) — one-way TLS 1.2 (`ECDHE-RSA-AES256-GCM-SHA384`)
   with certificate and host-name verification on, confirmed server-side; trust comes from a
   user-supplied PEM. Not available upstream: mTLS with a private CA, Oracle wallet files, OS trust
   store, revocation, `SSL_SERVER_DN_MATCH` (U-12…U-14). `TlsMode::Required` refuses non-TCPS endpoints
@@ -193,12 +193,12 @@ Known unsupported configurations of the primary driver (ADR-0001): Native Networ
 - [x] Full POC matrix. (spikes S1–S5, S7, S9 all run locally, 2026-09-19)
 
 ### Linux x64
-- [x] Build. Green on CI `ubuntu-latest` for PR #1 on 2026-09-20 (fmt, `clippy -D warnings`, `cargo test --workspace`, incl. `aws-lc-sys`): https://github.com/reldex/reldex/actions/runs/35419377082
+- [x] Build. Green on CI `ubuntu-latest` for PR #1 on 2026-09-19 (fmt, `clippy -D warnings`, `cargo test --workspace`, incl. `aws-lc-sys`): https://github.com/reldex/reldex/actions/runs/35419377082
 - [ ] Connect. Not attempted; CI has no database access by design (unit tests only, no real DB).
 - [ ] Core smoke matrix. Not attempted.
 
 ### macOS ARM64
-- [x] Build. Green on CI `macos-latest` (Apple Silicon) for PR #1 on 2026-09-20 (same steps): https://github.com/reldex/reldex/actions/runs/35419377082
+- [x] Build. Green on CI `macos-latest` (Apple Silicon) for PR #1 on 2026-09-19 (same steps): https://github.com/reldex/reldex/actions/runs/35419377082
 - [ ] Connect. Not attempted; no database access in CI.
 - [ ] Core smoke matrix. Not attempted.
 
@@ -318,7 +318,7 @@ table look more finished than the evidence supports.
 | 1 | Generic driver/session API exists | **Met** | `db-driver-api`/`db-core`, independently reviewed (commit `86f79d7`) |
 | 2 | Selected thin driver connects to the reference database | **Met** | Spike S1 — pass; `phase-0-spike-results.md` §3 |
 | 3 | Transaction behavior is correct | **Met** | Spike S3 — pass; `phase-0-spike-results.md` §3 |
-| 4 | Query cancellation is demonstrated | **Not met — accepted limitation (owner decision 2026-09-20)** | Spike S4; ADR-0001 "Spike outcome (2026-09-20)" and "Owner decision (2026-09-20)"; `phase-0-spike-results.md` §4 |
+| 4 | Query cancellation is demonstrated | **Not met — accepted limitation (owner decision 2026-09-19)** | Spike S4; ADR-0001 "Spike outcome (2026-09-19)" and "Owner decision (2026-09-19)"; `phase-0-spike-results.md` §4 |
 | 5 | Required datatypes/PL-SQL behaviors are integration-tested | **Met, with limits** | Spikes S2 (conditional go — NUMBER-bind and TIMESTAMP WITH TIME ZONE restrictions), S5 (pass), S7 (pass), S11 (NCLOB — pass), S12 (developer features — pass, but `CREATE TRIGGER … :NEW` is impossible, U-18) — `phase-0-spike-results.md` §3, §5 |
 | 6 | Desktop platform viability is established | **Met, with limits** | Windows x64 fully validated locally; Linux x64 and macOS ARM64 build/fmt/clippy/test green on CI (PR #1) but no database connect exercised in CI — see `README.md` "Current status" |
 | 7 | Android/iOS direct-connect feasibility: physical-device evidence or a documented blocker | **Met, with limits — stated honestly.** Android now has real device evidence; iOS still has none and its blocker is documented, not silent | Spike S6 — pass 2026-09-19, PR #3, all three mobile targets compile and link in CI (`phase-0-s6-mobile-cross-compile.md`). **Android device run — pass 2026-09-20**, 7/7 on an OPPO CPH2399 (Android 16, arm64-v8a) against the live database over USB `adb reverse`: connect+ping, NUMBER/DATE/TIMESTAMP/Thai/non-BMP fidelity, rollback+commit, 100 000 rows at ~15 k rows/s with peak RSS under 6.2 MB, TCPS confirmed by the server's `USERENV.NETWORK_PROTOCOL`, and a deadline that returns `Timeout` with a session that really does recover (`phase-0-android-device.md`). **What is still missing:** it is a native CLI binary over `adb shell`, not an APK (no Qt, no JNI, no permission model, `shell` SELinux context) and the transport is USB loopback, not Wi-Fi/cellular; on-device LOB, PL/SQL, cancellation-beyond-deadline, reconnect and background/resume were not run; and **no physical iOS device has been provided** (iOS additionally needs a Mac + Apple Developer account) |
@@ -336,7 +336,7 @@ table look more finished than the evidence supports.
 - **iOS physical-device validation** — needs a Mac with Xcode (CI already confirms the toolchain), an
   Apple Developer account (a free personal-team identity suffices for a 7-day local debug build), and
   a physical iPhone/iPad.
-- TCPS (spike S8) — done 2026-09-20, pass with limits (see Workstream F); the remaining TCPS questions
+- TCPS (spike S8) — done 2026-09-19, pass with limits (see Workstream F); the remaining TCPS questions
   are owner decisions (results file §9 items 6–7), confirmed 2026-09-19 (see below).
 - Driver fix for **C-5** (`ConnectionParams::connect_timeout` accepted and ignored) — **approved
   2026-09-19**: implement on a helper thread, default 15 s, user-configurable per connection
