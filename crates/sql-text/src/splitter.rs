@@ -165,9 +165,10 @@
 //! J round 2), not the only defensible reading of SQL\*Plus's own semantics
 //! — SQL\*Plus re-runs its statement buffer on a bare `/`, which for a
 //! desktop editor's purposes is ambiguous (re-run the *previous* statement?
-//! treat it as inert?) and unverified against real SQL\*Plus/SQLcl behavior.
-//! Producing no span at all is the one reading that cannot surprise a caller
-//! by re-executing something the user did not select, and it is what keeps
+//! treat it as inert?) and unverified against real SQL\*Plus/SQLcl behavior
+//! (see "Open questions for M4.3" below). Producing no span at all is the
+//! one reading that cannot surprise a caller by re-executing something the
+//! user did not select, and it is what keeps
 //! [`StatementSpan::content_start`] `<=` [`StatementSpan::content_end`] in
 //! every case: before this rule existed, a lone `/` immediately following an
 //! already-terminated statement could compute a `content_end` for a *new*,
@@ -203,6 +204,34 @@
 //!   where the machinery exists but is deliberately left off).
 //!   `StatementKind` is `#[non_exhaustive]` so a variant can be added later
 //!   without a breaking change.
+//!
+//! # Open questions for M4.3 (unverified against a real client)
+//!
+//! Two behaviors below are this crate's own reasonable, conservative
+//! reading of undocumented-for-our-purposes SQL\*Plus/SQLcl convention, not
+//! a confirmed match against either client — recorded here (ADR-0002
+//! amendment J6 has the same list) so M4.3's script executor, the first
+//! consumer with a real database/client session to check against, verifies
+//! them during its own integration tests rather than this assumption
+//! quietly calcifying into a false certainty:
+//!
+//! 1. A `/` line followed by a same-line comment (`/ -- note`) is **not**
+//!    treated as an authoritative lone `/` line by the internal
+//!    `is_lone_slash_line` helper (it requires the rest of the line to be
+//!    whitespace-only). Real SQL\*Plus/SQLcl may or may not tolerate a
+//!    trailing comment there.
+//! 2. A statement terminator (`;`) followed by a lone `/` line yields
+//!    exactly one statement and does not re-run it — see "A lone `/` line
+//!    with nothing pending produces no span at all" above (MUST-FIX #2,
+//!    ADR-0002 amendment J round 2). SQL\*Plus's own "re-run the buffer on a
+//!    bare `/`" semantics are themselves ambiguous for this exact case (rerun
+//!    the *previous* statement? treat it as inert?), so this crate's choice
+//!    (no span, no re-run) is a product decision, not a verified match.
+//!
+//! Both fail safely in the sense the module docs' "Safety first" section
+//! cares about — at most an over-conservative "not authoritative" reading,
+//! never an executable fragment carved from the middle of a statement — but
+//! neither has been checked against an actual client.
 
 use crate::dialect::{BlockKind, BlockStarter, KeywordSlot, Phrase, SqlDialect};
 use crate::lexer::tokenize;
@@ -456,8 +485,43 @@ fn is_word(kind: TokenKind) -> bool {
     matches!(kind, TokenKind::Keyword | TokenKind::Identifier)
 }
 
+/// Whitespace or a comment: content that belongs to the gap between
+/// statements, never to a statement's own text. This is deliberately
+/// **not** widened to include [`TokenKind::Directive`]: the top-level
+/// [`split_statements`] loop uses [`skip_trivial`] (built on this predicate)
+/// to find where the *next* statement's `content_start` begins, and a
+/// conditional-compilation directive there is real source text belonging to
+/// that next statement, not gap content to be skipped past — see
+/// [`is_trivial_or_directive`] for the separate, narrowly-scoped predicate
+/// used by the two internal scans that *do* need to see past a directive
+/// without stopping.
 fn is_trivial(kind: TokenKind) -> bool {
     matches!(kind, TokenKind::Whitespace | TokenKind::Comment)
+}
+
+/// [`is_trivial`], plus a conditional-compilation directive
+/// ([`TokenKind::Directive`]). Used **only** by [`collect_leading_words`]
+/// (so a directive preceding a block-starter's own keywords, e.g. `$IF
+/// $$flag $THEN\nBEGIN\n$END\n  NULL;\nEND;`, does not defeat the
+/// block-starter match — nothing about a directive there ever carries a
+/// leading keyword this module matches against) and by
+/// [`finish_with_maybe_slash`] (so a directive between a statement's closing
+/// terminator and a following lone `/` line, e.g. `END;\n$END\n/`, does not
+/// stop the search for that `/` before it is found). Every *other* internal
+/// scan in this file that skips trivia (the qualifier after `END`, a
+/// phrase's own internal gaps) keeps using the narrower [`is_trivial`]/
+/// [`skip_trivial`], since widening those was not needed to fix any known
+/// defect and — as this predicate's introduction itself proved once, at the
+/// top-level loop — widening a *shared* trivia notion in one place can
+/// silently change what a completely different call site means by "the next
+/// statement". Keeping this predicate distinct, and its use sites named
+/// individually, is deliberate: it must never become `is_trivial`'s own
+/// definition again.
+fn is_trivial_or_directive(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Whitespace | TokenKind::Comment | TokenKind::Directive
+    )
 }
 
 fn skip_trivial(tokens: &[Token], mut i: usize) -> usize {
@@ -517,10 +581,10 @@ fn skip_labels(tokens: &[Token], text: &str, start: usize, dialect: &SqlDialect)
 }
 
 /// Collects up to [`MAX_LEADING_WORDS`] leading word-tokens' text and the
-/// token index one past each, skipping whitespace/comments, stopping at the
-/// first token that is neither — a short statement (fewer words than any
-/// block-starter pattern needs) simply yields fewer words, which no pattern
-/// will match.
+/// token index one past each, skipping whitespace/comments/directives
+/// (see [`is_trivial_or_directive`]), stopping at the first token that is
+/// none of those — a short statement (fewer words than any block-starter
+/// pattern needs) simply yields fewer words, which no pattern will match.
 fn collect_leading_words<'t>(
     tokens: &[Token],
     text: &'t str,
@@ -531,7 +595,7 @@ fn collect_leading_words<'t>(
         let Some(token) = tokens.get(i) else { break };
         if is_word(token.kind) {
             words.push((&text[token.start..token.end], i + 1));
-        } else if !is_trivial(token.kind) {
+        } else if !is_trivial_or_directive(token.kind) {
             break;
         }
         i += 1;
@@ -722,12 +786,14 @@ fn end_at_slash_line(
     }
 }
 
-/// After a terminator has been found at `terminator`, looks past only
-/// whitespace/comments for a following lone `/` line ([`EndedBy::SlashLine`]
-/// wins when [`SqlDialect::slash_terminates_block`] is set); otherwise
-/// reports the terminator itself as the end, with
-/// [`terminated`](StatementSpan::terminated) following
-/// [`SqlDialect::block_may_end_without_slash`].
+/// After a terminator has been found at `terminator`, looks past
+/// whitespace/comments/directives (see [`is_trivial_or_directive`] — a
+/// directive between the terminator and a following `/` line, e.g.
+/// `END;\n$END\n/`, must not stop this search before the `/` is found) for a
+/// following lone `/` line ([`EndedBy::SlashLine`] wins when
+/// [`SqlDialect::slash_terminates_block`] is set); otherwise reports the
+/// terminator itself as the end, with [`terminated`](StatementSpan::terminated)
+/// following [`SqlDialect::block_may_end_without_slash`].
 fn finish_with_maybe_slash(
     tokens: &[Token],
     text: &str,
@@ -740,7 +806,7 @@ fn finish_with_maybe_slash(
     if dialect.slash_terminates_block {
         let mut k = next_i;
         while let Some(&token) = tokens.get(k) {
-            if is_trivial(token.kind) {
+            if is_trivial_or_directive(token.kind) {
                 k += 1;
                 continue;
             }

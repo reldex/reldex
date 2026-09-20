@@ -755,6 +755,45 @@ fn dollar_if_directives_inside_a_block_do_not_confuse_depth_tracking() {
 }
 
 #[test]
+fn additional_bug_a_leading_directive_before_the_blocks_own_begin_still_recognizes_the_block() {
+    // Found while extending the round-3 grammar with directives around "only
+    // the outer BEGIN": `is_trivial` (used by `collect_leading_words` to
+    // decide what may precede a block-starter's own keywords without
+    // defeating the match) covered only whitespace/comments, not
+    // `TokenKind::Directive`. A `$IF ... $THEN` sitting before this
+    // anonymous block's own `BEGIN` stopped leading-keyword collection
+    // before `BEGIN` was ever reached, so no `BlockStarter` matched at all
+    // and the whole script was misread as 3 unrelated `Plain` statements
+    // (split at the semicolons inside what should have been one block).
+    let dialect = support::oracle_like();
+    let text = "$IF $$my_flag $THEN\nBEGIN\n$END\n  NULL;\nEND;\n/\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated, "{spans:?}");
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn dollar_if_directive_around_only_the_blocks_closing_end_is_still_recognized() {
+    let dialect = support::oracle_like();
+    let text = "BEGIN\n  NULL;\n$IF $$my_flag $THEN\nEND;\n$END\n/\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated, "{spans:?}");
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn dollar_if_directive_around_a_whole_nested_block_does_not_confuse_depth_tracking() {
+    let dialect = support::oracle_like();
+    let text = "BEGIN\n  $IF $$flag $THEN\n    BEGIN\n      NULL;\n    END;\n  $ELSE\n    NULL;\n  $END\n  COMMIT;\nEND;\n/\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated, "{spans:?}");
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
 fn forward_declarations_in_a_package_spec_own_no_body() {
     let dialect = support::oracle_like();
     let text = "CREATE OR REPLACE PACKAGE forward_decls AS\n\

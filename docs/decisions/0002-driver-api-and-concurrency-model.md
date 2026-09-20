@@ -1316,6 +1316,101 @@ grammar-based property above). `cargo fmt --all -- --check`, `cargo clippy --wor
 96,000 generated scripts, both green) all pass; `RUSTDOCFLAGS="-D warnings" cargo doc -p
 reldex-sql-text --no-deps` is clean.
 
+### J6 — round-3 adversarial review: named gaps in the differential grammar, one bug found and fixed
+
+A third review **approved** J5's fixes outright (0 failures in 550,000 of the reviewer's own
+differential iterations and 6,000,000 fuzz cases, the differential oracle confirmed independent of
+the splitter, S1 checks pass, complexity linear) but, before merge, listed specific shapes the J5
+grammar did not generate — meaning a regression in any of them would not be caught by the in-repo
+gate even though the gate was green. `crates/sql-text/tests/differential.rs`'s grammar was extended
+with: `$IF`/`$THEN`/`$ELSIF`/`$ELSE`/`$END` directives wrapped around a statement, a whole nested
+block, only the outer `BEGIN`, and only the closing `END`; an opaque-source (`CREATE ... AND COMPILE
+JAVA SOURCE ...`) unit with Java text containing `;`/`{}`/`BEGIN`/`END`, generated only immediately
+before a forced `/` line, plus a dedicated standalone test confirming that without a following `/` it
+runs to `EndedBy::EndOfInput`/`terminated: false`; case-randomization applied to every keyword the
+generator emits (`UPPER`/`lower`/`Title`/`MiXeD`, chosen per occurrence) plus keyword-named
+identifiers (`Language`, `External`, `Before`, `After`, …) both quoted and as unquoted column
+aliases; a forward declaration with a `CAST(... AS ...)`/`CASE ... END`/`x IS NULL` parameter default
+nested inside *another subprogram's own* declare section (MUST-FIX #4's exact shape — previously only
+generated inside a package spec, never inside a sibling subprogram's declare section ahead of its own
+`BEGIN`); a guaranteed double-labelled nested-sibling-block shape; and a dedicated `gen_deep_body`
+generator that always recurses (unlike the general one, which bottoms out at a leaf 2 times out of 3)
+to force depth 3–5 nesting on every call, addressing the reviewer's note that deep nesting was
+under-represented.
+
+**One bug found while adding grammar coverage** (not by running the new grammar arms themselves, but
+while reasoning through how to construct the "directive around only the outer `BEGIN`" case — found
+and fixed before it could cause an in-repo gate failure): `collect_leading_words` — which walks a
+statement's leading tokens looking for a `BlockStarter` match — treated a conditional-compilation
+directive as neither a word nor trivia, so it stopped immediately at a directive appearing *before* a
+block's own leading keyword, without matching what came after. `$IF $$flag $THEN\nBEGIN\n$END\n
+NULL;\nEND;` was misread as three unrelated `Plain` statements instead of one `Block`. The same root
+cause defeated `finish_with_maybe_slash`'s search for a following lone `/` line whenever a directive
+sat between a block's closing terminator and that `/` (`END;\n$END\n/` stopped the search at `$END`,
+producing `InferredBlockEnd` plus a stray extra span instead of one `SlashLine`-terminated block).
+
+The first fix attempt widened the single, shared `is_trivial`/`skip_trivial` predicate (used at eight
+call sites) to also treat a directive as trivial. This fixed both manifestations above but broke a
+third thing no test yet exercised: `split_statements`'s own top-level loop uses that same predicate to
+find where the *next* statement's `content_start` begins — and a directive there is real source text
+belonging to that next statement, not gap content to be skipped past like whitespace. Widening it
+silently moved `content_start` for any statement beginning with a directive to *after* that directive,
+discovered only once the new grammar's "directive around only the outer `BEGIN`" units were actually
+joined with a preceding statement in the differential test (which asserts exact content recovery,
+unlike any test written for the original bug). The corrected fix keeps `is_trivial`/`skip_trivial` at
+their original, narrower scope and adds a second, explicitly-named predicate,
+`is_trivial_or_directive`, used *only* by `collect_leading_words` and `finish_with_maybe_slash` — the
+two call sites that actually needed it — leaving the other six untouched. This is itself a small
+instance of the round-2/round-3 pattern: a shared abstraction covering more call sites than a fix
+actually needs is a wider blast radius than the bug it closes.
+
+**A related, purely-in-test correctness note:** the "directive around only the closing `END`" grammar
+shape places its own `$END` directive *after* the `END;` it wraps, so — same reasoning as the
+opaque-source unit — which statement that trailing directive belongs to is undecidable from raw text
+alone once no `/` disambiguates it (the same kind of ambiguity a stray comment between two statements'
+terminators already has). The test forces a `/` immediately after this shape too, sidestepping the
+ambiguity rather than asserting an arbitrary answer to an ill-posed question; this is a property of
+the *test's* construction, not a splitter defect, and `StatementSpan::content` for this shape is
+unaffected either way (it already stopped, correctly, right after `END`, before both its own `;` and
+the trailing directive).
+
+**A second, deliberately non-Oracle-shaped dialect** (`differential.rs::minimal_non_oracle`: no
+`block_starters` at all, `;` the only terminator, no `/` handling) was added so vendor neutrality is
+exercised *behaviorally* — `BEGIN`/`COMMIT`/`END` read as ordinary `Plain` statements when the dialect
+supplies no block-starter data for them — rather than only by grepping `splitter.rs`/`lexer.rs` for
+vendor literals.
+
+**Open questions for M4.3 (script/statement execution), carried forward from J5's "Documented, not
+changed" note above and now made explicit rather than left implicit:** two behaviors remain
+unverified against a real SQL\*Plus/SQLcl client, and should be checked against one during M4.3's
+integration tests before execution semantics are finalized:
+
+1. A `/` line followed by a same-line comment (`/ -- note`) is not treated as an authoritative lone
+   `/` line by `is_lone_slash_line` (it requires the rest of the line to be whitespace-only). Real
+   SQL\*Plus/SQLcl may or may not tolerate a trailing comment there; this crate's current behavior is
+   a reasonable, conservative reading, not a confirmed match.
+2. A statement terminator (`;`) followed by a lone `/` line yields exactly one statement and does not
+   re-run it (MUST-FIX #2, J5) — a deliberate product decision for a desktop editor, not a verified
+   match for SQL\*Plus's own "re-run the buffer on a bare `/`" semantics, which are ambiguous for this
+   case in the first place (re-run the previous statement? treat it as inert?).
+
+Neither is a defect in the sense this review process looks for (both fail safely: at most an
+over-conservative "not authoritative" reading, never an executable fragment carved from the middle of
+a statement), but both are assumptions this crate makes without a real client to check them against,
+and M4.3's script executor is the first consumer positioned to do so.
+
+*Evidence:* `crates/sql-text/tests/corpus.rs`: 66 passing (3 new `dollar_if_*`/`additional_bug_a_leading_*`
+regression tests for the `is_trivial_or_directive` fix, confirmed genuine by reverting the fix and
+observing both directive-order-dependent tests fail with the exact predicted wrong span sequences)
+plus 1 unchanged `#[ignore]`d limitation (J3). `crates/sql-text/tests/differential.rs`: 3 tests —
+the extended grammar-based property (8 seeds, release mode 5,000 base scripts/seed × 3 join modes ×
+2 line endings = 240,000 scripts; 60 base scripts/seed in debug), the dedicated opaque-source-without-
+a-slash test, and the second-dialect behavioral test (4 seeds × 2,000 scripts = 8,000 more in
+release). All three `differential.rs` tests together: 8.04s wall time in release. `cargo fmt --all --
+check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and
+`cargo test -p reldex-sql-text --release` all pass; `RUSTDOCFLAGS="-D warnings" cargo doc -p
+reldex-sql-text --no-deps` is clean.
+
 ## Notes for driver implementers
 
 Findings from reading `oracle/rust-oracledb` **`=26.0.0-beta.3`** — the version this repository pins
