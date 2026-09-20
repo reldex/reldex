@@ -84,6 +84,19 @@ impl NullMask {
         self.len
     }
 
+    /// The raw bit words behind the mask: row `i` is bit `i % 64` of word
+    /// `i / 64`, LSB-first, set when the row is SQL NULL.
+    ///
+    /// Exposed so the FFI boundary can hand a C consumer the *same* bitmap
+    /// rather than copying it into a second one (ADR-0003 D4). It is the
+    /// layout this type already documents; making it readable does not change
+    /// it. Words past [`NullMask::len`] bits exist for padding and are always
+    /// zero.
+    #[must_use]
+    pub fn words(&self) -> &[u64] {
+        &self.bits
+    }
+
     /// Whether the mask covers no rows.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
@@ -152,6 +165,24 @@ impl TextColumn {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// The one contiguous buffer every value lives in.
+    ///
+    /// Together with [`TextColumn::offsets`] this is exactly what a C consumer
+    /// needs to read cells without a per-cell call or a copy (ADR-0003 D4):
+    /// value `row` is `buffer()[offsets()[row]..offsets()[row + 1]]`, and each
+    /// such slice is valid UTF-8 because the buffer is a [`String`].
+    #[must_use]
+    pub fn buffer(&self) -> &str {
+        &self.buffer
+    }
+
+    /// Byte offsets into [`TextColumn::buffer`], `len() + 1` entries
+    /// (empty for a column that holds no values at all).
+    #[must_use]
+    pub fn offsets(&self) -> &[usize] {
+        &self.offsets
+    }
 }
 
 /// Variable-length byte values stored as one buffer plus offsets.
@@ -211,6 +242,20 @@ impl BytesColumn {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// The one contiguous buffer every value lives in; see
+    /// [`TextColumn::buffer`] for why this is readable.
+    #[must_use]
+    pub fn buffer(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    /// Byte offsets into [`BytesColumn::buffer`], `len() + 1` entries
+    /// (empty for a column that holds no values at all).
+    #[must_use]
+    pub fn offsets(&self) -> &[usize] {
+        &self.offsets
     }
 }
 
@@ -375,6 +420,26 @@ impl Column {
     #[must_use]
     pub const fn kind(&self) -> ColumnKind {
         self.data.kind()
+    }
+
+    /// The column's values, laid out contiguously.
+    ///
+    /// Read cells with [`Column::value`] — it consults the NULL mask first,
+    /// which this does not. This exists for a consumer that wants the *whole
+    /// column* at once rather than one cell at a time: the FFI boundary hands
+    /// C the underlying buffer, offsets and element array so a grid can read
+    /// cells by pointer arithmetic instead of one call per cell
+    /// (ADR-0003 D4).
+    #[must_use]
+    pub const fn data(&self) -> &ColumnData {
+        &self.data
+    }
+
+    /// Which of the column's rows are SQL NULL, as the raw bitmap; see
+    /// [`NullMask::words`].
+    #[must_use]
+    pub const fn nulls(&self) -> &NullMask {
+        &self.nulls
     }
 
     /// Whether the row is SQL NULL.
@@ -1174,6 +1239,39 @@ mod tests {
         assert_eq!(column.get(2), Some("ข้อมูล"));
         assert_eq!(column.get(3), None);
         assert!(TextColumn::new().is_empty());
+    }
+
+    #[test]
+    fn a_column_exposes_the_layout_it_documents() {
+        // The FFI boundary hands these three things straight to C (ADR-0003
+        // D4). If the accessors ever disagree with `value()`, a grid would
+        // read different data from the same batch depending on the path.
+        let column = text_column(&[Some("alpha"), None, Some("ข้อมูล")]);
+        let ColumnData::Text(text) = column.data() else {
+            panic!("expected a text column, got {:?}", column.kind());
+        };
+        assert_eq!(text.offsets().len(), column.len() + 1);
+        for row in 0..column.len() {
+            let start = text.offsets()[row];
+            let end = text.offsets()[row + 1];
+            let from_layout = &text.buffer()[start..end];
+            let expected = match column.value(row) {
+                Some(ValueRef::Text(value)) => value,
+                // A NULL row keeps an empty placeholder in the buffer.
+                Some(ValueRef::Null) => "",
+                other => panic!("unexpected cell {other:?}"),
+            };
+            assert_eq!(from_layout, expected, "row {row}");
+        }
+
+        let words = column.nulls().words();
+        assert_eq!(words.len(), column.len().div_ceil(64));
+        for row in 0..column.len() {
+            let bit = (words[row / 64] >> (row % 64)) & 1 == 1;
+            assert_eq!(bit, column.is_null(row), "row {row}");
+        }
+        assert!(TextColumn::new().offsets().is_empty());
+        assert!(BytesColumn::new().buffer().is_empty());
     }
 
     #[test]

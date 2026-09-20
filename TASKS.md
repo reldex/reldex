@@ -90,7 +90,7 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 
 - [x] M1.1 Owner approval + toolchain install (Qt, CMake, Ninja, cbindgen) (owner + sonnet) — approved and installed 2026-09-20: Qt 6.8.3 msvc2022_64, CMake 4.4.3, Ninja 1.13.2, cbindgen 0.29.4; no GPL-only module present (`docs/exec-plans/active/phase-1-toolchain.md`, `tools/dev-env/env.sh`)
 - [x] M1.2 ★ Draft ADR-0003: Qt ↔ Rust integration (opus, review mandatory) — `docs/decisions/0003-qt-rust-integration.md` (Proposed)
-- [ ] M1.3 ★ `crates/ffi` skeleton: hub, session open/execute/fetch, batch views, errors, waker (opus, review mandatory)
+- [x] M1.3 ★ `crates/ffi` skeleton: hub, session open/execute/fetch, batch views, errors, waker (opus, review mandatory) — done 2026-09-20: `reldex-ffi` (cdylib+staticlib), 31 exports, ABI 2, cbindgen header `crates/ffi/include/reldex.h` checked in CI; independently reviewed (3 must-fix + 9 should-fix fixed); interim per-session pump until M2.5; Miri/ASan not yet run (ADR-0003 A9)
 - [ ] M1.4 C smoke harness (`ui/tests/ffi_smoke`), no Qt, mock driver, ASan on Linux (sonnet)
 - [ ] M1.5 CMake + Corrosion + Qt project skeleton; QML module for the adapter (sonnet)
 - [ ] M1.6 ★ `ResultTableModel` over borrowed batch views; `Bridge` waker→`invokeMethod` drain (opus, review mandatory)

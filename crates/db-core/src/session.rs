@@ -112,12 +112,27 @@ impl OutValues {
 /// thread — the cursor itself never leaves it (ADR-0002 D1/D2). A nested
 /// `REF CURSOR` or a large object returned through an output bind is handled
 /// the same way; see [`OutValue`].
+/// `#[non_exhaustive]` so a later field — M2.5's event queue will want at
+/// least one — is an additive change rather than a breaking one. Nothing
+/// outside `db-core` constructs an `ExecuteOutcome`; the worker thread is its
+/// only producer, so the attribute costs nothing today.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct ExecuteOutcome {
     /// The result set's id, if the statement produced one. Pass this to
     /// [`DatabaseSession::fetch_batch`] and, once done,
     /// [`DatabaseSession::close_result`].
     pub result: Option<ResultId>,
+    /// The result set's columns, in select-list order; empty when the
+    /// statement produced no result.
+    ///
+    /// The driver's `Cursor` never leaves the worker thread (ADR-0002 D1/D2)
+    /// and [`FetchedBatch`] carries only storage kinds, so this is the one
+    /// place a caller can learn a column's *name* and declared type. It is
+    /// copied off the cursor on the worker thread at execute time — plain data,
+    /// like everything else that crosses the boundary — because a grid needs
+    /// headers before its first row arrives.
+    pub columns: Vec<reldex_db_driver_api::ColumnMetadata>,
     /// How many rows the statement changed, if the driver reported it.
     pub rows_affected: Option<u64>,
     /// What kind of statement the server ran, as far as the driver can tell.

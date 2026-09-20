@@ -656,6 +656,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "reldex-ffi"
+version = "0.0.0"
+dependencies = [
+ "reldex-db-core",
+ "reldex-db-driver-api",
+ "reldex-driver-mock",
+]
+
+[[package]]
 name = "reldex-mobile-link-check"
 version = "0.0.0"
 dependencies = [

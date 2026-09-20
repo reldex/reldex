@@ -2,6 +2,7 @@
 
 **Status:** Proposed — acceptance conditional on spike S15 (below)
 **Date:** 2026-09-20
+**Amended:** 2026-09-20 (pre-acceptance, from building `crates/ffi` in M1.3 — see "Amendment (pre-acceptance): what building the boundary changed", items A1–A9; extended the same day with A10–A18 from the independent review of that work. The status is unchanged and S15 is still the gate.)
 **Supersedes/resolves:** `ARCHITECTURE.md` §13 item 2 (FFI mechanism), item 3's remaining FFI half (completion marshalling, thread affinity, reentrancy), and item 10 in part (crate layout for the FFI/UI tier).
 
 ## Context
@@ -177,3 +178,329 @@ Build the thinnest vertical slice that is *the real thing*: real `reldex-ffi`, r
 K1/K3 failure with a *diagnosed* cause in the model (not the boundary) is a design fix, not a kill — the kill is "the boundary itself cannot meet it".
 
 As of this writing (2026-09-20) spike S15 has not been run; this ADR's status stays **Proposed** until it is, per the owner-decision facts recorded in `docs/exec-plans/active/phase-1.md` (the owner has not accepted ADR-0003).
+
+## Amendment (pre-acceptance): what building the boundary changed (2026-09-20, task M1.3)
+
+Numbering: `A`. Items A1–A9 came from building the boundary; **A10–A18 came from the independent
+review of that work on 2026-09-20**, which approved it with must-fix findings. This ADR was written
+before `crates/ffi` existed. M1.3 built it — the hub, the
+session pump, the event queue, the batch views, the bulk formatter, the generated header — against
+the mock driver, and the notes below are the places where the implementation and the text above do
+not say the same thing. **The status is unchanged: this is still Proposed, and spike S15 is still
+the gate.** They are recorded now so that S15 measures the boundary that exists, and so the
+acceptance review is not the first time these differences are read.
+
+### A1 — `ReldexColumnView` carries its own bounds (D4)
+
+D4's sketch gives `row_count`, `data`, `offsets`, `fixed` and `fixed_stride`, but no length for any
+of the three arrays. A C caller could only derive them — `null_bits` from `row_count`, `offsets`
+from `row_count + 1`, `data` from `offsets[row_count]` — and deriving a bound is how an off-by-one
+becomes a read past the end of a Rust allocation. The shipped struct adds three fields:
+
+```c
+size_t null_word_count;   /* words actually behind null_bits */
+size_t data_len;          /* bytes actually behind data      */
+size_t fixed_len;         /* elements actually behind fixed  */
+```
+
+They cost 24 bytes per column per batch — once per column per fetch, never per cell — and they let
+the adapter (and a sanitizer, and a fuzzer) check every access against something the producer wrote
+rather than something the consumer computed. `offsets` still has `row_count + 1` entries; that one
+is stated in the header rather than given a field, because its length is fixed by the contract
+rather than by the data.
+
+### A2 — the element mirrors have no `struct_size`, deliberately (D4, D7)
+
+D7 says "every non-opaque struct begins with `uint32_t struct_size`". `ReldexNumber` and
+`ReldexTimestamp` do not, and must not: they are *array elements* behind `ReldexColumnView::fixed`,
+so a `struct_size` field would be paid once per cell, and a caller that disagreed about the size
+would read a misaligned array rather than a short struct. Their size crosses once per column, in
+`fixed_stride`, and the adapter's contract is to check `fixed_stride == sizeof(ReldexNumber)` before
+it indexes. D7's rule should be read as *every struct passed by pointer*; structs passed as array
+elements version through `fixed_stride` and through the major ABI number.
+
+### A3 — the re-entrancy guard is always on, not debug-only (D5 rule 1)
+
+D5 says "debug builds set a thread-local guard". The implementation sets it in every build. Two
+reasons: the guard is one thread-local load and store on a path that already crosses a language
+boundary and takes a mutex, so it is not measurable; and the failure it prevents in *release* is the
+one that matters — `reldex_hub_set_waker` called from inside a waker asks for a write lock that the
+wake itself holds for reading on the same thread, which is a deadlock of the UI thread, not a
+diagnostic. A rule that only holds in debug is not a contract. D5 rule 1 should read "every build".
+
+### A4 — `reldex_hub_pending_events` exists, and is not for the adapter
+
+Not in the ADR. `size_t reldex_hub_pending_events(const ReldexHub*)` reports the queue depth without
+taking anything from it. It exists because the coalescing property in D5 — a burst of completions
+onto an empty queue produces exactly **one** wake — cannot be tested by draining, since draining
+re-arms the edge. A test blocks N sessions, releases them, waits for the depth to reach N, and only
+then counts wakes. The adapter has no reason to call it: `drain()` should loop on
+`reldex_hub_next_event` until it returns false, which is the same information without a race. It is
+documented as diagnostic, and S15's K6 instrumentation may use it.
+
+### A5 — the per-session pump is interim, and M2.5 still owns the real queue
+
+ADR-0002 explicitly deferred "a per-session outbound completion/event queue for the FFI adapter"
+(its §B2) to the work that is now M2.5. M1.3 needed completions to become events *now*, and had two
+options: build the §B2 subset in `db-core`, or pump `Completion<T>` inside `crates/ffi` and leave
+§B2 whole for M2.5. **It pumps inside `crates/ffi`**, because the alternative is to design a core
+contract from one consumer's needs a milestone before the milestone that owns it, and because
+`Completion<T>` is consuming (`poll`/`wait` take `self`), so a core-side queue is a change to how
+every existing caller waits — not an addition. The cost is stated plainly: **one extra thread per
+open session**, parked in `Completion::wait`, on top of the worker thread `db-core` already runs. At
+the ~20 sessions of `SPEC.md` that is ~20 threads that do nothing but block, which is affordable and
+is *not* what should ship.
+
+What the pump does, so M2.5 can replace it without renegotiating the ABI:
+
+- Submission stays on the **caller's** thread. `reldex_session_execute` takes the session's slot
+  mutex, submits to `db-core`, and hands the resulting `Completion` to the pump under the same
+  mutex. Doing the submit on the pump would serialize it behind the previous reply and destroy the
+  adapter's ability to have the next fetch in flight while it renders the current batch (K4).
+- The slot mutex is what makes ordering exact without a sequence number: `db-core` replies to one
+  session strictly in order, so a pump that always waits on the oldest outstanding completion
+  produces per-session FIFO by construction.
+- Every accepted request produces exactly one event, including one that races a close: after a
+  successful close the pump drains what is still queued and answers each one.
+- Nothing polls. Every pump thread is *blocked* in `Completion::wait`; there is no sleep interval
+  anywhere on the completion path (the only spins in the crate are in test code, waiting for a
+  condition the test itself creates).
+
+**What M2.5 must decide, and what this does not decide for it:** whether the queue lives per session
+or per hub; whether it is bounded, and what back-pressure means when it is full; whether `Completion`
+grows a non-consuming `poll_ref` or is replaced by a channel; and whether events carry a core-side
+sequence number (the FFI's ordering argument above rests on the slot mutex, which a core queue would
+make unnecessary rather than inherit). The C ABI is unaffected by any of those choices: the adapter
+sees `reldex_hub_next_event` either way.
+
+### A6 — `db-core` gained one field: `ExecuteOutcome::columns`
+
+A grid needs column *names* before it has a row. `db-core`'s `Cursor` never leaves its worker thread
+and `FetchedBatch` carries only storage kinds, so there was no path by which a caller could learn
+them. `ExecuteOutcome` gained `columns: Vec<ColumnMetadata>` (empty for a statement with no result
+set), captured through the same panic-containing `call` helper as every other driver call, and
+`ColumnMetadata` is re-exported from `db-core`. Additive, no existing behaviour changed, and it is
+the right home regardless of what M2.5 does to the queue.
+
+### A7 — D3's names, and what is not there yet
+
+D3's table names `reldex_session_abandon`, `reldex_result_close` and `reldex_lob_close`. The shipped
+names are `reldex_session_close_result` (session-scoped, because the id is) and
+`reldex_session_close(hub, session, request, disposition)`, which covers both "close" and ADR-0002's
+`CloseDisposition` ladder — there is no separate `abandon`, because a close that needs a decision
+reports `RELDEX_CLOSE_OUTCOME_DECISION_REQUIRED` and leaves the session open, which is the behaviour
+D3's two names were reaching for. **LOBs do not cross yet**: `ReldexLobId` is not in the header, and
+a LOB column reports its kind without a handle. That is M1.8/M2 work, and it is a gap, not a
+decision.
+
+### A8 — the mock driver is a default cargo feature
+
+`reldex-ffi` has one feature, `mock-driver`, on by default; it links `reldex-driver-mock`, the only
+driver the boundary can currently open a session against. This is how M1.3 and S15 drive the
+boundary with no database.
+
+The rule this establishes, and the one M1.8 must keep: **a cargo feature never changes the ABI.**
+The exported symbol list and the generated header are identical with and without the feature, so one
+`reldex.h` describes every build and the adapter is never compiled against a different boundary than
+the one it was tested on. What a feature changes is *behaviour*: with `--no-default-features`
+(verified to compile and to be clippy-clean) `reldex_hub_open_session` reports
+`RELDEX_STATUS_INVALID_ARGUMENT` because there is no driver, and `reldex_mock_release_block` does
+nothing. A shipping build should have exactly that shape until a real driver feature replaces the
+mock as the default.
+
+### A9 — Miri was not run
+
+D2 lists "Miri over the crate's Rust-side unit tests". Miri needs a nightly toolchain and only
+stable is installed here, so this was **not** run and no claim is made about it. What should be run
+when a nightly is available, in the order of what it would actually catch:
+
+```bash
+cargo +nightly miri test -p reldex-ffi --lib                  # struct_size read/write, strings, arena
+cargo +nightly miri test -p reldex-ffi --test lifecycle       # null/unaligned/undersized arguments
+MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test -p reldex-ffi --lib
+```
+
+The integration tests that open sessions spawn threads and block on them; Miri runs those, but
+slowly, so `--lib` and `lifecycle` are the ones worth the wall-clock. The ASan/UBSan half of D2 is
+unchanged and belongs with the C smoke harness (M1.6), where `RELDEX_FFI_WAKER_ITERATIONS=10000`
+drives K5.
+
+### A10 — cancel from any thread is a *caller-sequenced* rule, not a free one (D5 rule 3)
+
+The independent review of M1.3 found two rules that contradicted each other:
+`reldex_hub_destroy` said no other thread may be inside a call, and
+`reldex_session_request_cancel` said it may be called from anywhere. Both are wanted, and together
+they are a use-after-free: `with_hub` borrows the hub through a raw pointer without touching the
+reference count, so a cancel on a worker thread that races a destroy on the main thread
+dereferences freed memory.
+
+The ABI gives the library nowhere to fix this on its own — `hub` is a raw pointer, and there is no
+handle whose lifetime could outlive the hub. So D5 rule 3 is amended to state the sequencing the
+caller owes, rather than leaving it implied:
+
+> Every thread that may call `reldex_session_request_cancel` must have **returned from that call**
+> — be joined, or otherwise proven quiescent — before `reldex_hub_destroy` is called. This library
+> has no internal synchronisation for it.
+
+A stale **session id** is safe and stays safe: ids are never reused, so a cancel naming a session
+that has since been closed reports `RELDEX_STATUS_NOT_FOUND` against a live hub. The rule is only
+about the **hub pointer**. In a Qt adapter it falls out naturally — the worker that offers Cancel is
+stopped before the bridge is torn down — but it has to be done on purpose. Both functions now say
+so in the header, and so does the header's contract summary.
+
+**The structural alternative, deliberately deferred.** A refcounted cancel handle
+(`reldex_session_cancel_handle` returning an opaque pointer that holds its own reference, plus
+`reldex_cancel_handle_release`) would make the race impossible instead of forbidden. It is not
+built, because nothing needs it yet: the only cross-thread caller contemplated is the adapter's own
+Cancel button, which is on the main thread. If a real background cancel appears — an export
+cancelling a long fetch, say — this is the fix, and it is additive.
+
+### A11 — the ABI version moved to 2, once, for the review's layout changes
+
+`ReldexEvent::column_count` and `warning_count` were `uint32_t` next to a `size_t row_count`. That
+is a struct whose integer widths have no rule, which is how a `-Wsign-compare` gets silenced with a
+cast that is wrong on one platform. The rule, now stated on the struct:
+
+* a **count of things in this process** (rows, columns, warnings) is `size_t`, because it is what
+  the caller loops with and what `reldex_batch_row_count` / `reldex_batch_column_count` already
+  return;
+* a **quantity the database reported** (`rows_affected`) is `uint64_t`, deliberately *not* `size_t`:
+  an `UPDATE` can change more rows than a 32-bit host can address;
+* an **id** is `uint64_t`; an **enum** is `int32_t`.
+
+That changes `ReldexEvent`'s layout, which D7 says is a **major** bump, so
+`RELDEX_ABI_VERSION_MAJOR` is `2`. Version 1 was never accepted and never shipped — this ADR is
+still Proposed — so the number moves once, here, together with the other review changes, rather
+than pretending a recompiled adapter would still be compatible. `ReldexMockStatement` also gained
+`PUMP_PANIC = 6`, which would only have been a minor bump on its own.
+
+### A12 — what is thread-safe about a fetched batch, and what that cost
+
+The review found `reldex_batch_column`, whose C signature takes `const ReldexBatch*`, mutating a
+`RefCell` behind it: the per-column mirror cache. Four threads describing the same `NUMBER` column
+reproduced "already mutably borrowed", and the race underneath it was undefined behaviour.
+
+The cache is now a `OnceLock` per column, so the first call is sound however many threads make it
+and every thread gets the same pointer. Making that *guarantee* rather than an accident needed one
+change outside the boundary: `LobStream` gained `Sync` (ADR-0002 amendment I3), because a
+`RowBatch` can hold parked LOB locators and without it `&RowBatch` could not cross a thread at all.
+`crates/ffi` asserts `ReldexBatch: Sync` at compile time, so the promise cannot rot.
+
+The contract, now stated on the batch functions and in the header:
+
+* **sound concurrently**: `reldex_batch_row_count`, `reldex_batch_column_count`,
+  `reldex_batch_column_info`, `reldex_batch_column` on one batch from any number of threads;
+* **not sound**: any of those racing `reldex_batch_release` — release consumes the batch, and no
+  internal synchronisation can make that safe;
+* **single-threaded**: `ReldexTextArena`. `reldex_batch_format_column` takes it by `&mut`, so two
+  threads may format from one batch only if each has its own arena.
+
+D5 rule 3 still says the adapter calls from the Qt main thread. A12 is about what the library
+*guarantees*, so that a worker thread rendering a window into its own arena is a design choice
+someone can make, not a latent race.
+
+### A13 — every outbound string is NUL-terminated, and that is now true
+
+`ReldexStr` promised "always NUL-terminated at `ptr[len]`" and `reldex_batch_column_info` broke it:
+column names came straight from `ColumnMetadata`, whose `name` is a `Box<str>`, so `ptr[len]` was a
+byte past the allocation. The review measured 3,295 of 4,096 `Box<str>` allocations with a non-zero
+byte there; the mock's names passed by luck. A C caller doing `QString::fromUtf8(info.name.ptr)` —
+which the promise invites — would read whatever was next in the heap.
+
+The rule is kept and made true, rather than weakened, because it is the rule C expects and a
+boundary that is honest only most of the time is worse than one that says "use `len`". The names
+are copied into NUL-terminated storage **once per result set**, shared by `Arc` with every batch
+that result produces — so a million-row result copies its three column names once, not once per
+batch and never per cell. `ReldexStr::borrow_nul_terminated` is now the only constructor for an
+outbound string and debug-asserts the terminator, so the next violation is a test failure rather
+than a latent one.
+
+The direction of the promise is also now stated, because it is asymmetric: **out of** Reldex,
+always terminated; **into** Reldex, `len` readable bytes and nothing more — a caller may pass a
+pointer into the middle of a larger buffer.
+
+### A14 — the pump contains its own panics (D2)
+
+D2 wraps every `extern "C"` body in `catch_unwind`, which cannot reach the session pump: that
+thread is ours, and an unwind out of it would leave every outstanding request unanswered. Nothing
+would report it — the adapter's spinner would simply never stop, which is the failure mode
+`SPEC.md` §2 ranks worst, a wrong answer with no error.
+
+The pump body is now caught. On a panic the session is marked lost and **every** request still owed
+a reply gets exactly one failure event: the one in flight (tracked in a small `owed` slot set before
+each blocking wait) and then everything still queued behind it. Rule 5 — exactly one reply per
+accepted request — therefore holds even when the library itself is the thing that broke. The mock
+driver has a reserved statement text that panics the pump on purpose so this is tested rather than
+asserted; it is compiled in only with the `mock-driver` feature, so no production build can be made
+to panic by statement text.
+
+### A15 — the formatter allocates nothing per cell
+
+The review measured the bulk formatter at 3.0 allocations and 141 ns per `NUMBER` cell, 4.0 and
+316 ns per `DATE` cell, against K4's 200 ns per-cell budget — and `NUMBER`/`TIMESTAMP` are what a
+grid of financial data is mostly made of. The causes were all shape, not algorithm: a `String`
+returned per cell, `to_string()` on a `Number` before re-rendering it, and `format!("{byte:02X}")`
+*per byte* of a `RAW`.
+
+Rendering now writes directly into the arena's buffer, with two reusable scratch buffers that live
+with the arena (one for a value's canonical `Display` form, one for digit work during rounding) and
+a hex lookup table. Re-implementing 40-digit decimal rendering to avoid the `Display` round-trip
+was considered and rejected: it is the part most likely to be quietly wrong, and reusing the
+buffer already removes the allocation.
+
+Measured after, on the dev machine, release, 5,000 rows: **NUMBER 40 ns/cell, VARCHAR2 18 ns/cell,
+DATE 148 ns/cell** — information only, not a claim, since K4 is S15's to measure on the real path.
+What *is* asserted is deterministic and in the suite: a counting global allocator in its own test
+binary proves **zero allocations** for a 600-cell window once the arena is warm, with rounding and
+digit grouping both on.
+
+### A16 — the event queue is unbounded, and what bounds it
+
+Stated because the review asked where back-pressure lives: nowhere in this ABI. Every accepted
+request eventually queues exactly one event, and a `FETCHED` event holds a `ReldexBatch` whose rows
+become the caller's memory. A caller that keeps fetching without draining, or drains without
+releasing, grows the queue without limit. The bound has to come from the adapter — a small number
+of fetches in flight per result, and a batch released when the model is done with it.
+`reldex_hub_pending_events` is the only signal the ABI gives about the backlog, and D5's budgeted
+`drain()` is the shape that uses it.
+
+Related, and also now in the header: the waker is **edge-triggered on empty → non-empty**, so a
+caller that stops draining while `reldex_hub_next_event` is still returning `true` gets no further
+wake and must re-post its own drain.
+
+### A17 — `reldex_hub_destroy` is prompt, and what that leaks
+
+D5 and this ADR both said destroy "returns promptly". Measured: 12.7 µs with a pump parked in an
+uninterruptible statement. What was not said is what it costs, which the header now states: until
+that statement returns on its own or the process exits, the pump thread, `db-core`'s worker thread
+and its connection, the hub allocation, and every queued event **with its batch** all stay alive
+and unreachable. That is a leak for as long as it lasts. It is the price of never blocking the UI
+thread on a ten-second statement (K6), it is bounded by the statement rather than by Reldex, and on
+`oracledb` 26.0.0-beta.3 — whose cancel cannot reach a running statement (ADR-0002 D2, spike S4) —
+it is the *normal* case, not an edge one.
+
+### A18 — smaller contract statements the review found missing
+
+All now in the header, on the function each belongs to:
+
+* **The waker must not let a C++ exception escape.** Unwinding one through an `extern "C"` frame
+  into Rust is undefined behaviour, and D2's `catch_unwind` does **not** contain it — that catches
+  Rust panics, a different mechanism. A waker that can throw wraps its own body.
+* **The re-entrancy guard is per thread, not per hub** (A3's rule, sharpened): a waker may not call
+  *any* `reldex_*` function on *any* hub. The guard is a thread-local flag and could not
+  distinguish hubs even if the contract wanted it to.
+* **`reldex_last_error_take()` is thread-local**, so an error recorded by a cancel on a worker
+  thread is not visible on the main thread. Every non-OK return now sets it first, so a take
+  immediately after a failure always describes *that* failure rather than a stale one — several
+  `NOT_FOUND` paths previously returned without recording anything.
+* **`reldex_hub_next_event` returning `false` means `*out` was not touched**, whether the queue was
+  empty or the argument was rejected. It validates the caller's `struct_size` by *reading* it now
+  rather than by probe-writing an empty event.
+* **`reldex_session_connect_warnings` appends to the arena**, so it invalidates views taken from
+  that arena, exactly like the formatter does.
+* **A submit before the `OPENED` event** is either refused with `INVALID_STATE` (nothing accepted,
+  no event follows) or accepted and answered normally — the session becomes usable when it
+  connects, not when the caller notices. The header used to claim the first case was the only one
+  while the code allowed the second; both are now stated and tested.
+* **`ReldexArenaView::data` is never null**, even for an empty arena, where it used to be a
+  dangling `0x1`.

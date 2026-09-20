@@ -87,7 +87,7 @@ pub use shared::SessionLifecycle;
 // session's worker thread, so nothing above `db-core` should be able to name
 // one. [`LobHandle`] is what callers get instead.
 pub use reldex_db_driver_api::{
-    CancelKind, CancelOutcome, Column, ConnectionId, ConnectionParams, DatabaseDriver, DbError,
-    DbResult, ErrorKind, RowBatch, SavepointName, SessionState, Statement, StatementKind,
-    TransactionState, ValueRef, Warning,
+    CancelKind, CancelOutcome, Column, ColumnMetadata, ConnectionId, ConnectionParams,
+    DatabaseDriver, DbError, DbResult, ErrorKind, RowBatch, SavepointName, SessionState, Statement,
+    StatementKind, TransactionState, ValueRef, Warning,
 };

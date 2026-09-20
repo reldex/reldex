@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use reldex_db_driver_api::{
     Capabilities, ConnectionId, DbError, ErrorKind, LobKind, NativeError, Number, SessionState,
-    SqlType, StatementKind, Timestamp, Warning,
+    SqlPosition, SqlType, StatementKind, Timestamp, Warning,
 };
 
 use crate::generated::GeneratedQuerySpec;
@@ -167,6 +167,7 @@ pub struct ScriptedError {
     kind: ErrorKind,
     message: String,
     native: Option<(i32, String)>,
+    position: Option<SqlPosition>,
     session_state: Option<SessionState>,
     retryable: bool,
 }
@@ -179,6 +180,7 @@ impl ScriptedError {
             kind,
             message: message.into(),
             native: None,
+            position: None,
             session_state: None,
             retryable: false,
         }
@@ -188,6 +190,18 @@ impl ScriptedError {
     #[must_use]
     pub fn with_native(mut self, code: i32, message: impl Into<String>) -> Self {
         self.native = Some((code, message.into()));
+        self
+    }
+
+    /// Attaches the position in the statement text the error points at.
+    ///
+    /// A real server reports one for a PL/SQL compilation failure
+    /// (`ORA-06550`) and the error pane highlights it (`SPEC.md` §24.14), so
+    /// the mock has to be able to produce one — otherwise nothing above the
+    /// driver can be tested against a positioned error without a database.
+    #[must_use]
+    pub fn with_position(mut self, position: SqlPosition) -> Self {
+        self.position = Some(position);
         self
     }
 
@@ -212,6 +226,9 @@ impl ScriptedError {
         let mut error = DbError::new(self.kind, self.message.clone());
         if let Some((code, message)) = &self.native {
             error = error.with_native(NativeError::new(*code, message.clone()));
+        }
+        if let Some(position) = self.position {
+            error = error.with_position(position);
         }
         if let Some(session_state) = self.session_state {
             error = error.with_session_state(session_state);

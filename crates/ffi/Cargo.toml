@@ -1,0 +1,46 @@
+[package]
+name = "reldex-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "reldex_ffi"
+# `cdylib` is what Android loads and what the C smoke harness links (ADR-0003
+# D9/D10); `staticlib` is what iOS links directly; `rlib` is what this crate's
+# own Rust tests use to call its `extern "C"` functions without going through a
+# dynamic loader.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[lints]
+workspace = true
+
+[features]
+# The boundary itself is vendor-neutral. A *concrete driver* is a build-time
+# choice, so each one is a feature and the default is the mock: spike S15, the
+# C smoke harness (M1.4) and every test here run with no database at all, and a
+# product build will be `--no-default-features --features oracle-driver` once
+# that feature exists (M2.11). Nothing in `src/` outside `mock.rs` knows which
+# driver it is talking to.
+default = ["mock-driver"]
+mock-driver = ["dep:reldex-driver-mock"]
+
+[dev-dependencies]
+# The tests check fetched cells against the mock's own
+# `GeneratedQuerySpec::expected_cell`, so they need the driver crate by name
+# even when a future build selects a different driver feature.
+reldex-driver-mock = { path = "../drivers/mock" }
+
+[dependencies]
+reldex-db-core = { path = "../db-core" }
+reldex-db-driver-api = { path = "../db-driver-api" }
+reldex-driver-mock = { path = "../drivers/mock", optional = true }
+
+# No production dependency beyond the two vendor-neutral crates above and the
+# driver the build selects (`AGENTS.md`, "do not add production dependencies
+# without documenting why"). `cbindgen` generates `include/reldex.h` but is a
+# *command-line tool* run by `gen-header.sh`, not a build-dependency: making it
+# one would put a parser of our own source into every build of the most
+# correctness-critical crate for no gain, since the header is committed and
+# verified (ADR-0003 D7).

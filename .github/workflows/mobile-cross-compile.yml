@@ -43,11 +43,18 @@ env:
   # `-p reldex-core-poc` builds **two** binaries: `reldex-core-poc` and
   # `reldex-device-check`, the Android physical-device harness
   # (`docs/exec-plans/active/phase-0-android-device.md`).
+  # `reldex-ffi` was added after M1.3: ADR-0003 D9 says the *same* C ABI serves
+  # both mobile targets — iOS links the `staticlib` into the app, Android loads
+  # the `cdylib` into the process Qt for Android already runs — so the crate
+  # that will actually be linked belongs in this check, not only the S6 probe
+  # that stands in for it. Cheap: its only dependencies (`db-core`, the mock
+  # driver) are already built here.
   S6_PACKAGES: >-
     -p reldex-db-driver-api
     -p reldex-db-core
     -p reldex-driver-oracle-thin
     -p reldex-mobile-link-check
+    -p reldex-ffi
     -p reldex-core-poc
   # Android API level targeted by the NDK toolchain. 26 (Android 8.0) is the
   # oldest level with full 64-bit-only device support and comfortably above
@@ -124,11 +131,13 @@ jobs:
             "$OUT"/libreldex_driver_oracle_thin.rlib \
             "$OUT"/libmobile_link_check.so \
             "$OUT"/libmobile_link_check.a \
+            "$OUT"/libreldex_ffi.so \
+            "$OUT"/libreldex_ffi.a \
             "$OUT"/reldex-core-poc \
             "$OUT"/reldex-device-check
           echo "--- file ---"
-          file "$OUT"/libmobile_link_check.so "$OUT"/reldex-core-poc \
-               "$OUT"/reldex-device-check
+          file "$OUT"/libmobile_link_check.so "$OUT"/libreldex_ffi.so \
+               "$OUT"/reldex-core-poc "$OUT"/reldex-device-check
           echo "--- stripped sizes (llvm-strip --strip-all, copy first) ---"
           cp "$OUT"/libmobile_link_check.so /tmp/libmobile_link_check.stripped.so
           cp "$OUT"/reldex-core-poc /tmp/reldex-core-poc.stripped
@@ -194,9 +203,12 @@ jobs:
             "$OUT"/libreldex_driver_oracle_thin.rlib \
             "$OUT"/libmobile_link_check.a \
             "$OUT"/libmobile_link_check.dylib \
+            "$OUT"/libreldex_ffi.a \
+            "$OUT"/libreldex_ffi.dylib \
             "$OUT"/reldex-core-poc
           echo "--- file ---"
-          file "$OUT"/libmobile_link_check.a "$OUT"/libmobile_link_check.dylib "$OUT"/reldex-core-poc
+          file "$OUT"/libmobile_link_check.a "$OUT"/libmobile_link_check.dylib \
+               "$OUT"/libreldex_ffi.a "$OUT"/libreldex_ffi.dylib "$OUT"/reldex-core-poc
           echo "--- stripped size (best-effort: strip on a .a strips its member objects) ---"
           cp "$OUT"/libmobile_link_check.a /tmp/libmobile_link_check.device.stripped.a
           strip -S /tmp/libmobile_link_check.device.stripped.a || echo "strip on .a failed/no-op, see log above"
@@ -213,6 +225,9 @@ jobs:
             "$OUT"/libreldex_driver_oracle_thin.rlib \
             "$OUT"/libmobile_link_check.a \
             "$OUT"/libmobile_link_check.dylib \
+            "$OUT"/libreldex_ffi.a \
+            "$OUT"/libreldex_ffi.dylib \
             "$OUT"/reldex-core-poc
           echo "--- file ---"
-          file "$OUT"/libmobile_link_check.a "$OUT"/libmobile_link_check.dylib "$OUT"/reldex-core-poc
+          file "$OUT"/libmobile_link_check.a "$OUT"/libmobile_link_check.dylib \
+               "$OUT"/libreldex_ffi.a "$OUT"/libreldex_ffi.dylib "$OUT"/reldex-core-poc
