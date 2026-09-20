@@ -92,7 +92,7 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 - [x] M1.2 ★ Draft ADR-0003: Qt ↔ Rust integration (opus, review mandatory) — `docs/decisions/0003-qt-rust-integration.md` (Proposed)
 - [x] M1.3 ★ `crates/ffi` skeleton: hub, session open/execute/fetch, batch views, errors, waker (opus, review mandatory) — done 2026-09-20: `reldex-ffi` (cdylib+staticlib), 31 exports, ABI 2, cbindgen header `crates/ffi/include/reldex.h` checked in CI; independently reviewed (3 must-fix + 9 should-fix fixed); interim per-session pump until M2.5; Miri/ASan not yet run (ADR-0003 A9)
 - [ ] M1.4 C smoke harness (`ui/tests/ffi_smoke`), no Qt, mock driver, ASan on Linux (sonnet)
-- [ ] M1.5 CMake + Corrosion + Qt project skeleton; QML module for the adapter (sonnet)
+- [x] M1.5 CMake + Corrosion + Qt project skeleton; QML module for the adapter (sonnet) — done 2026-09-20: `ui/` (CMake + Corrosion v0.6.1 pinned by commit, adapter QML module `Reldex.Adapter`, `Reldex` executable, offscreen QTest), `bash ui/build.sh --test`; verified on Windows only — Linux/macOS build unverified until the UI CI workflow exists (K7)
 - [ ] M1.6 ★ `ResultTableModel` over borrowed batch views; `Bridge` waker→`invokeMethod` drain (opus, review mandatory)
 - [x] M1.7 Mock driver: 1M-row generator of the S14 shape with controllable latency and a 10 s blocking statement (sonnet) — done 2026-09-20: `Action::GeneratedQuery` / `GeneratedQuerySpec` (lazy, O(batch) memory, `expected_cell` for random-access checks); 1M rows stream in ~0.55 s (release)
 - [ ] M1.8 ★ Spike S15 measurement run + report against kill criteria K1–K7 (opus, review mandatory)

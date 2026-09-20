@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-20T12:18:00+07:00",
+  "updatedAt": "2026-09-20T12:24:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1100,8 +1100,8 @@
               "status": "todo"
             },
             {
-              "title": "M1.5 CMake + Corrosion + Qt project skeleton; QML module for the adapter (sonnet)",
-              "status": "todo"
+              "title": "M1.5 CMake + Corrosion + Qt project skeleton; QML module for the adapter (sonnet) — done 2026-09-20: ui/ (CMake + Corrosion v0.6.1 pinned by commit, adapter QML module Reldex.Adapter, Reldex executable, offscreen QTest), bash ui/build.sh --test; verified on Windows only — Linux/macOS build unverified until the UI CI workflow exists (K7)",
+              "status": "done"
             },
             {
               "title": "M1.6 ★ ResultTableModel over borrowed batch views; Bridge waker→invokeMethod drain (opus, review mandatory)",
@@ -1618,6 +1618,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-20",
+      "text": "M1.5 done: Qt project skeleton under ui/ — CMake drives cargo via Corrosion (v0.6.1, pinned by commit), links the reldex-ffi cdylib, one QML singleton (CoreInfo.abiVersion), offscreen QTest green against ABI 2. Verified on Windows only; Linux/macOS paths are written but untested (no UI CI yet — K7 still open)."
+    },
     {
       "date": "2026-09-20",
       "text": "M1.3 done: reldex-ffi, the stable C ABI (31 exports, ABI 2). Independent review found 3 must-fix (false NUL-termination promise on column names, contradictory cancel/destroy threading rule, RefCell mutation behind a const batch) and 9 should-fix (formatter allocated 1-4x per cell: DATE 316 ns -> 148 ns, NUMBER 141 -> 40 ns after fix); all fixed. ADR-0003 stays Proposed (A1-A18); ADR-0002 amended I1-I4. Not yet verified: Miri, ASan, mobile link of reldex-ffi (first CI run is the evidence)."
