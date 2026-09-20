@@ -110,7 +110,14 @@ echo "ui/build.sh: configuring (${CONFIGURE_MSG}) into ${BUILD_DIR}"
 cmake "${CMAKE_CONFIGURE_ARGS[@]}"
 
 echo "ui/build.sh: building"
-cmake --build "${BUILD_DIR}"
+BUILD_ARGS=("${BUILD_DIR}")
+if [ "${SANITIZE}" -eq 1 ]; then
+    # --verbose: print every compiler invocation, so the -fsanitize flags on
+    # our own targets are visible in the build log as evidence (ADR-0003
+    # K5), not just asserted by this script or ui/cmake/Sanitizers.cmake.
+    BUILD_ARGS+=(--verbose)
+fi
+cmake --build "${BUILD_ARGS[@]}"
 
 if [ "${RUN_TESTS}" -eq 1 ]; then
     echo "ui/build.sh: running ctest"
