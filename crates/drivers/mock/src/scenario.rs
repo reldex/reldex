@@ -22,6 +22,11 @@
 //! spike U-7); a cancel that lands on the *next* statement
 //! ([`Scenario::set_late_cancel_lands_on_next_statement`]); and a driver call
 //! that panics outright ([`Action::Panic`], spike U-4).
+//!
+//! A result too large to ever hold in memory is scriptable too:
+//! [`Action::GeneratedQuery`] produces its rows lazily, one fetch at a time
+//! (see [`crate::GeneratedQuerySpec`]), instead of replaying a pre-built
+//! [`QueryPlan`].
 
 use std::collections::HashMap;
 use std::fmt;
@@ -34,6 +39,8 @@ use reldex_db_driver_api::{
     Capabilities, ConnectionId, DbError, ErrorKind, LobKind, NativeError, Number, SessionState,
     SqlType, StatementKind, Timestamp, Warning,
 };
+
+use crate::generated::GeneratedQuerySpec;
 
 /// One cell of a scripted row or result column.
 ///
@@ -398,6 +405,35 @@ impl fmt::Debug for BlockGate {
 }
 
 /// What a blocked statement reports once it stops waiting.
+///
+/// # Blocking for a fixed duration, then succeeding
+///
+/// This is already expressible with no further API: have a controller thread
+/// sleep for the duration and then call [`BlockGate::release`], which is safe
+/// to call whether or not anything has parked on the gate yet, so there is no
+/// race to get right. This is how the S15 FFI/UI spike's "a statement blocked
+/// for 10 seconds must not stall the rest of the UI" scenario is scripted —
+/// see `crates/drivers/mock/tests/block_for_duration.rs` for the full test,
+/// including that a shorter [`crate::Statement::with_deadline`] still fires as
+/// a timeout while the gate is not yet released, exactly as it does for any
+/// other blocked statement (ADR-0002 D2).
+///
+/// ```
+/// use std::sync::Arc;
+/// use std::time::Duration;
+/// use reldex_driver_mock::{BlockGate, BlockSpec};
+///
+/// let gate = BlockGate::new();
+/// let controller = Arc::clone(&gate);
+/// std::thread::spawn(move || {
+///     std::thread::sleep(Duration::from_millis(10));
+///     controller.release();
+/// });
+/// // Register `Action::Block(BlockSpec::new(gate))` on a statement and
+/// // execute it: the call blocks for ~10ms and then reports success, exactly
+/// // like a slow 10-second statement in the FFI/UI spike, just scaled down.
+/// let _spec = BlockSpec::new(gate);
+/// ```
 #[derive(Debug, Clone)]
 pub struct BlockSpec {
     pub(crate) gate: Arc<BlockGate>,
@@ -492,6 +528,13 @@ pub enum Action {
         /// conservative instead.
         opens_transaction: bool,
     },
+    /// Returns rows computed on demand, one fetch at a time, instead of
+    /// replaying a pre-built [`QueryPlan`].
+    ///
+    /// This is what a result too large to hold in memory — the 1,000,000-row
+    /// shape the S15 FFI/UI spike scrolls through a `TableView` — is scripted
+    /// with; see [`crate::GeneratedQuerySpec`].
+    GeneratedQuery(GeneratedQuerySpec),
     /// Reports `rows_affected` rows changed and `StatementKind::Dml`.
     ///
     /// If `insert` is set, the row is appended to the executing connection's

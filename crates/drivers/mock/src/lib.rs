@@ -49,10 +49,14 @@
 
 mod connection;
 mod cursor;
+mod generated;
 mod scenario;
 
 pub use connection::{MockConnection, MockDriver};
 pub use cursor::MockCursor;
+pub use generated::{
+    GeneratedColumn, GeneratedCursor, GeneratedQuerySpec, GeneratedQuerySpecError,
+};
 pub use scenario::{
     Action, BlockGate, BlockSpec, ColumnSpec, Counts, Matcher, QueryPlan, QuerySource, Scenario,
     ScriptValue, ScriptedError,

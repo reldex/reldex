@@ -12,6 +12,7 @@ use reldex_db_driver_api::{
 };
 
 use crate::cursor::{MockCursor, MockLobStream};
+use crate::generated::GeneratedCursor;
 use crate::scenario::{
     Action, BlockSpec, ParkOutcome, QueryPlan, QuerySource, Scenario, ScriptValue, TransactionEpoch,
 };
@@ -264,6 +265,17 @@ impl MockConnection {
         )
     }
 
+    fn new_generated_cursor(&self, spec: crate::GeneratedQuerySpec) -> GeneratedCursor {
+        self.scenario.record_cursor_opened();
+        GeneratedCursor::new(
+            self.id,
+            spec,
+            Arc::clone(&self.scenario),
+            self.closed_flag(),
+            self.epoch(),
+        )
+    }
+
     fn new_lob(&self, kind: reldex_db_driver_api::LobKind, bytes: Vec<u8>) -> LobLocator {
         LobLocator::new(Box::new(MockLobStream::new(
             self.id,
@@ -375,6 +387,13 @@ impl MockConnection {
                 let plan = self.resolve_query_source(source);
                 self.note_statement(StatementKind::Query, *opens_transaction);
                 let cursor = self.new_cursor(plan);
+                Ok(ExecutionOutcome::new()
+                    .with_cursor(Box::new(cursor))
+                    .with_statement_kind(StatementKind::Query))
+            }
+            Action::GeneratedQuery(spec) => {
+                self.note_statement(StatementKind::Query, false);
+                let cursor = self.new_generated_cursor(spec.clone());
                 Ok(ExecutionOutcome::new()
                     .with_cursor(Box::new(cursor))
                     .with_statement_kind(StatementKind::Query))

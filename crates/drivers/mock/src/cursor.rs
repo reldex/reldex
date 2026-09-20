@@ -123,7 +123,14 @@ fn type_mismatch(row: usize, column: &str, expected: &str) -> DbError {
     ))
 }
 
-fn build_column(
+/// Builds one column of a batch from row-major scripted values.
+///
+/// Shared with [`crate::generated::GeneratedCursor`], which builds the same
+/// shape of column from rows it produces on demand rather than from a
+/// pre-scripted [`QueryPlan`](crate::scenario::QueryPlan): the conversion from
+/// [`ScriptValue`] to [`ColumnData`] is identical either way, and duplicating
+/// it would risk the two cursors disagreeing on how a type is represented.
+pub(crate) fn build_column(
     spec: &ColumnSpec,
     rows: &[Vec<ScriptValue>],
     index: usize,
@@ -257,7 +264,9 @@ const fn column_kind_for(sql_type: SqlType) -> ColumnKind {
     }
 }
 
-fn build_metadata(columns: &[ColumnSpec]) -> Vec<ColumnMetadata> {
+/// Builds column metadata from column specs. Shared with
+/// [`crate::generated::GeneratedCursor`]; see [`build_column`].
+pub(crate) fn build_metadata(columns: &[ColumnSpec]) -> Vec<ColumnMetadata> {
     columns
         .iter()
         .map(|column| {
