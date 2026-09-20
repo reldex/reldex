@@ -413,10 +413,16 @@ pattern `ci.yml` already uses.
 
 ### Jobs
 
-1. **`ffi-smoke`** (windows/ubuntu/macos, `timeout-minutes: 15`) — builds
-   and runs `ui/tests/ffi_smoke` standalone, no Qt install. Windows uses the
-   `Visual Studio 17 2022` CMake generator specifically so the job needs no
-   vcvars setup at all (this job never touches `tools/dev-env/env.sh`).
+1. **`ffi-smoke`** (windows/ubuntu/macos, `timeout-minutes: 15`) — runs
+   `bash ui/tests/ffi_smoke/run.sh` directly (`--sanitize` on ubuntu only),
+   the exact script a developer runs locally, no Qt install. On Windows this
+   still goes through `tools/dev-env/env.sh` for MSVC discovery (via
+   vswhere) plus `-G Ninja`; an earlier version of this job tried a
+   `Visual Studio 17 2022` CMake generator specifically to avoid needing
+   vcvars at all, but that generator failed to find any VS instance on the
+   actual `windows-latest` runner (§12 item 6 below covers why env.sh's own
+   VS discovery had to become dynamic first), so this job now shares the
+   exact same env.sh + Ninja path `qt-build` already used successfully.
    Ubuntu additionally configures `-DRELDEX_SANITIZE=ON` and runs with
    `ASAN_OPTIONS=detect_leaks=1`.
 2. **`qt-build`** (windows/ubuntu/macos, `timeout-minutes: 25` — this is
@@ -425,7 +431,20 @@ pattern `ci.yml` already uses.
    runs `bash ui/build.sh --test` with `QT_QPA_PLATFORM=offscreen`. Ubuntu
    additionally installs `libgl1 libegl1 libxkbcommon0 libfontconfig1
    libdbus-1-3` — the runtime libraries Qt Quick's plugins `dlopen()` even
-   under the offscreen QPA backend.
+   under the offscreen QPA backend. macOS additionally runs
+   `.github/scripts/patch-macos-qt-agl.py` against the installed Qt right
+   after the install step, working around
+   [QTBUG-137687](https://bugreports.qt.io/browse/QTBUG-137687): Qt 6.8.3's
+   `FindWrapOpenGL.cmake` still links a hardcoded `-framework AGL`, which
+   Apple removed from the macOS 26 (Tahoe) / Xcode 26 SDK that
+   `macos-latest` now ships, so every Qt Quick target failed to link
+   (`ld: framework 'AGL' not found`) without this. Fixed upstream in Qt
+   6.8.4/6.9.2; not applied by bumping the version pin because 6.8.4 was not
+   yet published to aqtinstall's open-source macOS channel as of
+   2026-09-20 (`aqt list-qt mac desktop --spec 6.8` tops out at 6.8.3), and
+   moving to the 6.9 minor line is a version-policy decision for the owner,
+   not this task. The script fails the job loudly if the installed file's
+   text does not match what it expects, rather than silently no-op'ing.
 
 ### Action pins (commit SHA, per repository policy)
 

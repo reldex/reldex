@@ -141,6 +141,21 @@ jobs:
           modules: "qtshadertools"
           cache: true
 
+      - name: Work around QTBUG-137687 (Qt 6.8.3 links a removed AGL framework on the macOS 26 SDK)
+        # macos-latest now ships the macOS 26 (Tahoe) / Xcode 26 SDK, which
+        # dropped the AGL framework; Qt 6.8.3's FindWrapOpenGL.cmake still
+        # falls back to `-framework AGL` unconditionally, so every Qt Quick
+        # target fails to link. Fixed upstream in Qt 6.8.4/6.9.2
+        # (https://bugreports.qt.io/browse/QTBUG-137687), but 6.8.4 is not yet
+        # published to aqtinstall's open-source macOS channel and moving to
+        # the 6.9 minor line is a version-policy call beyond M1.4's scope
+        # (reported in that task's report, not decided here). See
+        # .github/scripts/patch-macos-qt-agl.py for exactly what this changes
+        # and why it fails loudly instead of silently no-op'ing.
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: python3 .github/scripts/patch-macos-qt-agl.py "${QT_ROOT_DIR}/lib/cmake/Qt6/FindWrapOpenGL.cmake"
+
       - name: Point CMake at the installed Qt
         # Belt and suspenders: install-qt-action's own docs say the Qt bin
         # directory being on PATH is normally enough for CMake to find Qt6,
