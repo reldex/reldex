@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-20T12:24:00+07:00",
+  "updatedAt": "2026-09-20T16:18:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1096,8 +1096,8 @@
               "status": "done"
             },
             {
-              "title": "M1.4 C smoke harness (ui/tests/ffi_smoke), no Qt, mock driver, ASan on Linux (sonnet)",
-              "status": "todo"
+              "title": "M1.4 C smoke harness (ui/tests/ffi_smoke), no Qt, mock driver, ASan on Linux (sonnet) — done 2026-09-20: ui/tests/ffi_smoke (C11 + C++17, 149 checks each, no Qt), ASan/UBSan clean on Linux CI; .github/workflows/ui.yml builds CMake+Corrosion+Qt 6.8.3 and runs the offscreen tests on windows/ubuntu/macos, every job under 3m05s vs K7's 25 min budget",
+              "status": "done"
             },
             {
               "title": "M1.5 CMake + Corrosion + Qt project skeleton; QML module for the adapter (sonnet) — done 2026-09-20: ui/ (CMake + Corrosion v0.6.1 pinned by commit, adapter QML module Reldex.Adapter, Reldex executable, offscreen QTest), bash ui/build.sh --test; verified on Windows only — Linux/macOS build unverified until the UI CI workflow exists (K7)",
@@ -1618,6 +1618,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-20",
+      "text": "M1.4 done: C smoke harness (C11 and C++17, 149 checks, ASan/UBSan clean on Linux CI) plus the UI CI workflow — Qt 6.8.3 builds and offscreen tests pass on Windows, Linux and macOS runners, slowest cold job 3m02s against K7's 25-minute budget. CI revealed and fixed 6 portability bugs in the M1.5 skeleton (hard-coded toolchain paths in env.sh, a macOS dylib copy race, Qt 6.8.3 vs the macOS 26 SDK's removed AGL framework — patched in CI only, QTBUG-137687). K7 numbers are CI evidence; the formal verdict belongs to the S15 report (M1.8)."
+    },
     {
       "date": "2026-09-20",
       "text": "M1.5 done: Qt project skeleton under ui/ — CMake drives cargo via Corrosion (v0.6.1, pinned by commit), links the reldex-ffi cdylib, one QML singleton (CoreInfo.abiVersion), offscreen QTest green against ABI 2. Verified on Windows only; Linux/macOS paths are written but untested (no UI CI yet — K7 still open)."
