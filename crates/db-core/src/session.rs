@@ -1125,12 +1125,15 @@ impl DatabaseSession {
                 .saturating_add(1),
         )?;
         let reply = CloseReplyTo::event(Arc::clone(&self.shared), self.id, request);
-        if self.shared.has_ended() {
-            // Idempotent, exactly like `DatabaseSession::close`: a session
-            // that has already been closed reports success rather than the
-            // failure a command sent to a worker nobody is left to run would
-            // produce.
-            reply.answer(Ok(()));
+        if let Some(settled) = self.shared.settled_close() {
+            // Idempotent, exactly like `DatabaseSession::close`, and decided
+            // from the same single record of **how** the session ended: a
+            // session a close really did end reports success, and one that was
+            // lost or abandoned reports that instead. Reading "a close has
+            // run" as "a close succeeded" is what made a close on a lost
+            // session sometimes answer `Ok(())` once the first close had ended
+            // it — the silent loss `SPEC.md` §10 forbids.
+            reply.answer(settled.map_err(CloseError::Failed));
             return Ok(());
         }
         let _ = self.send(Command::Close {
@@ -1282,7 +1285,7 @@ impl DatabaseSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if worker.is_none() {
-            return Ok(());
+            return self.settled_close();
         }
         let (tx, rx) = mpsc::channel();
         if !self.send(Command::Close {
@@ -1292,7 +1295,7 @@ impl DatabaseSession {
             if let Some(handle) = worker.take() {
                 let _ = handle.join();
             }
-            return Ok(());
+            return self.settled_close();
         }
         match rx.recv() {
             Ok(Err(err)) if err.session_is_still_open() => Err(err),
@@ -1306,8 +1309,26 @@ impl DatabaseSession {
                 if let Some(handle) = worker.take() {
                     let _ = handle.join();
                 }
-                Ok(())
+                self.settled_close()
             }
+        }
+    }
+
+    /// The answer a close owes when there is no worker left to ask.
+    ///
+    /// Every one of those cases used to return `Ok(())`, which asks the wrong
+    /// question: "is there a worker?" instead of "did a close actually end
+    /// this session, and did it succeed?". A session that was lost, abandoned,
+    /// or whose teardown detached its worker at the shutdown deadline has a
+    /// worker that is gone and a transaction that was never resolved, and a
+    /// caller told `Ok(())` would believe their commit happened
+    /// (`SPEC.md` §10).
+    fn settled_close(&self) -> Result<(), CloseError> {
+        match self.shared.settled_close() {
+            Some(settled) => settled.map_err(CloseError::Failed),
+            // The worker is gone and nothing recorded an end at all — so
+            // nothing recorded a *clean* one either.
+            None => Err(CloseError::Failed(self.shared.terminal_error())),
         }
     }
 }

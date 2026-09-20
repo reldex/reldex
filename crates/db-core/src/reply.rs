@@ -323,16 +323,15 @@ impl Drop for CloseReplyTo {
         {
             // A close is idempotent, and it stays idempotent when it loses a
             // race. Reaching here means the command never ran — the worker had
-            // already gone — so the question is only *why* it had gone. If a
-            // close had already ended this session cleanly, this one asked for
-            // something that is already true and the honest answer is success,
-            // exactly as `DatabaseSession::close` reports on the completion
-            // path. A session that is `Lost` really did fail, and says so.
-            let result = if shared.has_ended() && !shared.is_lost() {
-                Ok(())
-            } else {
-                Err(CloseError::Failed(shared.terminal_error()))
-            };
+            // already gone — so the question is only *why* it had gone, and
+            // that is exactly what `settled_close` answers, from the one
+            // record of how the session ended. A close that really did end
+            // this session cleanly makes this one a success; a session that
+            // was lost or abandoned owes it the truth instead.
+            let result = shared
+                .settled_close()
+                .unwrap_or_else(|| Err(shared.terminal_error()))
+                .map_err(CloseError::Failed);
             shared.emit_reply(SessionEvent::SessionClosed {
                 session,
                 request,

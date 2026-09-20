@@ -6,7 +6,7 @@
 //! and a plain [`std::sync::Mutex`] is enough — this is not a hot path.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use reldex_db_driver_api::{
@@ -136,6 +136,39 @@ impl LostReason {
     }
 }
 
+/// How a session ended — the one record every "this session is already over"
+/// answer is derived from.
+///
+/// Recorded once, on the worker thread, at the point the session actually
+/// ends. The distinction is the whole point: "a close has run" and "a close
+/// succeeded" are not the same thing, and only the second one lets a later
+/// close report success (`SPEC.md` §10, ADR-0002 K2/E7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndedAs {
+    /// An explicit [`crate::DatabaseSession::close`] ran on a live connection
+    /// and succeeded: the disposition the caller chose was carried out and the
+    /// connection was released. This is the only end that makes a later close
+    /// the documented no-op success.
+    Cleanly = 1,
+    /// The session ended without a close resolving anything: it was lost, it
+    /// was abandoned (which never commits and never rolls back explicitly,
+    /// ADR-0002 K5), or the close itself failed. A later close is told so.
+    Unresolved = 2,
+}
+
+impl EndedAs {
+    /// The stored code for a session that has not ended.
+    pub(crate) const NOT_ENDED: u8 = 0;
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Cleanly),
+            2 => Some(Self::Unresolved),
+            _ => None,
+        }
+    }
+}
+
 struct State {
     /// Where the session is in its lifecycle; see [`SessionLifecycle`].
     lifecycle: SessionLifecycle,
@@ -184,11 +217,15 @@ pub(crate) struct SessionShared {
     /// [`SessionEvent::Terminal`] is emitted exactly once however many paths
     /// observe the transition (ordering rule 3).
     terminal_emitted: AtomicBool,
-    /// Set once the worker has answered a close that actually ended the
-    /// session. A later close is then the documented no-op success, on either
-    /// path: on the completion path `DatabaseSession::close` sees no worker to
-    /// ask, and on the event path this is what says the same thing.
-    ended: AtomicBool,
+    /// How this session ended, as an [`EndedAs`] code, or
+    /// [`EndedAs::NOT_ENDED`] while it has not.
+    ///
+    /// The single authoritative record behind every idempotent close, on both
+    /// reply paths. It deliberately says *how* rather than merely *whether*:
+    /// only a close that actually ran to completion on a live connection makes
+    /// a later close the documented no-op success, and a session that was lost
+    /// or abandoned owes that later close the truth instead.
+    ended: AtomicU8,
     /// Set by [`crate::SessionRegistry::abandon`] when it gives up on a connect
     /// that has not finished. It only ever happens *before* a connection
     /// exists, so there is no ambiguity about what it describes: the open was
@@ -230,7 +267,7 @@ impl SessionShared {
             in_flight: AtomicUsize::new(0),
             events: Mutex::new(None),
             terminal_emitted: AtomicBool::new(false),
-            ended: AtomicBool::new(false),
+            ended: AtomicU8::new(EndedAs::NOT_ENDED),
             open_cancelled: AtomicBool::new(false),
             transaction_resolved_at_end: AtomicBool::new(false),
             requests: Arc::new(RequestSlots::default()),
@@ -369,15 +406,46 @@ impl SessionShared {
         self.requests.outstanding()
     }
 
-    /// Records that a close has ended this session, so a later one is a
-    /// no-op success rather than a failure from a channel nobody reads.
-    pub(crate) fn mark_ended(&self) {
-        self.ended.store(true, Ordering::Release);
+    /// Records **how** this session ended, once. The first writer wins.
+    ///
+    /// Called on the worker thread at the point the session actually ends, and
+    /// it is the only thing any later "this session is already over" answer is
+    /// derived from — see [`SessionShared::settled_close`].
+    pub(crate) fn mark_ended(&self, how: EndedAs) {
+        let _ = self.ended.compare_exchange(
+            EndedAs::NOT_ENDED,
+            how as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
-    /// Whether a close has already ended this session.
+    /// Whether this session has ended.
     pub(crate) fn has_ended(&self) -> bool {
-        self.ended.load(Ordering::Acquire)
+        self.ended.load(Ordering::Acquire) != EndedAs::NOT_ENDED
+    }
+
+    /// How this session ended, or `None` while it has not.
+    pub(crate) fn ended_as(&self) -> Option<EndedAs> {
+        EndedAs::from_code(self.ended.load(Ordering::Acquire))
+    }
+
+    /// The answer a close owes when the session is **already over**, or `None`
+    /// while it is not.
+    ///
+    /// Both idempotent-close paths go through this, so there is exactly one
+    /// place that decides it and exactly one thing it is decided from: the
+    /// record of how the session ended. Deriving it instead from "a close has
+    /// run" made a close on a *lost* session report success once the first
+    /// close had set that flag — the session really had ended, but nothing had
+    /// been committed, which is the loss `SPEC.md` §10 forbids hiding.
+    /// Idempotency answers "this session is already over", never "your commit
+    /// happened".
+    pub(crate) fn settled_close(&self) -> Option<DbResult<()>> {
+        match self.ended_as()? {
+            EndedAs::Cleanly => Some(Ok(())),
+            EndedAs::Unresolved => Some(Err(self.lost_transaction_error())),
+        }
     }
 
     /// Records that the open was given up on before the connect finished.

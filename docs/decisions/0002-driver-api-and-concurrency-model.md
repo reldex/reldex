@@ -1164,6 +1164,54 @@ loaded machine came out proportionally higher across *every* benchmark, includin
 touched, so treat all of these as shape rather than as figures to compare across machines.
 Allocations per event are unchanged at 0.033. Still information only, still not a claim.
 
+### E7 — an idempotent close reports *how* the session ended, not merely that it has
+
+Closing an already-closed session succeeds (K2's spirit, applied to the session rather than to a
+cursor). That rule was implemented as "a close has run, therefore report success", stored as one
+boolean on `SessionShared` and read by `DatabaseSession::submit_close` — and "a close has run" is
+not "a close succeeded". The worker sets that flag on **both** of its ends: the clean one, and the
+one where the connection was already gone and the close truthfully reported the loss. So a close
+submitted after a *lost* session had already been closed once could answer `Ok(())`, telling the
+caller their `Commit` had happened when nothing had been committed. Intermittent — it needed the
+worker to reach the flag between two submits on the caller's thread — and found by CI on
+`event_terminal.rs::a_close_after_a_lost_session_still_reports_the_loss` (3/1000 on the M2.5
+baseline). It is a latent M2.5 defect, not an M2.6 regression, and it is the loss `SPEC.md` §10
+exists to prevent, told backwards.
+
+**Decided: there is one record of how a session ended, and every "this session is already over"
+answer is derived from it.** `SessionShared` stores `EndedAs`, written once on the worker thread at
+the point the session ends, first writer wins:
+
+- `Cleanly` — an explicit `close` reached the end of the close path on a live connection. Getting
+  there means the caller's transaction was resolved as asked or there was none to resolve: the only
+  other ways out of the disposition step are `DecisionRequired`, `CommitFailed` and
+  `RollbackFailed`, and all three leave the session **open**. A failure from
+  `DatabaseConnection::close` itself does not change the classification — it is a report about
+  releasing the connection, not about the user's data, and it was already delivered to the close
+  that caused it.
+- `Unresolved` — everything else: the session was already lost when the close ran, it was abandoned
+  (which resolves nothing, by design, K5), or its worker ended without any close at all.
+
+`SessionShared::settled_close()` turns that into the answer, and all three call sites use it —
+`submit_close`'s short-circuit, `DatabaseSession::close`'s "there is no worker left to ask" paths,
+and `CloseReplyTo`'s `Drop`. **Idempotency answers "this session is already over", never "your
+commit happened."**
+
+This changes one documented behaviour: closing a **lost** session a second time now reports the
+loss again — with the original error's kind and native code — instead of returning `Ok(())`. The
+first close already said so; saying it once and then claiming success is worse than either
+consistent answer. Nothing runs on the second call either way, so the close is still idempotent in
+the sense that matters: it changes nothing, and it never reaches the driver. Closing a session that
+a close really did end cleanly still succeeds, however many times it is asked.
+
+*Evidence:* `event_terminal.rs::a_close_after_a_lost_session_still_reports_the_loss` and its
+deterministic twin `…::a_second_close_after_a_lost_session_reports_the_loss_deterministically`
+(which forces the interleaving by waiting for the first close's reply rather than hoping for it),
+against `…::concurrent_closes_all_report_success_on_a_cleanly_closed_session` for the other
+direction; both looped 3,000 times with no failures. `close_disposition.rs::close_is_idempotent` and
+`…::a_failing_connection_close_is_reported_but_the_session_is_gone` pin the clean side on both reply
+paths; `session_loss.rs` pins the lost side.
+
 ## Amendment: the session registry, a non-blocking open, and `abandon` (2026-09-21, task M2.6)
 
 Built to `docs/exec-plans/active/phase-1.md` §B3, on top of the event path (E1–E6). **Nothing about

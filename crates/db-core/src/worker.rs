@@ -64,7 +64,7 @@ use crate::reply::{CloseReplyTo, ReplyTo};
 use crate::session::{
     CloseDisposition, CloseError, ExecuteOutcome, FetchedBatch, OutValue, OutValues, SessionLimits,
 };
-use crate::shared::SessionShared;
+use crate::shared::{EndedAs, SessionShared};
 
 /// Why the worker is being asked to shut down.
 pub(crate) enum CloseIntent {
@@ -393,6 +393,12 @@ fn worker_main(
     // Covers the path no command took: the session handle was dropped without
     // an explicit close, so the channel simply ended.
     worker.shared.mark_closed();
+    // A session that got here without a close having ended it — its handle was
+    // dropped, or its command channel simply went away — ended without
+    // resolving anything. Recording that keeps "every ended session has a
+    // record of how" true; `mark_ended` is first-writer-wins, so a close that
+    // already ran keeps whatever it recorded.
+    worker.shared.mark_ended(EndedAs::Unresolved);
     // Computed here, on the worker thread, once every command that was queued
     // ahead of the end has run: this is the only point at which the answer
     // cannot still be invalidated by work the caller had already submitted.
@@ -1096,11 +1102,18 @@ impl Worker {
             let error = self.shared.lost_transaction_error();
             self.release_results();
             self.shared.mark_closed();
-            self.shared.mark_ended();
+            // Ended, but nothing was resolved — so every *later* close is told
+            // the same thing this one is, instead of reading "a close has run"
+            // as "a close succeeded".
+            self.shared.mark_ended(EndedAs::Unresolved);
             reply.answer(Err(CloseError::Failed(error)));
             return Flow::Exit;
         }
 
+        // Captured before `intent` is consumed: only an *explicit* close can
+        // end a session cleanly. An abandon resolves nothing by design
+        // (ADR-0002 K5), so it must never make a later close report success.
+        let explicit = matches!(intent, CloseIntent::Explicit(_));
         let disposition = match intent {
             CloseIntent::Explicit(disposition) => {
                 if disposition.is_none() && self.shared.has_possibly_active_transaction() {
@@ -1148,7 +1161,23 @@ impl Worker {
         self.release_results();
         let outcome = self.close_connection();
         self.shared.mark_closed();
-        self.shared.mark_ended();
+        // Reaching here on an *explicit* close means the caller's transaction
+        // was resolved or there was none: the only other way out of the
+        // disposition step above is `DecisionRequired`, `CommitFailed` or
+        // `RollbackFailed`, and all three leave the session open. So this is
+        // the one end that makes a later close the documented no-op success.
+        //
+        // `close_connection`'s own failure does not change that — it is a
+        // report about releasing the connection, not about the user's data, it
+        // was already delivered to *this* close, and repeating it forever
+        // would contradict "a failed close still ends the session; only the
+        // report survives". An abandon, by contrast, resolves nothing by
+        // design (ADR-0002 K5) and is never clean.
+        self.shared.mark_ended(if explicit {
+            EndedAs::Cleanly
+        } else {
+            EndedAs::Unresolved
+        });
         reply.answer(outcome.map_err(CloseError::Failed));
         Flow::Exit
     }

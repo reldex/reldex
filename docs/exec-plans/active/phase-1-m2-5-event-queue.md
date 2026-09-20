@@ -283,6 +283,35 @@ on push, one `Arc` drop and one `fetch_update` on pop.
 
 ---
 
+## 5b. Review round 2 (2026-09-21, found by CI during M2.6): the idempotent close
+
+One latent defect survived round 1 and was found by `test (ubuntu-latest)` on PR #22, failing
+`event_terminal.rs::a_close_after_a_lost_session_still_reports_the_loss` intermittently — 3/1000 on
+the M2.5 baseline (2b4426d), so **not an M2.6 regression**, and a real semantic bug rather than a
+flaky test.
+
+**What it was.** "Closing an already-closed session succeeds" was implemented as one boolean —
+`SessionShared::ended`, meaning *a close has run* — set by the worker on **both** of its ends: the
+clean one, and the one where the connection was already gone and the close had just reported the
+loss. `DatabaseSession::submit_close` short-circuited on that boolean and answered `Ok(())`. So the
+second, third or fourth close of a lost session could report that the caller's `Commit` had
+happened when nothing had been committed. Whether it did depended on the worker reaching the flag
+between two submits on the caller's thread, which is why it was intermittent; waiting for the first
+close's reply makes it happen every time.
+
+**The fix.** `SessionShared` now records *how* the session ended (`EndedAs::Cleanly` /
+`EndedAs::Unresolved`), written once on the worker thread at the point it ends, and
+`settled_close()` is the single place that turns that record into a close's answer. All three
+idempotent-close sites read it: `submit_close`, `DatabaseSession::close`'s "no worker left to ask"
+paths (which each returned a bare `Ok(())` before, including after a registry teardown detached the
+worker at its deadline), and `CloseReplyTo`'s `Drop`. Idempotency now answers "this session is
+already over", never "your commit happened". ADR-0002 amendment **E7** has the classification rule
+and the one behaviour it changes: a second close on a *lost* session reports the loss again, with
+the original kind and native code, instead of succeeding.
+
+**Proof.** The lost and clean directions looped 3,000 runs each, 0 failures, plus a deterministic
+regression test that forces the interleaving instead of hoping for it.
+
 ## 6. Locked in for M2.6 and M2.11
 
 Decided here, while the reasons are in front of us, so neither task re-litigates them.
