@@ -110,6 +110,12 @@ ScrollDriver::ScrollDriver(Bridge *bridge, QObject *parent)
             pattern = Pattern::BlockSame;
         } else if (name == QLatin1String("blockother")) {
             pattern = Pattern::BlockOther;
+        } else if (name == QLatin1String("streambase")) {
+            pattern = Pattern::StreamBase;
+        } else if (name == QLatin1String("streamblocked")) {
+            pattern = Pattern::StreamBlocked;
+        } else if (name == QLatin1String("streamscroll")) {
+            pattern = Pattern::StreamScroll;
         } else if (name == QLatin1String("idle")) {
             pattern = Pattern::Idle;
         } else {
@@ -141,6 +147,9 @@ ScrollDriver::ScrollDriver(Bridge *bridge, QObject *parent)
     m_keepDisplayAwake = envNumber("RELDEX_S15_NO_KEEPAWAKE", 0) == 0;
     m_startDelayMs = static_cast<int>(
             std::clamp<qint64>(envNumber("RELDEX_S15_START_DELAY_MS", 1500), 0, 600000));
+    m_streamRuns =
+            static_cast<int>(std::clamp<qint64>(envNumber("RELDEX_S15_STREAM_RUNS", 5), 1, 1000));
+    m_streamRows = std::clamp<qint64>(envNumber("RELDEX_S15_STREAM_ROWS", 100000), 1, 100000000);
     m_jumpState ^= static_cast<quint64>(envNumber("RELDEX_S15_SEED", 0)) * 0x9E3779B97F4A7C15ULL;
     if (m_jumpState == 0) {
         m_jumpState = 0x243F6A8885A308D3ULL;
@@ -322,6 +331,7 @@ void ScrollDriver::beginPhases()
     if (m_finished || m_phaseIndex >= 0) {
         return;
     }
+    Metrics *const metrics = m_bridge->metrics();
     m_memory.insert(QStringLiteral("baselineResidentBytes"), m_baselineResidentBytes);
     m_memory.insert(QStringLiteral("baselinePrivateBytes"), m_baselinePrivateBytes);
     m_memory.insert(QStringLiteral("preRunResidentBytes"), m_preRunResidentBytes);
@@ -331,8 +341,16 @@ void ScrollDriver::beginPhases()
     m_memory.insert(QStringLiteral("settledPrivateBytes"), Metrics::privateBytes());
     m_memory.insert(QStringLiteral("settleMs"), m_settleMs);
 
+    // The 1M-row stream that has just finished is the only place where drains
+    // are dense, so its aggregates are taken here -- before the phases clear
+    // them -- rather than being mixed with the much quieter drains a scroll
+    // phase produces.
+    m_streamPhaseStats.insert(QStringLiteral("drains"), metrics->drainStats());
+    m_streamPhaseStats.insert(QStringLiteral("drainBoundary"), metrics->drainBoundaryStats());
+    m_streamPhaseStats.insert(QStringLiteral("applyBatch"), metrics->applyBatchStats());
+
     const bool needsOther = std::any_of(m_phases.cbegin(), m_phases.cend(), [](const Phase &phase) {
-        return phase.pattern == Pattern::BlockOther;
+        return phase.pattern == Pattern::BlockOther || phase.pattern == Pattern::StreamBlocked;
     });
     if (needsOther) {
         // Opened now, so the phase that blocks it is not also timing a session
@@ -343,6 +361,20 @@ void ScrollDriver::beginPhases()
             m_otherBridge->session()->setMockBlockDurationMs(m_blockMs);
             m_otherBridge->session()->setRunOnOpen(false);
             m_otherBridge->session()->open();
+        }
+    }
+
+    const bool needsStream = std::any_of(m_phases.cbegin(), m_phases.cend(), [](const Phase &p) {
+        return isStreamPhase(p.pattern);
+    });
+    if (needsStream) {
+        m_streamBridge = new Bridge(this);
+        if (m_streamBridge->isValid()) {
+            m_streamBridge->session()->setMockRows(m_streamRows);
+            m_streamBridge->session()->setRunOnOpen(false);
+            m_streamBridge->session()->open();
+            connect(m_streamBridge->session(), &SessionController::resultComplete, this,
+                    &ScrollDriver::onStreamComplete);
         }
     }
 
@@ -360,6 +392,9 @@ void ScrollDriver::beginPhase()
     m_direction = 1;
     m_travelledPx = 0.0;
     m_blockSubmitted = false;
+    m_streamStartNs = 0;
+    m_streamDone = 0;
+    m_streamNs.clear();
     m_flickVelocityNow = m_flickVelocity;
     m_phaseMaxY = maxContentY();
     if (m_window != nullptr && m_window->screen() != nullptr
@@ -392,6 +427,10 @@ void ScrollDriver::onAfterAnimating()
         // measuring, so those frames are dropped here rather than being
         // averaged away later.
         m_bridge->metrics()->clearFrames();
+        // Same reasoning for the drains: a phase reports the drains that
+        // happened *during it*, so the cost of a batch landing while this
+        // window scrolls can be read next to that phase's frames.
+        m_bridge->metrics()->clearDrains();
         m_phaseStartNs = m_bridge->metrics()->nowNs();
         m_travelledPx = 0.0;
         submitBlock(phase.pattern);
@@ -400,8 +439,16 @@ void ScrollDriver::onAfterAnimating()
     advance();
 
     if (m_frameIndex >= m_warmupFrames + m_phaseFrames) {
-        endPhase();
-        return;
+        // A stream phase also has to see its timed rounds finish, or the
+        // comparison it exists for would have a different n in each half. The
+        // cap is a safety net, not a budget: if it ever fires the phase reports
+        // fewer rounds than asked and the report says so.
+        const bool roundsLeft = isStreamPhase(phase.pattern) && m_streamDone < m_streamRuns
+                && m_frameIndex < m_warmupFrames + (m_phaseFrames * 10);
+        if (!roundsLeft) {
+            endPhase();
+            return;
+        }
     }
     if (m_window != nullptr) {
         // Keep frames coming even when the pattern did not dirty anything
@@ -466,10 +513,18 @@ void ScrollDriver::advance()
     case Pattern::Sweep:
     case Pattern::Full:
     case Pattern::BlockSame:
-    case Pattern::BlockOther: {
+    case Pattern::BlockOther:
+    case Pattern::StreamBase:
+    case Pattern::StreamBlocked:
+    case Pattern::StreamScroll: {
+        // While the result is still streaming the content grows under the
+        // viewport, so the limit has to be read per frame rather than latched
+        // at phase start -- otherwise the sweep would spend the phase pinned to
+        // the first screenful, which is the easiest scrolling there is.
+        const double maxY = pattern == Pattern::StreamScroll ? maxContentY() : m_phaseMaxY;
         double y = contentY() + (m_phaseStepPx * m_direction);
-        if (y >= m_phaseMaxY) {
-            y = m_phaseMaxY;
+        if (y >= maxY) {
+            y = maxY;
             m_direction = -1;
         } else if (y <= 0.0) {
             y = 0.0;
@@ -517,6 +572,47 @@ void ScrollDriver::submitBlock(Pattern pattern)
         && m_otherBridge->isValid()) {
         m_blockSubmitted = true;
         m_otherBridge->session()->executeMockStatement(RELDEX_MOCK_STATEMENT_BLOCK);
+        return;
+    }
+    if (pattern == Pattern::StreamScroll) {
+        m_blockSubmitted = true; // nothing to release; the flag just stops a re-submit
+        // Re-executing here rather than before the warm-up means the frames
+        // this phase keeps are exactly the frames that overlap the stream.
+        m_bridge->run();
+        return;
+    }
+    if (isStreamPhase(pattern)) {
+        m_blockSubmitted = true;
+        if (pattern == Pattern::StreamBlocked && m_otherBridge != nullptr
+            && m_otherBridge->isValid()) {
+            m_otherBridge->session()->executeMockStatement(RELDEX_MOCK_STATEMENT_BLOCK);
+        }
+        startStreamRun();
+    }
+}
+
+void ScrollDriver::startStreamRun()
+{
+    if (m_streamBridge == nullptr || !m_streamBridge->isValid()) {
+        return;
+    }
+    m_streamStartNs = m_bridge->metrics()->nowNs();
+    m_streamBridge->run();
+}
+
+void ScrollDriver::onStreamComplete()
+{
+    if (m_finished || m_phaseIndex < 0 || m_phaseIndex >= m_phases.size()) {
+        return;
+    }
+    if (!isStreamPhase(m_phases.at(m_phaseIndex).pattern) || m_streamStartNs <= 0) {
+        return;
+    }
+    m_streamNs.append(m_bridge->metrics()->nowNs() - m_streamStartNs);
+    m_streamStartNs = 0;
+    ++m_streamDone;
+    if (m_streamDone < m_streamRuns) {
+        startStreamRun();
     }
 }
 
@@ -528,7 +624,8 @@ void ScrollDriver::releaseBlock()
     const Pattern pattern = m_phases.at(m_phaseIndex).pattern;
     if (pattern == Pattern::BlockSame) {
         m_bridge->releaseMockBlock(m_bridge->session()->sessionId());
-    } else if (pattern == Pattern::BlockOther && m_otherBridge != nullptr) {
+    } else if ((pattern == Pattern::BlockOther || pattern == Pattern::StreamBlocked)
+               && m_otherBridge != nullptr) {
         m_otherBridge->releaseMockBlock(m_otherBridge->session()->sessionId());
     }
     m_blockSubmitted = false;
@@ -542,6 +639,9 @@ void ScrollDriver::endPhase()
     QVariantMap result;
     result.insert(QStringLiteral("phase"), phase.name);
     result.insert(QStringLiteral("frames"), m_phaseFrames);
+    /// What the phase actually timed. Equal to `frames` except where a stream
+    /// phase ran on until its rounds finished.
+    result.insert(QStringLiteral("framesMeasured"), m_frameIndex - m_warmupFrames);
     result.insert(QStringLiteral("warmupFrames"), m_warmupFrames);
     result.insert(QStringLiteral("wallNs"), metrics->nowNs() - m_phaseStartNs);
     result.insert(QStringLiteral("contentMaxY"), m_phaseMaxY);
@@ -564,6 +664,30 @@ void ScrollDriver::endPhase()
     result.insert(QStringLiteral("rowsTravelled"), rowPx > 0.0 ? m_travelledPx / rowPx : 0.0);
     result.insert(QStringLiteral("frameIntervals"), metrics->frameStats());
     result.insert(QStringLiteral("renderWork"), metrics->renderWorkStats());
+    // The GUI thread's half of the frame: `TableView`'s polish, delegate
+    // creation and reuse, and every `data()` call -- including the windowed
+    // formatter -- happen here, so a "per-frame cost" without it is only half
+    // the frame. Note that on a platform whose `requestUpdate()` waits on an
+    // idle timer (`QT_QPA_UPDATE_IDLE_TIME`), that wait is inside this bracket.
+    result.insert(QStringLiteral("guiFrame"), metrics->guiFrameStats());
+    result.insert(QStringLiteral("guiHandover"), metrics->guiHandoverStats());
+    result.insert(QStringLiteral("sync"), metrics->syncStats());
+    // Drains that happened during this phase (cleared at the warm-up
+    // boundary), so "what a batch costs the UI thread while it is scrolling"
+    // is a measurement rather than an inference.
+    result.insert(QStringLiteral("drains"), metrics->drainStats());
+    result.insert(QStringLiteral("drainBoundary"), metrics->drainBoundaryStats());
+    result.insert(QStringLiteral("applyBatch"), metrics->applyBatchStats());
+    if (isStreamPhase(phase.pattern)) {
+        // Raw, not aggregated: n is small enough to print, and a reader of the
+        // report should see all of it rather than a percentile over five.
+        result.insert(QStringLiteral("streamNs"), m_streamNs);
+        result.insert(QStringLiteral("streamRunsRequested"), m_streamRuns);
+        result.insert(QStringLiteral("streamRunsDone"), m_streamDone);
+        result.insert(QStringLiteral("streamRows"), m_streamRows);
+        result.insert(QStringLiteral("streamRowsFetched"),
+                      m_streamBridge == nullptr ? 0 : m_streamBridge->session()->rowsFetched());
+    }
     result.insert(QStringLiteral("residentBytes"), Metrics::residentBytes());
     result.insert(QStringLiteral("privateBytes"), Metrics::privateBytes());
     result.insert(QStringLiteral("modelRows"), modelRows);
@@ -658,6 +782,13 @@ void ScrollDriver::finish()
     report.insert(QStringLiteral("summary"), metrics->summary());
     report.insert(QStringLiteral("applyBatch"), metrics->applyBatchStats());
     report.insert(QStringLiteral("drains"), metrics->drainStats());
+    report.insert(QStringLiteral("drainBoundary"), metrics->drainBoundaryStats());
+    // The initial stream's own drains, kept separate because that is where the
+    // batches are dense; the top-level `drains` above covers only whatever has
+    // happened since the last phase cleared them.
+    report.insert(QStringLiteral("initialStream"), m_streamPhaseStats);
+    report.insert(QStringLiteral("streamRuns"), m_streamRuns);
+    report.insert(QStringLiteral("streamRows"), m_streamRows);
     report.insert(QStringLiteral("rowsStreamed"), m_bridge->session()->rowsFetched());
     report.insert(QStringLiteral("orphanEvents"), m_bridge->orphanEvents());
 

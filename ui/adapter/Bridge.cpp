@@ -313,8 +313,20 @@ void Bridge::drain()
     timer.start();
     int events = 0;
     bool budgetHit = false;
+    // S15 K4 wants the boundary's share of a drain separated from Qt's. With
+    // metrics off this is one relaxed atomic load and nothing else.
+    const bool timing = m_metrics->isEnabled();
+    qint64 boundaryNs = 0;
     ReldexEvent raw = reldex::makeEvent();
-    while (reldex_hub_next_event(m_hub.get(), &raw)) {
+    for (;;) {
+        const qint64 takeStartNs = timing ? m_metrics->nowNs() : 0;
+        const bool got = reldex_hub_next_event(m_hub.get(), &raw);
+        if (timing) {
+            boundaryNs += m_metrics->nowNs() - takeStartNs;
+        }
+        if (!got) {
+            break;
+        }
         dispatch(raw);
         ++events;
         if (m_drainEventBudget > 0 && events >= m_drainEventBudget) {
@@ -330,7 +342,7 @@ void Bridge::drain()
 
     ++m_drainCount;
     m_drainedEvents += events;
-    m_metrics->recordDrain(events, timer.nsecsElapsed());
+    m_metrics->recordDrain(events, timer.nsecsElapsed(), boundaryNs);
 
     if (budgetHit) {
         // reldex.h, "THE WAKER": the waker fires only on empty -> non-empty,

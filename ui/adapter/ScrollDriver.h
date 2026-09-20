@@ -44,6 +44,17 @@
 //           runs -- on this session (which, with one result per session,
 //           necessarily replaces the result) or on a second Bridge/hub, which
 //           is what "another session" looks like in the M1.6 adapter.
+//   streambase / streamblocked
+//           K6's "or any other session" clause: a *third* hub executes and
+//           streams a result N times over while this window keeps sweeping,
+//           first with nothing blocked and then with the second hub's session
+//           blocked. The comparison of the two completion times is the
+//           measurement; a single number from either alone is not.
+//   streamscroll
+//           scrolling *while* the 1M-row result is still streaming: the phase
+//           re-executes on this session and then sweeps, so the timed frames
+//           overlap the drains, `applyBatch` and `endInsertRows` instead of
+//           following them. Reported next to the same phase's drain stats.
 //   idle    no motion at all, for the baseline the K6 comparison needs.
 
 #include <QJsonObject>
@@ -87,9 +98,26 @@ private Q_SLOTS:
     void onFirstFrameAfterInsert();
     void onResultComplete();
     void onAfterAnimating();
+    void onStreamComplete();
 
 private:
-    enum class Pattern { Idle, Flick, Sweep, Full, Jump, BlockSame, BlockOther };
+    enum class Pattern {
+        Idle,
+        Flick,
+        Sweep,
+        Full,
+        Jump,
+        BlockSame,
+        BlockOther,
+        StreamBase,
+        StreamBlocked,
+        StreamScroll,
+    };
+
+    [[nodiscard]] static bool isStreamPhase(Pattern pattern)
+    {
+        return pattern == Pattern::StreamBase || pattern == Pattern::StreamBlocked;
+    }
 
     struct Phase
     {
@@ -115,6 +143,8 @@ private:
     void requestDisplayStaysOn();
     void submitBlock(Pattern pattern);
     void releaseBlock();
+    /// Starts one timed execute-and-stream on the third hub.
+    void startStreamRun();
     [[nodiscard]] double maxContentY() const;
     [[nodiscard]] double contentY() const;
     void setContentY(double y);
@@ -129,6 +159,14 @@ private:
     /// the M1.6 adapter, which creates exactly one `SessionController` per
     /// `Bridge` (ui/README.md "Known limitations").
     Bridge *m_otherBridge = nullptr;
+    /// The third hub: the session whose execute-to-`resultComplete` time is
+    /// compared with and without [`m_otherBridge`]'s session blocked. It is a
+    /// third *Bridge* because the M1.6 adapter creates exactly one
+    /// `SessionController` per `Bridge`, so "two sessions, one of them blocked,
+    /// plus the window's own" cannot be arranged any other way here. The
+    /// same-hub version of the question is therefore not reachable, and the
+    /// report says so rather than implying this covers it.
+    Bridge *m_streamBridge = nullptr;
 
     bool m_enabled = false;
     bool m_attached = false;
@@ -162,6 +200,12 @@ private:
     bool m_displayRequested = false;
     int m_startDelayMs = 1500;
     bool m_ownsStart = false;
+    /// How many execute-and-stream rounds a `streambase`/`streamblocked` phase
+    /// times, and how many rows each one carries. Small enough that several
+    /// rounds fit in a phase; the number that matters is the *difference*
+    /// between the two phases, so both use the same values.
+    int m_streamRuns = 5;
+    qint64 m_streamRows = 100000;
 
     // --- run state ---------------------------------------------------------
     int m_runsDone = 0;
@@ -174,8 +218,14 @@ private:
     qint64 m_phaseStartNs = 0;
     quint64 m_jumpState = 0x243F6A8885A308D3ULL;
     bool m_blockSubmitted = false;
+    qint64 m_streamStartNs = 0;
+    int m_streamDone = 0;
+    QVariantList m_streamNs;
 
     QVariantList m_phaseResults;
+    /// The drain / batch aggregates for the initial 1M-row stream, taken before
+    /// the phases clear them so each phase can report its own.
+    QVariantMap m_streamPhaseStats;
     QVariantMap m_memory;
     qint64 m_baselineResidentBytes = 0;
     qint64 m_baselinePrivateBytes = 0;

@@ -316,7 +316,7 @@ unset it connects nothing and costs one `qgetenv` at startup.
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `RELDEX_S15_SCROLL` | off | comma-separated phases, run in order: `idle`, `flick`, `sweep`, `full`, `jump`, `blocksame`, `blockother` |
+| `RELDEX_S15_SCROLL` | off | comma-separated phases, run in order: `idle`, `flick`, `sweep`, `full`, `jump`, `blocksame`, `blockother`, `streambase`, `streamblocked`, `streamscroll` |
 | `RELDEX_S15_SCROLL_FRAMES` | `1800` | recorded frames per phase (`full` covers the whole result in one down+up over this many) |
 | `RELDEX_S15_WARMUP_FRAMES` | `30` | frames discarded at the start of each phase |
 | `RELDEX_S15_SCROLL_STEP_PX` | `110` | `sweep` speed, px/frame (~5 rows at the 22 px row height) |
@@ -325,6 +325,9 @@ unset it connects nothing and costs one `qgetenv` at startup.
 | `RELDEX_S15_START_DELAY_MS` | `1500` | wait before the first execute, so the K3 "before" sample is taken on a window that has already drawn |
 | `RELDEX_S15_SETTLE_MS` | `2000` | wait after the stream completes before sampling memory and scrolling |
 | `RELDEX_S15_BLOCK_MS` | `0` | the second session's block duration; `0` is "until released", and the driver releases it at the end of the phase |
+| `RELDEX_S15_STREAM_RUNS` | `5` | `streambase`/`streamblocked`: timed execute-and-stream rounds on the third hub |
+| `RELDEX_S15_STREAM_ROWS` | `100000` | rows per such round |
+| `RELDEX_S15_LOG` | — | file sink for Qt's own logging categories. `Reldex.exe` is a GUI-subsystem binary, so `QT_LOGGING_RULES` output has no console to reach without this |
 | `RELDEX_S15_OUT` | — | JSON summary path. **Required**: this is a GUI-subsystem binary whose stdout does not reach a pipe here |
 | `RELDEX_S15_CSV` | — | raw per-frame/per-drain CSV, for cross-checking a summary |
 | `RELDEX_S15_LABEL` | — | free text recorded in the JSON |
@@ -346,6 +349,15 @@ that were measured going wrong, and each is documented where it is implemented:
   what the frame cost. Run both ways and say which number answers which
   question.
 
+**`QT_QPA_UPDATE_IDLE_TIME=0` belongs with `RELDEX_S15_NO_VSYNC=1`.** The driver
+paces itself with `QQuickWindow::requestUpdate()`, and on Windows that goes
+through `QPlatformWindow::requestUpdate()`, whose idle timer defaults to 5 ms
+and is not overridden by the QPA plugin. That wait lands *inside* the measured
+frame, so a vsync-off pass without this variable reports a ~5 ms floor that
+belongs to the timer rather than to the application (measured: idle p50 5.24 ms
+→ 0.23 ms with it set). Set it for any pass whose question is "what did the
+frame cost?".
+
 #### Reproducing the M1.8 numbers
 
 ```bash
@@ -353,26 +365,50 @@ source tools/dev-env/env.sh
 bash ui/build.sh --release            # an optimized build; the numbers are Release
 OUT=/tmp/s15; mkdir -p "$OUT"
 
-# K1 -- scroll frame time over the full 1,000,000 rows, 100% and 150%
-RELDEX_UI_METRICS=1 RELDEX_S15_AUTORUN=1 RELDEX_S15_ROWS=1000000 RELDEX_S15_NO_VSYNC=1 \
+# K1a -- the BUDGET pass: vsync on, so a swap interval says whether the frame
+# made its 60 Hz deadline. Requires an awake display; check first that the idle
+# phase reads p50 ~= the refresh period, or the compositor is throttled and the
+# numbers are the window manager's.
+RELDEX_UI_METRICS=1 RELDEX_S15_AUTORUN=1 RELDEX_S15_ROWS=1000000 \
   RELDEX_S15_SCROLL=idle,flick,sweep,full,jump RELDEX_S15_SCROLL_FRAMES=3000 \
   RELDEX_S15_WARMUP_FRAMES=60 RELDEX_S15_SETTLE_MS=3000 \
-  RELDEX_S15_LABEL=k1-100 RELDEX_S15_OUT="$OUT/k1-100.json" ./build/ui-Release/Reldex.exe
+  RELDEX_S15_LABEL=k1v-100 RELDEX_S15_OUT="$OUT/k1v-100.json" ./build/ui-Release/Reldex.exe
 QT_SCALE_FACTOR=1.5 RELDEX_UI_METRICS=1 RELDEX_S15_AUTORUN=1 RELDEX_S15_ROWS=1000000 \
-  RELDEX_S15_NO_VSYNC=1 RELDEX_S15_SCROLL=idle,flick,sweep,full,jump \
-  RELDEX_S15_SCROLL_FRAMES=3000 RELDEX_S15_WARMUP_FRAMES=60 RELDEX_S15_SETTLE_MS=3000 \
-  RELDEX_S15_LABEL=k1-150 RELDEX_S15_OUT="$OUT/k1-150.json" ./build/ui-Release/Reldex.exe
+  RELDEX_S15_SCROLL=idle,flick,sweep,full,jump RELDEX_S15_SCROLL_FRAMES=3000 \
+  RELDEX_S15_WARMUP_FRAMES=60 RELDEX_S15_SETTLE_MS=3000 \
+  RELDEX_S15_LABEL=k1v-150 RELDEX_S15_OUT="$OUT/k1v-150.json" ./build/ui-Release/Reldex.exe
+
+# K1b -- the COST pass: vsync off AND the platform update idle timer off, or the
+# timer's 5 ms lands inside every measured frame (see above).
+RELDEX_UI_METRICS=1 RELDEX_S15_AUTORUN=1 RELDEX_S15_ROWS=1000000 \
+  RELDEX_S15_NO_VSYNC=1 QT_QPA_UPDATE_IDLE_TIME=0 \
+  RELDEX_S15_SCROLL=idle,flick,sweep,full,jump RELDEX_S15_SCROLL_FRAMES=3000 \
+  RELDEX_S15_WARMUP_FRAMES=60 RELDEX_S15_SETTLE_MS=3000 \
+  RELDEX_S15_LABEL=k1p-100 RELDEX_S15_OUT="$OUT/k1p-100.json" ./build/ui-Release/Reldex.exe
 
 # K2 -- cold: one execute per process, 30 processes
 for i in $(seq -w 1 30); do
-  RELDEX_UI_METRICS=1 RELDEX_S15_AUTORUN=1 RELDEX_S15_ROWS=1000000 RELDEX_S15_NO_VSYNC=1 \
+  RELDEX_UI_METRICS=1 RELDEX_S15_AUTORUN=1 RELDEX_S15_ROWS=1000000 \
     RELDEX_S15_RUNS=1 RELDEX_S15_START_DELAY_MS=0 \
     RELDEX_S15_OUT="$OUT/k2-cold-$i.json" ./build/ui-Release/Reldex.exe
 done
-# K2 -- warm: 31 executes in one process; run 1 is the cold one
-RELDEX_UI_METRICS=1 RELDEX_S15_AUTORUN=1 RELDEX_S15_ROWS=1000000 RELDEX_S15_NO_VSYNC=1 \
+# K2 -- warm: 31 executes in one process; run 1 is the cold one, and
+# `--skip 1` below is what drops it (it prints how many it dropped)
+RELDEX_UI_METRICS=1 RELDEX_S15_AUTORUN=1 RELDEX_S15_ROWS=1000000 \
   RELDEX_S15_RUNS=31 RELDEX_S15_START_DELAY_MS=0 \
   RELDEX_S15_OUT="$OUT/k2-warm.json" ./build/ui-Release/Reldex.exe
+# K2 -- what the cold first paint is made of: Qt's own scene-graph timings.
+# `Reldex.exe` is GUI-subsystem, so RELDEX_S15_LOG is how the log is captured.
+for rows in 1 1000 1000000; do
+  RELDEX_UI_METRICS=1 RELDEX_S15_AUTORUN=1 RELDEX_S15_ROWS="$rows" \
+    RELDEX_S15_RUNS=1 RELDEX_S15_START_DELAY_MS=0 \
+    QT_LOGGING_RULES='qt.scenegraph.time.*=true
+qt.scenegraph.general=true
+qt.rhi.general=true' \
+    RELDEX_S15_LOG="$OUT/firstframe-$rows.log" \
+    RELDEX_S15_OUT="$OUT/firstframe-$rows.json" ./build/ui-Release/Reldex.exe
+done
+grep "Frame prepared" "$OUT"/firstframe-*.log   # polish= is the answer
 
 # K3 -- retained memory, in-app (>=3 runs); K4's per-batch half comes with it
 RELDEX_UI_METRICS=1 RELDEX_S15_AUTORUN=1 RELDEX_S15_ROWS=1000000 RELDEX_S15_NO_VSYNC=1 \
@@ -385,14 +421,32 @@ RELDEX_S15_K4=1 ./build/ui-Release/tst_resultmodel.exe spikeS15BoundaryCost -o "
 # K5 -- 10,000-iteration waker teardown flood
 ./build/ui-Release/tst_teardown.exe -o "$OUT/k5.txt",txt
 
-# K6 -- a 10-second-class blocking statement under a scroll
-RELDEX_UI_METRICS=1 RELDEX_S15_AUTORUN=1 RELDEX_S15_ROWS=1000000 RELDEX_S15_NO_VSYNC=1 \
-  RELDEX_S15_SCROLL=sweep,blockother,sweep,blocksame RELDEX_S15_SCROLL_FRAMES=3000 \
+# K6 -- a 10-second-class blocking statement under a scroll, plus the
+# "or any other session" clause: `streambase` and `streamblocked` time a THIRD
+# hub's execute -> resultComplete with and without a second hub's session
+# parked in a blocking statement. `blocksame` goes last: it closes the result
+# the earlier phases are scrolling.
+RELDEX_UI_METRICS=1 RELDEX_S15_AUTORUN=1 RELDEX_S15_ROWS=1000000 \
+  RELDEX_S15_SCROLL=sweep,streambase,streamblocked,blockother,blocksame \
+  RELDEX_S15_SCROLL_FRAMES=600 RELDEX_S15_WARMUP_FRAMES=60 \
+  RELDEX_S15_STREAM_RUNS=5 RELDEX_S15_STREAM_ROWS=100000 \
   RELDEX_S15_OUT="$OUT/k6.json" ./build/ui-Release/Reldex.exe
 
+# Scrolling WHILE the result is still streaming -- the realistic worst case.
+# `streamscroll` re-executes and then sweeps, so the timed frames overlap the
+# drains instead of following them.
+RELDEX_UI_METRICS=1 RELDEX_S15_AUTORUN=1 RELDEX_S15_ROWS=1000000 \
+  RELDEX_S15_SCROLL=sweep,streamscroll,sweep RELDEX_S15_SCROLL_FRAMES=600 \
+  RELDEX_S15_WARMUP_FRAMES=60 RELDEX_S15_OUT="$OUT/streamscroll.json" \
+  ./build/ui-Release/Reldex.exe
+
 # read any of the JSON files
-python docs/exec-plans/active/phase-1-s15-data/summarize.py "$OUT"/k1-*.json
+python docs/exec-plans/active/phase-1-s15-data/summarize.py "$OUT"/k1*.json
+python docs/exec-plans/active/phase-1-s15-data/summarize.py --gui "$OUT"/k1*.json
+python docs/exec-plans/active/phase-1-s15-data/summarize.py --drains "$OUT"/k6.json
+python docs/exec-plans/active/phase-1-s15-data/summarize.py --stream "$OUT"/k6.json
 python docs/exec-plans/active/phase-1-s15-data/summarize.py --runs "$OUT"/k2-cold-*.json
+python docs/exec-plans/active/phase-1-s15-data/summarize.py --runs --skip 1 "$OUT/k2-warm.json"
 ```
 
 The results are in `docs/exec-plans/active/phase-1-s15-ffi-spike.md`, with the

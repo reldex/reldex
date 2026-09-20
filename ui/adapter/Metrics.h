@@ -56,12 +56,16 @@ public:
     void markFirstRowsInserted() { if (isEnabled()) { recordFirstRowsInserted(); } }
     void markResultComplete(qint64 rows) { if (isEnabled()) { recordResultComplete(rows); } }
 
-    /// One drain of the hub's event queue: how many events it took and how
-    /// long it held the UI thread.
-    void recordDrain(int events, qint64 nanos)
+    /// One drain of the hub's event queue: how many events it took, how long
+    /// it held the UI thread, and how much of that was spent *inside* the
+    /// boundary (`reldex_hub_next_event` plus taking ownership of what the
+    /// event carried). The remainder is Qt model/view work — routing,
+    /// `applyBatch`, `endInsertRows` and the signals it emits — which is the
+    /// distinction spike S15's K4 turns on.
+    void recordDrain(int events, qint64 nanos, qint64 boundaryNanos)
     {
         if (isEnabled()) {
-            recordDrainImpl(events, nanos);
+            recordDrainImpl(events, nanos, boundaryNanos);
         }
     }
 
@@ -79,16 +83,20 @@ public:
     /// per-frame scene-graph CPU work from its
     /// `beforeSynchronizing`/`afterRendering` pair.
     ///
-    /// All three are emitted on the **render** thread (with the threaded
-    /// render loop), so the samples are taken there under a mutex rather than
+    /// `frameSwapped`, `beforeSynchronizing`, `afterSynchronizing` and
+    /// `afterRendering` are emitted on the **render** thread (with the threaded
+    /// render loop), so those samples are taken there under a mutex rather than
     /// queued to the GUI thread, which would time the GUI thread's backlog
-    /// instead of the frame.
+    /// instead of the frame. `afterAnimating` is emitted on the GUI thread; the
+    /// same mutex covers it.
     ///
-    /// Why both: with vsync on, a swap interval quantizes to the refresh
-    /// period, so it answers "did this frame make its budget?" and cannot
-    /// answer "how much work was this frame?". `afterFrameEnd - beforeFrameBegin`
-    /// answers the second. Neither is a verdict; the spike report says which
-    /// number it is judging against which threshold.
+    /// Why more than one bracket: with vsync on, a swap interval quantizes to
+    /// the refresh period, so it answers "did this frame make its budget?" and
+    /// cannot answer "how much work was this frame?".
+    /// `afterRendering - beforeSynchronizing` answers the second for the render
+    /// thread, and [`guiFrameStats`] answers it for the GUI thread, which is
+    /// where the view's `data()` calls live. None of them is a verdict; the
+    /// spike report says which number it judges against which threshold.
     Q_INVOKABLE void attachWindow(QQuickWindow *window);
 
     /// Clears every sample and starts a new run.
@@ -98,6 +106,11 @@ public:
     /// marks, the drains and the batch costs alone. A measurement phase that
     /// wants to discard its own warm-up frames uses this.
     Q_INVOKABLE void clearFrames();
+
+    /// Clears the drain and per-batch samples only, so a measurement phase can
+    /// report the drains that happened *during it* rather than since the
+    /// process started.
+    Q_INVOKABLE void clearDrains();
 
     /// Ends the current execute -> first-pixels run: appends its four marks to
     /// [`runs`] and re-arms them for the next execute. Frame, drain and batch
@@ -117,6 +130,25 @@ public:
     [[nodiscard]] Q_INVOKABLE QVariantMap renderWorkStats() const;
     [[nodiscard]] Q_INVOKABLE QVariantMap applyBatchStats() const;
     [[nodiscard]] Q_INVOKABLE QVariantMap drainStats() const;
+    [[nodiscard]] Q_INVOKABLE QVariantMap drainBoundaryStats() const;
+
+    /// The GUI thread's share of a frame: from the previous frame's swap to
+    /// the end of this frame's polish (`afterAnimating`).
+    ///
+    /// This is where `TableView` loads and reuses delegates and where every
+    /// `data()` call — and therefore the windowed bulk formatter — actually
+    /// runs, so without it a "per-frame cost" is only the render thread's half.
+    /// **It also contains whatever the platform's update-request idle wait is**
+    /// (`QT_QPA_UPDATE_IDLE_TIME`, 5 ms by default on this platform), so it is
+    /// only a cost when that wait is taken out of the way.
+    [[nodiscard]] Q_INVOKABLE QVariantMap guiFrameStats() const;
+    /// `beforeSynchronizing - afterAnimating`: the handover from the GUI
+    /// thread to the render thread. Not work; recorded so that the three
+    /// brackets account for the whole frame rather than most of it.
+    [[nodiscard]] Q_INVOKABLE QVariantMap guiHandoverStats() const;
+    /// `afterSynchronizing - beforeSynchronizing`: the sync, during which the
+    /// GUI thread is blocked and `updatePaintNode` runs.
+    [[nodiscard]] Q_INVOKABLE QVariantMap syncStats() const;
 
     /// True when `frameSwapped` was last delivered on this object's own
     /// thread, i.e. the scene graph is using a non-threaded render loop.
@@ -167,17 +199,20 @@ private:
     {
         qint64 atNs;
         qint64 nanos;
+        qint64 boundaryNanos;
         int events;
     };
 
     void recordMark(qint64 &slot);
     void recordFirstRowsInserted();
     void recordResultComplete(qint64 rows);
-    void recordDrainImpl(int events, qint64 nanos);
+    void recordDrainImpl(int events, qint64 nanos, qint64 boundaryNanos);
     void recordApplyBatchImpl(qint64 nanos);
     void onFrameSwapped();
     void onFrameBegin();
     void onFrameEnd();
+    void onAfterAnimating();
+    void onAfterSynchronizing();
 
     /// Bounded so a long run cannot grow without limit; K3 is about the data
     /// pipeline's memory, and the instrument must not be part of the answer.
@@ -205,9 +240,22 @@ private:
     /// `afterRendering - beforeSynchronizing`: the scene graph's own CPU cost
     /// for the frame, with neither the swapchain wait nor the present in it.
     QVector<qint64> m_renderWorkNs;
+    /// Previous swap -> this frame's `afterAnimating`: the GUI thread's share.
+    QVector<qint64> m_guiFrameNs;
+    /// `afterAnimating` -> `beforeSynchronizing`: the handover.
+    QVector<qint64> m_guiHandoverNs;
+    /// `beforeSynchronizing` -> `afterSynchronizing`: the sync.
+    QVector<qint64> m_syncNs;
     qint64 m_frameBeginNs = -1;
+    qint64 m_afterAnimatingNs = -1;
     qint64 m_lastFrameNs = -1;
     qint64 m_firstFrameAfterInsertNs = -1;
     bool m_rowsInserted = false;
+    /// Set by the first `afterSynchronizing` **after** rows were inserted, so
+    /// the frame credited to K2 is one whose sync could actually have carried
+    /// those rows. Without it the next `frameSwapped` is latched, and with the
+    /// threaded render loop that swap can belong to a frame synchronized
+    /// *before* the insert — i.e. K2 could be reported one frame early.
+    bool m_syncedAfterInsert = false;
     bool m_framesOnGuiThread = false;
 };

@@ -135,6 +135,15 @@ void Metrics::attachWindow(QQuickWindow *window)
             Qt::DirectConnection);
     connect(window, &QQuickWindow::afterRendering, this, &Metrics::onFrameEnd,
             Qt::DirectConnection);
+    // The GUI thread's half of the frame. `afterAnimating` is emitted on the
+    // GUI thread at the end of polish -- which is where `TableView` loads its
+    // delegates and where every `data()` call runs -- and `afterSynchronizing`
+    // closes the window in which a just-inserted row can first reach the scene
+    // graph.
+    connect(window, &QQuickWindow::afterAnimating, this, &Metrics::onAfterAnimating,
+            Qt::DirectConnection);
+    connect(window, &QQuickWindow::afterSynchronizing, this, &Metrics::onAfterSynchronizing,
+            Qt::DirectConnection);
 }
 
 void Metrics::reset()
@@ -153,10 +162,15 @@ void Metrics::reset()
     const QMutexLocker locker(&m_frameMutex);
     m_frameIntervalsNs.clear();
     m_renderWorkNs.clear();
+    m_guiFrameNs.clear();
+    m_guiHandoverNs.clear();
+    m_syncNs.clear();
     m_frameBeginNs = -1;
+    m_afterAnimatingNs = -1;
     m_lastFrameNs = -1;
     m_firstFrameAfterInsertNs = -1;
     m_rowsInserted = false;
+    m_syncedAfterInsert = false;
 }
 
 void Metrics::clearFrames()
@@ -164,11 +178,22 @@ void Metrics::clearFrames()
     const QMutexLocker locker(&m_frameMutex);
     m_frameIntervalsNs.clear();
     m_renderWorkNs.clear();
+    m_guiFrameNs.clear();
+    m_guiHandoverNs.clear();
+    m_syncNs.clear();
     // Not `m_lastFrameNs`: clearing it would drop the interval that spans the
     // clear, which is the one frame a phase boundary actually costs. Keeping
     // it means the first recorded interval of a phase is measured from the
     // last frame of the previous one -- which is the truth about that frame.
     m_frameBeginNs = -1;
+}
+
+void Metrics::clearDrains()
+{
+    m_drains.clear();
+    m_applyBatchNs.clear();
+    m_drainTotalNs = 0;
+    m_drainTotalEvents = 0;
 }
 
 void Metrics::endRun()
@@ -182,6 +207,7 @@ void Metrics::endRun()
         run.insert(QStringLiteral("firstFrameAfterInsertNs"), m_firstFrameAfterInsertNs);
         m_firstFrameAfterInsertNs = -1;
         m_rowsInserted = false;
+        m_syncedAfterInsert = false;
     }
     m_runs.append(run);
 
@@ -205,9 +231,21 @@ void Metrics::recordMark(qint64 &slot)
 
 void Metrics::recordFirstRowsInserted()
 {
+    // `SessionController` calls this for **every** batch, not only the first,
+    // so the "wait for a sync that happened after the insert" gate is armed
+    // only on the run's first insert. Arming it per batch would hold the latch
+    // open until a sync happened with no batch landing in between -- which,
+    // during a 1,000,000-row stream, is not until the stream is nearly done.
+    // Measured before this guard: 1,401 ms reported for a first frame that
+    // arrives in ~11 ms.
+    const bool firstOfRun = m_firstRowsInsertedNs < 0;
     recordMark(m_firstRowsInsertedNs);
+    if (!firstOfRun) {
+        return;
+    }
     const QMutexLocker locker(&m_frameMutex);
     m_rowsInserted = true;
+    m_syncedAfterInsert = false;
 }
 
 void Metrics::recordResultComplete(qint64 rows)
@@ -216,12 +254,12 @@ void Metrics::recordResultComplete(qint64 rows)
     recordMark(m_resultCompleteNs);
 }
 
-void Metrics::recordDrainImpl(int events, qint64 nanos)
+void Metrics::recordDrainImpl(int events, qint64 nanos, qint64 boundaryNanos)
 {
     m_drainTotalNs += nanos;
     m_drainTotalEvents += events;
     if (m_drains.size() < kMaxSamples) {
-        m_drains.append(DrainSample { m_clock.nsecsElapsed(), nanos, events });
+        m_drains.append(DrainSample { m_clock.nsecsElapsed(), nanos, boundaryNanos, events });
     }
 }
 
@@ -244,7 +282,13 @@ void Metrics::onFrameSwapped()
     {
         const QMutexLocker locker(&m_frameMutex);
         m_framesOnGuiThread = QThread::currentThread() == thread();
-        if (m_rowsInserted && m_firstFrameAfterInsertNs < 0) {
+        // `m_syncedAfterInsert`, not just `m_rowsInserted`: with the threaded
+        // render loop the very next swap can belong to a frame that was
+        // synchronized before the rows were inserted, and crediting that swap
+        // to K2 reports the latency one frame early. Waiting for a sync that
+        // happened after the insert can instead be one frame late, which is
+        // the direction a latency measurement should err in.
+        if (m_rowsInserted && m_syncedAfterInsert && m_firstFrameAfterInsertNs < 0) {
             m_firstFrameAfterInsertNs = now;
             firstFrame = true;
         }
@@ -261,6 +305,34 @@ void Metrics::onFrameSwapped()
     }
 }
 
+void Metrics::onAfterAnimating()
+{
+    if (!isEnabled()) {
+        return;
+    }
+    const qint64 now = m_clock.nsecsElapsed();
+    const QMutexLocker locker(&m_frameMutex);
+    if (m_lastFrameNs >= 0 && m_guiFrameNs.size() < kMaxSamples) {
+        m_guiFrameNs.append(now - m_lastFrameNs);
+    }
+    m_afterAnimatingNs = now;
+}
+
+void Metrics::onAfterSynchronizing()
+{
+    if (!isEnabled()) {
+        return;
+    }
+    const qint64 now = m_clock.nsecsElapsed();
+    const QMutexLocker locker(&m_frameMutex);
+    if (m_frameBeginNs >= 0 && m_syncNs.size() < kMaxSamples) {
+        m_syncNs.append(now - m_frameBeginNs);
+    }
+    if (m_rowsInserted) {
+        m_syncedAfterInsert = true;
+    }
+}
+
 void Metrics::onFrameBegin()
 {
     if (!isEnabled()) {
@@ -268,6 +340,10 @@ void Metrics::onFrameBegin()
     }
     const qint64 now = m_clock.nsecsElapsed();
     const QMutexLocker locker(&m_frameMutex);
+    if (m_afterAnimatingNs >= 0 && m_guiHandoverNs.size() < kMaxSamples) {
+        m_guiHandoverNs.append(now - m_afterAnimatingNs);
+    }
+    m_afterAnimatingNs = -1;
     m_frameBeginNs = now;
 }
 
@@ -307,6 +383,24 @@ QVariantMap Metrics::applyBatchStats() const
     return statsOf(m_applyBatchNs);
 }
 
+QVariantMap Metrics::guiFrameStats() const
+{
+    const QMutexLocker locker(&m_frameMutex);
+    return statsOf(m_guiFrameNs);
+}
+
+QVariantMap Metrics::guiHandoverStats() const
+{
+    const QMutexLocker locker(&m_frameMutex);
+    return statsOf(m_guiHandoverNs);
+}
+
+QVariantMap Metrics::syncStats() const
+{
+    const QMutexLocker locker(&m_frameMutex);
+    return statsOf(m_syncNs);
+}
+
 QVariantMap Metrics::drainStats() const
 {
     QVector<qint64> nanos;
@@ -317,6 +411,16 @@ QVariantMap Metrics::drainStats() const
     QVariantMap map = statsOf(std::move(nanos));
     map.insert(QStringLiteral("totalEvents"), m_drainTotalEvents);
     return map;
+}
+
+QVariantMap Metrics::drainBoundaryStats() const
+{
+    QVector<qint64> nanos;
+    nanos.reserve(m_drains.size());
+    for (const DrainSample &sample : m_drains) {
+        nanos.append(sample.boundaryNanos);
+    }
+    return statsOf(std::move(nanos));
 }
 
 QVariantMap Metrics::summary() const
@@ -357,6 +461,7 @@ bool Metrics::writeCsv(const QString &path) const
     out << "mark,privateBytes," << privateBytes() << ",\n";
     for (const DrainSample &sample : m_drains) {
         out << "drain," << sample.atNs << ',' << sample.events << ',' << sample.nanos << '\n';
+        out << "drainboundary," << sample.boundaryNanos << ",,\n";
     }
     for (const qint64 nanos : m_applyBatchNs) {
         out << "applybatch," << nanos << ",,\n";
