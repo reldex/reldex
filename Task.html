@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-20T16:18:00+07:00",
+  "updatedAt": "2026-09-20T17:35:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1092,7 +1092,7 @@
               "status": "done"
             },
             {
-              "title": "M1.3 ★ crates/ffi skeleton: hub, session open/execute/fetch, batch views, errors, waker (opus, review mandatory) — done 2026-09-20: reldex-ffi (cdylib+staticlib), 31 exports, ABI 2, cbindgen header crates/ffi/include/reldex.h checked in CI; independently reviewed (3 must-fix + 9 should-fix fixed); interim per-session pump until M2.5; Miri/ASan not yet run (ADR-0003 A9)",
+              "title": "M1.3 ★ crates/ffi skeleton: hub, session open/execute/fetch, batch views, errors, waker (opus, review mandatory) — done 2026-09-20: reldex-ffi (cdylib+staticlib), 31 exports, ABI 2, cbindgen header crates/ffi/include/reldex.h checked in CI; independently reviewed (3 must-fix + 9 should-fix fixed); interim per-session pump until M2.5; Miri/ASan not yet run (ADR-0003 A9); ABI 3 the same day from the first consumers' findings: NUMBER/TIMESTAMP mirrors only on request (they cost 62 B/row nobody read), reldex_live_counts, column descriptions at EXECUTED, result id on FETCHED — independently reviewed (2 must-fix fixed)",
               "status": "done"
             },
             {
@@ -1618,6 +1618,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-20",
+      "text": "reldex-ffi ABI 3: the first consumers (Qt adapter review, C harness) showed that viewing every column made the library build NUMBER/TIMESTAMP mirrors nobody read — 62.0 B/row, about 30% of K3's 200 MB budget. Mirrors are now built only on request; added live-handle counts (K5 can assert 'nothing leaked' without ASan, which is unavailable on the dev machine), column descriptions at EXECUTED, result id on FETCHED, an empty-result mock. Independent review found a use-after-free in the pump-panic path of the new column accessor (fixed: retire, never free) and a missing result id on panic-answered events (fixed). ADR-0003 A19-A25, still Proposed."
+    },
     {
       "date": "2026-09-20",
       "text": "M1.4 done: C smoke harness (C11 and C++17, 149 checks, ASan/UBSan clean on Linux CI) plus the UI CI workflow — Qt 6.8.3 builds and offscreen tests pass on Windows, Linux and macOS runners, slowest cold job 3m02s against K7's 25-minute budget. CI revealed and fixed 6 portability bugs in the M1.5 skeleton (hard-coded toolchain paths in env.sh, a macOS dylib copy race, Qt 6.8.3 vs the macOS 26 SDK's removed AGL framework — patched in CI only, QTBUG-137687). K7 numbers are CI evidence; the formal verdict belongs to the S15 report (M1.8)."
