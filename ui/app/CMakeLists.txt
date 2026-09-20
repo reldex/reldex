@@ -34,4 +34,5 @@ target_link_libraries(Reldex
 )
 
 reldex_enable_warnings(Reldex)
+reldex_enable_sanitizers(Reldex)
 reldex_deploy_ffi_dll(Reldex)

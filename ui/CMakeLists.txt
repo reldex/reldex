@@ -33,6 +33,17 @@ endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CompilerWarnings)
+include(Sanitizers)
+
+# See ui/cmake/Sanitizers.cmake for what this instruments, what it never
+# touches, and why (ADR-0003 K5). Declared here, before any add_subdirectory()
+# below, so reldex_enable_sanitizers() sees a defined RELDEX_SANITIZE in
+# every subdirectory, including ui/tests/ffi_smoke's own copy of this same
+# option.
+option(RELDEX_SANITIZE
+    "Build our own targets (reldex_adapter, the Reldex app, every QTest binary, the ffi_smoke harness) with -fsanitize=address,undefined (GCC/Clang only; Qt and the reldex-ffi Rust cdylib stay uninstrumented, but ASan still intercepts their malloc/free from this process). See ui/build.sh --sanitize."
+    OFF
+)
 
 # Captured here (this file's own scope), not read directly inside
 # reldex_deploy_ffi_dll() below: CMAKE_CURRENT_SOURCE_DIR inside a function

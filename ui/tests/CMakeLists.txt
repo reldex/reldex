@@ -54,6 +54,7 @@ target_link_libraries(tst_coreinfo
 )
 
 reldex_enable_warnings(tst_coreinfo)
+reldex_enable_sanitizers(tst_coreinfo)
 reldex_deploy_ffi_dll(tst_coreinfo)
 
 add_test(NAME tst_coreinfo COMMAND tst_coreinfo)
@@ -98,6 +99,7 @@ function(reldex_add_adapter_test name)
             reldex_adapter
     )
     reldex_enable_warnings(${name})
+    reldex_enable_sanitizers(${name})
     reldex_deploy_ffi_dll(${name})
     add_test(NAME ${name} COMMAND ${name})
 endfunction()

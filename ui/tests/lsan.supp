@@ -1,0 +1,16 @@
+# LeakSanitizer suppressions for the qt-asan CI job (ui/build.sh --sanitize,
+# .github/workflows/ui.yml's qt-asan job). Wired via
+# LSAN_OPTIONS=suppressions=ui/tests/lsan.supp.
+#
+# Rule (M1.9 / ADR-0003 K5 brief): suppress ONLY by specific third-party
+# frame, each entry commented with why. A leak or error whose stack includes
+# a ui/adapter, ui/tests or reldex_ffi frame is never suppressed here -- it is
+# a finding, reported as-is.
+#
+# Syntax: https://github.com/google/sanitizers/wiki/AddressSanitizerLeakSanitizer#suppressions
+# leak:<pattern matched against the leak report's function/library names>
+#
+# No suppressions have been needed yet -- entries are added here only after a
+# CI run reports a leak whose full stack is confirmed to originate entirely
+# outside our own code (Qt, fontconfig, the GL/offscreen stack, or a
+# documented intentional Rust static per ADR-0003 A17).
