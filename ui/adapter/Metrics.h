@@ -17,6 +17,7 @@
 #include <QMutex>
 #include <QObject>
 #include <QString>
+#include <QVariantList>
 #include <QVariantMap>
 #include <QVector>
 #include <QtQml/qqmlregistration.h>
@@ -64,18 +65,64 @@ public:
         }
     }
 
-    /// Starts recording frame intervals from `window`'s swap signal.
+    /// One `ResultTableModel::applyBatch()` call: spike S15's K4 measures
+    /// exactly this -- event delivered until the batch is described and its
+    /// columns are viewable.
+    void recordApplyBatch(qint64 nanos)
+    {
+        if (isEnabled()) {
+            recordApplyBatchImpl(nanos);
+        }
+    }
+
+    /// Starts recording frame intervals from `window`'s swap signal, and the
+    /// per-frame scene-graph CPU work from its
+    /// `beforeSynchronizing`/`afterRendering` pair.
     ///
-    /// `frameSwapped` is emitted on the **render** thread, so the sample is
-    /// taken there under a mutex rather than queued to the GUI thread, which
-    /// would time the GUI thread's backlog instead of the frame.
+    /// All three are emitted on the **render** thread (with the threaded
+    /// render loop), so the samples are taken there under a mutex rather than
+    /// queued to the GUI thread, which would time the GUI thread's backlog
+    /// instead of the frame.
+    ///
+    /// Why both: with vsync on, a swap interval quantizes to the refresh
+    /// period, so it answers "did this frame make its budget?" and cannot
+    /// answer "how much work was this frame?". `afterFrameEnd - beforeFrameBegin`
+    /// answers the second. Neither is a verdict; the spike report says which
+    /// number it is judging against which threshold.
     Q_INVOKABLE void attachWindow(QQuickWindow *window);
 
     /// Clears every sample and starts a new run.
     Q_INVOKABLE void reset();
 
+    /// Clears the frame-interval and render-work samples only, leaving the
+    /// marks, the drains and the batch costs alone. A measurement phase that
+    /// wants to discard its own warm-up frames uses this.
+    Q_INVOKABLE void clearFrames();
+
+    /// Ends the current execute -> first-pixels run: appends its four marks to
+    /// [`runs`] and re-arms them for the next execute. Frame, drain and batch
+    /// samples are untouched.
+    Q_INVOKABLE void endRun();
+
+    /// One entry per [`endRun`], each a map of the four marks in nanoseconds.
+    [[nodiscard]] Q_INVOKABLE QVariantList runs() const;
+
     /// The marks and the aggregates, for a quick look from QML or a test.
     [[nodiscard]] Q_INVOKABLE QVariantMap summary() const;
+
+    /// count / min / mean / p50 / p90 / p95 / p99 / max in nanoseconds, plus
+    /// the number of samples above a few fixed millisecond marks. Aggregates,
+    /// not verdicts: nothing here knows what a threshold is.
+    [[nodiscard]] Q_INVOKABLE QVariantMap frameStats() const;
+    [[nodiscard]] Q_INVOKABLE QVariantMap renderWorkStats() const;
+    [[nodiscard]] Q_INVOKABLE QVariantMap applyBatchStats() const;
+    [[nodiscard]] Q_INVOKABLE QVariantMap drainStats() const;
+
+    /// True when `frameSwapped` was last delivered on this object's own
+    /// thread, i.e. the scene graph is using a non-threaded render loop.
+    /// `false` before the first frame is meaningless, so the summary reports
+    /// the frame count next to it.
+    [[nodiscard]] Q_INVOKABLE bool framesOnGuiThread() const;
 
     /// Writes every recorded sample as CSV: a `section,a,b,c` shape M1.8 can
     /// parse without a schema. Returns false if the file could not be written.
@@ -108,6 +155,13 @@ public:
 Q_SIGNALS:
     void enabledChanged();
 
+    /// Emitted once per run, from the thread that swapped the frame, when the
+    /// first frame after the first inserted rows has been presented -- spike
+    /// S15's K2 end point. A measurement driver connects to it queued (the
+    /// default across threads) and must not do work in the slot beyond
+    /// recording.
+    void firstFrameAfterInsert();
+
 private:
     struct DrainSample
     {
@@ -120,7 +174,10 @@ private:
     void recordFirstRowsInserted();
     void recordResultComplete(qint64 rows);
     void recordDrainImpl(int events, qint64 nanos);
+    void recordApplyBatchImpl(qint64 nanos);
     void onFrameSwapped();
+    void onFrameBegin();
+    void onFrameEnd();
 
     /// Bounded so a long run cannot grow without limit; K3 is about the data
     /// pipeline's memory, and the instrument must not be part of the answer.
@@ -139,9 +196,18 @@ private:
     qint64 m_drainTotalNs = 0;
     qint64 m_drainTotalEvents = 0;
 
+    QVector<qint64> m_applyBatchNs;
+
+    QVariantList m_runs;
+
     mutable QMutex m_frameMutex;
     QVector<qint64> m_frameIntervalsNs;
+    /// `afterRendering - beforeSynchronizing`: the scene graph's own CPU cost
+    /// for the frame, with neither the swapchain wait nor the present in it.
+    QVector<qint64> m_renderWorkNs;
+    qint64 m_frameBeginNs = -1;
     qint64 m_lastFrameNs = -1;
     qint64 m_firstFrameAfterInsertNs = -1;
     bool m_rowsInserted = false;
+    bool m_framesOnGuiThread = false;
 };

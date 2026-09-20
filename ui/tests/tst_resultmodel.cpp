@@ -7,7 +7,9 @@
 #include <QRandomGenerator>
 #include <QSignalSpy>
 #include <QTest>
+#include <QVariantMap>
 
+#include <algorithm>
 #include <utility>
 
 using adapter_test::liveCounts;
@@ -39,6 +41,7 @@ private Q_SLOTS:
     void reExecutingDuringAStreamRunsTheNewResultToCompletion();
     void zeroRowsMeansTheMocksDocumentedDefault();
     void sanityStreamOfAMillionRows();
+    void spikeS15BoundaryCost();
 };
 
 void TstResultModel::modelTesterSurvivesAMultiBatchStream()
@@ -712,6 +715,103 @@ void TstResultModel::sanityStreamOfAMillionRows()
           warmCells > 0 ? static_cast<double>(warmNs) / static_cast<double>(warmCells) : 0.0,
           static_cast<long long>(rssAfter), model->formattedWindowCount(),
           static_cast<long long>(model->formattedBytes()));
+}
+
+void TstResultModel::spikeS15BoundaryCost()
+{
+    // Spike S15's K4, headless, measured rather than asserted: this test
+    // **has no timing bound of its own** and never fails on a number
+    // (AGENTS.md: a perf gate belongs with the benchmark, not in the normal
+    // suite). It is skipped unless asked for, exactly like the 1M sanity
+    // stream above:
+    //
+    //   RELDEX_S15_K4=1 ./tst_resultmodel spikeS15BoundaryCost -o k4.txt,txt
+    //
+    // What it separates, and why: K4 has two halves with different units --
+    // a per-batch cost (event delivered -> batch described and its columns
+    // viewable, i.e. `applyBatch`) and a per-cell `data()` cost. The per-cell
+    // half differs by column kind, because `TEXT` is read straight out of the
+    // borrowed UTF-8 while `NUMBER` and `DATE` come from the bulk formatter's
+    // windowed arena -- so one average over "a cell" would hide the only
+    // distinction that matters.
+    if (adapter_test::envNumber("RELDEX_S15_K4", 0) == 0) {
+        QSKIP("set RELDEX_S15_K4=1 to run the S15 boundary-cost measurement");
+    }
+    const qint64 rows = adapter_test::envNumber("RELDEX_S15_ROWS", 1000000);
+    const int fetchRows = static_cast<int>(adapter_test::envNumber("RELDEX_S15_FETCH_ROWS", 1000));
+    const int inFlight =
+            static_cast<int>(adapter_test::envNumber("RELDEX_S15_FETCHES_IN_FLIGHT", 2));
+
+    Bridge bridge;
+    QVERIFY(bridge.isValid());
+    // Recording on, so `applyBatch` is timed for every batch of the stream.
+    bridge.metrics()->setEnabled(true);
+    ResultTableModel *model = bridge.session()->model();
+
+    const qint64 rssBefore = Metrics::residentBytes();
+    const qint64 privateBefore = Metrics::privateBytes();
+    QElapsedTimer wall;
+    wall.start();
+    QVERIFY(streamGeneratedQuery(bridge, rows, fetchRows, inFlight, 0, 900000));
+    const qint64 streamMs = wall.elapsed();
+    const qint64 rssDelta = Metrics::residentBytes() - rssBefore;
+    const qint64 privateDelta = Metrics::privateBytes() - privateBefore;
+    QCOMPARE(static_cast<qint64>(model->rowCount()), rows);
+
+    const QVariantMap apply = bridge.metrics()->applyBatchStats();
+    qInfo("K4 applyBatch over %lld batches: p50 %lld ns, p99 %lld ns, max %lld ns, mean %lld ns",
+          apply.value(QStringLiteral("count")).toLongLong(),
+          apply.value(QStringLiteral("p50Ns")).toLongLong(),
+          apply.value(QStringLiteral("p99Ns")).toLongLong(),
+          apply.value(QStringLiteral("maxNs")).toLongLong(),
+          apply.value(QStringLiteral("meanNs")).toLongLong());
+
+    // --- per-cell, one column kind at a time --------------------------------
+    // A viewport-sized block of rows far enough into the result that nothing
+    // about it is the first batch.
+    const int base = static_cast<int>(std::min<qint64>(rows / 2, model->rowCount() - 2048));
+    constexpr int kViewportRows = 40;
+    constexpr int kRepeats = 200;
+
+    const char *const names[] = { "NUMBER (formatted)", "VARCHAR2 (zero-copy text)",
+                                  "DATE (formatted)" };
+    for (int column = 0; column < 3; ++column) {
+        // Cold: this (batch, column, window) has never been rendered, so the
+        // first read pays for the whole window. Measured on a window nothing
+        // else has touched, one per column.
+        const int coldRow = base + ((column + 1) * ResultTableModel::formatWindowRows() * 3);
+        QElapsedTimer cold;
+        cold.start();
+        const QVariant coldCell = model->data(model->index(coldRow, column), Qt::DisplayRole);
+        const qint64 coldNs = cold.nsecsElapsed();
+        QVERIFY(coldCell.isValid());
+
+        // Warm: the window is now rendered, so this is what a repaint pays.
+        QElapsedTimer warm;
+        warm.start();
+        qint64 cells = 0;
+        for (int repeat = 0; repeat < kRepeats; ++repeat) {
+            for (int row = base; row < base + kViewportRows; ++row) {
+                QVERIFY(model->data(model->index(row, column), Qt::DisplayRole).isValid());
+                ++cells;
+            }
+        }
+        const qint64 warmNs = warm.nsecsElapsed();
+        qInfo("K4 data() column %d %-26s cold first cell %lld ns; warm %.1f ns/cell over %lld "
+              "cells",
+              column, names[column], static_cast<long long>(coldNs),
+              static_cast<double>(warmNs) / static_cast<double>(cells),
+              static_cast<long long>(cells));
+    }
+
+    qInfo("K4 context: %lld rows in %lld ms; RSS +%lld B (%.1f B/row); private +%lld B "
+          "(%.1f B/row); formatted cache %d windows / %lld bytes; batches %d",
+          static_cast<long long>(rows), static_cast<long long>(streamMs),
+          static_cast<long long>(rssDelta), static_cast<double>(rssDelta) / static_cast<double>(rows),
+          static_cast<long long>(privateDelta),
+          static_cast<double>(privateDelta) / static_cast<double>(rows),
+          model->formattedWindowCount(), static_cast<long long>(model->formattedBytes()),
+          model->batchCount());
 }
 
 QTEST_GUILESS_MAIN(TstResultModel)

@@ -1,0 +1,11 @@
+variant,stage,n,p50_ms,p95_ms,max_ms,mean_ms
+"cold process, execute at startup",execute -> first rows in model,30,190.65,198.22,202.47,191.28
+"cold process, execute at startup",execute -> first frame swapped,30,621.97,810.77,811.47,636.88
+"cold process, window already drawn",execute -> first rows in model,10,2.01,2.29,2.29,2.05
+"cold process, window already drawn",execute -> first frame swapped,10,431.82,459.68,459.68,434.26
+"warm, 2nd..31st execute in one process",execute -> first rows in model,30,1.3,1.56,1.57,1.28
+"warm, 2nd..31st execute in one process",execute -> first frame swapped,30,11.16,12.3,12.35,11.2
+"cold process, 1000-row result",execute -> first rows in model,8,188.27,196.21,196.21,165.97
+"cold process, 1000-row result",execute -> first frame swapped,8,617.12,622.7,622.7,594.13
+"cold process, 100000-row result",execute -> first rows in model,8,191.27,203.8,203.8,193.17
+"cold process, 100000-row result",execute -> first frame swapped,8,634.31,661.0,661.0,633.73

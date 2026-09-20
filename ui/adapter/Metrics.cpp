@@ -8,7 +8,10 @@
 #include <QFile>
 #include <QMutexLocker>
 #include <QTextStream>
+#include <QThread>
 #include <QtQuick/QQuickWindow>
+
+#include <algorithm>
 
 #ifdef Q_OS_WIN
 #ifndef WIN32_LEAN_AND_MEAN
@@ -30,6 +33,66 @@ bool metricsEnabledByEnvironment()
 {
     const QByteArray value = qgetenv("RELDEX_UI_METRICS");
     return !value.isEmpty() && value != "0";
+}
+
+/// Nearest-rank percentile over an already-sorted vector. Nearest-rank rather
+/// than interpolated because these are latencies: a reported p99 should be a
+/// frame that actually happened, not an average of two that did.
+qint64 percentileOf(const QVector<qint64> &sorted, double fraction)
+{
+    if (sorted.isEmpty()) {
+        return -1;
+    }
+    auto rank = static_cast<qsizetype>(fraction * static_cast<double>(sorted.size()));
+    rank = std::clamp<qsizetype>(rank, 0, sorted.size() - 1);
+    return sorted.at(rank);
+}
+
+/// count / min / mean / percentiles / max, plus how many samples sat above a
+/// few fixed millisecond marks. The marks are *counts*, deliberately not
+/// judgements: 8 ms and 16.7 ms are the two numbers K1 is written in terms of,
+/// 33 ms is K6's, and 20 ms is here because it is the next refresh period up
+/// at 50 Hz and makes a near-miss visible.
+QVariantMap statsOf(QVector<qint64> samples)
+{
+    QVariantMap map;
+    map.insert(QStringLiteral("count"), static_cast<qint64>(samples.size()));
+    if (samples.isEmpty()) {
+        return map;
+    }
+    std::sort(samples.begin(), samples.end());
+    qint64 total = 0;
+    qint64 over8 = 0;
+    qint64 over16_7 = 0;
+    qint64 over20 = 0;
+    qint64 over33 = 0;
+    for (const qint64 sample : samples) {
+        total += sample;
+        if (sample > 8000000) {
+            ++over8;
+        }
+        if (sample > 16700000) {
+            ++over16_7;
+        }
+        if (sample > 20000000) {
+            ++over20;
+        }
+        if (sample > 33000000) {
+            ++over33;
+        }
+    }
+    map.insert(QStringLiteral("minNs"), samples.first());
+    map.insert(QStringLiteral("meanNs"), total / samples.size());
+    map.insert(QStringLiteral("p50Ns"), percentileOf(samples, 0.50));
+    map.insert(QStringLiteral("p90Ns"), percentileOf(samples, 0.90));
+    map.insert(QStringLiteral("p95Ns"), percentileOf(samples, 0.95));
+    map.insert(QStringLiteral("p99Ns"), percentileOf(samples, 0.99));
+    map.insert(QStringLiteral("maxNs"), samples.last());
+    map.insert(QStringLiteral("over8ms"), over8);
+    map.insert(QStringLiteral("over16_7ms"), over16_7);
+    map.insert(QStringLiteral("over20ms"), over20);
+    map.insert(QStringLiteral("over33ms"), over33);
+    return map;
 }
 
 } // namespace
@@ -60,6 +123,18 @@ void Metrics::attachWindow(QQuickWindow *window)
     // is where the frame actually was.
     connect(window, &QQuickWindow::frameSwapped, this, &Metrics::onFrameSwapped,
             Qt::DirectConnection);
+    // `beforeSynchronizing` .. `afterRendering`, NOT
+    // `beforeFrameBegin` .. `afterFrameEnd`. The obvious pair is the wrong
+    // one, and measurement rather than reasoning settled it: `QRhi::beginFrame`
+    // -- which contains the swapchain's frame-latency wait -- runs *inside*
+    // `beforeFrameBegin`/`afterFrameEnd`, so on a throttled desktop that pair
+    // reported 252 ms per frame while the scene graph's own work was 0.3 ms.
+    // This pair brackets the scene graph's CPU work for the frame (sync plus
+    // the render pass) and excludes both the wait and the present.
+    connect(window, &QQuickWindow::beforeSynchronizing, this, &Metrics::onFrameBegin,
+            Qt::DirectConnection);
+    connect(window, &QQuickWindow::afterRendering, this, &Metrics::onFrameEnd,
+            Qt::DirectConnection);
 }
 
 void Metrics::reset()
@@ -72,12 +147,53 @@ void Metrics::reset()
     m_drains.clear();
     m_drainTotalNs = 0;
     m_drainTotalEvents = 0;
+    m_applyBatchNs.clear();
+    m_runs.clear();
 
     const QMutexLocker locker(&m_frameMutex);
     m_frameIntervalsNs.clear();
+    m_renderWorkNs.clear();
+    m_frameBeginNs = -1;
     m_lastFrameNs = -1;
     m_firstFrameAfterInsertNs = -1;
     m_rowsInserted = false;
+}
+
+void Metrics::clearFrames()
+{
+    const QMutexLocker locker(&m_frameMutex);
+    m_frameIntervalsNs.clear();
+    m_renderWorkNs.clear();
+    // Not `m_lastFrameNs`: clearing it would drop the interval that spans the
+    // clear, which is the one frame a phase boundary actually costs. Keeping
+    // it means the first recorded interval of a phase is measured from the
+    // last frame of the previous one -- which is the truth about that frame.
+    m_frameBeginNs = -1;
+}
+
+void Metrics::endRun()
+{
+    QVariantMap run;
+    run.insert(QStringLiteral("executeSubmittedNs"), m_executeSubmittedNs);
+    run.insert(QStringLiteral("firstEventNs"), m_firstEventNs);
+    run.insert(QStringLiteral("firstRowsInsertedNs"), m_firstRowsInsertedNs);
+    {
+        const QMutexLocker locker(&m_frameMutex);
+        run.insert(QStringLiteral("firstFrameAfterInsertNs"), m_firstFrameAfterInsertNs);
+        m_firstFrameAfterInsertNs = -1;
+        m_rowsInserted = false;
+    }
+    m_runs.append(run);
+
+    m_executeSubmittedNs = -1;
+    m_firstEventNs = -1;
+    m_firstRowsInsertedNs = -1;
+    m_resultCompleteNs = -1;
+}
+
+QVariantList Metrics::runs() const
+{
+    return m_runs;
 }
 
 void Metrics::recordMark(qint64 &slot)
@@ -109,6 +225,13 @@ void Metrics::recordDrainImpl(int events, qint64 nanos)
     }
 }
 
+void Metrics::recordApplyBatchImpl(qint64 nanos)
+{
+    if (m_applyBatchNs.size() < kMaxSamples) {
+        m_applyBatchNs.append(nanos);
+    }
+}
+
 void Metrics::onFrameSwapped()
 {
     // Runs on the render thread (DirectConnection), which is why `m_enabled`
@@ -117,14 +240,83 @@ void Metrics::onFrameSwapped()
         return;
     }
     const qint64 now = m_clock.nsecsElapsed();
+    bool firstFrame = false;
+    {
+        const QMutexLocker locker(&m_frameMutex);
+        m_framesOnGuiThread = QThread::currentThread() == thread();
+        if (m_rowsInserted && m_firstFrameAfterInsertNs < 0) {
+            m_firstFrameAfterInsertNs = now;
+            firstFrame = true;
+        }
+        if (m_lastFrameNs >= 0 && m_frameIntervalsNs.size() < kMaxSamples) {
+            m_frameIntervalsNs.append(now - m_lastFrameNs);
+        }
+        m_lastFrameNs = now;
+    }
+    if (firstFrame) {
+        // Outside the lock: a slot connected to this must never be able to
+        // deadlock against the recorder, and across threads this is queued
+        // anyway.
+        Q_EMIT firstFrameAfterInsert();
+    }
+}
+
+void Metrics::onFrameBegin()
+{
+    if (!isEnabled()) {
+        return;
+    }
+    const qint64 now = m_clock.nsecsElapsed();
     const QMutexLocker locker(&m_frameMutex);
-    if (m_rowsInserted && m_firstFrameAfterInsertNs < 0) {
-        m_firstFrameAfterInsertNs = now;
+    m_frameBeginNs = now;
+}
+
+void Metrics::onFrameEnd()
+{
+    if (!isEnabled()) {
+        return;
     }
-    if (m_lastFrameNs >= 0 && m_frameIntervalsNs.size() < kMaxSamples) {
-        m_frameIntervalsNs.append(now - m_lastFrameNs);
+    const qint64 now = m_clock.nsecsElapsed();
+    const QMutexLocker locker(&m_frameMutex);
+    if (m_frameBeginNs >= 0 && m_renderWorkNs.size() < kMaxSamples) {
+        m_renderWorkNs.append(now - m_frameBeginNs);
     }
-    m_lastFrameNs = now;
+    m_frameBeginNs = -1;
+}
+
+bool Metrics::framesOnGuiThread() const
+{
+    const QMutexLocker locker(&m_frameMutex);
+    return m_framesOnGuiThread;
+}
+
+QVariantMap Metrics::frameStats() const
+{
+    const QMutexLocker locker(&m_frameMutex);
+    return statsOf(m_frameIntervalsNs);
+}
+
+QVariantMap Metrics::renderWorkStats() const
+{
+    const QMutexLocker locker(&m_frameMutex);
+    return statsOf(m_renderWorkNs);
+}
+
+QVariantMap Metrics::applyBatchStats() const
+{
+    return statsOf(m_applyBatchNs);
+}
+
+QVariantMap Metrics::drainStats() const
+{
+    QVector<qint64> nanos;
+    nanos.reserve(m_drains.size());
+    for (const DrainSample &sample : m_drains) {
+        nanos.append(sample.nanos);
+    }
+    QVariantMap map = statsOf(std::move(nanos));
+    map.insert(QStringLiteral("totalEvents"), m_drainTotalEvents);
+    return map;
 }
 
 QVariantMap Metrics::summary() const
@@ -166,11 +358,17 @@ bool Metrics::writeCsv(const QString &path) const
     for (const DrainSample &sample : m_drains) {
         out << "drain," << sample.atNs << ',' << sample.events << ',' << sample.nanos << '\n';
     }
+    for (const qint64 nanos : m_applyBatchNs) {
+        out << "applybatch," << nanos << ",,\n";
+    }
     {
         const QMutexLocker locker(&m_frameMutex);
         out << "mark,firstFrameAfterInsertNs," << m_firstFrameAfterInsertNs << ",\n";
         for (const qint64 interval : m_frameIntervalsNs) {
             out << "frame," << interval << ",,\n";
+        }
+        for (const qint64 nanos : m_renderWorkNs) {
+            out << "renderwork," << nanos << ",,\n";
         }
     }
     out.flush();

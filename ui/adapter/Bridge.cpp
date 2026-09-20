@@ -105,6 +105,11 @@ Bridge::Bridge(QObject *parent)
     // holding a callback into storage whose destructor never runs, because a
     // constructor that does not complete has no destructor call to undo it.
     m_metrics = new Metrics(this);
+    // Created unconditionally, like `Metrics`, so `bridge.scrollDriver` is
+    // never null in QML even on a Bridge that refuses to start. It reads the
+    // environment in its constructor and does nothing else unless a
+    // measurement run asked for it.
+    m_scrollDriver = new ScrollDriver(this, this);
 
     const quint32 abi = reldex_abi_version();
     if ((abi >> 16) != static_cast<quint32>(RELDEX_ABI_VERSION_MAJOR)) {
@@ -248,6 +253,12 @@ bool Bridge::run()
 
 bool Bridge::autoStart()
 {
+    if (m_scrollDriver != nullptr && m_scrollDriver->ownsStart()) {
+        // A measurement run starts the query itself, a moment later, so that
+        // its "before" memory sample is taken on a window that has already
+        // drawn (ui/adapter/ScrollDriver.cpp).
+        return false;
+    }
     return autoRunRequested() && run();
 }
 
