@@ -95,16 +95,57 @@ fn assert_line_by_line_matches_whole_document(text: &str, dialect: &SqlDialect) 
     );
 }
 
+/// Checks the invariants every [`StatementSpan`] must satisfy, on its own,
+/// regardless of its neighbors: `content_start <= content_end <= full_end`,
+/// every one of those three offsets sits on a UTF-8 character boundary of
+/// `text` (a span built from a byte offset that is not one would slice a
+/// multi-byte character in half), and [`StatementSpan::content`]/
+/// [`StatementSpan::full`] do not panic. A round-2 adversarial review found a
+/// span whose `content_start` could exceed its `content_end` (a lone `/`
+/// line following an already-terminated statement, with nothing of its own
+/// pending — see the [`crate` root splitter module docs' "lone `/` line with
+/// nothing pending"] section), which made `.content()` panic; every test
+/// helper and the fuzz test now calls this on every span they touch instead
+/// of trusting the weaker `content_end <= full_end` check alone.
+fn assert_span_invariants(text: &str, span: &StatementSpan) {
+    assert!(
+        text.is_char_boundary(span.content_start),
+        "content_start {} is not a char boundary: {span:?}",
+        span.content_start
+    );
+    assert!(
+        text.is_char_boundary(span.content_end),
+        "content_end {} is not a char boundary: {span:?}",
+        span.content_end
+    );
+    assert!(
+        text.is_char_boundary(span.full_end),
+        "full_end {} is not a char boundary: {span:?}",
+        span.full_end
+    );
+    assert!(
+        span.content_start <= span.content_end,
+        "content_start > content_end: {span:?}"
+    );
+    assert!(
+        span.content_end <= span.full_end,
+        "content_end > full_end: {span:?}"
+    );
+    assert!(span.full_end <= text.len(), "full_end past end: {span:?}");
+    // Must not panic.
+    let _ = span.content(text);
+    let _ = span.full(text);
+}
+
 fn assert_spans_reproduce_text(text: &str, spans: &[StatementSpan]) {
     let mut pos = 0usize;
     let mut rebuilt = String::with_capacity(text.len());
     for span in spans {
+        assert_span_invariants(text, span);
         assert!(
             span.content_start >= pos,
             "statement span went backwards: {span:?}"
         );
-        assert!(span.content_end <= span.full_end);
-        assert!(span.full_end <= text.len());
         rebuilt.push_str(&text[pos..span.full_end]);
         pos = span.full_end;
     }
@@ -765,16 +806,64 @@ fn ended_by_distinguishes_terminator_slash_line_and_inferred_block_end() {
 }
 
 #[test]
-fn consecutive_lone_slash_lines_each_produce_their_own_span() {
+fn consecutive_lone_slash_lines_with_nothing_pending_produce_no_spans_of_their_own() {
+    // Lead decision (ADR-0002 amendment J, round 2): a lone `/` line with no
+    // statement text pending produces no span at all — the first `/` closes
+    // nothing new (statement 1 already ended at its own `;`), so it is
+    // skipped rather than read as its own zero-content statement, and the
+    // same for the second `/`. Before this rule, the plain-statement scan
+    // that started at such a `/` computed a `content_end` that landed before
+    // its own `content_start`, panicking in `StatementSpan::content`.
     let dialect = support::oracle_like();
     let text = "SELECT 1 FROM dual;\n/\n/\nSELECT 2 FROM dual;\n";
     let spans = split_statements(text, &dialect);
     assert_spans_reproduce_text(text, &spans);
-    // The first `/` closes nothing new (statement 1 already ended at `;`);
-    // the plain-statement scan that starts at the first `/` immediately
-    // recognizes it (per S1) as its own zero-content statement, and the
-    // same for the second `/`.
-    assert!(spans.len() >= 3, "{spans:?}");
+    assert_eq!(spans.len(), 2, "{spans:?}");
+    assert_eq!(spans[0].content(text), "SELECT 1 FROM dual");
+    assert_eq!(spans[1].content(text), "SELECT 2 FROM dual");
+}
+
+#[test]
+fn a_lone_slash_line_at_the_very_start_of_a_script_produces_no_span() {
+    // Isolated reproducer for the same rule: nothing precedes the `/` at
+    // all, so `content_start` was never even computed for a would-be span —
+    // trim_end() on an all-whitespace prefix could otherwise underflow past
+    // byte 0's neighborhood into a negative-looking (but merely very small)
+    // `content_end` relative to whatever came after.
+    let dialect = support::oracle_like();
+    let text = "\n/\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_spans_reproduce_text(text, &spans);
+    assert_eq!(spans.len(), 1, "{spans:?}");
+    assert_eq!(spans[0].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn a_lone_slash_line_immediately_after_a_terminated_plain_statement_produces_no_second_span() {
+    // The exact reproducer cited by the round-2 review: `content_end` for
+    // the second (would-be) span landed at byte 20 while `content_start` was
+    // 21 — a `content_start > content_end` panic in `StatementSpan::content`.
+    let dialect = support::oracle_like();
+    let text = "SELECT 1 FROM dual;\n/\n";
+    let spans = split_statements(text, &dialect);
+    assert_spans_reproduce_text(text, &spans);
+    assert_eq!(spans.len(), 1, "{spans:?}");
+    assert_eq!(spans[0].content(text), "SELECT 1 FROM dual");
+    assert_eq!(spans[0].ended_by, EndedBy::Terminator);
+}
+
+#[test]
+fn a_lone_slash_line_with_nothing_before_it_at_all_produces_no_span() {
+    // The other exact reproducer cited by the round-2 review: `"\n/"` alone
+    // — `content_end` computed as `1` while `content_start` (had a span been
+    // produced at all) would have been `1` as well, but the true bug was
+    // upstream of that arithmetic: this text has no statement anywhere in
+    // it, so the correct answer is zero spans, not a lucky-looking `1 <= 1`.
+    let dialect = support::oracle_like();
+    let text = "\n/";
+    let spans = split_statements(text, &dialect);
+    assert_spans_reproduce_text(text, &spans);
+    assert_eq!(spans.len(), 0, "{spans:?}");
 }
 
 #[test]
@@ -794,6 +883,268 @@ fn a_sql_case_expression_with_a_bare_end_inside_a_block_closes_correctly() {
     let spans = split_statements(text, &dialect);
     assert_eq!(spans.len(), 1);
     assert!(spans[0].terminated);
+}
+
+// ------------------------------------------------- round-2 regression tests
+
+#[test]
+fn must_fix_1_bare_begin_starter_with_one_nested_inner_block_is_one_span() {
+    // The round-2 reproducer: a bare `BEGIN` starter's match already
+    // consumed the frame's own body-opening `BEGIN`, so the next `BEGIN`
+    // must be read as a nested block, never as "the frame's body" again.
+    // Before `BlockStarter::opens_body` existed, this split into 2 spans
+    // (`"BEGIN\n  BEGIN\n    NULL;\n  END;"` and an orphaned `"END"`).
+    let dialect = support::oracle_like();
+    let text = "BEGIN\n  BEGIN\n    NULL;\n  END;\nEND;\n/\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated, "{spans:?}");
+    assert_eq!(
+        spans[0].content(text),
+        "BEGIN\n  BEGIN\n    NULL;\n  END;\nEND"
+    );
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn must_fix_1_bare_begin_starter_with_sibling_inner_blocks_is_one_span() {
+    // The "class A" variant: with N sibling inner blocks, the pre-fix defect
+    // produced N+1 spans, with the middle one a complete, independently
+    // runnable anonymous block carved out of the middle of the real one.
+    let dialect = support::oracle_like();
+    let text = "BEGIN\n  BEGIN NULL; END;\n  BEGIN NULL; END;\nEND;\n/\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated, "{spans:?}");
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn must_fix_1_bare_begin_starter_with_an_exception_handler_containing_a_nested_block_is_one_span() {
+    let dialect = support::oracle_like();
+    let text = "BEGIN\n  NULL;\nEXCEPTION\n  WHEN OTHERS THEN\n    BEGIN\n      NULL;\n    END;\nEND;\n/\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated, "{spans:?}");
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn must_fix_1_declare_starter_with_a_nested_inner_block_was_already_correct() {
+    // Control: `DECLARE`'s `opens_body` is `false` (its own `BEGIN` still
+    // lies ahead), so this shape never depended on the round-2 fix — it
+    // stays correct before and after.
+    let dialect = support::oracle_like();
+    let text =
+        "DECLARE\n  v NUMBER;\nBEGIN\n  BEGIN\n    NULL;\n  END;\nEND;\n/\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated, "{spans:?}");
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn must_fix_1_create_procedure_with_a_nested_subprogram_was_already_correct() {
+    // Control: a `CREATE PROCEDURE` starter's `opens_body` is `false` too —
+    // its own body's `BEGIN` still lies ahead of a nested subprogram's own
+    // complete `BEGIN ... END`.
+    let dialect = support::oracle_like();
+    let text = "CREATE OR REPLACE PROCEDURE p AS\n  PROCEDURE h IS\n  BEGIN\n    NULL;\n  END h;\nBEGIN\n  h;\nEND p;\n/\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated, "{spans:?}");
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn must_fix_1_a_labelled_nested_block_inside_a_bare_begin_starter_is_one_span() {
+    let dialect = support::oracle_like();
+    let text =
+        "BEGIN\n  <<inner>>\n  BEGIN\n    NULL;\n  END inner;\nEND;\n/\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated, "{spans:?}");
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn must_fix_1_a_labelled_outer_and_inner_bare_begin_starter_is_one_span() {
+    let dialect = support::oracle_like();
+    let text = "<<outer>>\nBEGIN\n  <<inner>>\n  BEGIN\n    NULL;\n  END inner;\nEND outer;\n/\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated, "{spans:?}");
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn must_fix_3_a_variable_named_language_right_after_is_does_not_trigger_a_false_call_spec() {
+    // Fail-safe direction: a missed call spec merely swallows to the next
+    // `/`/EOF; a false one carves the real body out from under the
+    // statement. `language`/`external` must only ever match as full phrases.
+    let dialect = support::oracle_like();
+    let text = "CREATE OR REPLACE PROCEDURE p IS\n  language NUMBER := 1;\nBEGIN\n  NULL;\nEND p;\n/\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated, "{spans:?}");
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn must_fix_3_a_constant_named_external_in_mixed_case_does_not_trigger_a_false_call_spec() {
+    let dialect = support::oracle_like();
+    let text = "CREATE OR REPLACE PROCEDURE p IS\n  External CONSTANT VARCHAR2(1) := 'x';\nBEGIN\n  NULL;\nEND p;\n/\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated, "{spans:?}");
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn must_fix_3_a_cursor_named_language_does_not_trigger_a_false_call_spec() {
+    let dialect = support::oracle_like();
+    let text = "CREATE OR REPLACE PROCEDURE p IS\n  CURSOR Language IS SELECT 1 FROM dual;\nBEGIN\n  NULL;\nEND p;\n/\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated, "{spans:?}");
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn must_fix_3_a_quoted_identifier_named_language_does_not_trigger_a_false_call_spec() {
+    // A quoted identifier is a distinct `TokenKind` from a plain word, so it
+    // was never a `is_word` candidate in the first place — this is a
+    // regression net for the call-spec path specifically, alongside the
+    // pre-existing `a_quoted_end_identifier_...` test for `END`.
+    let dialect = support::oracle_like();
+    let text = "CREATE OR REPLACE PROCEDURE p IS\n  \"language\" NUMBER := 1;\nBEGIN\n  NULL;\nEND p;\n/\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated, "{spans:?}");
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn must_fix_4_a_forward_declarations_cast_default_does_not_corrupt_the_containers_init_section() {
+    // Concrete pre-fix failure: without paren-depth tracking in
+    // `scan_header`, the `AS` inside `CAST(1 AS NUMBER)` was read as this
+    // forward declaration's own body intro, leaving a phantom
+    // `pending_bodies` debt that the container's own init `BEGIN` then
+    // wrongly "fulfilled" (nesting instead of being absorbed as the
+    // container's own body) — corrupting depth tracking so the container's
+    // real closing `END` never matched at depth `0`.
+    //
+    // Deliberately no `/` between `END pk7;` and the next statement: safety
+    // principle S1 would otherwise rescue the miscounted scan at that `/`
+    // line regardless of the bug (S1 is checked unconditionally, ahead of
+    // depth/`pending_bodies`), masking the very difference this test exists
+    // to catch — pre-fix, the corrupted depth never returns to `0` at `END
+    // pk7`, so the scan runs past it looking for one more `END` that never
+    // comes, swallowing `SELECT 1 FROM dual;` into one unterminated span
+    // instead of two.
+    let dialect = support::oracle_like();
+    let text = "CREATE OR REPLACE PACKAGE BODY pk7 AS\n  PROCEDURE p2(a NUMBER DEFAULT CAST(1 AS NUMBER));\nBEGIN\n  NULL;\nEND pk7;\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert_eq!(spans[0].ended_by, EndedBy::InferredBlockEnd, "{spans:?}");
+    assert!(spans[0].terminated, "{spans:?}");
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn must_fix_4_a_parameter_defaults_case_expression_does_not_corrupt_header_scanning() {
+    let dialect = support::oracle_like();
+    let text = "CREATE OR REPLACE PACKAGE BODY pk8 AS\n  FUNCTION f2(b NUMBER DEFAULT CASE WHEN 1 = 1 THEN 1 ELSE 2 END) RETURN NUMBER IS\n  BEGIN\n    RETURN b;\n  END f2;\nEND pk8;\n/\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated, "{spans:?}");
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn must_fix_4_a_constructors_return_self_as_result_is_correctly_owes_a_body() {
+    let dialect = support::oracle_like();
+    let text = "CREATE OR REPLACE TYPE BODY obj_t AS\n  CONSTRUCTOR FUNCTION obj_t(x NUMBER) RETURN SELF AS RESULT IS\n  BEGIN\n    RETURN;\n  END;\nEND;\n/\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated, "{spans:?}");
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn must_fix_4_a_forward_declared_constructors_return_self_as_result_owns_no_body() {
+    // Concrete pre-fix failure: without `body_intro_exceptions`, the `AS` in
+    // `SELF AS RESULT` was read as this forward declaration's own body
+    // intro, leaving the same kind of phantom `pending_bodies` debt as the
+    // `CAST` case above — wrongly consumed by the container's own init
+    // `BEGIN`, corrupting depth tracking so the real closing `END` never
+    // matched at depth `0`. No `/` after `END pkg6;`, for the same reason as
+    // the `CAST` test above: S1 would otherwise rescue the miscounted scan
+    // and mask the difference.
+    let dialect = support::oracle_like();
+    let text = "CREATE OR REPLACE PACKAGE BODY pkg6 AS\n  FUNCTION make_it(x NUMBER) RETURN SELF AS RESULT;\nBEGIN\n  NULL;\nEND pkg6;\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert_eq!(spans[0].ended_by, EndedBy::InferredBlockEnd, "{spans:?}");
+    assert!(spans[0].terminated, "{spans:?}");
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn additional_bug_a_nested_begin_inside_an_inner_members_own_body_does_not_fulfill_an_outer_pending_debt()
+ {
+    // Found by the grammar-based differential test (`tests/differential.rs`),
+    // not by any of the round-2 review's 4 named MUST-FIX items: a two-level
+    // -deep nested subprogram (`mid_p` declared inside `outer_p`'s declare
+    // section, and `inner_p` declared inside *`mid_p`'s own* declare
+    // section) where `inner_p`'s own body itself contains a nested `BEGIN …
+    // END`. Root cause: `scan_structured`'s `BEGIN` dispatch treated
+    // `pending_bodies > 0` alone as "this `BEGIN` fulfills a header's debt",
+    // without also requiring `depth == 0` — so once already inside
+    // `inner_p`'s own body (`depth == 1`), the *nested* `BEGIN` there was
+    // wrongly consumed as fulfilling `mid_p`'s still-outstanding debt
+    // instead of simply nesting, corrupting depth tracking so `outer_p`'s
+    // real closing `END` never matched at depth `0` — splitting this single
+    // statement into two (one ending at `mid_p`'s own `END`, one starting
+    // fresh at `outer_p`'s body).
+    let dialect = support::oracle_like();
+    let text = "CREATE OR REPLACE PROCEDURE outer_p AS\n\
+                  PROCEDURE mid_p IS\n\
+                    PROCEDURE inner_p IS\n\
+                    BEGIN\n\
+                      BEGIN\n\
+                        NULL;\n\
+                      END;\n\
+                    END inner_p;\n\
+                  BEGIN\n\
+                    inner_p;\n\
+                  END mid_p;\n\
+                BEGIN\n\
+                  mid_p;\n\
+                END outer_p;\n\
+                /\n\
+                SELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated, "{spans:?}");
+    assert!(
+        spans[0].content(text).trim_end().ends_with("END outer_p"),
+        "{spans:?}"
+    );
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
+}
+
+#[test]
+fn must_fix_4_the_outer_statements_own_cast_default_does_not_corrupt_the_top_level_scan() {
+    // The other half of the same finding: the *outer* statement's own
+    // signature (not only a nested member's) is scanned by `scan_structured`
+    // itself, not `scan_header` — its word-dispatch is paren-gated too.
+    let dialect = support::oracle_like();
+    let text = "CREATE OR REPLACE FUNCTION f3(a NUMBER DEFAULT CAST(1 AS NUMBER)) RETURN NUMBER IS\nBEGIN\n  RETURN a;\nEND f3;\n/\nSELECT 1 FROM dual;\n";
+    let spans = split_statements(text, &dialect);
+    assert_eq!(kinds(&spans), [StatementKind::Block, StatementKind::Plain]);
+    assert!(spans[0].terminated, "{spans:?}");
+    assert_eq!(spans[1].content(text), "SELECT 1 FROM dual");
 }
 
 // -------------------------------------------------------------- fuzzing
@@ -858,6 +1209,25 @@ const FRAGMENTS: &[&str] = &[
     "SELECT N'nat' FROM dual;\n",
     "\n",
     "   \n",
+    "/\n",
+    // Round-2 vocabulary: a bare-`BEGIN` starter with nested/sibling inner
+    // blocks (MUST-FIX #1) and an exception handler containing one.
+    "BEGIN\n  BEGIN\n    NULL;\n  END;\nEND;\n/\n",
+    "BEGIN\n  BEGIN NULL; END;\n  BEGIN NULL; END;\nEND;\n/\n",
+    "BEGIN\n  NULL;\nEXCEPTION\n  WHEN OTHERS THEN\n    BEGIN\n      NULL;\n    END;\nEND;\n/\n",
+    // Identifiers legally named `language`/`external`/`is`/`as`/`before`/
+    // `after` right after a header's own `IS` (MUST-FIX #3's fail-safe
+    // direction).
+    "CREATE OR REPLACE PROCEDURE p3 IS\n  language NUMBER := 1;\n  external VARCHAR2(1) := 'x';\nBEGIN\n  NULL;\nEND p3;\n/\n",
+    // A forward declaration whose parameter default hides `AS`/`IS`/`CASE …
+    // END` behind parens (MUST-FIX #4).
+    "CREATE OR REPLACE PACKAGE pk4 AS\n  PROCEDURE p2(a NUMBER DEFAULT CAST(1 AS NUMBER));\n  FUNCTION f2(b NUMBER DEFAULT CASE WHEN 1 = 1 THEN 1 ELSE 2 END) RETURN NUMBER;\nEND pk4;\n/\n",
+    // A constructor method's `RETURN SELF AS RESULT IS` (MUST-FIX #4's
+    // `body_intro_exceptions`).
+    "CREATE OR REPLACE TYPE BODY obj_t AS\n  CONSTRUCTOR FUNCTION obj_t(x NUMBER) RETURN SELF AS RESULT IS\n  BEGIN\n    RETURN;\n  END;\nEND;\n/\n",
+    // A lone `/` line immediately after an already-terminated statement, with
+    // nothing pending (MUST-FIX #2's lead decision).
+    "SELECT 1 FROM dual;\n/\n",
 ];
 
 fn assert_split_invariants(text: &str, dialect: &SqlDialect) {
@@ -866,14 +1236,12 @@ fn assert_split_invariants(text: &str, dialect: &SqlDialect) {
     assert_line_by_line_matches_whole_document(text, dialect);
 
     let spans = split_statements(text, dialect);
+    // `assert_spans_reproduce_text` already calls `assert_span_invariants` on
+    // every span (content_start <= content_end <= full_end, char-boundary
+    // checks, and a non-panicking `.content()`/`.full()` call) — see that
+    // helper's own docs for the round-2 defect (a lone `/` line with nothing
+    // pending) this specifically guards against.
     assert_spans_reproduce_text(text, &spans);
-    for span in &spans {
-        assert!(text.is_char_boundary(span.content_start), "{text:?}");
-        assert!(text.is_char_boundary(span.content_end), "{text:?}");
-        assert!(text.is_char_boundary(span.full_end), "{text:?}");
-        assert!(span.content_start <= span.content_end, "{text:?}");
-        assert!(span.content_end <= span.full_end, "{text:?}");
-    }
     for pair in spans.windows(2) {
         assert!(pair[0].full_end <= pair[1].content_start, "{text:?}");
     }

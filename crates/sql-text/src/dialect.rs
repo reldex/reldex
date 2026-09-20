@@ -80,7 +80,7 @@ pub enum BlockKind {
     /// PL/SQL block structure: `BEGIN`/`CASE`/`IF`/`LOOP` vs. `END`, plus
     /// member/subprogram headers that may each owe a body of their own
     /// (`PROCEDURE`/`FUNCTION … IS|AS`, and — once
-    /// [`SqlDialect::compound_trigger_marker`] has been seen — a compound
+    /// [`SqlDialect::sectioned_body_marker`] has been seen — a compound
     /// trigger's timing-point sections). One depth-tracking algorithm
     /// handles a lone `BEGIN…END`, a single subprogram, and a
     /// `PACKAGE`/`TYPE`/compound-`TRIGGER` body with any number of
@@ -122,6 +122,28 @@ pub struct BlockStarter {
     pub slots: &'static [KeywordSlot],
     /// How the statement's body is scanned once these keywords have matched.
     pub kind: BlockKind,
+    /// Whether this starter's *own* matched keyword sequence already is the
+    /// frame's body opener, so [`crate::splitter`]'s depth-tracking scan must
+    /// start as though one body has already been absorbed at depth `0`
+    /// (`true`) rather than starting fresh and waiting to absorb the next
+    /// bare [`SqlDialect::block_body_opener`] it sees (`false`).
+    ///
+    /// `true` only for a bare `BEGIN` starter: matching consumes the `BEGIN`
+    /// itself, so the *next* `BEGIN` the scan finds is unambiguously a nested
+    /// block, never the frame's own body opener. `false` for every other
+    /// starter shape (`DECLARE`, `CREATE PROCEDURE`/`FUNCTION`/`TRIGGER`,
+    /// `PACKAGE`/`TYPE BODY`): each of these consumes only its *introducing*
+    /// keyword, and the frame's own `BEGIN` (the declare section's mandatory
+    /// one, the subprogram's one body, or the container's optional init
+    /// section) still lies ahead in the token stream, to be absorbed the
+    /// normal way. Getting this wrong for the `BEGIN` starter was a
+    /// confirmed adversarial-review defect (ADR-0002 amendment J, round 2):
+    /// an implicit "first `BEGIN` in the scan is always the body" assumption
+    /// mistook a `BEGIN`-block's first *nested* sibling for its own body,
+    /// splitting `BEGIN BEGIN NULL; END; BEGIN NULL; END; END;` into three
+    /// spans instead of one — this field makes the distinction explicit data
+    /// instead of an assumption `crate::splitter` had to get right by luck.
+    pub opens_body: bool,
 }
 
 /// Quoting forms this dialect recognizes, beyond the SQL-standard plain
@@ -153,12 +175,14 @@ pub struct CommentRules {
     /// Oracle behaves.
     pub block_comment: Option<(&'static str, &'static str)>,
     /// Words (compared case-insensitively) that, as a line's very first
-    /// word, start a SQL\*Plus-style line comment running to end of line —
-    /// Oracle: `["REM", "REMARK"]`. Empty disables this form. `SPEC.md` §15
+    /// word, start a line comment running to end of line — Oracle:
+    /// `["REM", "REMARK"]` (a SQL\*Plus-ism, but the mechanism itself is not
+    /// vendor-specific: any dialect with a first-word-of-line comment form
+    /// supplies its own words here). Empty disables this form. `SPEC.md` §15
     /// defers SQL\*Plus client commands ("Future SQL\*Plus-like commands may
     /// be added progressively"), so Oracle's Phase 1 descriptor leaves this
     /// empty even though the lexer implements it and is tested against it.
-    pub sqlplus_line_comment_words: &'static [&'static str],
+    pub line_comment_words: &'static [&'static str],
 }
 
 /// The vendor-specific facts this crate's lexer and splitter need, supplied
@@ -230,22 +254,46 @@ pub struct SqlDialect {
     /// Keywords that introduce a member/subprogram header which may — but,
     /// if it turns out to be a forward declaration ending directly at a
     /// terminator, or a call-spec (see
-    /// [`call_spec_keywords`](Self::call_spec_keywords)), need not — owe a
+    /// [`call_spec_phrases`](Self::call_spec_phrases)), need not — owe a
     /// body of its own. Oracle: `["PROCEDURE", "FUNCTION"]` (this covers
     /// `MEMBER FUNCTION`, `STATIC PROCEDURE`, `CONSTRUCTOR FUNCTION`, … too,
     /// since only the trigger word itself is matched).
     pub subprogram_header_keywords: &'static [&'static str],
     /// Keywords that, once a [`subprogram_header_keywords`](Self::subprogram_header_keywords)
     /// header reaches one of them, mean "the body follows here" (unless
-    /// immediately followed by a [`call_spec_keywords`](Self::call_spec_keywords)
-    /// word). Oracle: `["IS", "AS"]`.
+    /// immediately followed by a [`call_spec_phrases`](Self::call_spec_phrases)
+    /// phrase, or the word is actually part of a
+    /// [`body_intro_exceptions`](Self::body_intro_exceptions) phrase). Oracle:
+    /// `["IS", "AS"]`.
     pub body_intro_keywords: &'static [&'static str],
-    /// Keywords that, immediately after a
+    /// Two-or-more-word phrases whose *last* word is a
+    /// [`body_intro_keywords`](Self::body_intro_keywords) match that must
+    /// nonetheless be ignored — it does not introduce a body. Oracle:
+    /// `[&["SELF", "AS"]]`, for a constructor function's `RETURN SELF AS
+    /// RESULT IS ...`: the `AS` in `SELF AS RESULT` is not the header's body
+    /// intro (the trailing `IS` is); matched by looking at the word(s)
+    /// immediately preceding a candidate `body_intro_keywords` match, at
+    /// paren depth `0`, the same way [`call_spec_phrases`](Self::call_spec_phrases)
+    /// looks at the word(s) immediately following one. Empty disables this
+    /// check (no exceptions apply).
+    pub body_intro_exceptions: &'static [Phrase],
+    /// Full phrases that, starting immediately after a
     /// [`body_intro_keywords`](Self::body_intro_keywords) word, mean the
     /// header is a call-spec (`LANGUAGE JAVA ...` / `EXTERNAL ...`) with no
     /// PL/SQL body — it ends at its own next statement terminator instead.
-    /// Oracle: `["LANGUAGE", "EXTERNAL"]`.
-    pub call_spec_keywords: &'static [&'static str],
+    /// Whole phrases, not single words, are required specifically so that a
+    /// variable/constant/cursor named `language` or `external` — legal
+    /// identifiers — can never be mistaken for a call-spec: matching a bare
+    /// `LANGUAGE` word away from its own full form is the fail-safe-*wrong*
+    /// direction (it carves a runnable block's body out from under it),
+    /// whereas failing to recognize a genuine call-spec merely swallows
+    /// extra, syntactically inert, text up to the next `/`/EOF. Oracle:
+    /// `[&["LANGUAGE", "JAVA"], &["LANGUAGE", "C"], &["LANGUAGE",
+    /// "JAVASCRIPT"], &["EXTERNAL", "LIBRARY"], &["EXTERNAL", "NAME"]]` — the
+    /// legacy `EXTERNAL` call-spec is always written with a following
+    /// `LIBRARY` or `NAME`, so requiring that second word keeps a lone
+    /// `external` identifier from ever matching.
+    pub call_spec_phrases: &'static [Phrase],
     /// Keywords that, seen before any body has been owed or absorbed at the
     /// outermost level of a [`BlockKind::Structured`] statement, mean the
     /// whole statement is body-less DDL ending at its own next statement
@@ -253,24 +301,28 @@ pub struct SqlDialect {
     /// proc(:NEW.x);` — a trigger whose body is a single `CALL`, never a
     /// `BEGIN`/`END` block).
     pub body_less_markers: &'static [&'static str],
-    /// The phrase that marks a compound trigger, e.g. Oracle's
-    /// `Some(&["COMPOUND", "TRIGGER"])`. Once seen anywhere during a
-    /// [`BlockKind::Structured`] scan, [`compound_trigger_timing_starters`](Self::compound_trigger_timing_starters)
-    /// words are treated like [`subprogram_header_keywords`](Self::subprogram_header_keywords)
+    /// The phrase that marks a statement as having independently-scoped
+    /// sections rather than one body, e.g. Oracle's `Some(&["COMPOUND",
+    /// "TRIGGER"])`. Once seen anywhere during a [`BlockKind::Structured`]
+    /// scan, [`section_header_starters`](Self::section_header_starters) words
+    /// are treated like [`subprogram_header_keywords`](Self::subprogram_header_keywords)
     /// for the rest of that statement. Before the marker is seen (or when
     /// this field is `None`), those words are ordinary content — an
     /// ordinary (non-compound) trigger's own `BEFORE INSERT ON t` timing
     /// clause must not be mistaken for a compound trigger's timing-point
-    /// section header.
-    pub compound_trigger_marker: Option<Phrase>,
-    /// Timing-point words that introduce a compound trigger's own
-    /// `<timing-point> IS ... BEGIN ... END <timing-point>;` section, once
-    /// [`compound_trigger_marker`](Self::compound_trigger_marker) has been
-    /// seen. Oracle: `["BEFORE", "AFTER", "INSTEAD"]` (covering `BEFORE
-    /// STATEMENT`, `AFTER STATEMENT`, `BEFORE EACH ROW`, `AFTER EACH ROW`,
-    /// and `INSTEAD OF EACH ROW` — only the first word is matched, the rest
-    /// is skipped the same way a subprogram's name and parameter list are).
-    pub compound_trigger_timing_starters: &'static [&'static str],
+    /// section header. Named for the general shape rather than Oracle's
+    /// compound-trigger vocabulary specifically, since any dialect with an
+    /// analogous "one statement, several independently-scoped sections"
+    /// construct supplies its own marker phrase here.
+    pub sectioned_body_marker: Option<Phrase>,
+    /// Words that introduce one of a sectioned statement's own
+    /// `<word> ... IS ... BEGIN ... END <word>;`-shaped sections, once
+    /// [`sectioned_body_marker`](Self::sectioned_body_marker) has been seen.
+    /// Oracle: `["BEFORE", "AFTER", "INSTEAD"]` (covering `BEFORE STATEMENT`,
+    /// `AFTER STATEMENT`, `BEFORE EACH ROW`, `AFTER EACH ROW`, and `INSTEAD
+    /// OF EACH ROW` — only the first word is matched, the rest is skipped the
+    /// same way a subprogram's name and parameter list are).
+    pub section_header_starters: &'static [&'static str],
     /// The conditional-compilation directive prefix character, e.g. Oracle's
     /// `Some('$')` for `$IF`/`$THEN`/`$ELSIF`/`$ELSE`/`$END` and the inquiry
     /// form `$$name` (`$$PLSQL_UNIT`, …). When set, the lexer reads

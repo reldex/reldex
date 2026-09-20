@@ -55,17 +55,25 @@
 //!
 //! - A word matching [`SqlDialect::subprogram_header_keywords`]
 //!   (`PROCEDURE`/`FUNCTION`) — or, once
-//!   [`SqlDialect::compound_trigger_marker`] has been seen,
-//!   [`SqlDialect::compound_trigger_timing_starters`] (`BEFORE`/`AFTER`/
-//!   `INSTEAD`) — starts a header scan: skip forward (parameter lists and
-//!   names are opaque to it, since neither a statement terminator nor `IS`/
-//!   `AS` can legally occur inside one) to the first
-//!   [`SqlDialect::body_intro_keywords`] word (`IS`/`AS`) or statement
-//!   terminator, whichever comes first. A terminator first means a *forward
-//!   declaration* (a package/type spec's `PROCEDURE go;`, owing nothing).
-//!   `IS`/`AS` immediately followed by a [`SqlDialect::call_spec_keywords`]
-//!   word (`LANGUAGE`/`EXTERNAL`) means a call-spec (also owing nothing,
-//!   ending at its own next terminator). Otherwise one body is now *owed*
+//!   [`SqlDialect::sectioned_body_marker`] has been seen,
+//!   [`SqlDialect::section_header_starters`] (`BEFORE`/`AFTER`/
+//!   `INSTEAD`) — starts a header scan: skip forward, tracking `(`/`)` depth
+//!   so a parameter default's own `IS`/`AS`/terminator (`CAST(x AS t)`,
+//!   `CASE WHEN x IS NULL THEN … END`) is never mistaken for the header's
+//!   own, to the first depth-`0` [`SqlDialect::body_intro_keywords`] word
+//!   (`IS`/`AS`) or statement terminator, whichever comes first — except a
+//!   word that only completes a [`SqlDialect::body_intro_exceptions`] phrase
+//!   (Oracle: `SELF AS`, inside a constructor's `RETURN SELF AS RESULT IS`),
+//!   which is skipped over as ordinary content since it does not introduce a
+//!   body itself. A terminator first means a *forward declaration* (a
+//!   package/type spec's `PROCEDURE go;`, owing nothing). `IS`/`AS`
+//!   immediately followed by a [`SqlDialect::call_spec_phrases`] phrase
+//!   (`LANGUAGE JAVA …`/`EXTERNAL LIBRARY …`) means a call-spec (also owing
+//!   nothing, ending at its own next terminator) — matched as a full phrase,
+//!   never a single word, so that a variable, constant, or cursor legally
+//!   named `language` or `external` is never mistaken for one (see
+//!   [`SqlDialect::call_spec_phrases`]'s own documentation for why this
+//!   fail-safe direction was chosen). Otherwise one body is now *owed*
 //!   (`pending_bodies += 1`).
 //! - A `BEGIN`: if a body is owed, this is it — fulfill one
 //!   (`pending_bodies -= 1`) and open a nesting level for its matching
@@ -76,6 +84,22 @@
 //!   package/type body's optional initialization section, or a lone
 //!   `PROCEDURE`/`DECLARE`/`BEGIN` statement's one required body, handled by
 //!   the same rule. Any other `BEGIN` nests.
+//!
+//!   Whether the *matched starter's own keywords* already consumed the
+//!   frame's body opener is [`BlockStarter::opens_body`] — data, not an
+//!   assumption this scan makes: true only for a bare `BEGIN` starter (whose
+//!   match already consumed the one `BEGIN` this frame will ever be owed
+//!   unconditionally, so the scan starts as though that absorption already
+//!   happened), false for every other starter (`DECLARE`, `CREATE
+//!   PROCEDURE`/`FUNCTION`/`TRIGGER`, `PACKAGE`/`TYPE BODY`), whose own
+//!   `BEGIN` still lies ahead and is absorbed by this same rule the normal
+//!   way. An adversarial review (ADR-0002 amendment J, round 2) found that
+//!   an earlier revision always started this scan as though nothing had been
+//!   absorbed, so a `BEGIN` starter's first *nested* `BEGIN…END` was
+//!   misappropriated as the frame's own body — splitting `BEGIN BEGIN NULL;
+//!   END; END;` into two spans (an orphaned `END`) and, with sibling inner
+//!   blocks, carving a complete runnable statement out of the middle of one
+//!   (`BEGIN BEGIN NULL; END; BEGIN NULL; END; END;` → 3 spans instead of 1).
 //! - [`SqlDialect::body_less_markers`] (`CALL`), seen before any body has
 //!   been owed or absorbed at the outermost level, means the whole statement
 //!   is body-less DDL ending at its own next terminator (a trigger whose
@@ -86,6 +110,16 @@
 //! members that may themselves declare nested subprograms in their own
 //! declare sections" — all three are the same shape once headers are allowed
 //! to owe a body independently of the statement's own.
+//!
+//! All of the word-dispatch above — `body_less_markers`, the outer
+//! statement's own call-spec check, `subprogram_header_keywords`/
+//! `section_header_starters`, `block_end_keyword`, `block_body_opener`, and
+//! `block_nesting_openers` — is additionally gated on this scan's own `(`/`)`
+//! depth being `0`: a parameter default's `CASE … END` or `CAST(x AS t)`
+//! sitting in the *outer* statement's own signature (not only a nested
+//! member's, which the internal `scan_header` helper handles separately)
+//! must not be read as structural. This closes the other half of the same
+//! round-2 finding as `scan_header`'s own paren tracking.
 //!
 //! Once the outermost `END` (or a body-less marker's own terminator) is
 //! found, `SPEC.md` §15's own words — "block boundaries **and** `/`" — are
@@ -116,6 +150,36 @@
 //! that may itself contain `;`, so nothing but S1 (a lone `/` line) or end of
 //! input ever closes it.
 //!
+//! # A lone `/` line with nothing pending produces no span at all
+//!
+//! [`split_statements`] checks, before it decides whether the next
+//! statement is plain or a block — before it even records a
+//! [`StatementSpan::content_start`] — whether the very next non-trivial
+//! token is itself an authoritative lone `/` line. If it is, nothing was
+//! pending: the previous statement (if any) already closed cleanly, only
+//! whitespace/comments separate it from this `/`, and there is no text for
+//! this `/` to submit. Such a line is skipped and produces **no span**: not
+//! an empty statement, and not a re-submission of whatever preceded it.
+//!
+//! This is a deliberate product decision (lead decision, ADR-0002 amendment
+//! J round 2), not the only defensible reading of SQL\*Plus's own semantics
+//! — SQL\*Plus re-runs its statement buffer on a bare `/`, which for a
+//! desktop editor's purposes is ambiguous (re-run the *previous* statement?
+//! treat it as inert?) and unverified against real SQL\*Plus/SQLcl behavior.
+//! Producing no span at all is the one reading that cannot surprise a caller
+//! by re-executing something the user did not select, and it is what keeps
+//! [`StatementSpan::content_start`] `<=` [`StatementSpan::content_end`] in
+//! every case: before this rule existed, a lone `/` immediately following an
+//! already-terminated statement could compute a `content_end` for a *new*,
+//! near-empty span that landed **before** that span's own `content_start`
+//! (the new span's only "content" was trivia the previous statement had
+//! already consumed), which made [`StatementSpan::content`] panic — a
+//! confirmed adversarial-review defect (ADR-0002 amendment J, round 2).
+//! The internal `end_at_slash_line` helper additionally clamps its own
+//! `content_end` to never go below the `content_start` its caller is
+//! building, as defense in depth for any scan this top-level check does not
+//! cover.
+//!
 //! # Known limitations
 //!
 //! - **`WITH FUNCTION … SELECT …` (Oracle 12c inline PL/SQL in a query).**
@@ -135,12 +199,12 @@
 //!   "Future SQL\*Plus-like commands may be added progressively" — Phase 1
 //!   does not require them, so none of Oracle's Phase-1 descriptor enables
 //!   the machinery `sql-text` would need (see
-//!   [`crate::dialect::CommentRules::sqlplus_line_comment_words`] for a case
+//!   [`crate::dialect::CommentRules::line_comment_words`] for a case
 //!   where the machinery exists but is deliberately left off).
 //!   `StatementKind` is `#[non_exhaustive]` so a variant can be added later
 //!   without a breaking change.
 
-use crate::dialect::{BlockKind, KeywordSlot, Phrase, SqlDialect};
+use crate::dialect::{BlockKind, BlockStarter, KeywordSlot, Phrase, SqlDialect};
 use crate::lexer::tokenize;
 use crate::token::{Token, TokenKind};
 
@@ -274,6 +338,20 @@ pub fn split_statements(text: &str, dialect: &SqlDialect) -> Vec<StatementSpan> 
         i = skip_trivial(&tokens, i);
         let Some(first) = tokens.get(i) else { break };
 
+        // A lone `/` line with nothing pending: no statement text separates
+        // it from whatever (if anything) came before, so it terminates
+        // nothing and opens nothing. Produce no span at all — see the module
+        // docs' "A lone `/` line with nothing pending produces no span at
+        // all" section. This must be checked before `content_start` is even
+        // computed, since there is no statement here to have one.
+        if first.kind == TokenKind::Operator
+            && (dialect.slash_terminates_block || dialect.slash_terminates_plain)
+            && is_lone_slash_line(text, *first)
+        {
+            i += 1;
+            continue;
+        }
+
         let content_start = first.start;
         cursor.advance_to(text, content_start);
         let start_line = cursor.line;
@@ -288,11 +366,17 @@ pub fn split_statements(text: &str, dialect: &SqlDialect) -> Vec<StatementSpan> 
 
         let outcome = match matched_starter {
             Some((starter, resume)) => match starter.kind {
-                BlockKind::Structured => scan_structured(&tokens, text, resume, dialect),
-                BlockKind::OpaqueSource => scan_opaque_source(&tokens, text, resume, dialect),
-                BlockKind::ParenDelimited => scan_paren_delimited(&tokens, text, resume, dialect),
+                BlockKind::Structured => {
+                    scan_structured(&tokens, text, resume, dialect, starter, content_start)
+                }
+                BlockKind::OpaqueSource => {
+                    scan_opaque_source(&tokens, text, resume, dialect, content_start)
+                }
+                BlockKind::ParenDelimited => {
+                    scan_paren_delimited(&tokens, text, resume, dialect, content_start)
+                }
             },
-            None => scan_plain(&tokens, text, i, dialect),
+            None => scan_plain(&tokens, text, i, dialect, content_start),
         };
 
         cursor.advance_to(text, outcome.full_end);
@@ -500,8 +584,9 @@ fn matches_block_starter(
 
 /// Whether `phrase`'s words match consecutively starting at token index `i`
 /// (skipping trivia between them), without consuming anything — used to spot
-/// [`SqlDialect::compound_trigger_marker`] appearing anywhere in a
-/// [`BlockKind::Structured`] scan.
+/// [`SqlDialect::sectioned_body_marker`] appearing anywhere in a
+/// [`BlockKind::Structured`] scan, and a [`SqlDialect::call_spec_phrases`]
+/// phrase starting right after a `body_intro_keywords` word.
 fn peek_phrase_matches(tokens: &[Token], text: &str, start: usize, phrase: Phrase) -> bool {
     let mut i = start;
     for (n, expected) in phrase.iter().enumerate() {
@@ -515,6 +600,35 @@ fn peek_phrase_matches(tokens: &[Token], text: &str, start: usize, phrase: Phras
             return false;
         }
         i += 1;
+    }
+    true
+}
+
+/// Whether `phrase`'s words match, in order, ending at and including token
+/// index `end` (skipping trivia between them going backward) — the mirror
+/// image of [`peek_phrase_matches`], used to check
+/// [`SqlDialect::body_intro_exceptions`]: does the word *before* a candidate
+/// `body_intro_keywords` match (Oracle: `AS`) complete an excepted phrase
+/// (Oracle: `SELF AS`) rather than a real body intro?
+fn ends_with_phrase(tokens: &[Token], text: &str, end: usize, phrase: Phrase) -> bool {
+    let mut cursor = Some(end);
+    for expected in phrase.iter().rev() {
+        loop {
+            let Some(idx) = cursor else { return false };
+            let Some(&token) = tokens.get(idx) else {
+                return false;
+            };
+            if is_trivial(token.kind) {
+                cursor = idx.checked_sub(1);
+                continue;
+            }
+            if !is_word(token.kind) || !expected.eq_ignore_ascii_case(&text[token.start..token.end])
+            {
+                return false;
+            }
+            cursor = idx.checked_sub(1);
+            break;
+        }
     }
     true
 }
@@ -571,13 +685,32 @@ fn trailing_line_end(text: &str, from: usize) -> usize {
 /// Builds the [`ScanOutcome`] for safety principle S1: `slash_token` is an
 /// authoritative lone `/` line ending the statement right now, regardless of
 /// any other state the caller was tracking.
+///
+/// `content_start` is the byte offset of the span's own
+/// [`StatementSpan::content_start`] (not necessarily this scan's own `start`
+/// parameter, which for a block statement is already past the matched
+/// starter's keywords). `content_end` is clamped to never fall below it: by
+/// construction (see the module docs' "lone `/` line with nothing pending"
+/// section) it never should, since a real, already-known-non-trivial token
+/// always lies between `content_start` and `slash_token`, but this is
+/// defense in depth for any scan path that does not itself guarantee that —
+/// an unclamped `content_end` computed purely from `slash_token`'s position
+/// in the whole document was a confirmed adversarial-review defect
+/// (ADR-0002 amendment J, round 2): `text[..slash_token.start].trim_end()`
+/// can strip back past a span's own `content_start` when only trivia
+/// separates them, producing `content_start > content_end` and a panic in
+/// [`StatementSpan::content`].
 fn end_at_slash_line(
     text: &str,
     slash_token: Token,
     kind: StatementKind,
     next_i: usize,
+    content_start: usize,
 ) -> ScanOutcome {
-    let content_end = text[..slash_token.start].trim_end().len();
+    let content_end = text[..slash_token.start]
+        .trim_end()
+        .len()
+        .max(content_start);
     let full_end = trailing_line_end(text, slash_token.end);
     ScanOutcome {
         content_end,
@@ -642,14 +775,20 @@ fn finish_with_maybe_slash(
 /// `SELECT 10`, exactly matching SQL\*Plus/SQLcl): the splitter's job is to
 /// find where the *client* would draw the boundary, not to validate SQL
 /// grammar.
-fn scan_plain(tokens: &[Token], text: &str, start: usize, dialect: &SqlDialect) -> ScanOutcome {
+fn scan_plain(
+    tokens: &[Token],
+    text: &str,
+    start: usize,
+    dialect: &SqlDialect,
+    content_start: usize,
+) -> ScanOutcome {
     let mut i = start;
     while let Some(&token) = tokens.get(i) {
         if dialect.slash_terminates_plain
             && token.kind == TokenKind::Operator
             && is_lone_slash_line(text, token)
         {
-            return end_at_slash_line(text, token, StatementKind::Plain, i + 1);
+            return end_at_slash_line(text, token, StatementKind::Plain, i + 1, content_start);
         }
         if is_terminator(text, token, dialect) {
             return ScanOutcome {
@@ -675,11 +814,12 @@ fn scan_opaque_source(
     text: &str,
     start: usize,
     _dialect: &SqlDialect,
+    content_start: usize,
 ) -> ScanOutcome {
     let mut i = start;
     while let Some(&token) = tokens.get(i) {
         if token.kind == TokenKind::Operator && is_lone_slash_line(text, token) {
-            return end_at_slash_line(text, token, StatementKind::Block, i + 1);
+            return end_at_slash_line(text, token, StatementKind::Block, i + 1, content_start);
         }
         i += 1;
     }
@@ -696,6 +836,7 @@ fn scan_paren_delimited(
     text: &str,
     start: usize,
     dialect: &SqlDialect,
+    content_start: usize,
 ) -> ScanOutcome {
     let mut i = start;
     let mut paren_depth: i32 = 0;
@@ -704,7 +845,7 @@ fn scan_paren_delimited(
             && token.kind == TokenKind::Operator
             && is_lone_slash_line(text, token)
         {
-            return end_at_slash_line(text, token, StatementKind::Block, i + 1);
+            return end_at_slash_line(text, token, StatementKind::Block, i + 1, content_start);
         }
         if token.kind == TokenKind::Operator {
             match &text[token.start..token.end] {
@@ -738,32 +879,61 @@ fn scan_paren_delimited(
 }
 
 /// Scans forward from right after a [`SqlDialect::subprogram_header_keywords`]/
-/// [`SqlDialect::compound_trigger_timing_starters`] word (`i` is the index of
-/// the token right after it) to decide whether this header owes a body.
-/// Neither a statement terminator nor
-/// [`SqlDialect::body_intro_keywords`] can legally occur inside a parameter
-/// list or a name, so this does not need to track paren depth: whichever of
-/// the two is found first, at any depth, is the answer.
+/// [`SqlDialect::section_header_starters`] word (`i` is the index of the
+/// token right after it) to decide whether this header owes a body.
+///
+/// Tracks `(`/`)` depth: a statement terminator or
+/// [`SqlDialect::body_intro_keywords`] word only counts at depth `0`, so a
+/// parameter default's own `CAST(x AS t)`/`CASE WHEN x IS NULL THEN … END`
+/// cannot be mistaken for the header's own `AS`/`IS` or terminator (a
+/// confirmed adversarial-review defect — ADR-0002 amendment J, round 2 —
+/// this scan was previously blind to parens entirely). A depth-`0`
+/// `body_intro_keywords` word that only completes a
+/// [`SqlDialect::body_intro_exceptions`] phrase (Oracle: a constructor's
+/// `RETURN SELF AS RESULT IS`, where `AS` is not the real body intro) is
+/// skipped over rather than treated as one.
 ///
 /// Returns `(resume_index, owes_body)`.
 fn scan_header(tokens: &[Token], text: &str, start: usize, dialect: &SqlDialect) -> (usize, bool) {
     let mut i = start;
+    let mut paren_depth: i32 = 0;
     while let Some(&token) = tokens.get(i) {
-        if is_word(token.kind) {
+        if token.kind == TokenKind::Operator {
+            match &text[token.start..token.end] {
+                "(" => {
+                    paren_depth += 1;
+                    i += 1;
+                    continue;
+                }
+                ")" => {
+                    paren_depth -= 1;
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            if paren_depth <= 0 && is_terminator(text, token, dialect) {
+                return (i + 1, false);
+            }
+            i += 1;
+            continue;
+        }
+        if paren_depth <= 0 && is_word(token.kind) {
             let word = &text[token.start..token.end];
             if dialect
                 .body_intro_keywords
                 .iter()
                 .any(|k| k.eq_ignore_ascii_case(word))
+                && !dialect
+                    .body_intro_exceptions
+                    .iter()
+                    .any(|phrase| ends_with_phrase(tokens, text, i, phrase))
             {
                 let after = skip_trivial(tokens, i + 1);
-                let is_call_spec = tokens.get(after).is_some_and(|t| {
-                    is_word(t.kind)
-                        && dialect
-                            .call_spec_keywords
-                            .iter()
-                            .any(|k| k.eq_ignore_ascii_case(&text[t.start..t.end]))
-                });
+                let is_call_spec = dialect
+                    .call_spec_phrases
+                    .iter()
+                    .any(|phrase| peek_phrase_matches(tokens, text, after, phrase));
                 if is_call_spec {
                     let mut j = after;
                     while let Some(&t2) = tokens.get(j) {
@@ -776,8 +946,6 @@ fn scan_header(tokens: &[Token], text: &str, start: usize, dialect: &SqlDialect)
                 }
                 return (i + 1, true);
             }
-        } else if token.kind == TokenKind::Operator && is_terminator(text, token, dialect) {
-            return (i + 1, false);
         }
         i += 1;
     }
@@ -793,6 +961,7 @@ fn scan_to_terminator(
     text: &str,
     start: usize,
     dialect: &SqlDialect,
+    content_start: usize,
 ) -> ScanOutcome {
     let mut i = start;
     while let Some(&token) = tokens.get(i) {
@@ -800,7 +969,7 @@ fn scan_to_terminator(
             && token.kind == TokenKind::Operator
             && is_lone_slash_line(text, token)
         {
-            return end_at_slash_line(text, token, StatementKind::Block, i + 1);
+            return end_at_slash_line(text, token, StatementKind::Block, i + 1, content_start);
         }
         if is_terminator(text, token, dialect) {
             return finish_with_maybe_slash(
@@ -873,40 +1042,62 @@ fn finish_structured(
 }
 
 /// Scans a [`crate::dialect::BlockKind::Structured`] statement from its
-/// first token (`start`, right after the matched [`crate::dialect::BlockStarter`]'s
-/// own leading keywords). See the [module documentation](self)'s
-/// "block-termination rule" section for the full algorithm; safety principle
-/// S1 (an authoritative `/` line) is checked before anything else on every
-/// token, so it always wins regardless of `depth`/`pending_bodies`.
+/// first token (`start`, right after the matched `starter`'s own leading
+/// keywords). See the [module documentation](self)'s "block-termination
+/// rule" section for the full algorithm; safety principle S1 (an
+/// authoritative `/` line) is checked before anything else on every token,
+/// so it always wins regardless of `depth`/`pending_bodies`/`paren_depth`.
+///
+/// `starter.opens_body` seeds `absorbed_body`: see [`BlockStarter::opens_body`]
+/// and the module docs for why a bare `BEGIN` starter must start this scan
+/// as though its one body has already been absorbed, while every other
+/// starter shape starts fresh. All structural word-dispatch below is also
+/// gated on this scan's own `(`/`)` depth being `0`, so the *outer*
+/// statement's own parameter list (as opposed to a nested member's, which
+/// [`scan_header`] guards separately) cannot corrupt `depth`/`pending_bodies`
+/// via a parameter default's `CASE … END`/`CAST(x AS t)`.
 #[allow(clippy::too_many_lines)]
 fn scan_structured(
     tokens: &[Token],
     text: &str,
     start: usize,
     dialect: &SqlDialect,
+    starter: &BlockStarter,
+    content_start: usize,
 ) -> ScanOutcome {
     let mut i = start;
     let mut depth: i32 = 0;
     let mut pending_bodies: u32 = 0;
-    let mut absorbed_body = false;
+    let mut absorbed_body = starter.opens_body;
     let mut is_compound = false;
+    let mut paren_depth: i32 = 0;
 
     while let Some(&token) = tokens.get(i) {
         if dialect.slash_terminates_block
             && token.kind == TokenKind::Operator
             && is_lone_slash_line(text, token)
         {
-            return end_at_slash_line(text, token, StatementKind::Block, i + 1);
+            return end_at_slash_line(text, token, StatementKind::Block, i + 1, content_start);
         }
 
-        if !is_word(token.kind) {
+        if token.kind == TokenKind::Operator {
+            match &text[token.start..token.end] {
+                "(" => paren_depth += 1,
+                ")" => paren_depth -= 1,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+
+        if !is_word(token.kind) || paren_depth > 0 {
             i += 1;
             continue;
         }
         let word = &text[token.start..token.end];
 
         if !is_compound
-            && let Some(marker) = dialect.compound_trigger_marker
+            && let Some(marker) = dialect.sectioned_body_marker
             && peek_phrase_matches(tokens, text, i, marker)
         {
             is_compound = true;
@@ -920,7 +1111,7 @@ fn scan_structured(
                 .iter()
                 .any(|k| k.eq_ignore_ascii_case(word))
         {
-            return scan_to_terminator(tokens, text, i + 1, dialect);
+            return scan_to_terminator(tokens, text, i + 1, dialect, content_start);
         }
 
         // The *outer* statement's own header is already consumed by the
@@ -938,17 +1129,18 @@ fn scan_structured(
                 .body_intro_keywords
                 .iter()
                 .any(|k| k.eq_ignore_ascii_case(word))
+            && !dialect
+                .body_intro_exceptions
+                .iter()
+                .any(|phrase| ends_with_phrase(tokens, text, i, phrase))
         {
             let after = skip_trivial(tokens, i + 1);
-            let is_call_spec = tokens.get(after).is_some_and(|t| {
-                is_word(t.kind)
-                    && dialect
-                        .call_spec_keywords
-                        .iter()
-                        .any(|k| k.eq_ignore_ascii_case(&text[t.start..t.end]))
-            });
+            let is_call_spec = dialect
+                .call_spec_phrases
+                .iter()
+                .any(|phrase| peek_phrase_matches(tokens, text, after, phrase));
             if is_call_spec {
-                return scan_to_terminator(tokens, text, after, dialect);
+                return scan_to_terminator(tokens, text, after, dialect, content_start);
             }
         }
 
@@ -958,7 +1150,7 @@ fn scan_structured(
             .any(|k| k.eq_ignore_ascii_case(word))
             || (is_compound
                 && dialect
-                    .compound_trigger_timing_starters
+                    .section_header_starters
                     .iter()
                     .any(|k| k.eq_ignore_ascii_case(word)));
 
@@ -981,7 +1173,22 @@ fn scan_structured(
         }
 
         if word.eq_ignore_ascii_case(dialect.block_body_opener) {
-            if pending_bodies > 0 {
+            // `pending_bodies > 0` alone is not enough: it only says *some*
+            // header somewhere up the stack still owes a body, not that
+            // *this* `BEGIN` is the one that fulfills it. Once `depth > 0` —
+            // already inside a body that a previous `BEGIN` opened, whether
+            // by fulfilling a debt or by absorption — any further `BEGIN`
+            // is unambiguously a nested block, never a fulfillment, no
+            // matter how many debts are still outstanding further up.
+            // Requiring `depth == 0` too was a confirmed defect the
+            // grammar-based differential test found (ADR-0002 amendment J,
+            // round 2): a two-level-deep nested subprogram whose *inner*
+            // member's own body itself contained a nested `BEGIN … END` had
+            // that inner `BEGIN` wrongly consumed as fulfilling the
+            // *outer* member's still-pending debt, corrupting depth
+            // tracking so the outermost statement's real closing `END`
+            // never matched at depth `0`.
+            if pending_bodies > 0 && depth == 0 {
                 pending_bodies -= 1;
                 depth += 1;
             } else if depth == 0 && !absorbed_body {

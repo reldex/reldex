@@ -478,15 +478,12 @@ fn next_token_normal(
         );
     }
 
-    if !dialect.comments.sqlplus_line_comment_words.is_empty()
-        && *at_line_start
-        && ch.is_alphabetic()
-    {
+    if !dialect.comments.line_comment_words.is_empty() && *at_line_start && ch.is_alphabetic() {
         let len = leading_identifier_len(cursor.rest());
         let word = &cursor.rest()[..len];
         if dialect
             .comments
-            .sqlplus_line_comment_words
+            .line_comment_words
             .iter()
             .any(|w| w.eq_ignore_ascii_case(word))
         {
@@ -681,10 +678,17 @@ mod tests {
             block_end_keyword: "END",
             subprogram_header_keywords: &["PROCEDURE", "FUNCTION"],
             body_intro_keywords: &["IS", "AS"],
-            call_spec_keywords: &["LANGUAGE", "EXTERNAL"],
+            body_intro_exceptions: &[&["SELF", "AS"]],
+            call_spec_phrases: &[
+                &["LANGUAGE", "JAVA"],
+                &["LANGUAGE", "C"],
+                &["LANGUAGE", "JAVASCRIPT"],
+                &["EXTERNAL", "LIBRARY"],
+                &["EXTERNAL", "NAME"],
+            ],
             body_less_markers: &["CALL"],
-            compound_trigger_marker: Some(&["COMPOUND", "TRIGGER"]),
-            compound_trigger_timing_starters: &["BEFORE", "AFTER", "INSTEAD"],
+            sectioned_body_marker: Some(&["COMPOUND", "TRIGGER"]),
+            section_header_starters: &["BEFORE", "AFTER", "INSTEAD"],
             directive_prefix: Some('$'),
             quoting: QuotingRules {
                 alternative_quote_prefixes: &["Q", "NQ"],
@@ -693,7 +697,7 @@ mod tests {
             comments: CommentRules {
                 line_comment: Some("--"),
                 block_comment: Some(("/*", "*/")),
-                sqlplus_line_comment_words: &[],
+                line_comment_words: &[],
             },
             bind_variables: true,
             substitution_variables: true,
@@ -888,7 +892,7 @@ mod tests {
     #[test]
     fn rem_comment_only_fires_at_the_start_of_a_line_and_as_a_whole_word() {
         let mut dialect = test_dialect();
-        dialect.comments.sqlplus_line_comment_words = &["REM", "REMARK"];
+        dialect.comments.line_comment_words = &["REM", "REMARK"];
         assert_eq!(
             kinds_with(&dialect, "REM a comment\nSELECT 1")[0],
             (TokenKind::Comment, "REM a comment")

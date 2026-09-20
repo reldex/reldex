@@ -78,6 +78,10 @@ const CREATE_SUBPROGRAM_STARTER: BlockStarter = BlockStarter {
         KeywordSlot::Required(&[&["PROCEDURE"], &["FUNCTION"], &["TRIGGER"]]),
     ],
     kind: BlockKind::Structured,
+    // The subprogram's/trigger's own body still lies ahead (its `BEGIN`, or
+    // `CALL` for a body-less trigger) — this starter consumes only the
+    // introducing DDL keywords.
+    opens_body: false,
 };
 
 /// `CREATE [OR REPLACE] [EDITIONABLE|NONEDITIONABLE] {PACKAGE[ BODY]|TYPE BODY}`:
@@ -94,6 +98,10 @@ const CREATE_COMPOUND_STARTER: BlockStarter = BlockStarter {
         KeywordSlot::Required(&[&["PACKAGE"], PACKAGE_BODY, TYPE_BODY]),
     ],
     kind: BlockKind::Structured,
+    // The container's optional initialization section (its own `BEGIN`, if
+    // any) still lies ahead, after any number of members — this starter
+    // consumes only the introducing DDL keywords.
+    opens_body: false,
 };
 
 /// `CREATE [OR REPLACE] [EDITIONABLE|NONEDITIONABLE] TYPE` (without `BODY`):
@@ -108,6 +116,9 @@ const CREATE_TYPE_SPEC_STARTER: BlockStarter = BlockStarter {
         KeywordSlot::Required(&[&["TYPE"]]),
     ],
     kind: BlockKind::ParenDelimited,
+    // `opens_body` is meaningless for `BlockKind::ParenDelimited` (there is
+    // no `BEGIN`/`END` body-tracking scan to seed at all); `false` is inert.
+    opens_body: false,
 };
 
 /// `CREATE [OR REPLACE] [AND RESOLVE|AND COMPILE] [NOFORCE] JAVA SOURCE ...`:
@@ -127,16 +138,27 @@ const CREATE_JAVA_SOURCE_STARTER: BlockStarter = BlockStarter {
         KeywordSlot::Required(&[JAVA_SOURCE]),
     ],
     kind: BlockKind::OpaqueSource,
+    // `opens_body` is meaningless for `BlockKind::OpaqueSource` (no
+    // `BEGIN`/`END` tracking at all); `false` is inert.
+    opens_body: false,
 };
 
 const DECLARE_STARTER: BlockStarter = BlockStarter {
     slots: &[KeywordSlot::Required(&[&["DECLARE"]])],
     kind: BlockKind::Structured,
+    // A `DECLARE` block's own `BEGIN` still lies ahead, after the declare
+    // section — this starter consumes only the `DECLARE` keyword itself.
+    opens_body: false,
 };
 
 const BEGIN_STARTER: BlockStarter = BlockStarter {
     slots: &[KeywordSlot::Required(&[&["BEGIN"]])],
     kind: BlockKind::Structured,
+    // Matching this starter already consumed the block's own `BEGIN`, so
+    // the *next* `BEGIN` the scan finds is unambiguously a nested block —
+    // see `BlockStarter::opens_body`'s own documentation for the
+    // adversarial-review defect this field fixes.
+    opens_body: true,
 };
 
 const BLOCK_STARTERS: &[BlockStarter] = &[
@@ -187,7 +209,7 @@ const KEYWORDS: &[&str] = &[
     "USING", "OUT", "IN", "NOCOPY", "IS", "AS", "CONSTANT", "OTHERS",
     "RAISE_APPLICATION_ERROR", "RESULT_CACHE", "DETERMINISTIC", "PIPELINED",
     "AUTHID", "DEFINER", "CURRENT_USER", "LANGUAGE", "JAVA", "LIBRARY",
-    "EXTERNAL", "ROWTYPE",
+    "EXTERNAL", "ROWTYPE", "SUBTYPE", "REF", "SELF", "RESULT",
     // types
     "NUMBER", "VARCHAR2", "CHAR", "NCHAR", "NVARCHAR2", "DATE", "TIMESTAMP",
     "INTERVAL", "CLOB", "NCLOB", "BLOB", "RAW", "LONG", "ROWID", "UROWID",
@@ -222,10 +244,24 @@ pub const fn sql_dialect() -> SqlDialect {
         block_end_keyword: "END",
         subprogram_header_keywords: &["PROCEDURE", "FUNCTION"],
         body_intro_keywords: &["IS", "AS"],
-        call_spec_keywords: &["LANGUAGE", "EXTERNAL"],
+        // A constructor method's `RETURN SELF AS RESULT IS ...`: the `AS` in
+        // `SELF AS RESULT` is not a body intro (the trailing `IS` is).
+        body_intro_exceptions: &[&["SELF", "AS"]],
+        // Full phrases, not single words — see `call_spec_phrases`'s own
+        // documentation for why a lone `LANGUAGE`/`EXTERNAL` word must never
+        // be enough (a variable, constant, or cursor may legally be named
+        // either). The legacy `EXTERNAL` call-spec is always written with a
+        // following `LIBRARY` or `NAME`.
+        call_spec_phrases: &[
+            &["LANGUAGE", "JAVA"],
+            &["LANGUAGE", "C"],
+            &["LANGUAGE", "JAVASCRIPT"],
+            &["EXTERNAL", "LIBRARY"],
+            &["EXTERNAL", "NAME"],
+        ],
         body_less_markers: &["CALL"],
-        compound_trigger_marker: Some(&["COMPOUND", "TRIGGER"]),
-        compound_trigger_timing_starters: &["BEFORE", "AFTER", "INSTEAD"],
+        sectioned_body_marker: Some(&["COMPOUND", "TRIGGER"]),
+        section_header_starters: &["BEFORE", "AFTER", "INSTEAD"],
         directive_prefix: Some('$'),
         quoting: QuotingRules {
             alternative_quote_prefixes: &["Q", "NQ"],
@@ -240,7 +276,7 @@ pub const fn sql_dialect() -> SqlDialect {
             // lexed as ordinary statement text today rather than silently
             // misread. `reldex_sql_text::lexer` implements and tests the
             // non-empty behavior for when that work is scheduled.
-            sqlplus_line_comment_words: &[],
+            line_comment_words: &[],
         },
         bind_variables: true,
         substitution_variables: true,

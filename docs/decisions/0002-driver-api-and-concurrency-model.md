@@ -1200,6 +1200,122 @@ line-by-line-vs-whole-document `tokenize` invariant holds under both LF and CRLF
 "known-good blocks joined by `/`" round-trip property (independently-valid blocks concatenated, split,
 and confirmed to come back as exactly one span each, all terminated).
 
+### J5 — round-2 adversarial review: a rewrite that fixed J4 but introduced a worse, harder-to-see bug
+
+A second, independent adversarial review of J4's fix rejected it: every J4 finding was confirmed
+fixed, and 6,000,000 random-fragment fuzz cases (an extension of J4's own fuzz test) found no
+gap/overlap violation — but random fragment concatenation essentially never produces a *balanced*,
+deeply nested structure, so it could not see a new defect that only manifests once nesting is
+balanced. Four MUST-FIX defects were found by direct code reading; a fifth, worse one was found only
+after this review commissioned the grammar-based differential test J5 itself required (below) — the
+review's own point that fuzzing fragments and generating whole valid structures catch different bug
+classes, proven in the same round.
+
+**MUST-FIX #1 — a `BEGIN` starter's own first nested block was mistaken for its body.**
+`BlockStarter` gained `opens_body: bool` (`true` only for the bare `BEGIN` starter, `false` for every
+other shape): the depth-tracking scan now starts as though one body has already been absorbed exactly
+when the starter's own matched keywords *were* that body's opener, rather than always starting fresh
+and letting the first `BEGIN` found — nested or not — claim the role by an implicit, previously
+untested assumption. Pre-fix, `BEGIN BEGIN NULL; END; END;` split into 2 spans (an orphaned `END`);
+with sibling inner blocks, an *N*-sibling script produced *N + 1* spans, the middle ones complete,
+independently runnable statements carved from a single one.
+
+**MUST-FIX #2 — a lone `/` line with nothing pending panicked `StatementSpan::content`.**
+`end_at_slash_line` computed `content_end` by trimming trailing whitespace from the whole document up
+to the `/`'s own position, with no floor — so a `/` line immediately following an already-terminated
+statement (nothing but whitespace between them) could compute a `content_end` for a new, near-empty
+span that landed *before* that span's own `content_start`. Lead decision, recorded here because it
+changes what a script author's habit means: **a lone `/` line with no pending statement text produces
+no span at all** — not an empty statement, not a re-submission of the previous one (SQL\*Plus's own
+"re-run the buffer" semantics for this case are themselves unverified against a real desktop-editor
+use, so this crate does not attempt to reproduce them). `split_statements` now checks this before a
+span's `content_start` is even computed; `end_at_slash_line` additionally clamps `content_end` to
+never fall below the `content_start` its caller is building, as defense in depth.
+
+**MUST-FIX #3 — a variable literally named `language`/`external` was read as a call-spec.**
+`SqlDialect::call_spec_keywords: &[&str]` (single words) is now `call_spec_phrases: &[Phrase]` (full
+phrases: Oracle ships `LANGUAGE JAVA`/`LANGUAGE C`/`LANGUAGE JAVASCRIPT`/`EXTERNAL LIBRARY`/`EXTERNAL
+NAME`), matched as whole phrases in both `scan_header` and `scan_structured`'s own outer-header check.
+The fail-safe direction only goes one way: a missed call-spec merely swallows extra, syntactically
+inert text up to the next `/`/EOF, while a *false* one carves a real body out from under the statement
+that owns it — so recognizing a call-spec now requires a full phrase match, never a single word that a
+legal identifier could collide with.
+
+**MUST-FIX #4 — a header scan was parenthesis-blind.** Neither `scan_header` (a nested member's own
+header) nor `scan_structured`'s own outer-header check tracked `(`/`)` depth, so a parameter default's
+own `AS`/`IS`/`CASE … END` — `PROCEDURE p2(a NUMBER DEFAULT CAST(1 AS NUMBER))`, a forward
+declaration — was read as the header's real body intro, corrupting `pending_bodies` and, in turn,
+consuming the container's own real `BEGIN` as fulfilling a phantom debt instead of being absorbed as
+the container's own body. Both scans now track paren depth and only treat `IS`/`AS`/a terminator as
+significant at depth `0`. A constructor method's `RETURN SELF AS RESULT IS ...` has the same shape at
+depth `0` (the `AS` in `SELF AS RESULT` is not a body intro) — a new `SqlDialect::body_intro_exceptions:
+&[Phrase]` field (Oracle: `[SELF AS]`) lets a dialect declare such phrases as data, checked by looking
+at the word(s) immediately *preceding* a candidate body-intro match.
+
+**An additional, more severe bug found only by the new differential test** (see below), not among the
+four the code-reading pass found: `scan_structured`'s `BEGIN` dispatch treated `pending_bodies > 0`
+alone as "this `BEGIN` fulfills a header's debt", without also requiring `depth == 0`. A two-level-deep
+nested subprogram (an inner member declared inside a *middle* member's own declare section, where the
+inner member's own body itself contained a further nested `BEGIN ... END`) had that innermost `BEGIN`
+wrongly consumed as fulfilling the *middle* member's still-outstanding debt, because it was reached
+while `pending_bodies` was still nonzero from that outer debt — even though the scan was already
+nested one level deeper (`depth == 1`) by the time it got there. The fix adds the missing
+`depth == 0` requirement: once already inside a body a previous `BEGIN` opened, any further `BEGIN` is
+unambiguously a nested block, never a fulfillment, regardless of how many debts remain further up the
+stack. Random-fragment fuzzing (both the J4 fuzz test and this round's 6,000,000-case run) could not
+find this either, for the same structural reason it missed MUST-FIX #1: two-plus levels of nested,
+still-pending subprogram declarations essentially never arise from concatenating independent
+fragments.
+
+**The acceptance gate this round added: a grammar-based differential test**
+(`crates/sql-text/tests/differential.rs`, modeled on but not copied from the reviewer's own reference
+implementation). Rather than concatenating independent fragments, it generates whole,
+structurally-valid, self-contained PL/SQL "units" — anonymous blocks (bare/labelled/`DECLARE`,
+nested and sibling inner blocks, an exception handler containing a block), subprograms with
+two-level-deep nested subprograms and `CAST`/`CASE`-bearing parameter defaults, cursors and
+`TYPE ... IS RECORD|TABLE OF|REF CURSOR`/`SUBTYPE ... IS` declarations, package specs (forward
+declarations, a call-spec member) and bodies (members, an init section with an `EXCEPTION` handler),
+type specs (object/varray/table-of/incomplete) and a type body (`MEMBER`/`STATIC`/`CONSTRUCTOR ...
+RETURN SELF AS RESULT`), simple/compound/`INSTEAD OF`/`CALL` triggers and `WHEN (... IS NULL)`, and
+plain SQL with `CASE` expressions and subquery `AS` aliases — concatenates 3–8 of them three ways
+(always a `/` line between units, never one, or an independent coin flip per boundary, the last of
+which also exercises MUST-FIX #2's rule by sometimes placing a `/` after a *plain* unit too), under
+both LF and CRLF, and asserts `split_statements` recovers **exactly** the generated units: the same
+count, in order, each one's `StatementSpan::content` equal (after stripping the unit's own trailing
+`;`, its only defined trimming rule) to what was generated, the expected `StatementKind`/`EndedBy`,
+and every span invariant (`content_start <= content_end <= full_end`, char-boundary offsets,
+`.content()`/`.full()` never panicking). 8 fixed seeds (including the reviewer's own 1/42/3/987/2024),
+2,000 base scripts per seed in release mode × 3 join modes × 2 line endings = 96,000 scripts checked;
+40 base scripts per seed in debug. The random-fragment fuzz test's own vocabulary was extended with
+round-2 fragments (nested/sibling `BEGIN` blocks, a `language`/`external`-named variable, the `CAST`
+forward declaration, a constructor's `RETURN SELF AS RESULT`) and its assertions now call
+`.content()`/`.full()` on every span, not only check offset ordering.
+
+**Renames (naming only; no vendor literal ever lived in `splitter.rs`'s logic, confirmed by this
+review):** `CommentRules::sqlplus_line_comment_words` → `line_comment_words`;
+`SqlDialect::compound_trigger_marker` → `sectioned_body_marker`;
+`SqlDialect::compound_trigger_timing_starters` → `section_header_starters` — the mechanism (a marker
+phrase announcing independently-scoped sections, and the words that start one) is not itself an
+Oracle-specific idea, only Oracle's *instance* of it (`COMPOUND TRIGGER`/`BEFORE`/`AFTER`/`INSTEAD`) is.
+
+**Documented, not changed:** when safety principle S1 rescues a miscounted scan at a `/` line, its
+span's content boundaries are already identical to a clean `EndedBy::SlashLine` close — both paths
+share `end_at_slash_line`. A `/` line followed by a same-line comment (`/ -- note`) is *not* currently
+treated as a lone `/` line by `is_lone_slash_line` (it requires the rest of the line to be
+whitespace-only); this is consistent across every scan that calls it, but unverified against real
+SQL\*Plus/SQLcl behavior, which may or may not tolerate a trailing comment there.
+
+*Evidence:* `crates/sql-text/tests/corpus.rs` grew to 64 passing tests (43 named reproducers/round-1
+regressions, 12 new round-2 MUST-FIX reproducers named `must_fix_1_*`/`must_fix_3_*`/`must_fix_4_*`
+covering every starter shape and identifier-collision case listed above, 1 named
+`additional_bug_*` for the fifth defect, plus the pre-existing corpus/fuzz suite) plus 1 remaining
+`#[ignore]`d limitation (unchanged, J3); a new `crates/sql-text/tests/differential.rs` (1 test, the
+grammar-based property above). `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+-- -D warnings`, `cargo test --workspace`, and `cargo test -p reldex-sql-text --release`
+(63 `corpus.rs` tests including the 800,000-case extended fuzz run, 1 `differential.rs` test covering
+96,000 generated scripts, both green) all pass; `RUSTDOCFLAGS="-D warnings" cargo doc -p
+reldex-sql-text --no-deps` is clean.
+
 ## Notes for driver implementers
 
 Findings from reading `oracle/rust-oracledb` **`=26.0.0-beta.3`** — the version this repository pins

@@ -31,6 +31,7 @@ const CREATE_SUBPROGRAM_STARTER: BlockStarter = BlockStarter {
         KeywordSlot::Required(&[&["PROCEDURE"], &["FUNCTION"], &["TRIGGER"]]),
     ],
     kind: BlockKind::Structured,
+    opens_body: false,
 };
 
 const CREATE_COMPOUND_STARTER: BlockStarter = BlockStarter {
@@ -41,6 +42,7 @@ const CREATE_COMPOUND_STARTER: BlockStarter = BlockStarter {
         KeywordSlot::Required(&[&["PACKAGE"], PACKAGE_BODY, TYPE_BODY]),
     ],
     kind: BlockKind::Structured,
+    opens_body: false,
 };
 
 const CREATE_TYPE_SPEC_STARTER: BlockStarter = BlockStarter {
@@ -51,6 +53,7 @@ const CREATE_TYPE_SPEC_STARTER: BlockStarter = BlockStarter {
         KeywordSlot::Required(&[&["TYPE"]]),
     ],
     kind: BlockKind::ParenDelimited,
+    opens_body: false,
 };
 
 const CREATE_JAVA_SOURCE_STARTER: BlockStarter = BlockStarter {
@@ -62,16 +65,19 @@ const CREATE_JAVA_SOURCE_STARTER: BlockStarter = BlockStarter {
         KeywordSlot::Required(&[JAVA_SOURCE]),
     ],
     kind: BlockKind::OpaqueSource,
+    opens_body: false,
 };
 
 const DECLARE_STARTER: BlockStarter = BlockStarter {
     slots: &[KeywordSlot::Required(&[&["DECLARE"]])],
     kind: BlockKind::Structured,
+    opens_body: false,
 };
 
 const BEGIN_STARTER: BlockStarter = BlockStarter {
     slots: &[KeywordSlot::Required(&[&["BEGIN"]])],
     kind: BlockKind::Structured,
+    opens_body: true,
 };
 
 const BLOCK_STARTERS: &[BlockStarter] = &[
@@ -185,6 +191,12 @@ const KEYWORDS: &[&str] = &[
     "VARCHAR2",
     "DATE",
     "ROWTYPE",
+    "SUBTYPE",
+    "REF",
+    "SELF",
+    "RESULT",
+    "RECORD",
+    "UNDER",
 ];
 
 /// Oracle-*shaped* dialect: `/` terminates a block or plain statement, and a
@@ -202,10 +214,17 @@ pub(crate) fn oracle_like() -> SqlDialect {
         block_end_keyword: "END",
         subprogram_header_keywords: &["PROCEDURE", "FUNCTION"],
         body_intro_keywords: &["IS", "AS"],
-        call_spec_keywords: &["LANGUAGE", "EXTERNAL"],
+        body_intro_exceptions: &[&["SELF", "AS"]],
+        call_spec_phrases: &[
+            &["LANGUAGE", "JAVA"],
+            &["LANGUAGE", "C"],
+            &["LANGUAGE", "JAVASCRIPT"],
+            &["EXTERNAL", "LIBRARY"],
+            &["EXTERNAL", "NAME"],
+        ],
         body_less_markers: &["CALL"],
-        compound_trigger_marker: Some(&["COMPOUND", "TRIGGER"]),
-        compound_trigger_timing_starters: &["BEFORE", "AFTER", "INSTEAD"],
+        sectioned_body_marker: Some(&["COMPOUND", "TRIGGER"]),
+        section_header_starters: &["BEFORE", "AFTER", "INSTEAD"],
         directive_prefix: Some('$'),
         quoting: QuotingRules {
             alternative_quote_prefixes: &["Q", "NQ"],
@@ -214,7 +233,7 @@ pub(crate) fn oracle_like() -> SqlDialect {
         comments: CommentRules {
             line_comment: Some("--"),
             block_comment: Some(("/*", "*/")),
-            sqlplus_line_comment_words: &[],
+            line_comment_words: &[],
         },
         bind_variables: true,
         substitution_variables: true,
@@ -225,6 +244,11 @@ pub(crate) fn oracle_like() -> SqlDialect {
 /// The same dialect, but strict about `/`: a block without a trailing `/`
 /// line is reported as not terminated. Used by the tests that specifically
 /// exercise [`SqlDialect::block_may_end_without_slash`].
+///
+/// `#[allow(dead_code)]`: this file is compiled once per test binary (each
+/// of `corpus.rs`/`differential.rs` declares its own `#[path] mod support`),
+/// and not every binary exercises every dialect variant this module offers.
+#[allow(dead_code)]
 pub(crate) fn oracle_like_strict_slash() -> SqlDialect {
     SqlDialect {
         block_may_end_without_slash: false,
@@ -234,13 +258,15 @@ pub(crate) fn oracle_like_strict_slash() -> SqlDialect {
 
 /// The same dialect, with the SQL\*Plus `REM`/`REMARK` line comment enabled —
 /// used by the one test that exercises
-/// [`reldex_sql_text::CommentRules::sqlplus_line_comment_words`], which
-/// Oracle's own Phase 1 descriptor leaves empty (out of scope per
-/// `SPEC.md` §15).
+/// [`reldex_sql_text::CommentRules::line_comment_words`], which Oracle's own
+/// Phase 1 descriptor leaves empty (out of scope per `SPEC.md` §15).
+///
+/// `#[allow(dead_code)]`: see [`oracle_like_strict_slash`]'s doc comment.
+#[allow(dead_code)]
 pub(crate) fn oracle_like_with_rem_comments() -> SqlDialect {
     SqlDialect {
         comments: CommentRules {
-            sqlplus_line_comment_words: &["REM", "REMARK"],
+            line_comment_words: &["REM", "REMARK"],
             ..oracle_like().comments
         },
         ..oracle_like()
