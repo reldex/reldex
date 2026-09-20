@@ -197,6 +197,52 @@ fn the_off_switch_restores_the_explanatory_refusal_unchanged() {
 }
 
 #[test]
+fn with_the_rewrite_off_a_sqlplus_terminator_silently_creates_an_invalid_trigger() {
+    // What the normalisation is worth, measured rather than argued. The off
+    // switch means "send my trigger DDL exactly as I wrote it", so this is the
+    // server's own answer to a trailing SQL*Plus `/`, and it is worse than a
+    // rejection: the statement **succeeds** and leaves a trigger that does not
+    // compile. A client that passes the `/` through tells its user the trigger
+    // was created, and the user finds out otherwise the next time the table is
+    // written to.
+    let mut connection = connect_without_the_rewrite();
+    let table = unique("s12b_raw_t");
+    let trigger = unique("s12b_raw_g");
+    audited_table(connection.as_mut(), &table);
+
+    let outcome = connection
+        .execute(&Statement::new(format!(
+            "CREATE TRIGGER {trigger} BEFORE INSERT ON {table} FOR EACH ROW\n\
+             BEGIN NULL; END;\n/"
+        )))
+        .expect("the server accepts it, which is the whole problem");
+    drop(outcome);
+
+    let owner = scalar(connection.as_mut(), "SELECT USER FROM dual");
+    let status = scalar(
+        connection.as_mut(),
+        &format!(
+            "SELECT status FROM all_objects WHERE owner = '{owner}' AND \
+             object_name = '{}' AND object_type = 'TRIGGER'",
+            stored(&trigger)
+        ),
+    );
+    assert_eq!(
+        status, "INVALID",
+        "if this ever reports VALID, the server started ignoring the terminator and the \
+         normalisation in `rewrite.rs` is no longer load-bearing"
+    );
+    observation(format!(
+        "with the rewrite off, `CREATE TRIGGER …\\n/` is accepted and leaves a {status} \
+         trigger — the normalisation the switch disables is what prevents that"
+    ));
+
+    exec_quietly(connection.as_mut(), &format!("DROP TRIGGER {trigger}"));
+    exec_quietly(connection.as_mut(), &format!("DROP TABLE {table} PURGE"));
+    connection.close().expect("close");
+}
+
+#[test]
 fn a_body_containing_the_obvious_delimiter_forces_another_one_and_still_works() {
     // The body contains `]'`, which is exactly the closing sequence of the
     // first delimiter the driver tries. A rewrite that did not notice would
@@ -413,36 +459,214 @@ fn a_trigger_without_a_placeholder_is_sent_exactly_as_written() {
 }
 
 #[test]
-fn the_plsql_string_literal_limit_the_refusal_is_derived_from_is_the_real_one() {
-    // The refusal says 32767 bytes. That number comes from PL/SQL's `VARCHAR2`
-    // limit rather than from anything this driver controls, so it is measured
-    // here rather than asserted from documentation. Probing the literal
-    // directly costs one round trip each way; building a 32 KB trigger would
-    // cost far more and prove the same thing.
+fn a_sqlplus_terminator_is_understood_whether_or_not_the_trigger_needs_rewriting() {
+    // The asymmetry this test exists to prevent: the `/` used to be stripped
+    // only on the way into the rewrite, so a trigger mentioning `:NEW` worked
+    // and the identical trigger without one failed ORA-00911 — a difference the
+    // user cannot see the cause of.
+    let mut connection = connect();
+    let table = unique("s12b_s_t");
+    audited_table(connection.as_mut(), &table);
+
+    let owner = scalar(connection.as_mut(), "SELECT USER FROM dual");
+    for (label, body) in [
+        ("with a placeholder", "BEGIN :NEW.note := 'slash'; END;"),
+        ("without one", "BEGIN NULL; END;"),
+    ] {
+        let trigger = unique("s12b_s_g");
+        let outcome = connection
+            .execute(&Statement::new(format!(
+                "CREATE TRIGGER {trigger} BEFORE INSERT ON {table} FOR EACH ROW\n{body}\n/"
+            )))
+            .unwrap_or_else(|error| {
+                panic!("a trailing SQL*Plus terminator must be understood {label}: {error}")
+            });
+        assert_eq!(outcome.statement_kind(), StatementKind::Ddl);
+        drop(outcome);
+        // Acceptance proves nothing here: the server takes the `/` and creates
+        // a trigger that does not compile (see
+        // `with_the_rewrite_off_a_sqlplus_terminator_silently_creates_an_invalid_trigger`).
+        // Only the status says whether the terminator was understood.
+        assert_eq!(
+            scalar(
+                connection.as_mut(),
+                &format!(
+                    "SELECT status FROM all_objects WHERE owner = '{owner}' AND \
+                     object_name = '{}' AND object_type = 'TRIGGER'",
+                    stored(&trigger)
+                ),
+            ),
+            "VALID",
+            "the trigger {label} compiled from text that still held its `/`"
+        );
+        observation(format!(
+            "CREATE TRIGGER {label}, submitted with a trailing `/` line: created VALID"
+        ));
+        exec_quietly(connection.as_mut(), &format!("DROP TRIGGER {trigger}"));
+    }
+
+    // And a `/` that is not a terminator line of its own is still part of the
+    // statement — stripping that one would change what the trigger computes.
+    let trigger = unique("s12b_s_d");
+    exec(
+        connection.as_mut(),
+        &format!(
+            "CREATE TRIGGER {trigger} BEFORE INSERT ON {table} FOR EACH ROW\n\
+             BEGIN :NEW.note := TO_CHAR(:NEW.id / 2); END;"
+        ),
+    );
+    exec(
+        connection.as_mut(),
+        &format!("INSERT INTO {table} (id) VALUES (9)"),
+    );
+    assert_eq!(
+        scalar(
+            connection.as_mut(),
+            &format!("SELECT note FROM {table} WHERE id = 9"),
+        ),
+        "4.5",
+        "the division survived; a `/` inside the statement is not a terminator"
+    );
+    connection.rollback().expect("rollback");
+    exec_quietly(connection.as_mut(), &format!("DROP TRIGGER {trigger}"));
+
+    exec_quietly(connection.as_mut(), &format!("DROP TABLE {table} PURGE"));
+    connection.close().expect("close");
+}
+
+#[test]
+fn a_call_trigger_works_with_and_without_the_terminator_a_user_would_type() {
+    // A `CALL` trigger's body is not a PL/SQL block, so the `;` a SQL*Plus user
+    // types after it is punctuation the server rejects — inside
+    // `EXECUTE IMMEDIATE` and sent directly alike. The `END;` of a PL/SQL body
+    // is the opposite: it must survive, which every other test here covers.
+    let mut connection = connect();
+    let table = unique("s12b_call_t");
+    let procedure = unique("s12b_call_p");
+    let log = unique("s12b_call_l");
+    audited_table(connection.as_mut(), &table);
+    exec(
+        connection.as_mut(),
+        &format!("CREATE TABLE {log} (id NUMBER(9))"),
+    );
+    exec(
+        connection.as_mut(),
+        &format!(
+            "CREATE PROCEDURE {procedure}(p_id NUMBER) IS BEGIN \
+             INSERT INTO {log} (id) VALUES (p_id); END;"
+        ),
+    );
+
+    for (label, terminator) in [("without a terminator", ""), ("with one", ";")] {
+        let trigger = unique("s12b_call_g");
+        let outcome = connection
+            .execute(&Statement::new(format!(
+                "CREATE TRIGGER {trigger} AFTER INSERT ON {table} FOR EACH ROW \
+                 CALL {procedure}(:NEW.id){terminator}"
+            )))
+            .unwrap_or_else(|error| panic!("a CALL trigger {label} must work: {error}"));
+        assert_eq!(outcome.statement_kind(), StatementKind::Ddl);
+        assert!(
+            outcome
+                .warnings()
+                .iter()
+                .any(|warning| warning.message().contains("was rewritten")),
+            "a CALL trigger mentions `:NEW`, so it is rewritten like any other: {:?}",
+            outcome.warnings()
+        );
+        drop(outcome);
+        observation(format!("a CALL trigger {label} was rewritten and created"));
+
+        // It fires, which is the only proof that the body survived intact.
+        exec(
+            connection.as_mut(),
+            &format!("INSERT INTO {table} (id) VALUES (42)"),
+        );
+        assert_eq!(
+            scalar(
+                connection.as_mut(),
+                &format!("SELECT COUNT(*) FROM {log} WHERE id = 42"),
+            ),
+            "1",
+            "the CALL trigger {label} did not fire"
+        );
+        connection.rollback().expect("rollback");
+        exec_quietly(connection.as_mut(), &format!("DROP TRIGGER {trigger}"));
+    }
+
+    exec_quietly(connection.as_mut(), &format!("DROP PROCEDURE {procedure}"));
+    exec_quietly(connection.as_mut(), &format!("DROP TABLE {log} PURGE"));
+    exec_quietly(connection.as_mut(), &format!("DROP TABLE {table} PURGE"));
+    connection.close().expect("close");
+}
+
+#[test]
+fn the_plsql_string_literal_limit_is_on_the_value_not_on_the_source_text() {
+    // The refusal says 32767 bytes, and measures the **body** — which is the
+    // literal's value on both wrapping paths, but is *not* its source length on
+    // either: `q'[…]'` adds four characters, and the doubled-quote fallback adds
+    // one for every quote in the body. A 32 KB trigger full of quotes therefore
+    // emits a literal whose source text is well over 32767 bytes, and whether
+    // that is allowed decides whether the driver must measure the body or the
+    // emitted literal.
+    //
+    // So the question is measured, not assumed: does PL/SQL limit what the
+    // literal *is worth* or how long it is *written*? Probing the literal
+    // directly costs one round trip each; building 32 KB triggers would cost far
+    // more and prove the same thing.
     let mut connection = connect();
 
-    for (bytes, expected_to_work) in [(32767_usize, true), (32768_usize, false)] {
-        let filler = "x".repeat(bytes);
-        let sql = format!("BEGIN DECLARE s VARCHAR2(32767); BEGIN s := q'[{filler}]'; END; END;");
-        let outcome = connection.execute(&Statement::new(sql));
-        match (&outcome, expected_to_work) {
-            (Ok(_), true) => observation(format!(
-                "a {bytes}-byte PL/SQL string literal is accepted, which is the limit the \
-                 rewrite refusal uses"
-            )),
-            (Err(error), false) => observation(format!(
-                "a {bytes}-byte PL/SQL string literal is rejected: {error}"
-            )),
-            (Ok(_), false) => panic!(
-                "a {bytes}-byte literal was accepted; the driver's {} limit is too low and \
-                 the refusal message is wrong",
-                32767
-            ),
-            (Err(error), true) => panic!(
-                "a {bytes}-byte literal was rejected, so the driver's limit is too high: \
-                 {error}"
-            ),
-        }
+    // (label, value bytes, quotes inside the value, write it as a q-string)
+    let probes = [
+        ("q-string at the limit", 32767_usize, 0_usize, true),
+        ("q-string one byte over", 32768, 0, true),
+        // The decisive pair. 4000 quotes double to 8000 characters, so the
+        // source text is 4000 bytes longer than the value in each case.
+        ("doubled quotes at the limit", 32767, 4000, false),
+        ("doubled quotes one byte over", 32768, 4000, false),
+        // The worst source text the fallback can emit: a body at the limit made
+        // almost entirely of quotes doubles to very nearly 64 KB. If a statement
+        // that long were rejected for its *length*, measuring the body would
+        // still let the driver send something the server refuses for a reason
+        // that has nothing to do with the trigger — which is what the refusal
+        // exists to prevent.
+        ("doubled quotes, worst case source", 32767, 32743, false),
+    ];
+
+    for (label, value_bytes, quotes, q_string) in probes {
+        let value = format!("{}{}", "x".repeat(value_bytes - quotes), "'".repeat(quotes));
+        assert_eq!(value.len(), value_bytes);
+        let literal = if q_string {
+            format!("q'[{value}]'")
+        } else {
+            format!("'{}'", value.replace('\'', "''"))
+        };
+        let source_bytes = literal.len();
+        let outcome = connection.execute(&Statement::new(format!(
+            "BEGIN DECLARE s VARCHAR2(32767); BEGIN s := {literal}; END; END;"
+        )));
+        let accepted = outcome.is_ok();
+        observation(format!(
+            "{label}: value {value_bytes} bytes, literal source {source_bytes} bytes -> {}",
+            match &outcome {
+                Ok(_) => "accepted".to_owned(),
+                Err(error) => format!("rejected: {error}"),
+            }
+        ));
+        assert_eq!(
+            accepted,
+            value_bytes <= 32767,
+            "{label}: the server's answer does not match \"the limit is on the value\"; \
+             the driver measures the body, so if the limit is really on the source text \
+             (value {value_bytes}, source {source_bytes}) the refusal in `rewrite.rs` is \
+             measuring the wrong thing"
+        );
     }
+    observation(
+        "the limit is on the literal's value, not on its source text: a 36 KB source that \
+         is worth 32767 bytes is accepted, and a 32768-byte value is rejected however it is \
+         written. Measuring the body — which is the value on both wrapping paths — is \
+         therefore the right check",
+    );
     connection.close().expect("close");
 }

@@ -162,13 +162,18 @@ driver version (spike S8, U-12…U-14). Network loss/reconnect, NCLOB, EXPLAIN P
 metadata/dictionary access and privileged connections are all validated (spikes S10–S14): a dead
 socket is detected and reported honestly (`NetworkLost`/`Lost`) in microseconds, and nothing
 reconnects silently — but a **black-holed** connection needs a caller-set deadline to return at all,
-and that deadline then costs the session (no TCP keepalive exists upstream, `EXPIRE_TIME` is parsed
-and never used, and a connect cannot be bounded either — U-15…U-17). `CREATE TRIGGER` with `:NEW`/
-`:OLD` cannot be executed directly, because the upstream parser treats them as bind placeholders even
-inside DDL (U-18); the documented workaround is to submit the DDL inside
-`BEGIN EXECUTE IMMEDIATE q'[…]'; END;`, proven in the same spike. Mobile: cross-compile to
-`aarch64-linux-android`/`aarch64-apple-ios`/`aarch64-apple-ios-sim` is proven in CI (spike S6);
-physical-device validation is still pending (§25, unchanged).
+and that deadline then costs the session (no TCP keepalive exists upstream and `EXPIRE_TIME` is parsed
+and never used — U-16, U-17). A **connect** cannot be bounded by the upstream crate either (U-15), so
+the driver bounds it itself — see "Connect timeout" below; nothing can interrupt an abandoned attempt,
+which costs one thread until it finishes. `CREATE TRIGGER` with `:NEW`/`:OLD` cannot be executed by the
+upstream crate directly, because its parser treats them as bind placeholders even inside DDL (U-18); the
+driver applies the `BEGIN EXECUTE IMMEDIATE q'[…]'; END;` workaround automatically — see "Trigger DDL
+auto-rewrite" below — subject to a 32767-byte trigger-text limit and with any syntax error's position
+referring to the wrapper block. Mobile: cross-compile to
+`aarch64-linux-android`/`aarch64-apple-ios`/`aarch64-apple-ios-sim` is proven in CI (spike S6), and the
+core + driver + TLS stack has run on a physical Android arm64 phone as a native binary
+(`phase-0-android-device.md`); the packaged-app path and any iOS device evidence are still pending
+(§25, unchanged).
 
 Connectivity:
 - host/port

@@ -1799,15 +1799,48 @@ What the rewrite has to get right, and how:
   `<close>'`, so the driver tries `[ { < ( ! ~ ^ # | + @ $` and takes the first
   whose closing sequence does not occur in the body; if every one collides it
   falls back to an ordinary literal with the quotes doubled, which always works.
-- **A trailing SQL\*Plus `/` line is stripped** along with trailing whitespace,
-  and the trigger's own final `END;` is kept — the first is SQL\*Plus talking to
-  itself, the second is PL/SQL.
+- **Client-side punctuation is removed from every trigger the driver
+  recognises**, not only from the ones it wraps. A trailing SQL\*Plus `/` line
+  goes, along with trailing whitespace; so does the statement terminator after a
+  trigger body that is *not* a PL/SQL block (`… FOR EACH ROW CALL p(:NEW.id);`),
+  which the server rejects with `ORA-00911` inside `EXECUTE IMMEDIATE`. The
+  trigger's own final `END;` is kept — that semicolon is the language, not
+  punctuation for the client.
+
+  Doing this only on the wrapped path, as the first version did, made the
+  driver's behaviour depend on something the user cannot see: the same trigger
+  with and without a `:NEW` was treated differently. Found by the independent
+  review (2026-09-20), and **worse than the review supposed**: a `/` sent
+  through to the server is not rejected. Oracle 19.3 *accepts* the statement and
+  creates a trigger that is **INVALID** — success reported to the user, a broken
+  object left behind, and nothing said. That measurement is now a test of its
+  own (`with_the_rewrite_off_a_sqlplus_terminator_silently_creates_an_invalid_trigger`),
+  and it is what the normalisation is worth.
+
+  The terminator strip is **conservative by construction**: the semicolon goes
+  only when the text before it clearly does not close a PL/SQL block (`END`,
+  `END name`, `END "name"` all keep it). Anything unreadable — a quoted trailing
+  identifier, which `END "My Trigger"` and `CALL "My Proc"` share — is left
+  exactly as written, because sending a statement the server rejects is a much
+  smaller harm than deleting a character that mattered.
+
+  Both removals are gated by the same off switch: with
+  `oracle.rewrite_trigger_ddl = false` the driver sends trigger DDL exactly as
+  submitted, terminator and all. The switch means "do not touch my trigger DDL",
+  which is one promise rather than two.
 - **Too large is refused, not sent.** `EXECUTE IMMEDIATE` of a literal passes a
-  PL/SQL `VARCHAR2`, so the limit is **32767 bytes**. Measured against the live
-  database rather than taken from documentation: 32767 is accepted and 32768
-  fails with `PLS-00172: string literal too long`
-  (`the_plsql_string_literal_limit_the_refusal_is_derived_from_is_the_real_one`).
-  Beyond it the driver refuses with `ErrorKind::Unsupported` and says why.
+  PL/SQL `VARCHAR2`, so the limit is **32767 bytes**, and what it bounds is what
+  the literal is *worth*, not how long it is *written*. That distinction was
+  raised by the independent review — the doubled-quote fallback can emit a
+  literal far longer than the body — and settled by measurement rather than
+  argument
+  (`the_plsql_string_literal_limit_is_on_the_value_not_on_the_source_text`): a
+  32767-byte value is accepted written as 32772, 36769 **and 65512** bytes of
+  source, and a 32768-byte value fails `PLS-00172: string literal too long`
+  however it is written. The body is exactly the value on both wrapping paths,
+  so measuring the body is both correct and complete; measuring the emitted
+  literal would refuse statements the server accepts. Beyond the limit the
+  driver refuses with `ErrorKind::Unsupported` and says why.
 - **`StatementKind::Ddl` is unchanged**, so `db-core`'s transaction tracking and
   `committed_implicitly` behave exactly as they would for the statement the user
   typed. The block is a PL/SQL block only on the wire.
@@ -1827,27 +1860,46 @@ What the rewrite has to get right, and how:
   dropped with it: a rewritten statement is always trigger DDL, so it has
   neither a cursor nor output binds.
 
-*What the rewrite cannot preserve, stated rather than hidden:* the position of a
-**syntax** error now refers to the wrapper block rather than to the user's text
-(`SPEC.md` §24.14). That was already true of the workaround S12 documented; it
-is the price of the only mechanism that makes the statement runnable at all, and
-it is why `oracle.rewrite_trigger_ddl` exists. The compilation-error path does
-**not** lose anything, because its diagnostics come from `ALL_ERRORS` and carry
-their own line and column.
+**The two residual limits of the rewrite, in full:**
 
-*Evidence:* ten offline unit tests in `rewrite.rs` (detection across every
+1. **A rewritten trigger must fit in 32767 bytes** — the PL/SQL string literal's
+   value, measured on the trigger text itself, as above. Beyond that it is
+   refused with the reason rather than sent.
+2. **A syntax error's position refers to the wrapper block**, not to the user's
+   text (`SPEC.md` §24.14). That was already true of the workaround S12
+   documented; it is the price of the only mechanism that makes the statement
+   runnable at all, and it is why `oracle.rewrite_trigger_ddl` exists. The
+   compilation-error path does **not** lose anything, because its diagnostics
+   come from `ALL_ERRORS` and carry their own line and column.
+
+Both disappear when U-18 is fixed upstream, which is what Issue G asks for, and
+both are reasons to delete the rewrite then rather than keep it.
+
+*Known and deliberately not implemented:* when a rewritten statement **fails**,
+the warnings the outcome would have carried are not drained onto the error —
+`finish_rewritten` returns the error as it is. This is pre-existing behaviour on
+every error path in the driver, not something the rewrite introduced, and
+changing it for one path would make the driver inconsistent with itself.
+Revisit as one change across all of them if warning-on-failure is ever wanted.
+
+*Evidence:* thirteen offline unit tests in `rewrite.rs` (detection across every
 spelling and every near-miss; the transcribed scan against upstream's rules;
-delimiter selection including the all-collide fallback; the `/` strip; the size
-refusal; the warning's content) and seven live tests in
-`crates/drivers/oracle-thin/tests/s12b_trigger_rewrite.rs` — **7 passed, 0
-failed, 0.77 s** on 2026-09-20 — covering a rewritten trigger that is created
+delimiter selection including the all-collide fallback; the `/` strip and the
+`/` that must **not** be stripped; the statement terminator after a `CALL` body
+against the `END;` that stays; symmetry between a trigger that is wrapped and
+one that is not; the size refusal; the warning's content) and ten live tests in
+`crates/drivers/oracle-thin/tests/s12b_trigger_rewrite.rs` — **10 passed, 0
+failed, 1.04 s** on 2026-09-20 — covering a rewritten trigger that is created
 and **actually fires** (with no invented row count), the off switch returning
 the refusal unchanged with nothing created, a body containing `]'` and `}'`
 forcing a later delimiter and still producing the right value, a compound
 trigger, a trigger that compiles with errors, a trigger with no placeholder
-being sent untouched, and the literal limit. S12's own refusal test, renamed to
-`…_when_the_rewrite_is_off`, is the seventh independent check that the off
-switch changes nothing else.
+being sent untouched, a `CALL` trigger with and without the terminator a user
+would type, a trailing `/` understood whether or not the trigger needs
+rewriting (asserted on the created object's **status**, because acceptance
+proves nothing here), the silent `INVALID` trigger the off switch leaves, and
+the literal limit. S12's own refusal test, renamed to `…_when_the_rewrite_is_off`,
+is one more independent check that the off switch changes nothing else.
 
 ---
 
@@ -2363,7 +2415,7 @@ is bounded by the user's own retries — but it is the owner's call, and it shou
 be made alongside the upstream request (Issue F), which would remove the need
 for it entirely.
 
-#### What shipped (2026-09-19)
+#### What shipped (2026-09-20)
 
 Option 3, in `crates/drivers/oracle-thin/src/connect_timeout.rs`. The contract
 is unchanged; this is driver-local behaviour, and neither `db-core` nor the mock
@@ -2407,18 +2459,47 @@ driver is affected.
   limit, says the attempt was abandoned, and names the extension that waits
   indefinitely.
 
-*Evidence:* ten offline unit tests in `connect_timeout.rs`, including
+Two hardening changes came out of the independent review (2026-09-20) and are
+part of what shipped:
+
+- **A caller-set limit is capped at one hour** (`MAX_CONNECT_TIMEOUT`).
+  `Duration::MAX`, and the very large values a units mix-up produces, would
+  otherwise become a `Condvar::wait_timeout` that never fires — the unbounded
+  connect this work exists to prevent, arrived at by accident. Waiting
+  indefinitely stays reachable through the extension and nowhere else, so it is
+  always something the caller asked for in as many words.
+- **"Either adopted or closed" is now total.** `wait` marks the rendezvous
+  abandoned when the limit passes; a waiting frame that *unwinds* used to leave
+  it looking live, so a late delivery would succeed and the connection would sit
+  in the `Handoff`, closed by nobody. A drop guard now abandons it and disposes
+  of anything already delivered.
+
+*Evidence:* thirteen offline unit tests in `connect_timeout.rs`, including
 `a_connect_into_a_black_hole_is_bounded_by_the_limit_and_says_so` against a
 local `TcpListener` that accepts and never speaks — no database needed — and
 `a_handoff_that_expired_hands_a_late_value_back_instead_of_adopting_it`, which
-proves the no-adoption property **deterministically** (a real late `Connection`
-cannot be constructed offline, so what is tested is the rendezvous that governs
-adoption, on one thread, with no race to lose). Live, `run-it.ps1
-s10_network_loss -- --test-threads=1` on 2026-09-19: **14 passed, 0 failed,
-73.3 s**, with the two rewritten cases measuring **2.0 s** each where they
+proves the no-adoption property **deterministically** (on one thread, with no
+race to lose). A real late `Connection` cannot be constructed offline, so the
+end-to-end forms —
+`a_session_that_arrives_after_the_limit_is_closed_on_its_own_thread`,
+`a_waiter_that_unwinds_still_leaves_nothing_adopted_or_leaked` and
+`a_panic_while_connecting_is_reported_through_the_shipped_path` — drive the
+**shipped** mechanism with the attempt supplied as a parameter, rather than a
+copy of it rebuilt in the test. That seam exists because the review found the
+panic test had been testing its own copy: a regression in the production body
+(losing the `payload.as_ref()`) would have passed. Live, `run-it.sh
+s10_network_loss -- --test-threads=1` on 2026-09-20: **14 passed, 0 failed,
+72.5 s**, with the two rewritten cases measuring **2.0 s** each where they
 previously measured 22.0 s and "still outstanding after 30 s", and a third,
 `a_connect_with_no_limit_at_all_is_still_expressible_and_still_unbounded`,
 showing the flag really does remove the bound.
+
+*Known and deliberately not implemented:* there is no counter or cap on
+abandoned helper threads. One thread per abandoned attempt, alive until
+upstream's connect returns, is the documented cost; a cap would have to decide
+what to do when it is reached, and refusing a connect because earlier ones are
+still hung is a worse failure than the one it prevents. Revisit if a UI is ever
+able to retry fast enough to matter.
 
 ### C-6 — there is no connect-time warning channel — **fixed**
 
@@ -2480,7 +2561,7 @@ closed without ever executing a statement never delivers the finding. That is
 why the case that actually weakens a session — the unenforceable DN pin — is an
 **error** and not a warning: it does not depend on this path at all.
 
-#### What shipped (2026-09-19)
+#### What shipped (2026-09-20)
 
 Exactly the minimal proposal, approved by the owner (§9 item 13) and recorded
 as ADR-0002 amendment **W1/W2**. One additive, vendor-neutral, **defaulted**,

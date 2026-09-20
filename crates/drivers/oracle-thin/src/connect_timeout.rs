@@ -70,7 +70,25 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// `oracledb` will end it (U-15, U-17). A UI that offers this must say so.
 pub const EXT_CONNECT_TIMEOUT_UNBOUNDED: &str = "oracle.connect_timeout_unbounded";
 
+/// The longest a caller-set limit can actually be.
+///
+/// One hour, which no connect that is going to succeed needs: spike S1 measured
+/// a 119 ms median and spike S8 a 155 ms TCPS connect. The cap exists because
+/// waiting "almost forever" and waiting forever are different promises, and only
+/// one of them is meant to be reachable by accident. A `Duration::MAX` — or any
+/// of the very large values a units mix-up produces, such as seconds read as
+/// milliseconds — would otherwise turn into a `Condvar::wait_timeout` that never
+/// fires, which is the unbounded connect this module exists to prevent.
+///
+/// Waiting indefinitely remains available, through [`EXT_CONNECT_TIMEOUT_UNBOUNDED`]
+/// and nowhere else, so it is always something the caller asked for in as many
+/// words.
+pub const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
 /// The limit that applies to one connect attempt; `None` means no limit.
+///
+/// A caller-set limit is capped at [`MAX_CONNECT_TIMEOUT`]; "no limit" is only
+/// ever expressed by [`EXT_CONNECT_TIMEOUT_UNBOUNDED`].
 pub(crate) fn limit(params: &ConnectionParams) -> Option<Duration> {
     if matches!(
         params.extensions().get(EXT_CONNECT_TIMEOUT_UNBOUNDED),
@@ -78,7 +96,39 @@ pub(crate) fn limit(params: &ConnectionParams) -> Option<Duration> {
     ) {
         return None;
     }
-    Some(params.connect_timeout().unwrap_or(DEFAULT_CONNECT_TIMEOUT))
+    Some(
+        params
+            .connect_timeout()
+            .unwrap_or(DEFAULT_CONNECT_TIMEOUT)
+            .min(MAX_CONNECT_TIMEOUT),
+    )
+}
+
+/// How a value that arrived after its caller gave up is disposed of, on the
+/// thread that produced it.
+///
+/// A late [`Connection`] is never handed to anybody (see [`Handoff`]), so
+/// something has to close it, and that something must not be the caller — which
+/// is the whole point. Naming the operation in a trait is also what lets the
+/// mechanism below be exercised without a database.
+pub(crate) trait Discard {
+    /// Releases whatever this owns. Failures are past helping: there is nobody
+    /// left to report them to.
+    fn discard(self);
+}
+
+impl Discard for Connection {
+    fn discard(mut self) {
+        let _ = self.close();
+    }
+}
+
+impl<T: Discard> Discard for DbResult<T> {
+    fn discard(self) {
+        if let Ok(value) = self {
+            value.discard();
+        }
+    }
 }
 
 /// The limit passed before the attempt produced anything.
@@ -164,6 +214,56 @@ impl<T> Handoff<T> {
         self.delivered.notify_one();
         Ok(())
     }
+
+    /// Gives up on this rendezvous without having waited it out, and takes back
+    /// anything already delivered into it.
+    ///
+    /// [`Handoff::wait`] marks the attempt abandoned when the limit passes, but
+    /// that is not the only way a waiter can leave: its frame can unwind. The
+    /// returned value is one that was delivered and never collected, which has
+    /// no worker left to dispose of it — so whoever calls this must.
+    pub(crate) fn abandon(&self) -> Option<T> {
+        let mut state = self.lock();
+        state.abandoned = true;
+        state.value.take()
+    }
+}
+
+/// Marks a [`Handoff`] abandoned unless the waiter really did collect its value.
+///
+/// Without this, "either the caller adopts the session or the worker closes it"
+/// holds for a limit that expires and not for a waiting frame that unwinds: the
+/// rendezvous would still look live, a late `deliver` would succeed, and the
+/// connection would sit in the `Handoff` until the last `Arc` went, closed by
+/// nobody. With it, the guarantee is total.
+struct AbandonUnlessCollected<'a, T: Discard> {
+    handoff: &'a Handoff<T>,
+    collected: bool,
+}
+
+impl<'a, T: Discard> AbandonUnlessCollected<'a, T> {
+    fn new(handoff: &'a Handoff<T>) -> Self {
+        Self {
+            handoff,
+            collected: false,
+        }
+    }
+
+    /// The waiter has the value; there is nothing left to abandon.
+    fn collected(&mut self) {
+        self.collected = true;
+    }
+}
+
+impl<T: Discard> Drop for AbandonUnlessCollected<'_, T> {
+    fn drop(&mut self) {
+        if self.collected {
+            return;
+        }
+        if let Some(value) = self.handoff.abandon() {
+            value.discard();
+        }
+    }
 }
 
 /// Names one helper thread, so a stack in a debugger or a crash dump says what
@@ -183,6 +283,26 @@ pub(crate) fn connect_within(
     limit: Duration,
     map_error: impl FnOnce(&oracledb::Error) -> DbError + Send + 'static,
 ) -> DbResult<Connection> {
+    within(limit, move || oracledb::connect(config), map_error)
+}
+
+/// The mechanism [`connect_within`] is made of, with the attempt itself as a
+/// parameter.
+///
+/// Generic for one reason: `oracledb::connect` cannot be asked to panic, to
+/// succeed late, or to succeed at all without a database, so a test that
+/// rebuilt this body around a closure of its own would be testing its own copy —
+/// and a regression here, such as losing the `payload.as_ref()` below, would
+/// pass. Everything a test needs to vary goes through these parameters instead,
+/// so the code under test is the code that ships.
+fn within<T, E>(
+    limit: Duration,
+    attempt: impl FnOnce() -> Result<T, E> + Send + 'static,
+    map_error: impl FnOnce(&E) -> DbError + Send + 'static,
+) -> DbResult<T>
+where
+    T: Discard + Send + 'static,
+{
     let handoff = Handoff::new();
     let worker = Arc::clone(&handoff);
     thread::Builder::new()
@@ -195,9 +315,9 @@ pub(crate) fn connect_within(
             // while unwinding, so a panic inside a round trip aborts the
             // process (U-4) — which is a reason to keep panicking inputs out,
             // not a reason to drop the guard.
-            let attempt = panic::catch_unwind(AssertUnwindSafe(|| oracledb::connect(config)));
-            let result = match attempt {
-                Ok(Ok(connection)) => Ok(connection),
+            let outcome = panic::catch_unwind(AssertUnwindSafe(attempt));
+            let result = match outcome {
+                Ok(Ok(value)) => Ok(value),
                 Ok(Err(error)) => Err(map_error(&error)),
                 // `payload.as_ref()`, not `&payload`: a `&Box<dyn Any + Send>`
                 // unsizes to `dyn Any + Send` as the *box*, so the downcast to
@@ -205,10 +325,10 @@ pub(crate) fn connect_within(
                 // "a non-string payload".
                 Err(payload) => Err(panic_error(payload.as_ref())),
             };
-            if let Err(Ok(mut connection)) = worker.deliver(result) {
+            if let Err(late) = worker.deliver(result) {
                 // The caller gave up. This session is never handed to anybody:
                 // close it here, on the thread that opened it.
-                let _ = connection.close();
+                late.discard();
             }
         })
         .map_err(|error| {
@@ -217,8 +337,12 @@ pub(crate) fn connect_within(
             ))
         })?;
 
+    let mut guard = AbandonUnlessCollected::new(&handoff);
     match handoff.wait(limit) {
-        Ok(result) => result,
+        Ok(result) => {
+            guard.collected();
+            result
+        }
         Err(Expired) => Err(expired(limit)),
     }
 }
@@ -263,6 +387,7 @@ fn panic_error(payload: &(dyn std::any::Any + Send)) -> DbError {
 mod tests {
     use std::io::Read;
     use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
 
     use reldex_db_driver_api::{Credentials, Endpoint, Extensions, Secret};
@@ -456,37 +581,135 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_panic_in_the_helper_thread_is_reported_rather_than_unwinding() {
-        // `connect_within` cannot be made to panic on demand, so the containment
-        // is exercised through the same rendezvous it uses: a worker that
-        // panics delivers nothing, and the caller's bounded wait still returns.
-        let handoff: Arc<Handoff<DbResult<()>>> = Handoff::new();
-        let worker = Arc::clone(&handoff);
-        let thread = thread::spawn(move || {
-            let attempt = panic::catch_unwind(AssertUnwindSafe(|| -> DbResult<()> {
-                panic!("upstream fell over while connecting")
-            }));
-            let result = match attempt {
-                Ok(result) => result,
-                Err(payload) => Err(panic_error(payload.as_ref())),
-            };
-            let _ = worker.deliver(result);
-        });
-        let reported = handoff
-            .wait(Duration::from_secs(5))
-            .expect("the panic is delivered as a value, not as an unwind");
-        thread.join().expect("the helper thread does not unwind");
+    /// A stand-in for a `Connection` that records whether it was disposed of.
+    ///
+    /// `oracledb::Connection` cannot be built without a database, which is the
+    /// only reason this exists; it goes through the shipped [`within`] by the
+    /// same route a real session does.
+    #[derive(Debug)]
+    struct Session(Arc<AtomicBool>);
 
+    impl Discard for Session {
+        fn discard(self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_panic_while_connecting_is_reported_through_the_shipped_path() {
+        // Exercising `within` itself, not a copy of it: `oracledb::connect`
+        // cannot be asked to panic, so the attempt is a parameter. A regression
+        // in the production body — losing the `payload.as_ref()`, dropping the
+        // `catch_unwind` — fails here.
+        let reported = within(
+            Duration::from_secs(5),
+            || -> Result<Session, String> { panic!("upstream fell over while connecting") },
+            |error: &String| DbError::internal(error.clone()),
+        );
         let error = match reported {
-            Ok(()) => panic!("expected the contained panic"),
+            Ok(_) => panic!("expected the contained panic"),
             Err(error) => error,
         };
         assert_eq!(error.kind(), ErrorKind::DriverInternal);
         assert!(
             error.message().contains("fell over while connecting"),
-            "{error}"
+            "the panic's own message must survive, not \"a non-string payload\": {error}"
         );
+    }
+
+    #[test]
+    fn a_session_that_arrives_after_the_limit_is_closed_on_its_own_thread() {
+        // The end-to-end form of the non-adoption guarantee, through the shipped
+        // path: the caller gives up, the attempt finishes anyway, and the value
+        // it produced is disposed of by the thread that made it.
+        let closed = Arc::new(AtomicBool::new(false));
+        let late = Arc::clone(&closed);
+        let (release, wait_for_release) = mpsc::channel::<()>();
+
+        let outcome = within(
+            Duration::from_millis(50),
+            move || -> Result<Session, String> {
+                // Finish only once the caller's limit has certainly passed.
+                let _ = wait_for_release.recv();
+                Ok(Session(late))
+            },
+            |error: &String| DbError::internal(error.clone()),
+        );
+        assert!(outcome.is_err(), "the limit was 50 ms");
+        assert!(
+            !closed.load(Ordering::SeqCst),
+            "the attempt has not finished yet"
+        );
+
+        release.send(()).expect("the helper thread is still there");
+        // The disposal happens on the helper thread, so it is not instant.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !closed.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(
+            closed.load(Ordering::SeqCst),
+            "a session that arrived late was neither adopted nor closed"
+        );
+    }
+
+    #[test]
+    fn a_waiter_that_unwinds_still_leaves_nothing_adopted_or_leaked() {
+        // `wait` marks the attempt abandoned when the limit passes, which covers
+        // the expected exit. This covers the other one: a frame that leaves by
+        // unwinding must not leave the rendezvous looking live, or a value
+        // already delivered into it sitting there closed by nobody.
+        let closed = Arc::new(AtomicBool::new(false));
+        let handoff: Arc<Handoff<DbResult<Session>>> = Handoff::new();
+
+        let unwound = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = AbandonUnlessCollected::new(&handoff);
+            handoff
+                .deliver(Ok(Session(Arc::clone(&closed))))
+                .unwrap_or_else(|_| panic!("nobody has given up yet"));
+            panic!("the waiting frame goes away without collecting");
+        }));
+        assert!(unwound.is_err());
+
+        assert!(
+            closed.load(Ordering::SeqCst),
+            "a value already delivered must be disposed of by the frame that abandons it"
+        );
+        assert!(
+            handoff
+                .deliver(Ok(Session(Arc::new(AtomicBool::new(false)))))
+                .is_err(),
+            "and the rendezvous must be closed to later deliveries"
+        );
+    }
+
+    #[test]
+    fn a_limit_long_enough_to_be_no_limit_at_all_is_capped() {
+        // Waiting forever must be something a caller asked for in as many words,
+        // not something a `Duration::MAX` or a units mix-up produces.
+        for asked in [
+            Duration::MAX,
+            Duration::from_secs(u64::from(u32::MAX)),
+            MAX_CONNECT_TIMEOUT + Duration::from_secs(1),
+        ] {
+            assert_eq!(
+                limit(&params().with_connect_timeout(asked)),
+                Some(MAX_CONNECT_TIMEOUT),
+                "{asked:?}"
+            );
+        }
+        // Anything inside the cap is left exactly as asked.
+        assert_eq!(
+            limit(&params().with_connect_timeout(MAX_CONNECT_TIMEOUT)),
+            Some(MAX_CONNECT_TIMEOUT)
+        );
+        let ordinary = Duration::from_secs(30);
+        assert_eq!(
+            limit(&params().with_connect_timeout(ordinary)),
+            Some(ordinary)
+        );
+        // And the cap is not a way to wait indefinitely by accident.
+        assert!(MAX_CONNECT_TIMEOUT < Duration::MAX);
     }
 
     #[test]
