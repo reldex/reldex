@@ -9,10 +9,17 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-# Phase 0 Workstream A: this harness exercises the **driver contract** on its
-# own, so a failure here is unambiguously a driver problem. It is the
-# composition root, which is why it may name a concrete driver; see the
-# documented deviation in `src/main.rs`. `reldex-db-core` returns as a
-# dependency when its session layer lands.
+# Phase 0 Workstream A: the `reldex-core-poc` binary exercises the **driver
+# contract** on its own, so a failure there is unambiguously a driver problem.
+# It is the composition root, which is why it may name a concrete driver; see
+# the documented deviation in `src/main.rs`.
 reldex-db-driver-api = { path = "../db-driver-api" }
 reldex-driver-oracle-thin = { path = "../drivers/oracle-thin" }
+# Workstream B's session layer has landed, so the second binary in this crate
+# — `src/bin/reldex-device-check.rs`, the Android physical-device evidence
+# harness — goes through it and runs every database call on `db-core`'s worker
+# thread. `src/main.rs` deliberately still does not: keeping one harness on the
+# bare driver contract is what makes a driver failure distinguishable from a
+# core failure. Cargo has no per-binary dependencies, so this edge exists for
+# the whole crate and is used by one of its two binaries.
+reldex-db-core = { path = "../db-core" }

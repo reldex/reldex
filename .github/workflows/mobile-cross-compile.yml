@@ -38,8 +38,11 @@ env:
   # concrete Oracle thin driver (which pulls in `oracledb` -> `rustls` ->
   # `aws-lc-rs` -> `aws-lc-sys`), the link-check probe crate (produces a real
   # cdylib/staticlib so the *linker*, not just the compiler, is exercised),
-  # and the Phase 0 harness binary (a plain executable is meaningful on
-  # Android; cheap to also try on iOS in the same invocation).
+  # and the Phase 0 harness binaries (a plain executable is meaningful on
+  # Android; cheap to also try on iOS in the same invocation). Note that
+  # `-p reldex-core-poc` builds **two** binaries: `reldex-core-poc` and
+  # `reldex-device-check`, the Android physical-device harness
+  # (`docs/exec-plans/active/phase-0-android-device.md`).
   S6_PACKAGES: >-
     -p reldex-db-driver-api
     -p reldex-db-core
@@ -121,9 +124,11 @@ jobs:
             "$OUT"/libreldex_driver_oracle_thin.rlib \
             "$OUT"/libmobile_link_check.so \
             "$OUT"/libmobile_link_check.a \
-            "$OUT"/reldex-core-poc
+            "$OUT"/reldex-core-poc \
+            "$OUT"/reldex-device-check
           echo "--- file ---"
-          file "$OUT"/libmobile_link_check.so "$OUT"/reldex-core-poc
+          file "$OUT"/libmobile_link_check.so "$OUT"/reldex-core-poc \
+               "$OUT"/reldex-device-check
           echo "--- stripped sizes (llvm-strip --strip-all, copy first) ---"
           cp "$OUT"/libmobile_link_check.so /tmp/libmobile_link_check.stripped.so
           cp "$OUT"/reldex-core-poc /tmp/reldex-core-poc.stripped

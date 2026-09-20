@@ -61,6 +61,16 @@ When changing result handling, FFI boundaries, rendering models, metadata loadin
 - measure CPU, memory, allocation, latency, or frame time as appropriate;
 - keep benchmark results with the relevant task/plan when they influence an architectural decision.
 
+## Scripts and shell
+
+Project scripts are bash-first (owner decision 2026-09-20).
+
+- The `.sh` script is the primary, tested, documented entry point. It must run under Git Bash on Windows as well as on Linux and macOS.
+- A PowerShell twin (`.ps1`) is optional; when one exists it must stay in step with the `.sh` script.
+- Documentation leads with the bash command.
+- Mind Git Bash path conversion when calling native Windows tools (`cygpath`, `MSYS_NO_PATHCONV=1`), and never echo credentials (`set +x`, no environment dumps).
+- Scripts set `PATH` and tool variables for the current process only; they never edit user or machine configuration.
+
 ## Documentation
 
 Update documentation in the same change when behavior or architecture changes.
