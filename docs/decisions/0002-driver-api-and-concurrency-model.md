@@ -7,12 +7,16 @@ independent review of the `db-core` session layer, see "Amendments after the db-
 amended again by the owner's connect-time-warning decision, see "Amendment: the connect-time warning
 channel"; amended again to say where a connection is *created*, see "Amendment: a connection is
 created on a helper thread"; amended again to make a batch's column storage readable and shareable,
-see "Amendment: a batch's column storage is readable, not only indexable"
+see "Amendment: a batch's column storage is readable, not only indexable"; amended again to record
+where the SQL/PL-SQL dialect descriptor lives, see "Amendment: the `SqlDialect` descriptor"; amended
+again after an independent adversarial review of the splitter found a panic and several unsafe
+mis-splits, see "the `SqlDialect` descriptor" §J4
 **Date:** 2026-09-19
 **Amended:** 2026-09-19 (API review), 2026-09-19 (Phase 0 spikes), 2026-09-19 (db-core session
 review), 2026-09-19 (owner confirmation), 2026-09-20 (connect-time warning channel, C-6),
 2026-09-20 (connection created on a helper thread, C-5), 2026-09-20 (column storage readable, M1.3),
-2026-09-20 (`LobStream: Sync` and `ExecuteOutcome` non-exhaustive, M1.3 review)
+2026-09-20 (`LobStream: Sync` and `ExecuteOutcome` non-exhaustive, M1.3 review),
+2026-09-20 (`SqlDialect` descriptor, M2.4), 2026-09-21 (`SqlDialect` splitter-safety review, M2.4)
 
 ## Context
 
@@ -1005,6 +1009,407 @@ M1.3 added a field (`columns`, see ADR-0003 A6) and M2.5's event queue will want
 Nothing outside `db-core` constructs an `ExecuteOutcome` — the worker thread is its only producer —
 so the attribute costs nothing today and makes the next field an additive change rather than a
 breaking one.
+
+## Amendment: the `SqlDialect` descriptor (2026-09-20, M2.4)
+
+Numbering: `J`. `docs/exec-plans/active/phase-1.md` §B4 named this as "additive, in `db-core` rather
+than the contract" ahead of implementation; this amendment records where it actually landed and why,
+which is one crate further out than that sketch, for reasons specific to how M2.4 was carried out
+(see below) and, independently, to dependency direction.
+
+### J1 — `SqlDialect` lives in the new `reldex-sql-text` crate, not in `db-core` or `db-driver-api`
+
+`SPEC.md` §15 forbids splitting a script by every semicolon and requires understanding SQL/PL-SQL
+block boundaries and SQL\*Plus's `/`. That parsing is vendor-neutral logic parameterized by
+vendor-specific facts — which keywords open a block, which quoting forms exist, whether `/` matters
+— and D8 already listed "script/statement-boundary parsing" as out of scope for *this contract*.
+M2.4 keeps it out of the contract and gives it its own crate, `crates/sql-text`
+(`reldex-sql-text`), with:
+
+```rust
+pub struct SqlDialect {
+    pub statement_terminators: &'static [char],
+    pub slash_terminates_block: bool,
+    pub block_may_end_without_slash: bool,
+    pub block_starters: &'static [BlockStarter],
+    pub block_body_opener: &'static str,
+    pub block_nesting_openers: &'static [&'static str],
+    pub block_end_keyword: &'static str,
+    pub quoting: QuotingRules,
+    pub comments: CommentRules,
+    pub bind_variables: bool,
+    pub substitution_variables: bool,
+    pub keywords: &'static [&'static str],
+}
+```
+
+built entirely from `'static` data (so it is `Copy`, no allocation), consumed by
+`reldex_sql_text::{tokenize, tokenize_block, split_statements, statement_at}`. Oracle's own value is
+built by the driver: `reldex_driver_oracle_thin::sql_dialect() -> SqlDialect`, a plain function (not
+a trait method — see J2), added to that crate without touching `db-driver-api` at all.
+
+**This is the shape as of the original M2.4 implementation.** §J4 below records the fields an
+adversarial review added the same day the type first landed; see that section for the current
+complete field list rather than relying on this snapshot.
+
+Two reasons, not one:
+
+1. **Dependency direction.** `SqlDialect` is the parameter of `reldex-sql-text`'s own public API. A
+   type a crate's signature names should not live one layer further down the dependency graph than
+   the crate itself, or every caller of the lexer/splitter — including a future consumer that is
+   neither `db-core` nor a driver, such as a standalone formatter — would have to depend on `db-core`
+   (sessions, transactions, the worker/registry machinery) or on `db-driver-api` (which D8 keeps
+   deliberately small) just to name the parameter type. `reldex-sql-text` depends on nothing; a
+   driver depends on it (as `oracle-thin` already depends on `db-driver-api`) to build its
+   descriptor; `db-core` and the FFI/UI layer may depend on it directly.
+2. **Isolation during implementation.** M2.4 and M2.5/M2.6 (the event-queue and session-registry
+   `db-core` refactor) were carried out concurrently in separate worktrees specifically so neither
+   blocked the other (`docs/exec-plans/active/phase-1.md` §C.2, "Parallelism"). Adding a type to
+   `db-core` from the M2.4 worktree would have collided with that work for no benefit to either side.
+   This constraint made the `db-core` placement impractical regardless of J1's dependency-direction
+   argument, which would have argued against it anyway.
+
+`ARCHITECTURE.md` §13 item 12 is updated from an open question to resolved, pointing here.
+
+### J2 — no change to the `DatabaseDriver`/`DatabaseConnection` traits
+
+Unlike the `take_connect_warnings`, server-output and metadata-catalog amendments above, this one
+adds **no** trait method. `sql_dialect()` is a plain associated function on the concrete
+`OracleThinDriver`-adjacent module, not `DatabaseDriver::sql_dialect()`, because nothing calls it
+through a `Box<dyn DatabaseDriver>`: `db-core`'s worker never needs a script's dialect (it executes
+one statement at a time, handed to it already split), and the UI/FFI layer, which does need it to
+drive the editor, already knows which driver it is talking to and can call the concrete function
+directly. Adding a defaulted trait method for this would be additive and therefore possible, but
+would commit every future driver to "supplying a dialect" as a contract obligation before a second
+driver exists to say whether that shape is right — the same restraint D8 already applies elsewhere.
+If a second driver arrives and the UI needs to select a dialect without knowing the concrete driver
+type, that is the moment to revisit this as a genuine amendment, not before.
+
+### J3 — what stays out of scope, and why
+
+Following `AGENTS.md` "Scope discipline" and `SPEC.md` §15's own "Future SQL\*Plus-like commands may
+be added progressively": `reldex-sql-text` implements SQL\*Plus's `REM`/`REMARK` line comment as
+machinery (`CommentRules::sqlplus_line_comment_words`, since renamed — see J4), and `StatementKind` is
+`#[non_exhaustive]` to leave room for a `SqlPlusCommand` variant later, but Oracle's Phase 1
+`SqlDialect` leaves that word list empty and no `SqlPlusCommand` variant exists yet — there is nothing
+in Phase 1's scope that needs either.
+
+One splitting shape remains a documented, `#[ignore]`d-test limitation rather than a silently-wrong
+answer: Oracle 12c's `WITH FUNCTION … SELECT …` inline PL/SQL, which does not start with a
+block-starter keyword at all and would need scanning past arbitrary `WITH`-clause syntax to
+recognize. (Two others originally listed here — a `CREATE TRIGGER … CALL proc(…);` body with no
+`BEGIN`/`END`, and a `CREATE TYPE … AS OBJECT (…);` spec with no `BEGIN`/`END` — were fixed by J4's
+`pending_bodies`/`BlockKind::ParenDelimited` model and are no longer limitations.) This one does not
+silently mis-execute a statement either: `WITH FUNCTION`'s inline body's own `;`s are read as
+ordinary plain-statement terminators, over-splitting the script into several statements that each
+fail to parse alone — never an executable fragment carved out of the middle of one.
+
+*Evidence:* `crates/sql-text/tests/corpus.rs` — see J4 for the post-review test count and the fuzz
+evidence, which supersedes the counts originally recorded here. `tests/corpus/*.sql` (a PL/SQL
+package with nested `BEGIN`/`CASE`/`IF`/`LOOP`, a trigger using the `:NEW`/`:OLD` shape
+`oracle-thin::rewrite` also recognizes, Thai text in strings/comments/quoted identifiers, every
+`q'...'` delimiter form, and — added by J4 — labelled/nested blocks, compound triggers, `JAVA SOURCE`,
+and `$IF` directives) is checked under both LF and CRLF against two invariants: line-by-line
+`tokenize_block` (state carried, as `QSyntaxHighlighter` would drive it) equals whole-document
+`tokenize`; and a script's statement spans plus the gaps between them reproduce the input exactly. A
+5&nbsp;MB repeated-statement script is included to keep the splitter linear (not timed —
+`AGENTS.md`/this task: "no timing upper bounds in tests").
+
+### J4 — adversarial review: a panic, unsafe mis-splits, and the splitter's safety principles
+
+An independent adversarial review of J1's implementation (commit `e78ab58`, the same day it landed)
+approved the architecture but found one guaranteed panic and several mis-splits serious enough to
+require a same-day fix before this ADR could be considered settled, because a `StatementSpan` is not
+a highlighting range — it is what gets executed against a real database. Both classes of defect, and
+the fix, are recorded here rather than in a second ADR because they change no boundary this ADR did
+not already own: `SqlDialect`'s field list and the splitter's algorithm, both introduced by J1.
+
+**The panic.** `statement_at` clamped an out-of-range offset to `text.len()` but never floored it to a
+UTF-8 character boundary, so an offset landing inside a multi-byte character (e.g. a byte-order mark)
+panicked on the first `&text[..offset]` slice. Fixed with a hand-rolled `floor_char_boundary` (the
+standard library's own is not yet stable) applied before any slicing.
+
+**The mis-splits**, all in the depth-tracking algorithm: a labelled block (`<<outer>> BEGIN ... END
+outer;`) was not recognized as a block at all, because leading-keyword matching stopped at the `<`
+operator; a subprogram nested inside another subprogram's declare section could be mistaken for the
+outer's own body opener/closer; a compound trigger's timing-point sections (`BEFORE STATEMENT IS
+BEGIN ... END BEFORE STATEMENT;`) were not understood as owning their own body, so the trigger's
+depth count never returned to the level needed to recognize its own close; and a package/type body
+with an initialization section *after* its members closed at the wrong point. Each of these could
+produce either a `StatementKind::Plain` span carved out of the middle of a block (executable on its
+own, and wrong) or a block that ran unterminated to end of input, silently swallowing every statement
+after it.
+
+**The fix** replaces the single `absorbs_body_opener: bool` per `BlockStarter` with one unified
+model, `crates/sql-text/src/splitter.rs`'s module docs describe in full:
+
+- A `pending_bodies: u32` counter, incremented when a word matching the new
+  `SqlDialect::subprogram_header_keywords` (`PROCEDURE`/`FUNCTION`) or — once
+  `SqlDialect::compound_trigger_marker` (`COMPOUND TRIGGER`) has been seen —
+  `SqlDialect::compound_trigger_timing_starters` (`BEFORE`/`AFTER`/`INSTEAD`) is found to owe a body
+  (i.e. its header reaches `SqlDialect::body_intro_keywords` (`IS`/`AS`) before a statement
+  terminator, and is not immediately followed by a `SqlDialect::call_spec_keywords`
+  (`LANGUAGE`/`EXTERNAL`) call-spec).
+- A `BEGIN` fulfills a pending body if one is owed; otherwise it is absorbed as the *current nesting
+  frame's own* body exactly once (covering a lone `PROCEDURE`/`DECLARE`/`BEGIN` statement and a
+  package/type body's optional init section with the same rule); any other `BEGIN` nests.
+- `SqlDialect::label_delimiters` (`<<`/`>>`) are skipped before leading-keyword matching.
+- `SqlDialect::body_less_markers` (`CALL`) recognizes a trigger whose body is a bare `CALL`, owing no
+  body at all.
+- A new `BlockKind` on `BlockStarter` (`Structured`, `OpaqueSource`, `ParenDelimited`) replaces the
+  boolean: `ParenDelimited` (Oracle: `CREATE [OR REPLACE] TYPE` without `BODY`) tracks balanced
+  parens to the first depth-`0` terminator, with no `BEGIN`/`END` concept at all; `OpaqueSource`
+  (Oracle: `CREATE ... JAVA SOURCE ...`) is not PL/SQL and ends only at a lone `/` line or end of
+  input, its own `;` characters being ordinary body content.
+- `SqlDialect::directive_prefix` (`$`) makes the lexer read `$IF`/`$THEN`/`$ELSIF`/`$ELSE`/`$END` and
+  `$$PLSQL_UNIT`-shaped inquiry directives as one new `TokenKind::Directive` token, so `$END`'s `END`
+  can never be read as the block's own closing keyword.
+
+**The safety principle (new, and the reason a class of *undiscovered* future bugs in the above is
+already bounded):** a lone `/` line is now checked on *every* token of *every* scan in the module,
+overriding nesting depth or any pending body the moment it is seen
+(`SqlDialect::slash_terminates_block`/`slash_terminates_plain`, the latter new — S1 in the module
+docs). SQL\*Plus itself never sends a block to the server until `/` is typed, so this is not a new
+behavior invented for safety's sake; it is the same convention scripts already rely on, now enforced
+by the splitter rather than assumed. Its effect: even a block-structure miscount this review did not
+find can produce at most one over-large statement, never an executable fragment carved from the
+middle of one (S3 in the module docs) — the dangerous failure mode is structurally unreachable, not
+merely untested.
+
+**`StatementSpan::ended_by: EndedBy`** (`#[non_exhaustive]`: `Terminator`, `SlashLine`,
+`InferredBlockEnd`, `EndOfInput`) is new, so a caller — in particular M4.3's script executor — can
+tell *why* a span ended where it did, not only whether `terminated` is `true`. `docs/exec-plans/active/phase-1.md`'s
+M4.3 row is updated to say execution must consult it.
+
+**Vendor-neutrality fixes**, found by the same review: `lexer.rs` had `"REM"`/`"REMARK"`,
+`"Q"`/`"NQ"`, hard-coded as string literals rather than sourced from `SqlDialect` data, contradicting
+this crate's own stated invariant. `CommentRules::sqlplus_rem: bool` is now
+`sqlplus_line_comment_words: &'static [&'static str]`, and `QuotingRules::alternative_quoting`/
+`national_prefix: bool` are now `alternative_quote_prefixes`/`national_string_prefixes: &'static
+[&'static str]` — the words themselves are driver-supplied data, matching how every other keyword in
+this descriptor already worked.
+
+*Evidence:* `crates/sql-text/tests/corpus.rs` grew to 43 passing tests plus 1 remaining `#[ignore]`d
+limitation (`WITH FUNCTION`, J3), including one test per named reproducer above, a
+`statement_at`-never-panics sweep over every byte offset (including out-of-range ones) of Thai/emoji/
+BOM text, and a new deterministic fuzz test (a dependency-free xorshift32 PRNG — this crate stays at
+zero dependencies — combining grammar-aware fragments across 4 fixed seeds, 200,000 cases each in
+release mode, 800,000 total) checking: no panics; every span's boundaries land on a character
+boundary and are non-overlapping; spans plus gaps reproduce the input exactly; the
+line-by-line-vs-whole-document `tokenize` invariant holds under both LF and CRLF; and a new
+"known-good blocks joined by `/`" round-trip property (independently-valid blocks concatenated, split,
+and confirmed to come back as exactly one span each, all terminated).
+
+### J5 — round-2 adversarial review: a rewrite that fixed J4 but introduced a worse, harder-to-see bug
+
+A second, independent adversarial review of J4's fix rejected it: every J4 finding was confirmed
+fixed, and 6,000,000 random-fragment fuzz cases (an extension of J4's own fuzz test) found no
+gap/overlap violation — but random fragment concatenation essentially never produces a *balanced*,
+deeply nested structure, so it could not see a new defect that only manifests once nesting is
+balanced. Four MUST-FIX defects were found by direct code reading; a fifth, worse one was found only
+after this review commissioned the grammar-based differential test J5 itself required (below) — the
+review's own point that fuzzing fragments and generating whole valid structures catch different bug
+classes, proven in the same round.
+
+**MUST-FIX #1 — a `BEGIN` starter's own first nested block was mistaken for its body.**
+`BlockStarter` gained `opens_body: bool` (`true` only for the bare `BEGIN` starter, `false` for every
+other shape): the depth-tracking scan now starts as though one body has already been absorbed exactly
+when the starter's own matched keywords *were* that body's opener, rather than always starting fresh
+and letting the first `BEGIN` found — nested or not — claim the role by an implicit, previously
+untested assumption. Pre-fix, `BEGIN BEGIN NULL; END; END;` split into 2 spans (an orphaned `END`);
+with sibling inner blocks, an *N*-sibling script produced *N + 1* spans, the middle ones complete,
+independently runnable statements carved from a single one.
+
+**MUST-FIX #2 — a lone `/` line with nothing pending panicked `StatementSpan::content`.**
+`end_at_slash_line` computed `content_end` by trimming trailing whitespace from the whole document up
+to the `/`'s own position, with no floor — so a `/` line immediately following an already-terminated
+statement (nothing but whitespace between them) could compute a `content_end` for a new, near-empty
+span that landed *before* that span's own `content_start`. Lead decision, recorded here because it
+changes what a script author's habit means: **a lone `/` line with no pending statement text produces
+no span at all** — not an empty statement, not a re-submission of the previous one (SQL\*Plus's own
+"re-run the buffer" semantics for this case are themselves unverified against a real desktop-editor
+use, so this crate does not attempt to reproduce them). `split_statements` now checks this before a
+span's `content_start` is even computed; `end_at_slash_line` additionally clamps `content_end` to
+never fall below the `content_start` its caller is building, as defense in depth.
+
+**MUST-FIX #3 — a variable literally named `language`/`external` was read as a call-spec.**
+`SqlDialect::call_spec_keywords: &[&str]` (single words) is now `call_spec_phrases: &[Phrase]` (full
+phrases: Oracle ships `LANGUAGE JAVA`/`LANGUAGE C`/`LANGUAGE JAVASCRIPT`/`EXTERNAL LIBRARY`/`EXTERNAL
+NAME`), matched as whole phrases in both `scan_header` and `scan_structured`'s own outer-header check.
+The fail-safe direction only goes one way: a missed call-spec merely swallows extra, syntactically
+inert text up to the next `/`/EOF, while a *false* one carves a real body out from under the statement
+that owns it — so recognizing a call-spec now requires a full phrase match, never a single word that a
+legal identifier could collide with.
+
+**MUST-FIX #4 — a header scan was parenthesis-blind.** Neither `scan_header` (a nested member's own
+header) nor `scan_structured`'s own outer-header check tracked `(`/`)` depth, so a parameter default's
+own `AS`/`IS`/`CASE … END` — `PROCEDURE p2(a NUMBER DEFAULT CAST(1 AS NUMBER))`, a forward
+declaration — was read as the header's real body intro, corrupting `pending_bodies` and, in turn,
+consuming the container's own real `BEGIN` as fulfilling a phantom debt instead of being absorbed as
+the container's own body. Both scans now track paren depth and only treat `IS`/`AS`/a terminator as
+significant at depth `0`. A constructor method's `RETURN SELF AS RESULT IS ...` has the same shape at
+depth `0` (the `AS` in `SELF AS RESULT` is not a body intro) — a new `SqlDialect::body_intro_exceptions:
+&[Phrase]` field (Oracle: `[SELF AS]`) lets a dialect declare such phrases as data, checked by looking
+at the word(s) immediately *preceding* a candidate body-intro match.
+
+**An additional, more severe bug found only by the new differential test** (see below), not among the
+four the code-reading pass found: `scan_structured`'s `BEGIN` dispatch treated `pending_bodies > 0`
+alone as "this `BEGIN` fulfills a header's debt", without also requiring `depth == 0`. A two-level-deep
+nested subprogram (an inner member declared inside a *middle* member's own declare section, where the
+inner member's own body itself contained a further nested `BEGIN ... END`) had that innermost `BEGIN`
+wrongly consumed as fulfilling the *middle* member's still-outstanding debt, because it was reached
+while `pending_bodies` was still nonzero from that outer debt — even though the scan was already
+nested one level deeper (`depth == 1`) by the time it got there. The fix adds the missing
+`depth == 0` requirement: once already inside a body a previous `BEGIN` opened, any further `BEGIN` is
+unambiguously a nested block, never a fulfillment, regardless of how many debts remain further up the
+stack. Random-fragment fuzzing (both the J4 fuzz test and this round's 6,000,000-case run) could not
+find this either, for the same structural reason it missed MUST-FIX #1: two-plus levels of nested,
+still-pending subprogram declarations essentially never arise from concatenating independent
+fragments.
+
+**The acceptance gate this round added: a grammar-based differential test**
+(`crates/sql-text/tests/differential.rs`, modeled on but not copied from the reviewer's own reference
+implementation). Rather than concatenating independent fragments, it generates whole,
+structurally-valid, self-contained PL/SQL "units" — anonymous blocks (bare/labelled/`DECLARE`,
+nested and sibling inner blocks, an exception handler containing a block), subprograms with
+two-level-deep nested subprograms and `CAST`/`CASE`-bearing parameter defaults, cursors and
+`TYPE ... IS RECORD|TABLE OF|REF CURSOR`/`SUBTYPE ... IS` declarations, package specs (forward
+declarations, a call-spec member) and bodies (members, an init section with an `EXCEPTION` handler),
+type specs (object/varray/table-of/incomplete) and a type body (`MEMBER`/`STATIC`/`CONSTRUCTOR ...
+RETURN SELF AS RESULT`), simple/compound/`INSTEAD OF`/`CALL` triggers and `WHEN (... IS NULL)`, and
+plain SQL with `CASE` expressions and subquery `AS` aliases — concatenates 3–8 of them three ways
+(always a `/` line between units, never one, or an independent coin flip per boundary, the last of
+which also exercises MUST-FIX #2's rule by sometimes placing a `/` after a *plain* unit too), under
+both LF and CRLF, and asserts `split_statements` recovers **exactly** the generated units: the same
+count, in order, each one's `StatementSpan::content` equal (after stripping the unit's own trailing
+`;`, its only defined trimming rule) to what was generated, the expected `StatementKind`/`EndedBy`,
+and every span invariant (`content_start <= content_end <= full_end`, char-boundary offsets,
+`.content()`/`.full()` never panicking). 8 fixed seeds (including the reviewer's own 1/42/3/987/2024),
+2,000 base scripts per seed in release mode × 3 join modes × 2 line endings = 96,000 scripts checked;
+40 base scripts per seed in debug. The random-fragment fuzz test's own vocabulary was extended with
+round-2 fragments (nested/sibling `BEGIN` blocks, a `language`/`external`-named variable, the `CAST`
+forward declaration, a constructor's `RETURN SELF AS RESULT`) and its assertions now call
+`.content()`/`.full()` on every span, not only check offset ordering.
+
+**Renames (naming only; no vendor literal ever lived in `splitter.rs`'s logic, confirmed by this
+review):** `CommentRules::sqlplus_line_comment_words` → `line_comment_words`;
+`SqlDialect::compound_trigger_marker` → `sectioned_body_marker`;
+`SqlDialect::compound_trigger_timing_starters` → `section_header_starters` — the mechanism (a marker
+phrase announcing independently-scoped sections, and the words that start one) is not itself an
+Oracle-specific idea, only Oracle's *instance* of it (`COMPOUND TRIGGER`/`BEFORE`/`AFTER`/`INSTEAD`) is.
+
+**Documented, not changed:** when safety principle S1 rescues a miscounted scan at a `/` line, its
+span's content boundaries are already identical to a clean `EndedBy::SlashLine` close — both paths
+share `end_at_slash_line`. A `/` line followed by a same-line comment (`/ -- note`) is *not* currently
+treated as a lone `/` line by `is_lone_slash_line` (it requires the rest of the line to be
+whitespace-only); this is consistent across every scan that calls it, but unverified against real
+SQL\*Plus/SQLcl behavior, which may or may not tolerate a trailing comment there.
+
+*Evidence:* `crates/sql-text/tests/corpus.rs` grew to 64 passing tests (43 named reproducers/round-1
+regressions, 12 new round-2 MUST-FIX reproducers named `must_fix_1_*`/`must_fix_3_*`/`must_fix_4_*`
+covering every starter shape and identifier-collision case listed above, 1 named
+`additional_bug_*` for the fifth defect, plus the pre-existing corpus/fuzz suite) plus 1 remaining
+`#[ignore]`d limitation (unchanged, J3); a new `crates/sql-text/tests/differential.rs` (1 test, the
+grammar-based property above). `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+-- -D warnings`, `cargo test --workspace`, and `cargo test -p reldex-sql-text --release`
+(63 `corpus.rs` tests including the 800,000-case extended fuzz run, 1 `differential.rs` test covering
+96,000 generated scripts, both green) all pass; `RUSTDOCFLAGS="-D warnings" cargo doc -p
+reldex-sql-text --no-deps` is clean.
+
+### J6 — round-3 adversarial review: named gaps in the differential grammar, one bug found and fixed
+
+A third review **approved** J5's fixes outright (0 failures in 550,000 of the reviewer's own
+differential iterations and 6,000,000 fuzz cases, the differential oracle confirmed independent of
+the splitter, S1 checks pass, complexity linear) but, before merge, listed specific shapes the J5
+grammar did not generate — meaning a regression in any of them would not be caught by the in-repo
+gate even though the gate was green. `crates/sql-text/tests/differential.rs`'s grammar was extended
+with: `$IF`/`$THEN`/`$ELSIF`/`$ELSE`/`$END` directives wrapped around a statement, a whole nested
+block, only the outer `BEGIN`, and only the closing `END`; an opaque-source (`CREATE ... AND COMPILE
+JAVA SOURCE ...`) unit with Java text containing `;`/`{}`/`BEGIN`/`END`, generated only immediately
+before a forced `/` line, plus a dedicated standalone test confirming that without a following `/` it
+runs to `EndedBy::EndOfInput`/`terminated: false`; case-randomization applied to every keyword the
+generator emits (`UPPER`/`lower`/`Title`/`MiXeD`, chosen per occurrence) plus keyword-named
+identifiers (`Language`, `External`, `Before`, `After`, …) both quoted and as unquoted column
+aliases; a forward declaration with a `CAST(... AS ...)`/`CASE ... END`/`x IS NULL` parameter default
+nested inside *another subprogram's own* declare section (MUST-FIX #4's exact shape — previously only
+generated inside a package spec, never inside a sibling subprogram's declare section ahead of its own
+`BEGIN`); a guaranteed double-labelled nested-sibling-block shape; and a dedicated `gen_deep_body`
+generator that always recurses (unlike the general one, which bottoms out at a leaf 2 times out of 3)
+to force depth 3–5 nesting on every call, addressing the reviewer's note that deep nesting was
+under-represented.
+
+**One bug found while adding grammar coverage** (not by running the new grammar arms themselves, but
+while reasoning through how to construct the "directive around only the outer `BEGIN`" case — found
+and fixed before it could cause an in-repo gate failure): `collect_leading_words` — which walks a
+statement's leading tokens looking for a `BlockStarter` match — treated a conditional-compilation
+directive as neither a word nor trivia, so it stopped immediately at a directive appearing *before* a
+block's own leading keyword, without matching what came after. `$IF $$flag $THEN\nBEGIN\n$END\n
+NULL;\nEND;` was misread as three unrelated `Plain` statements instead of one `Block`. The same root
+cause defeated `finish_with_maybe_slash`'s search for a following lone `/` line whenever a directive
+sat between a block's closing terminator and that `/` (`END;\n$END\n/` stopped the search at `$END`,
+producing `InferredBlockEnd` plus a stray extra span instead of one `SlashLine`-terminated block).
+
+The first fix attempt widened the single, shared `is_trivial`/`skip_trivial` predicate (used at eight
+call sites) to also treat a directive as trivial. This fixed both manifestations above but broke a
+third thing no test yet exercised: `split_statements`'s own top-level loop uses that same predicate to
+find where the *next* statement's `content_start` begins — and a directive there is real source text
+belonging to that next statement, not gap content to be skipped past like whitespace. Widening it
+silently moved `content_start` for any statement beginning with a directive to *after* that directive,
+discovered only once the new grammar's "directive around only the outer `BEGIN`" units were actually
+joined with a preceding statement in the differential test (which asserts exact content recovery,
+unlike any test written for the original bug). The corrected fix keeps `is_trivial`/`skip_trivial` at
+their original, narrower scope and adds a second, explicitly-named predicate,
+`is_trivial_or_directive`, used *only* by `collect_leading_words` and `finish_with_maybe_slash` — the
+two call sites that actually needed it — leaving the other six untouched. This is itself a small
+instance of the round-2/round-3 pattern: a shared abstraction covering more call sites than a fix
+actually needs is a wider blast radius than the bug it closes.
+
+**A related, purely-in-test correctness note:** the "directive around only the closing `END`" grammar
+shape places its own `$END` directive *after* the `END;` it wraps, so — same reasoning as the
+opaque-source unit — which statement that trailing directive belongs to is undecidable from raw text
+alone once no `/` disambiguates it (the same kind of ambiguity a stray comment between two statements'
+terminators already has). The test forces a `/` immediately after this shape too, sidestepping the
+ambiguity rather than asserting an arbitrary answer to an ill-posed question; this is a property of
+the *test's* construction, not a splitter defect, and `StatementSpan::content` for this shape is
+unaffected either way (it already stopped, correctly, right after `END`, before both its own `;` and
+the trailing directive).
+
+**A second, deliberately non-Oracle-shaped dialect** (`differential.rs::minimal_non_oracle`: no
+`block_starters` at all, `;` the only terminator, no `/` handling) was added so vendor neutrality is
+exercised *behaviorally* — `BEGIN`/`COMMIT`/`END` read as ordinary `Plain` statements when the dialect
+supplies no block-starter data for them — rather than only by grepping `splitter.rs`/`lexer.rs` for
+vendor literals.
+
+**Open questions for M4.3 (script/statement execution), carried forward from J5's "Documented, not
+changed" note above and now made explicit rather than left implicit:** two behaviors remain
+unverified against a real SQL\*Plus/SQLcl client, and should be checked against one during M4.3's
+integration tests before execution semantics are finalized:
+
+1. A `/` line followed by a same-line comment (`/ -- note`) is not treated as an authoritative lone
+   `/` line by `is_lone_slash_line` (it requires the rest of the line to be whitespace-only). Real
+   SQL\*Plus/SQLcl may or may not tolerate a trailing comment there; this crate's current behavior is
+   a reasonable, conservative reading, not a confirmed match.
+2. A statement terminator (`;`) followed by a lone `/` line yields exactly one statement and does not
+   re-run it (MUST-FIX #2, J5) — a deliberate product decision for a desktop editor, not a verified
+   match for SQL\*Plus's own "re-run the buffer on a bare `/`" semantics, which are ambiguous for this
+   case in the first place (re-run the previous statement? treat it as inert?).
+
+Neither is a defect in the sense this review process looks for (both fail safely: at most an
+over-conservative "not authoritative" reading, never an executable fragment carved from the middle of
+a statement), but both are assumptions this crate makes without a real client to check them against,
+and M4.3's script executor is the first consumer positioned to do so.
+
+*Evidence:* `crates/sql-text/tests/corpus.rs`: 66 passing (3 new `dollar_if_*`/`additional_bug_a_leading_*`
+regression tests for the `is_trivial_or_directive` fix, confirmed genuine by reverting the fix and
+observing both directive-order-dependent tests fail with the exact predicted wrong span sequences)
+plus 1 unchanged `#[ignore]`d limitation (J3). `crates/sql-text/tests/differential.rs`: 3 tests —
+the extended grammar-based property (8 seeds, release mode 5,000 base scripts/seed × 3 join modes ×
+2 line endings = 240,000 scripts; 60 base scripts/seed in debug), the dedicated opaque-source-without-
+a-slash test, and the second-dialect behavioral test (4 seeds × 2,000 scripts = 8,000 more in
+release). All three `differential.rs` tests together: 8.04s wall time in release. `cargo fmt --all --
+check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and
+`cargo test -p reldex-sql-text --release` all pass; `RUSTDOCFLAGS="-D warnings" cargo doc -p
+reldex-sql-text --no-deps` is clean.
 
 ## Amendment: the event reply path (2026-09-20, task M2.5)
 

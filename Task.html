@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-21T03:51:00+07:00",
+  "updatedAt": "2026-09-21T04:16:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1158,8 +1158,8 @@
               "note": "Done 2026-09-20, independently reviewed."
             },
             {
-              "title": "M2.4 crates/sql-text: lexer + statement splitter driven by a SqlDialect descriptor the driver supplies (sonnet)",
-              "status": "todo"
+              "title": "M2.4 crates/sql-text: lexer + statement splitter driven by a SqlDialect descriptor the driver supplies (sonnet) — done 2026-09-21: reldex-sql-text (zero deps, no unsafe) — lexer + statement splitter driven by a driver-supplied SqlDialect; a lone / is authoritative, ambiguity fails safe, every span says how it ended (ended_by); adversarially reviewed three rounds (a panic and several mis-splits fixed); grammar-based differential test, 248,000 scripts; ADR-0002 amendment J",
+              "status": "done"
             },
             {
               "title": "M2.5 ★ EventQueue/EventSink/SessionEvent/Waker + ReplyTo refactor of the worker (opus, review mandatory) — done 2026-09-21: EventQueue/EventSink/SessionEvent/Waker + ReplyTo in db-core (no thread per session); ordering rules 1–5 and exactly-once Terminal tested; back-pressure bound 2R + U + 3 made true (slot released when the consumer pops); 42 session tests run on both reply paths; independently reviewed twice (3 must-fix fixed); FFI pump switch is M2.11 (phase-1-m2-5-event-queue.md)",
@@ -1650,7 +1650,11 @@
   "activity": [
     {
       "date": "2026-09-21",
-      "text": "M2.6 done: SessionRegistry with non-blocking open and abandon. Independent review found no leaked connection in 960 randomized sessions and clean lock discipline, and 3 must-fix, all about not hiding transaction loss or blocking shutdown: abandon() reported 'no transaction lost' from a caller-thread snapshot while a queued INSERT was still to run and be rolled back; registry teardown waited N x 500 ms serially although the ADR claimed the waits overlapped (now one deadline: ~0.51 s for 8 stuck sessions); and a DML that dies with its connection re-read the dead connection's cached 'inactive' state. The authoritative answer is now Terminal.transaction_possibly_lost, computed on the worker when the session really ends. The C ABI is unchanged; M2.11 switches the FFI to this path and must carry the new field to the user."
+      "text": "M2.6 done: SessionRegistry with non-blocking open and abandon. Independent review found no leaked connection in 960 randomized sessions and clean lock discipline, and 3 must-fix, all about not hiding transaction loss or blocking shutdown: abandon() reported 'no transaction lost' from a caller-thread snapshot while a queued INSERT was still to run and be rolled back; registry teardown waited N x 500 ms serially although the ADR claimed the waits overlapped (now one deadline: ~0.51 s for 8 stuck sessions); and a DML that dies with its connection re-read the dead connection's cached 'inactive' state. The authoritative answer is now Terminal.transaction_possibly_lost, computed on the worker when the session really ends. The C ABI is unchanged; M2.11 switches the FFI to this path and must carry the new field to the user. CI then exposed a latent M2.5 race (3 in 1,000 runs on main): after a lost session, a second close could answer 'closed cleanly'. Fixed at the root — how a session ended (cleanly / unresolved) is recorded once on the worker and every idempotent close answers from that record; a repeated close on a lost session now reports the loss again (ADR-0002 E7). 3,000-iteration loops, 0 failures."
+    },
+    {
+      "date": "2026-09-21",
+      "text": "M2.4 done: the SQL/PL-SQL lexer and statement splitter (crates/sql-text), driven by a dialect descriptor the Oracle driver supplies, so the core stays vendor-neutral. Three rounds of adversarial review found a panic and several mis-splits (a statement boundary in the wrong place can run the wrong SQL), all fixed; the safety rules are now explicit: a lone '/' line always ends the unit, an ambiguous construct never splits early, and every statement reports how it ended. A grammar-based differential test recovers 248,000 generated scripts exactly. Honest limit: two behaviours (a '/' inside an unterminated plain statement; a directive line inside a block) are not yet verified against SQL*Plus/SQLcl and are recorded for M4.3."
     },
     {
       "date": "2026-09-21",
