@@ -210,6 +210,16 @@ fn a_panicking_driver_call_is_contained_and_the_torn_connection_is_not_closed() 
         .expect_err("a panicking driver call must be reported, not unwound");
     assert_eq!(error.kind(), ErrorKind::DriverInternal);
     assert!(error.message().contains("panicked"), "{error}");
+    // The panic's own message, not a placeholder. `Action::Panic` panics with a
+    // `String`, so this also pins the downcast: reporting "a non-string
+    // payload" for every contained panic would throw away the one thing that
+    // says what went wrong.
+    assert!(
+        error
+            .message()
+            .contains("reldex-driver-mock: scripted panic"),
+        "{error}"
+    );
     assert!(session.is_lost());
 
     assert_eq!(

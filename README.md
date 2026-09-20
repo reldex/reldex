@@ -11,10 +11,12 @@ Reldex is an independent project and is not affiliated with, endorsed by, or spo
 **Phase 0 closed with a GO for Phase 1 from the owner on 2026-09-19.** The Phase 1 Desktop MVP plan
 (milestones M1–M6) is in [`docs/exec-plans/active/phase-1.md`](docs/exec-plans/active/phase-1.md), and
 [ADR-0003](docs/decisions/0003-qt-rust-integration.md) (Qt ↔ Rust integration) is drafted as
-**Proposed**, pending spike S15. M1 — and all of Phase 1 — is blocked on the owner's approval to
-install the Qt/CMake/Ninja toolchain. Phase 0 tail work continues in parallel on branch
-`phase-0/driver-carryover` (connect_timeout/C-5, `CREATE TRIGGER` rewrite/U-18, connect-warning
-channel/C-6) and `phase-0/android-device` (Android physical-device validation).
+**Proposed**, pending spike S15. The owner approved the toolchain and the
+Phase 1 kickoff decisions on 2026-09-20; the toolchain is installed (`docs/exec-plans/active/phase-1-toolchain.md`)
+and spike S15 is next. The Phase 0 tail work is done: the driver now enforces a connect timeout (C-5),
+rewrites `CREATE TRIGGER` DDL that upstream cannot execute (U-18) and reports connect-time warnings (C-6);
+and the core + driver + TLS stack has run on a physical Android phone as a native binary
+(`docs/exec-plans/active/phase-0-android-device.md`). Still open: the packaged-app path on Android and any iOS device evidence.
 
 **Phase 0 — Architecture Validation.** Spikes S1–S5, S7, S8 and S9 ran against a live Oracle Database
 19.3 (Docker) on 2026-09-19; the evidence-gap spikes S10–S14 (network loss/reconnect, NCLOB, developer

@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-20T08:30:00+07:00",
+  "updatedAt": "2026-09-20T07:09:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1038,8 +1038,8 @@
             },
             {
               "title": "Driver: honour connect_timeout (C-5)",
-              "status": "in_progress",
-              "note": "ConnectionParams::connect_timeout is accepted and ignored (phase-0-spike-results.md §7 C-5); approved 2026-09-19: helper thread, default 15 s, user-configurable per connection profile including \"no limit\"; in progress on branch phase-0/driver-carryover, not yet merged — Phase 1 M2.1 (docs/exec-plans/active/phase-1.md) consumes the result."
+              "status": "done",
+              "note": "ConnectionParams::connect_timeout is accepted and ignored (phase-0-spike-results.md §7 C-5); approved 2026-09-19: helper thread, default 15 s, user-configurable per connection profile including \"no limit\"; in progress on branch phase-0/driver-carryover, not yet merged — Phase 1 M2.1 (docs/exec-plans/active/phase-1.md) consumes the result. Done 2026-09-20, independently reviewed."
             },
             {
               "title": "Owner decisions §9 items 8–12",
@@ -1048,13 +1048,13 @@
             },
             {
               "title": "Driver: CREATE TRIGGER auto-rewrite for :NEW/:OLD (U-18)",
-              "status": "in_progress",
-              "note": "Rewrite to BEGIN EXECUTE IMMEDIATE q'[…]'; END; on by default, always reported to the user as a warning with the statement actually sent available for inspection, off switch at connection level (approved 2026-09-19, phase-0-spike-results.md §9 item 11); in progress on branch phase-0/driver-carryover, not yet merged — Phase 1 M2.2 consumes the result."
+              "status": "done",
+              "note": "Rewrite to BEGIN EXECUTE IMMEDIATE q'[…]'; END; on by default, always reported to the user as a warning with the statement actually sent available for inspection, off switch at connection level (approved 2026-09-19, phase-0-spike-results.md §9 item 11); in progress on branch phase-0/driver-carryover, not yet merged — Phase 1 M2.2 consumes the result. Done 2026-09-20, independently reviewed."
             },
             {
               "title": "Contract: connect-time warning channel (C-6)",
-              "status": "in_progress",
-              "note": "Additive take_connect_warnings-style method on DatabaseConnection, collected once by db-core after connect; approved in principle 2026-09-19, sequenced after pull request #5 (TCPS descriptor guard); record as an ADR-0002 amendment when implemented; in progress on branch phase-0/driver-carryover, not yet merged — Phase 1 M2.3 consumes the result."
+              "status": "done",
+              "note": "Additive take_connect_warnings-style method on DatabaseConnection, collected once by db-core after connect; approved in principle 2026-09-19, sequenced after pull request #5 (TCPS descriptor guard); record as an ADR-0002 amendment when implemented; in progress on branch phase-0/driver-carryover, not yet merged — Phase 1 M2.3 consumes the result. Done 2026-09-20, independently reviewed."
             },
             {
               "title": "Docs: recommend SQLNET.EXPIRE_TIME in user-facing connection troubleshooting docs",
@@ -1125,16 +1125,19 @@
           "title": "M2 — Core readiness: events, async open, settings, SQL text, driver leftovers",
           "tasks": [
             {
-              "title": "M2.1 ★ Driver: honour connect_timeout on a helper thread (C-5/U-15) (opus, review mandatory) — carried over from Phase 0, in progress on phase-0/driver-carryover; M2 consumes the result",
-              "status": "in_progress"
+              "title": "M2.1 ★ Driver: honour connect_timeout on a helper thread (C-5/U-15) (opus, review mandatory) — carried over from Phase 0 and done 2026-09-20; M2 consumes the result",
+              "status": "done",
+              "note": "Done 2026-09-20, independently reviewed."
             },
             {
-              "title": "M2.2 Driver: CREATE TRIGGER :NEW/:OLD auto-rewrite (U-18) (sonnet) — carried over from Phase 0, in progress on phase-0/driver-carryover; M2 consumes the result",
-              "status": "in_progress"
+              "title": "M2.2 Driver: CREATE TRIGGER :NEW/:OLD auto-rewrite (U-18) (sonnet) — carried over from Phase 0 and done 2026-09-20; M2 consumes the result",
+              "status": "done",
+              "note": "Done 2026-09-20, independently reviewed."
             },
             {
-              "title": "M2.3 ★ Contract: take_connect_warnings (C-6) + ADR-0002 amendment (opus, review mandatory) — carried over from Phase 0, in progress on phase-0/driver-carryover; M2 consumes the result",
-              "status": "in_progress"
+              "title": "M2.3 ★ Contract: take_connect_warnings (C-6) + ADR-0002 amendment (opus, review mandatory) — carried over from Phase 0 and done 2026-09-20; M2 consumes the result",
+              "status": "done",
+              "note": "Done 2026-09-20, independently reviewed."
             },
             {
               "title": "M2.4 crates/sql-text: lexer + statement splitter driven by a SqlDialect descriptor the driver supplies (sonnet)",
@@ -1366,7 +1369,7 @@
               "status": "todo"
             },
             {
-              "title": "Owner: Phase-0 leftovers (C-5, U-18, C-6) carried into Phase 1 M2 — confirmed 2026-09-19; in progress on phase-0/driver-carryover (decision C.3 #12)",
+              "title": "Owner: Phase-0 leftovers (C-5, U-18, C-6) carried into Phase 1 M2 — confirmed 2026-09-19; done 2026-09-20 (decision C.3 #12)",
               "status": "done"
             },
             {
@@ -1615,6 +1618,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-20",
+      "text": "Driver carry-over merged: connect-time warning channel (C-6, ADR-0002 amendment W1/W2), connect timeout enforced by the driver (C-5: default 15 s, capped at 1 h, unbounded only by explicit extension; ADR-0002 amendment H1/H2), and the CREATE TRIGGER auto-rewrite (U-18: on by default, off switch, always reported). Independent review: no injection, no late adoption, no transaction-tracking regression. Residual U-18 limits: 32767-byte trigger text; syntax-error positions refer to the wrapper block. A latent db-core defect (contained panics lost their message) was fixed on the way."
+    },
     {
       "date": "2026-09-20",
       "text": "Owner approved the Phase 1 kickoff decisions as recommended (phase-1.md C.3 #1–#9). Toolchain installed and proven from Git Bash: Qt 6.8.3 msvc2022_64, CMake 4.4.3, Ninja 1.13.2, cbindgen 0.29.4 — hello-world Qt Quick app and QuickTest pass offscreen; no GPL-only Qt module installed. Project scripts are now bash-first."

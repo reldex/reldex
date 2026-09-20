@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use reldex_db_driver_api::{
     Capabilities, ConnectionId, DbError, ErrorKind, LobKind, NativeError, Number, SessionState,
-    SqlType, StatementKind, Timestamp,
+    SqlType, StatementKind, Timestamp, Warning,
 };
 
 /// One cell of a scripted row or result column.
@@ -638,6 +638,7 @@ pub struct Counts {
 struct Inner {
     capabilities: Capabilities,
     connect: Behavior,
+    connect_warnings: Vec<Warning>,
     ping: Behavior,
     cancel: Behavior,
     commit: Behavior,
@@ -675,6 +676,7 @@ impl Default for Scenario {
                     .with_lob_streaming(true)
                     .with_error_position(true),
                 connect: Behavior::Succeed,
+                connect_warnings: Vec::new(),
                 ping: Behavior::Succeed,
                 cancel: Behavior::Succeed,
                 commit: Behavior::Succeed,
@@ -723,6 +725,23 @@ impl Scenario {
     /// Makes every future `connect` fail with `error`.
     pub fn fail_connect(&self, error: ScriptedError) {
         self.lock().connect = Behavior::Fail(error);
+    }
+
+    /// Scripts the non-fatal findings every future connection reports through
+    /// [`reldex_db_driver_api::DatabaseConnection::take_connect_warnings`].
+    ///
+    /// The real case is a transport parameter a driver cannot honour but that
+    /// does not weaken the session, so refusing the connection would be wrong
+    /// and silence would leave an imported profile believing it configured
+    /// something (contract gap C-6, `oracledb` U-14). Each connection gets its
+    /// own copy, and takes it once.
+    pub fn set_connect_warnings(&self, warnings: Vec<Warning>) {
+        self.lock().connect_warnings = warnings;
+    }
+
+    /// The findings a connection opened now would report.
+    pub(crate) fn connect_warnings(&self) -> Vec<Warning> {
+        self.lock().connect_warnings.clone()
     }
 
     /// Makes every future `ping` fail with `error`.
