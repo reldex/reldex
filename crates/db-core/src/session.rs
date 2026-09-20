@@ -15,7 +15,9 @@ use reldex_db_driver_api::{
     DbResult, RowBatch, SavepointName, Statement, StatementKind, ValueRef, Warning,
 };
 
+use crate::events::{CompletedOperation, EventSink, RequestId};
 use crate::ids::{LobHandle, ResultId, SessionId};
+use crate::reply::{CloseReplyTo, ReplyPayload, ReplyTo};
 use crate::shared::{SessionLifecycle, SessionShared};
 use crate::worker::{self, CloseIntent, Command};
 
@@ -417,6 +419,7 @@ impl<T> fmt::Debug for Completion<T> {
 pub struct SessionLimits {
     max_open_results: NonZeroUsize,
     max_lob_chunk_bytes: NonZeroUsize,
+    max_outstanding_requests: NonZeroUsize,
 }
 
 impl SessionLimits {
@@ -435,12 +438,37 @@ impl SessionLimits {
         None => unreachable!(),
     };
 
+    /// How many event-path requests one session may have accepted and
+    /// **undrained** before [`DatabaseSession::submit_execute`] and its
+    /// siblings refuse another.
+    ///
+    /// This is what bounds the reply events one session can put in an
+    /// [`crate::EventQueue`]: a request takes a slot when it is accepted and
+    /// gives it back when the consumer takes its reply *out of* the queue, so
+    /// a consumer that stops draining stops the submitter rather than letting
+    /// the queue grow. [`DatabaseSession::submit_close`] is the one exemption
+    /// and gets one slot above the limit, because a session at its limit must
+    /// still be able to end. 1,024 is far more than a worksheet ever has in flight
+    /// (a handful of fetches, at most) and small enough that a runaway
+    /// submitter is reported rather than allowed to grow the queue without
+    /// limit.
+    ///
+    /// It does **not** apply to [`Completion`]-path calls: those hold their
+    /// reply in the caller's own `Completion`, so they are bounded by the
+    /// caller, and the command queue itself stays unbounded on purpose
+    /// (ADR-0002 K9).
+    pub const DEFAULT_MAX_OUTSTANDING_REQUESTS: NonZeroUsize = match NonZeroUsize::new(1024) {
+        Some(value) => value,
+        None => unreachable!(),
+    };
+
     /// The default limits.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             max_open_results: Self::DEFAULT_MAX_OPEN_RESULTS,
             max_lob_chunk_bytes: Self::DEFAULT_MAX_LOB_CHUNK_BYTES,
+            max_outstanding_requests: Self::DEFAULT_MAX_OUTSTANDING_REQUESTS,
         }
     }
 
@@ -468,6 +496,19 @@ impl SessionLimits {
     #[must_use]
     pub const fn max_lob_chunk_bytes(self) -> NonZeroUsize {
         self.max_lob_chunk_bytes
+    }
+
+    /// Sets how many event-path requests one session may have outstanding.
+    #[must_use]
+    pub const fn with_max_outstanding_requests(mut self, requests: NonZeroUsize) -> Self {
+        self.max_outstanding_requests = requests;
+        self
+    }
+
+    /// How many event-path requests one session may have outstanding.
+    #[must_use]
+    pub const fn max_outstanding_requests(self) -> NonZeroUsize {
+        self.max_outstanding_requests
     }
 }
 
@@ -507,6 +548,9 @@ pub struct DatabaseSession {
     /// Collected once, on the worker thread, right after `connect` returned.
     /// Fixed for the session's lifetime, so this needs no lock.
     connect_warnings: Vec<Warning>,
+    /// Stamped by the [`SessionManager`] that opened this session; read on the
+    /// event-path submit to bound outstanding requests.
+    limits: SessionLimits,
 }
 
 impl DatabaseSession {
@@ -648,23 +692,306 @@ impl DatabaseSession {
             .is_ok()
     }
 
-    fn submit<T>(
+    fn submit<T: ReplyPayload>(
         &self,
-        make_command: impl FnOnce(mpsc::Sender<DbResult<T>>) -> Command,
+        subject: T::Subject,
+        make_command: impl FnOnce(ReplyTo<T>) -> Command,
     ) -> Completion<T> {
         let (tx, rx) = mpsc::channel();
-        let command = make_command(tx.clone());
+        let command = make_command(ReplyTo::one_shot(tx.clone(), subject));
         if !self.send(command) {
             let _ = tx.send(Err(self.shared.terminal_error()));
         }
         Completion { rx }
     }
 
+    /// The event-path twin of [`DatabaseSession::submit`].
+    ///
+    /// Everything that can refuse a request happens *before* the reply channel
+    /// exists, so a refusal accepts nothing and produces no event. Once the
+    /// [`ReplyTo`] is built, exactly one event follows however the command
+    /// ends — including the case where it cannot be delivered at all, where
+    /// the dropped reply channel emits the failure itself (see
+    /// [`crate::reply`]).
+    fn submit_event<T: ReplyPayload>(
+        &self,
+        request: RequestId,
+        subject: T::Subject,
+        make_command: impl FnOnce(ReplyTo<T>) -> Command,
+    ) -> DbResult<()> {
+        self.check_event_route()?;
+        self.shared
+            .reserve_request(self.limits.max_outstanding_requests().get())?;
+        let reply = ReplyTo::event(Arc::clone(&self.shared), self.id, request, subject);
+        let _ = self.send(make_command(reply));
+        Ok(())
+    }
+
+    fn check_event_route(&self) -> DbResult<()> {
+        if self.shared.has_events() {
+            return Ok(());
+        }
+        Err(DbError::internal(
+            "reldex-db-core: this session has no event queue; call \
+             DatabaseSession::bind_events before submitting",
+        ))
+    }
+
+    // ------------------------------------------------------------- events
+
+    /// Routes this session's replies into `sink` instead of (or as well as)
+    /// per-request [`Completion`]s.
+    ///
+    /// Call once, immediately after opening the session and before submitting
+    /// anything. Both paths stay available afterwards — they are the same
+    /// commands with a different reply channel — but only requests submitted
+    /// through the `submit_*` family produce events. Binding also turns on the
+    /// session's unsolicited events
+    /// ([`crate::SessionEvent::TransactionStateChanged`],
+    /// [`crate::SessionEvent::Executing`]) and its one
+    /// [`crate::SessionEvent::Terminal`].
+    ///
+    /// # Errors
+    ///
+    /// [`reldex_db_driver_api::ErrorKind::DriverInternal`] if this session
+    /// already routes its events somewhere: a second queue would split one
+    /// session's event stream in two and break the per-session ordering the
+    /// first consumer was promised.
+    ///
+    /// [`reldex_db_driver_api::ErrorKind::Resource`] if this session has
+    /// already announced its end. [`crate::SessionEvent::Terminal`] is emitted
+    /// once, at the transition; a queue bound afterwards would never receive
+    /// one, so the bind is refused instead of handing back a stream that can
+    /// only fail request by request.
+    pub fn bind_events(&self, sink: EventSink) -> DbResult<()> {
+        self.shared.bind_events(sink)
+    }
+
+    /// How many event-path requests this session has accepted and whose reply
+    /// the consumer has not yet taken out of the queue, against
+    /// [`SessionLimits::max_outstanding_requests`].
+    ///
+    /// A request still counts once the worker has answered it and until the
+    /// reply is drained — that is what makes the limit bound the queue — so
+    /// this is "work this session has in the consumer's hands", not "work the
+    /// worker is busy with". Dropping the [`crate::EventQueue`] releases every
+    /// slot it held, so this falls back to zero.
+    ///
+    /// A snapshot, for diagnostics and for a caller that wants to throttle
+    /// before it is refused.
+    #[must_use]
+    pub fn outstanding_requests(&self) -> usize {
+        self.shared.outstanding()
+    }
+
+    /// Submits a statement; its reply is one
+    /// [`crate::SessionEvent::Executed`] carrying `request`, preceded by one
+    /// [`crate::SessionEvent::Executing`] when the worker starts it.
+    ///
+    /// Returns as soon as the command is queued; the reply is produced on the
+    /// worker thread. One exception is worth knowing about for a consumer with
+    /// a [`crate::Waker`]: when the command cannot be delivered at all — the
+    /// session has already ended — the failure event is produced *here*, on
+    /// the calling thread, and if it fills an empty queue this call also runs
+    /// the waker before returning. See [`crate::Waker`].
+    ///
+    /// # Errors
+    ///
+    /// The only synchronous failures are "no queue is bound" and
+    /// [`reldex_db_driver_api::ErrorKind::Resource`] when
+    /// [`SessionLimits::max_outstanding_requests`] is already reached. Both
+    /// accept nothing, so no event follows. Every other failure — including a
+    /// lost or closed session — arrives as the request's own single event.
+    pub fn submit_execute(&self, request: RequestId, statement: Statement) -> DbResult<()> {
+        self.submit_event(request, (), |reply| Command::Execute { statement, reply })
+    }
+
+    /// Submits a fetch; its reply is one [`crate::SessionEvent::Fetched`],
+    /// which names `result` whether it succeeded or failed.
+    ///
+    /// # Errors
+    ///
+    /// As [`DatabaseSession::submit_execute`].
+    pub fn submit_fetch(
+        &self,
+        request: RequestId,
+        result: ResultId,
+        max_rows: NonZeroUsize,
+    ) -> DbResult<()> {
+        self.submit_event(request, result, |reply| Command::FetchBatch {
+            result,
+            max_rows,
+            reply,
+        })
+    }
+
+    /// Submits a commit; its reply is one [`crate::SessionEvent::Completed`]
+    /// with [`CompletedOperation::Commit`].
+    ///
+    /// # Errors
+    ///
+    /// As [`DatabaseSession::submit_execute`].
+    pub fn submit_commit(&self, request: RequestId) -> DbResult<()> {
+        self.submit_event(request, CompletedOperation::Commit, |reply| {
+            Command::Commit { reply }
+        })
+    }
+
+    /// Submits a rollback; its reply is one [`crate::SessionEvent::Completed`]
+    /// with [`CompletedOperation::Rollback`].
+    ///
+    /// # Errors
+    ///
+    /// As [`DatabaseSession::submit_execute`].
+    pub fn submit_rollback(&self, request: RequestId) -> DbResult<()> {
+        self.submit_event(request, CompletedOperation::Rollback, |reply| {
+            Command::Rollback { reply }
+        })
+    }
+
+    /// Submits a savepoint; its reply is one
+    /// [`crate::SessionEvent::Completed`] with
+    /// [`CompletedOperation::Savepoint`].
+    ///
+    /// # Errors
+    ///
+    /// As [`DatabaseSession::submit_execute`].
+    pub fn submit_savepoint(&self, request: RequestId, name: SavepointName) -> DbResult<()> {
+        self.submit_event(request, CompletedOperation::Savepoint, |reply| {
+            Command::Savepoint { name, reply }
+        })
+    }
+
+    /// Submits a rollback to a savepoint; its reply is one
+    /// [`crate::SessionEvent::Completed`] with
+    /// [`CompletedOperation::RollbackToSavepoint`].
+    ///
+    /// # Errors
+    ///
+    /// As [`DatabaseSession::submit_execute`].
+    pub fn submit_rollback_to_savepoint(
+        &self,
+        request: RequestId,
+        name: SavepointName,
+    ) -> DbResult<()> {
+        self.submit_event(request, CompletedOperation::RollbackToSavepoint, |reply| {
+            Command::RollbackToSavepoint { name, reply }
+        })
+    }
+
+    /// Submits a ping; its reply is one [`crate::SessionEvent::Completed`]
+    /// with [`CompletedOperation::Ping`].
+    ///
+    /// # Errors
+    ///
+    /// As [`DatabaseSession::submit_execute`].
+    pub fn submit_ping(&self, request: RequestId) -> DbResult<()> {
+        self.submit_event(request, CompletedOperation::Ping, |reply| Command::Ping {
+            reply,
+        })
+    }
+
+    /// Submits a large-object read; its reply is one
+    /// [`crate::SessionEvent::LobChunk`], which names `lob` whether it
+    /// succeeded or failed.
+    ///
+    /// # Errors
+    ///
+    /// As [`DatabaseSession::submit_execute`].
+    pub fn submit_read_lob_chunk(
+        &self,
+        request: RequestId,
+        lob: LobHandle,
+        max_bytes: NonZeroUsize,
+    ) -> DbResult<()> {
+        self.submit_event(request, lob, |reply| Command::ReadLobChunk {
+            lob,
+            max_bytes,
+            reply,
+        })
+    }
+
+    /// Submits a result close; its reply is one
+    /// [`crate::SessionEvent::Completed`] with
+    /// [`CompletedOperation::CloseResult`].
+    ///
+    /// # Errors
+    ///
+    /// As [`DatabaseSession::submit_execute`].
+    pub fn submit_close_result(&self, request: RequestId, result: ResultId) -> DbResult<()> {
+        self.submit_event(request, CompletedOperation::CloseResult(result), |reply| {
+            Command::CloseResult { result, reply }
+        })
+    }
+
+    /// Submits a large-object close; its reply is one
+    /// [`crate::SessionEvent::Completed`] with
+    /// [`CompletedOperation::CloseLob`].
+    ///
+    /// # Errors
+    ///
+    /// As [`DatabaseSession::submit_execute`].
+    pub fn submit_close_lob(&self, request: RequestId, lob: LobHandle) -> DbResult<()> {
+        self.submit_event(request, CompletedOperation::CloseLob(lob), |reply| {
+            Command::CloseLob { lob, reply }
+        })
+    }
+
+    /// Submits a session close; its reply is one
+    /// [`crate::SessionEvent::SessionClosed`], followed — only if the session
+    /// actually ended — by this session's single
+    /// [`crate::SessionEvent::Terminal`].
+    ///
+    /// Unlike [`DatabaseSession::close`] this does not block and does not join
+    /// the worker thread; the worker finishes on its own once it has answered
+    /// everything that was queued behind the close.
+    ///
+    /// A close reserves against **one more** than
+    /// [`SessionLimits::max_outstanding_requests`], so a session at its limit
+    /// can still be told to end: refusing the one request that shrinks a
+    /// session's footprint because the session has too much outstanding is the
+    /// wrong way round. The exemption is exactly one — a *second* close while
+    /// the first is still undrained is refused like anything else — so the
+    /// published bound grows by one event per session and no further.
+    ///
+    /// # Errors
+    ///
+    /// As [`DatabaseSession::submit_execute`], with the `Resource` limit one
+    /// higher. Teardown never depends on this: [`DatabaseSession::close`] and
+    /// `Drop` answer through a [`Completion`] and reserve nothing.
+    pub fn submit_close(
+        &self,
+        request: RequestId,
+        disposition: Option<CloseDisposition>,
+    ) -> DbResult<()> {
+        self.check_event_route()?;
+        self.shared.reserve_request(
+            self.limits
+                .max_outstanding_requests()
+                .get()
+                .saturating_add(1),
+        )?;
+        let reply = CloseReplyTo::event(Arc::clone(&self.shared), self.id, request);
+        if self.shared.has_ended() {
+            // Idempotent, exactly like `DatabaseSession::close`: a session
+            // that has already been closed reports success rather than the
+            // failure a command sent to a worker nobody is left to run would
+            // produce.
+            reply.answer(Ok(()));
+            return Ok(());
+        }
+        let _ = self.send(Command::Close {
+            intent: CloseIntent::Explicit(disposition),
+            reply,
+        });
+        Ok(())
+    }
+
     /// Executes one statement. Binds, deadlines and the fetch-size hint live
     /// on [`Statement`] itself.
     #[must_use]
     pub fn execute(&self, statement: Statement) -> Completion<ExecuteOutcome> {
-        self.submit(|reply| Command::Execute { statement, reply })
+        self.submit((), |reply| Command::Execute { statement, reply })
     }
 
     /// Fetches the next batch of an open result. An empty batch means the
@@ -678,7 +1005,7 @@ impl DatabaseSession {
         result: ResultId,
         max_rows: NonZeroUsize,
     ) -> Completion<FetchedBatch> {
-        self.submit(|reply| Command::FetchBatch {
+        self.submit(result, |reply| Command::FetchBatch {
             result,
             max_rows,
             reply,
@@ -690,31 +1017,42 @@ impl DatabaseSession {
     /// rollback or a fetch error.
     #[must_use]
     pub fn close_result(&self, result: ResultId) -> Completion<()> {
-        self.submit(|reply| Command::CloseResult { result, reply })
+        self.submit(CompletedOperation::CloseResult(result), |reply| {
+            Command::CloseResult { result, reply }
+        })
     }
 
     /// Commits the open transaction.
     #[must_use]
     pub fn commit(&self) -> Completion<()> {
-        self.submit(|reply| Command::Commit { reply })
+        self.submit(CompletedOperation::Commit, |reply| Command::Commit {
+            reply,
+        })
     }
 
     /// Rolls the open transaction back.
     #[must_use]
     pub fn rollback(&self) -> Completion<()> {
-        self.submit(|reply| Command::Rollback { reply })
+        self.submit(CompletedOperation::Rollback, |reply| Command::Rollback {
+            reply,
+        })
     }
 
     /// Establishes a savepoint.
     #[must_use]
     pub fn savepoint(&self, name: SavepointName) -> Completion<()> {
-        self.submit(|reply| Command::Savepoint { name, reply })
+        self.submit(CompletedOperation::Savepoint, |reply| Command::Savepoint {
+            name,
+            reply,
+        })
     }
 
     /// Rolls back to a savepoint, leaving the transaction open.
     #[must_use]
     pub fn rollback_to_savepoint(&self, name: SavepointName) -> Completion<()> {
-        self.submit(|reply| Command::RollbackToSavepoint { name, reply })
+        self.submit(CompletedOperation::RollbackToSavepoint, |reply| {
+            Command::RollbackToSavepoint { name, reply }
+        })
     }
 
     /// Validates that the session is still alive. Used after
@@ -723,7 +1061,7 @@ impl DatabaseSession {
     /// next request when needed; callers rarely need to invoke this directly.
     #[must_use]
     pub fn ping(&self) -> Completion<()> {
-        self.submit(|reply| Command::Ping { reply })
+        self.submit(CompletedOperation::Ping, |reply| Command::Ping { reply })
     }
 
     /// Reads the next chunk of a parked large object, on this session's worker
@@ -742,7 +1080,7 @@ impl DatabaseSession {
     /// such.
     #[must_use]
     pub fn read_lob_chunk(&self, lob: LobHandle, max_bytes: NonZeroUsize) -> Completion<Vec<u8>> {
-        self.submit(|reply| Command::ReadLobChunk {
+        self.submit(lob, |reply| Command::ReadLobChunk {
             lob,
             max_bytes,
             reply,
@@ -755,7 +1093,9 @@ impl DatabaseSession {
     /// session. Idempotent, like [`DatabaseSession::close_result`].
     #[must_use]
     pub fn close_lob(&self, lob: LobHandle) -> Completion<()> {
-        self.submit(|reply| Command::CloseLob { lob, reply })
+        self.submit(CompletedOperation::CloseLob(lob), |reply| {
+            Command::CloseLob { lob, reply }
+        })
     }
 
     /// Closes the session, resolving its transaction first.
@@ -794,7 +1134,7 @@ impl DatabaseSession {
         let (tx, rx) = mpsc::channel();
         if !self.send(Command::Close {
             intent: CloseIntent::Explicit(disposition),
-            reply: tx,
+            reply: CloseReplyTo::one_shot(tx),
         }) {
             if let Some(handle) = worker.take() {
                 let _ = handle.join();
@@ -855,7 +1195,7 @@ impl Drop for DatabaseSession {
         let (tx, rx) = mpsc::channel();
         if !self.send(Command::Close {
             intent: CloseIntent::Abandon,
-            reply: tx,
+            reply: CloseReplyTo::one_shot(tx),
         }) {
             let _ = handle.join();
             return;
@@ -936,6 +1276,7 @@ impl SessionManager {
             cancel_handle: handle.cancel_handle,
             cancel_kind: handle.cancel_kind,
             connect_warnings: handle.connect_warnings,
+            limits: self.limits,
         })
     }
 }

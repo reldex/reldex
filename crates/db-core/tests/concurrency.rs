@@ -10,8 +10,9 @@ use reldex_driver_mock::{Action, ColumnSpec, QuerySource, ScriptValue};
 
 const SESSION_COUNT: usize = 8;
 
-#[test]
-fn eight_concurrent_sessions_make_progress_independently_and_never_share_state() {
+fn eight_concurrent_sessions_make_progress_independently_and_never_share_state(
+    path: support::ReplyPath,
+) {
     let scenario = support::scenario();
     for i in 0..SESSION_COUNT {
         let table = format!("t{i}");
@@ -38,7 +39,7 @@ fn eight_concurrent_sessions_make_progress_independently_and_never_share_state()
         .map(|i| {
             let scenario = std::sync::Arc::clone(&scenario);
             thread::spawn(move || {
-                let session = support::open(&scenario);
+                let session = support::open_on(&scenario, path);
                 let table = format!("t{i}");
                 for _ in 0..5 {
                     session
@@ -90,4 +91,8 @@ fn eight_concurrent_sessions_make_progress_independently_and_never_share_state()
             "table t{i} must hold exactly the rows its own session committed"
         );
     }
+}
+
+support::both_paths! {
+    eight_concurrent_sessions_make_progress_independently_and_never_share_state,
 }

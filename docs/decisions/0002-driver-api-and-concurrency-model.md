@@ -1411,6 +1411,164 @@ check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --w
 `cargo test -p reldex-sql-text --release` all pass; `RUSTDOCFLAGS="-D warnings" cargo doc -p
 reldex-sql-text --no-deps` is clean.
 
+## Amendment: the event reply path (2026-09-20, task M2.5)
+
+The "Deferred, and deliberately not built now" section above promised that a per-session outbound
+queue for the FFI adapter was additive: "both shapes coexist — the adapter would drain one queue
+instead of holding many `Completion`s". This amendment is that work, built to
+`docs/exec-plans/active/phase-1.md` §B2. **Nothing about the driver contract changes**; what changes
+is where a `db-core` request's answer goes. Numbering: `E` = event path.
+
+### E1 — a request's answer is a `ReplyTo`, and `Completion` is one of its two arms
+
+The worker's per-request `Sender<DbResult<T>>` became `ReplyTo<T>`, which is either that same
+oneshot or `{ session, request, sink }`. Every command, every error path and every resource rule is
+shared between the two arms by construction, which is what stops the paths diverging (§B5's last
+row). `Completion<T>`'s API and behaviour are unchanged, including the `worker_vanished` error a
+dropped worker still produces, and its tests were not touched.
+
+The core's public surface grows by: `RequestId`, `Waker`, `EventCaps`, `EventSink`, `EventQueue`,
+`SessionEvent`, `CompletedOperation`, `event_channel`, `DatabaseSession::bind_events`, eleven
+`DatabaseSession::submit_*` methods, `DatabaseSession::outstanding_requests`,
+`SessionLimits::{with_,}max_outstanding_requests` and `EventQueue`'s own accessors
+(`next`, `drain_into`, `wait_timeout`, `len`, `is_empty`, `set_waker`, `dropped_unsolicited`,
+`pending_dropped_lines`, `waker_panics`, `caps`). `#![forbid(unsafe_code)]` was added to the crate
+root while doing it, because the claim was being made in prose and nowhere else.
+
+### E2 — exactly one reply per accepted request is structural, not bookkept
+
+`ReplyTo::answer` consumes the channel, so "never two" is a type error. "Never zero" is `Drop`: a
+reply channel dropped unanswered emits the session's terminal failure as it goes. That single
+mechanism covers the worker exiting with commands still queued, a submit whose command could not be
+delivered because the worker had already gone, and an unwind through the worker itself — and it
+replaces the "set of requests we still owe" that `crates/ffi`'s interim pump has to maintain by hand
+(ADR-0003 A14). The synthesised failure keeps the *shape* a success would have had, result id and
+large-object handle included, so an adapter routing on those never special-cases failures
+(ADR-0003 A21, applied to the core).
+
+The one thing that can refuse a request is `SessionLimits::max_outstanding_requests` (default
+1,024), checked before the reply channel exists. A refusal accepts nothing and produces no event,
+because an event reporting that the queue is full would be circular. The per-session command channel
+stays unbounded (K9): what is bounded is the reply *events*.
+
+A request's slot is released when the **consumer takes its reply out of the queue**, not when the
+worker produces it. Releasing on production was the first implementation and it bounded nothing: the
+worker answers a `ping` in microseconds, so a submitter that retried on `Resource` could push a
+queue nobody was draining to any length it liked (measured at 5,000 events with the counter reading
+zero). The counter is therefore shared between the session and the queue, which carries an `Arc` of
+it on the queued reply itself; the release is a single atomic performed under the queue's own mutex
+during a pop — no second lock, no ordering edge, and no per-session lookup on the hot path. Putting
+the slot on the event rather than in a per-session tally also makes the accounting hard to get
+wrong: a reply cannot release a slot it was never holding, and a slot cannot outlive its event
+whichever way the queue ends. Dropping the `EventQueue` ends the stream: everything in it is discarded, every
+slot it held is released, and later events are discarded on arrival rather than accumulating where
+nobody can read them. A session that outlives its consumer keeps working (it may still have a close
+to run) and is bounded, from then on, by what its worker has genuinely not reached yet.
+
+`submit_close` is the **one exemption**: it reserves against `max_outstanding_requests + 1`. Refusing
+the single request that *shrinks* a session's footprint, on the grounds that the session has too much
+outstanding, is backwards — and while nothing deadlocks without the exemption (`DatabaseSession::close`
+and `Drop` answer through a `Completion` and reserve nothing), an event-driven adapter would have been
+told it cannot ask a session to end. The exemption is exactly one: a second close while the first is
+still undrained is refused like any other request, so the class grows the bound by one event per
+session and no further. Per session, the queue therefore holds at most
+`2 × max_outstanding_requests + max_unsolicited_per_session + 3` events — `R + 1` replies, `R`
+`Executing`s, `U + 1` unsolicited and one `Terminal`.
+
+Closing is idempotent, and stays idempotent when closes race. Only one of several concurrent closes
+finds a worker to run; the rest reach a session that has already ended and are answered by `Drop`.
+They asked the same question and the true answer is the same — the session is closed — so they
+report `Ok`, exactly as `DatabaseSession::close` does on the completion path. A session that is
+`Lost` still reports the failure: idempotency is not a licence to claim a clean close that never
+happened (`SPEC.md` §10).
+
+### E3 — `Terminal` is emitted at the transition, once, after everything accepted before it
+
+`SessionShared` gained a one-shot flag. The worker emits `SessionEvent::Terminal` when the session
+reaches `Lost` or `Closed`, and before doing so it answers every command already in its queue —
+those requests were accepted before the transition, so rule 3 puts their replies ahead of the
+announcement. A `Close` found in that queue is *run* rather than failed, because failing it would
+leave the worker looping while `DatabaseSession::close` waited to join it.
+
+What this does **not** promise, stated because the difference is real: a request submitted
+concurrently with the transition may be answered after `Terminal`. That is rule 3's second sentence,
+and it is the only honest guarantee available without blocking submission — which `SPEC.md` §11/§19
+forbids. Nor is rule 1 a promise about *acceptance* order: failures a submit synthesises on its own
+thread interleave with the failures the worker is producing as it drains, so a consumer routes
+strictly by `RequestId` and retires a session's state on `Terminal` — never on "every earlier
+request looks answered". `Lost` wins over `Closed` in the announcement, as K8 already had it.
+
+Because there is one announcement and no second one, `bind_events` is **refused** (`Resource`) on a
+session that has already emitted its `Terminal`. Binding late would hand a consumer a stream that
+never terminates: every submit failing one by one with nothing to say the session is gone.
+
+### E4 — a panic in the consumer's waker is caught, counted and survived
+
+The waker is edge-triggered on empty → non-empty, is invoked with no queue or session lock held, and
+is never invoked from inside a pop. `EventQueue::set_waker` takes the registration lock exclusively,
+so it cannot return while a wake is running — the use-after-free ADR-0003 D5 rule 2 and spike
+criterion K5 are about. Two consequences are part of the contract rather than accidents: a waker
+must never call `set_waker` (read lock inside write lock is a self-deadlock), and a waker can run on
+the thread that **submitted** a request, because a submit whose command cannot be delivered
+synthesises its own failure event and may be the one that fills an empty queue. M2.11's re-entrancy
+guard has to tolerate that. The mechanism now lives here, in `db-core`, rather than only in
+`crates/ffi`; M2.11 deletes the FFI's copy and delegates.
+
+A waker that panics is caught and counted (`EventQueue::waker_panics`), and the queue keeps working
+with that waker still registered. The alternatives were rejected: letting it unwind would eventually
+cross an FFI frame, which is undefined behaviour; poisoning the queue would turn a consumer's bug
+into a stalled session; unregistering it silently would leave a UI that never hears about another
+row and cannot tell why.
+
+### E5 — the drop policy, and what may never be dropped
+
+A reply event, `Executing` and `Terminal` are never dropped and never coalesced — they are bounded
+instead, by E2's slot accounting (`R + 1` replies, counting the close exemption, and `R` `Executing`s
+per session). Only the unsolicited classes are capped, per session, at
+`EventCaps::max_unsolicited_per_session` (256):
+
+* `TransactionStateChanged` reports a *state*, so an undelivered one for that session is updated in
+  place to the newer value, and when the session has none queued the new one is admitted **even at
+  the cap**. Both halves are needed: coalescing alone still loses the first change after a burst of
+  `ServerOutput` has used up the session's allowance, and "a transaction is open" is exactly the
+  fact that must never be lost — a UI that misses it shows Commit and Rollback disabled over a live
+  transaction. The class therefore costs at most one event per session above the cap. Nothing is
+  lost and no drop is counted; the cost is that a coalesced value is delivered at the earlier of the
+  two positions. It is advisory — `close` still re-decides on the worker (K4) and
+  `has_possibly_active_transaction()` is authoritative — so paying position to never lose the state
+  is the right way round.
+* `ServerOutput` (whose producer is M2.7) is dropped at the cap, and the drop is reported rather
+  than hidden: the incoming event is the one refused, so what is already queued survives, and its
+  line count is added to that session's pending count and delivered as `dropped` on the next
+  `ServerOutput` that session does get through. A session that goes quiet or ends with lines still
+  owed has no next one, so the count also stays readable through
+  `EventQueue::pending_dropped_lines(session)`. `EventQueue::dropped_unsolicited` counts refused
+  events for diagnostics and never resets.
+
+Dropping the *oldest* queued event instead was considered and rejected: it is O(n) in a shared FIFO,
+and it discards the beginning of a PL/SQL run, which is where the error usually is.
+
+### E6 — what the event path costs
+
+Measured on the dev machine, release, against the mock driver; information only, not a claim.
+A `ping` round trip through the event path costs **432–537 ns** with one producer session and
+**351–391 ns/event** with eight, against **2,043–2,215 ns** and **328–410 ns** for the same round
+trip through `Completion` — the single-session case improves because the submitter no longer parks
+on a reply. A counting global allocator in its own test binary
+(`crates/ffi/tests/core_event_cost.rs`, hosted there because `crates/ffi/tests/fences.rs` restricts
+the `unsafe_code` opt-out to the FFI boundary) measures **0.033 allocations per event** once warm,
+all of it the command channel's own block amortisation: carrying an event through the queue
+allocates nothing beyond the event. The full numbers, and the 1M-row FFI figures either side of the
+refactor, are in `docs/exec-plans/active/phase-1.md` beside M2.5.
+
+Those per-event figures **predate the reply-slot accounting** added in review round 1 (see E2). With
+the slot on the queued event, independent runs on a quiet machine measure 412–563 ns at one producer
+and 408–436 ns at eight — the eight-producer case ~10% above the number above, which is what the
+slot costs: one `Arc` clone on the push, one `Arc` drop and one `fetch_update` on the pop. Runs on a
+loaded machine came out proportionally higher across *every* benchmark, including ones M2.5 never
+touched, so treat all of these as shape rather than as figures to compare across machines.
+Allocations per event are unchanged at 0.033. Still information only, still not a claim.
+
 ## Notes for driver implementers
 
 Findings from reading `oracle/rust-oracledb` **`=26.0.0-beta.3`** — the version this repository pins

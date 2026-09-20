@@ -10,8 +10,7 @@ use reldex_db_core::Statement;
 use reldex_db_driver_api::{LobKind, SqlType};
 use reldex_driver_mock::{Action, ColumnSpec, QueryPlan, QuerySource, ScriptValue};
 
-#[test]
-fn multi_batch_fetch_runs_to_exhaustion() {
+fn multi_batch_fetch_runs_to_exhaustion(path: support::ReplyPath) {
     let scenario = support::scenario();
     let columns = vec![ColumnSpec::new("N", SqlType::Number)];
     let rows: Vec<Vec<ScriptValue>> = (0..7_i64).map(|v| vec![ScriptValue::from(v)]).collect();
@@ -20,7 +19,7 @@ fn multi_batch_fetch_runs_to_exhaustion() {
         Action::query(QuerySource::Fixed(QueryPlan::new(columns, rows))),
     );
 
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     let outcome = session
         .execute(Statement::new("SELECT * FROM t"))
         .wait()
@@ -51,8 +50,7 @@ fn multi_batch_fetch_runs_to_exhaustion() {
     assert!(again.is_empty());
 }
 
-#[test]
-fn unsupported_column_does_not_fail_the_batch() {
+fn unsupported_column_does_not_fail_the_batch(path: support::ReplyPath) {
     let scenario = support::scenario();
     let columns = vec![
         ColumnSpec::new("NAME", SqlType::VARCHAR),
@@ -71,7 +69,7 @@ fn unsupported_column_does_not_fail_the_batch() {
         Action::query(QuerySource::Fixed(QueryPlan::new(columns, rows))),
     );
 
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     let outcome = session
         .execute(Statement::new("SELECT * FROM t"))
         .wait()
@@ -95,8 +93,7 @@ fn unsupported_column_does_not_fail_the_batch() {
     assert_eq!(batch.value(1, 0).and_then(|v| v.as_str()), Some("b"));
 }
 
-#[test]
-fn lob_streaming_reads_in_chunks_on_the_worker_thread() {
+fn lob_streaming_reads_in_chunks_on_the_worker_thread(path: support::ReplyPath) {
     let scenario = support::scenario();
     let columns = vec![ColumnSpec::new(
         "DOC",
@@ -114,7 +111,7 @@ fn lob_streaming_reads_in_chunks_on_the_worker_thread() {
         ))),
     );
 
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     let connection_id = session.connection_id();
     let outcome = session
         .execute(Statement::new("SELECT doc FROM t"))
@@ -160,8 +157,7 @@ fn lob_streaming_reads_in_chunks_on_the_worker_thread() {
     assert_ne!(seen[0], thread::current().id());
 }
 
-#[test]
-fn caller_thread_never_executes_driver_code() {
+fn caller_thread_never_executes_driver_code(path: support::ReplyPath) {
     let scenario = support::scenario();
     scenario.on_sql(
         "SELECT 1 FROM dual",
@@ -170,7 +166,7 @@ fn caller_thread_never_executes_driver_code() {
             vec![vec![ScriptValue::from(1_i64)]],
         ))),
     );
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     let connection_id = session.connection_id();
 
     let outcome = session
@@ -196,4 +192,11 @@ fn caller_thread_never_executes_driver_code() {
         thread::current().id(),
         "the calling (test) thread must never itself execute driver code"
     );
+}
+
+support::both_paths! {
+    multi_batch_fetch_runs_to_exhaustion,
+    unsupported_column_does_not_fail_the_batch,
+    lob_streaming_reads_in_chunks_on_the_worker_thread,
+    caller_thread_never_executes_driver_code,
 }

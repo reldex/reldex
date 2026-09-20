@@ -95,8 +95,8 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 - [x] M1.5 CMake + Corrosion + Qt project skeleton; QML module for the adapter (sonnet) — done 2026-09-20: `ui/` (CMake + Corrosion v0.6.1 pinned by commit, adapter QML module `Reldex.Adapter`, `Reldex` executable, offscreen QTest), `bash ui/build.sh --test`; verified on Windows only — Linux/macOS build unverified until the UI CI workflow exists (K7)
 - [x] M1.6 ★ `ResultTableModel` over borrowed batch views; `Bridge` waker→`invokeMethod` drain (opus, review mandatory) — done 2026-09-20: `Bridge` (waker → coalesced queued drain, 256 events / 4 ms budget, re-posts itself), `SessionController` (bounded fetches in flight), `ResultTableModel` (borrowed batch views; text = pointer reads, other kinds bulk-formatted per 1,024-row window into an LRU cache ≤ 8 MiB), `Metrics` hooks for S15; independently reviewed (3 must-fix fixed); K5 flood teardown 10,000 iterations with live-handle counts back to zero; ASan not available on the Windows dev machine (x64 runtime missing)
 - [x] M1.7 Mock driver: 1M-row generator of the S14 shape with controllable latency and a 10 s blocking statement (sonnet) — done 2026-09-20: `Action::GeneratedQuery` / `GeneratedQuerySpec` (lazy, O(batch) memory, `expected_cell` for random-access checks); 1M rows stream in ~0.55 s (release)
-- [ ] M1.8 ★ Spike S15 measurement run + report against kill criteria K1–K7 (opus, review mandatory)
-- [ ] M1.9 Accept or re-open ADR-0003; update `ARCHITECTURE.md` §13 items 2/3/10, `TASKS.md`, `Task.html` (sonnet)
+- [x] M1.8 ★ Spike S15 measurement run + report against kill criteria K1–K7 (opus, review mandatory) — done 2026-09-20: `docs/exec-plans/active/phase-1-s15-ffi-spike.md`; K1/K3/K4/K5/K6/K7 pass (K1/K5 with a named gap), **K2 fails as written** (cold first paint 903.55 ms vs a 150 ms threshold; warm path 15.85 ms passes by ~9×, cause outside the boundary); no criterion's failure is located in the boundary
+- [~] M1.9 Accept or re-open ADR-0003; update `ARCHITECTURE.md` §13 items 2/3/10, `TASKS.md`, `Task.html` (sonnet) — S15 recorded; ADR-0003 stays Proposed, awaiting owner ruling on K1 p99 wording, K2 warm/cold, K3 baseline
 
 ### M2 — Core readiness: events, async open, settings, SQL text, driver leftovers
 
@@ -104,7 +104,7 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 - [x] M2.2 Driver: `CREATE TRIGGER` `:NEW`/`:OLD` auto-rewrite (U-18) (sonnet) — carried over from Phase 0 and done 2026-09-20; M2 consumes the result
 - [x] M2.3 ★ Contract: `take_connect_warnings` (C-6) + ADR-0002 amendment (opus, review mandatory) — carried over from Phase 0 and done 2026-09-20; M2 consumes the result
 - [ ] M2.4 `crates/sql-text`: lexer + statement splitter driven by a `SqlDialect` descriptor the driver supplies (sonnet)
-- [ ] M2.5 ★ `EventQueue`/`EventSink`/`SessionEvent`/`Waker` + `ReplyTo` refactor of the worker (opus, review mandatory)
+- [x] M2.5 ★ `EventQueue`/`EventSink`/`SessionEvent`/`Waker` + `ReplyTo` refactor of the worker (opus, review mandatory) — done 2026-09-21: `EventQueue`/`EventSink`/`SessionEvent`/`Waker` + `ReplyTo` in `db-core` (no thread per session); ordering rules 1–5 and exactly-once `Terminal` tested; back-pressure bound `2R + U + 3` made true (slot released when the consumer pops); 42 session tests run on both reply paths; independently reviewed twice (3 must-fix fixed); FFI pump switch is M2.11 (`phase-1-m2-5-event-queue.md`)
 - [ ] M2.6 ★ `SessionRegistry` + non-blocking `open`, `abandon` semantics (opus, review mandatory)
 - [ ] M2.7 ★ Server output capability (DBMS_OUTPUT) in contract + driver + core polling when enabled (opus, review mandatory)
 - [ ] M2.8 Metadata catalog descriptor (`MetadataCatalog`) + Oracle dictionary SQL for the 9 object groups (sonnet)
@@ -144,6 +144,7 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 - [ ] M5.5 CLOB/BLOB viewers over `read_lob_chunk`, paged, with a size warning (sonnet)
 - [ ] M5.6 ★ Fetch-batch benchmark across row shapes and a real network; pick and record the shipped default (opus, review mandatory)
 - [ ] M5.7 Perf gate re-run on the real database; record against M1's numbers (sonnet)
+- [ ] M5.8 ★ Scrolling while a result is still streaming drops ≈ 0.3% of frames (GUI-thread bound: drains + view work) — budget the drain per frame / insert coalescing (opus, review mandatory)
 
 ### M6 — Browse, prove, package
 
@@ -155,6 +156,7 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 - [ ] M6.6 ★ Windows packaging: `windeployqt6`, unsigned installer, first-run layout (opus, review mandatory)
 - [ ] M6.7 CI: build the Qt project on all three OS; run offscreen QML/QTest and the C smoke harness; cache Qt and cargo (sonnet)
 - [ ] M6.8 ★ Phase 1 DoD review against `SPEC.md` §24, honest status per item; update `TASKS.md`, `phase-1.md`, `Task.html` (opus, review mandatory)
+- [ ] M6.9 Cold first paint ≈ 800–900 ms (D3D11 device creation ≈ 250 ms + first delegate-instantiation polish ≈ 551 ms) vs `SPEC.md` §19 startup target — investigate fix candidates named in the S15 report (sonnet)
 
 ### Owner decisions (Phase 1)
 
@@ -173,6 +175,7 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 - [x] Owner: upstream issues F and G — decided 2026-09-19 not to submit for now; drafts kept for tracking only, results file §6 (decision C.3 #13)
 - [x] Owner: mobile test hardware — resolved 2026-09-19: Android arm64 phone (OPPO CPH2399) provided, NDK 28.2 installed; physical-device validation itself is separate Phase-0 tail work in progress on `phase-0/android-device`; iOS still needs a Mac + Apple Developer account + device, not provided (decision C.3 #14)
 - [ ] Owner: Community/Pro licensing decision before M6.6 so the notices file and About dialog are right the first time (decision C.3 #15)
+- [ ] Owner: Rule on S15 (K1 p99 wording, K2 warm vs cold, K3 baseline/metric) and accept or re-open ADR-0003
 
 ## P2 — IDE capabilities
 

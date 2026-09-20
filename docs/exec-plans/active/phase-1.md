@@ -1,16 +1,24 @@
 # Execution Plan — Phase 1 Desktop MVP
 
-**Status:** Active — toolchain install approved by the owner 2026-09-20 and in progress (M1.1); spike S15 next
+**Status:** Active — spike S15 complete 2026-09-20 (M1.8 done); ADR-0003 stays Proposed, awaiting an
+owner ruling on three open questions (M1.9 in progress). M2 core work proceeds under the owner's
+standing instruction to continue through phases, since nothing in M2 depends on the ADR's wording and
+nothing there would be wasted by a re-open.
 **Date:** 2026-09-20
 **Depends on:** [ADR-0001](../../decisions/0001-database-driver-strategy.md) (database driver strategy),
 [ADR-0002](../../decisions/0002-driver-api-and-concurrency-model.md) (driver API and concurrency model),
-[ADR-0003](../../decisions/0003-qt-rust-integration.md) (Qt ↔ Rust integration — **Proposed**, acceptance
-conditional on spike S15), and [`phase-0.md`](phase-0.md) (Phase 0 exit assessment — the owner gave the
-**GO for Phase 1 on 2026-09-19**).
+[ADR-0003](../../decisions/0003-qt-rust-integration.md) (Qt ↔ Rust integration — **Proposed**, spike S15
+complete 2026-09-20, owner ruling requested), and [`phase-0.md`](phase-0.md) (Phase 0 exit assessment —
+the owner gave the **GO for Phase 1 on 2026-09-19**).
 
 **Purpose.** This is the Phase 1 (Desktop MVP) execution plan produced immediately after the Phase 1 GO:
 the core (`db-core`) changes needed before/with the UI (§B), the milestone plan M1–M6 with owner/inputs/
-outputs/dependencies/acceptance criteria per task (§C), and the risk register (§D). ADR-0003 is not accepted yet (it waits for spike S15). The owner decisions in §C.3 carry their
+outputs/dependencies/acceptance criteria per task (§C), and the risk register (§D). ADR-0003 is not
+accepted yet: spike S15 is complete and recorded (`docs/exec-plans/active/phase-1-s15-ffi-spike.md`),
+no criterion's failure is located in the boundary, and both the measurement author and an independent
+reviewer recommend acceptance — but the lead does not accept it unilaterally and does not re-open the
+design; three rulings are requested from the owner instead (M1.9, and see ADR-0003's own "S15 result"
+section). The owner decisions in §C.3 carry their
 current status: #1–#9 were approved as recommended on 2026-09-20; #10, #11 and #15 are still open. Status per task uses the same legend as `TASKS.md`: `[x]` done, `[~]` in progress,
 `[ ]` todo, `[!]` blocked.
 
@@ -121,13 +129,23 @@ pub enum SessionEvent {
 
 **Ordering guarantees (the contract the adapter may rely on):**
 
-1. Per session, events are delivered in the order the worker produced them.
+1. Per session, events are delivered in the order they were **produced**. Production order is not acceptance order, and M2.5 made that explicit: at a terminal transition a submit can synthesise its own failure on the caller's thread while the worker is draining and failing the commands it already had, so those failures interleave. A consumer must route strictly by `RequestId` and must **not** infer "every earlier request of this session is answered" from a reply; session state is retired on `Terminal` only.
 2. Every accepted request produces **exactly one** reply event for its `RequestId` — never zero, never two — including when the session is already `Lost` or `Closed` (the reply is then the failure, carrying the original kind and native code per K8).
 3. `Terminal` is delivered **exactly once** per session, after every reply for requests accepted before the transition. Requests submitted after it still get their one failure reply, which may follow `Terminal`.
 4. `Executing` precedes the matching `Executed` and follows any earlier request's reply on that session.
 5. **No ordering is promised across sessions.** The hub interleaves freely.
 
 **Back-pressure.** Reply events are bounded by outstanding requests, which is bounded by a new `SessionLimits::max_outstanding_requests` (default 1,024). Exceeding it is the **one synchronous failure** in the submit API — `Err(DbError)` with `ErrorKind::Resource`, no event — because producing an event for it would be circular. Unsolicited events (`ServerOutput`, `TransactionStateChanged`) use a bounded per-session ring with coalescing; drops are *counted and reported* on the next event (`dropped`) so the UI can say "output truncated" rather than silently lying. This mirrors K9: the command queue stays unbounded, the resources do not.
+
+**Back-pressure, as implemented (M2.5, after review).** Four things above needed pinning down, because the first implementation was bounded only on paper:
+
+* A request's slot is released when the **consumer drains its reply**, not when the worker produces it. Releasing on production bounds nothing — the worker answers a `ping` in microseconds, so a submitter retrying on `Resource` grew an undrained queue to 5,000 events with the counter reading zero. `DatabaseSession::outstanding_requests()` therefore means "accepted and not yet drained".
+* Dropping the `EventQueue` ends the stream: everything in it is discarded, every slot it held is released, and later events are discarded on arrival. Sessions keep working (one may have a close to run) and are then bounded by what their worker has not yet reached.
+* `TransactionStateChanged` is not subject to the cap at all: it coalesces in place when one is queued and is **admitted over the cap** when none is, so the class costs at most one event per session and a state change can never be lost behind a `ServerOutput` burst. `ServerOutput` is the only class that is dropped; its line count rides out on the next delivered `ServerOutput`, or is read with `EventQueue::pending_dropped_lines(session)` when there is no next one.
+
+* `submit_close` reserves against **one more** than the limit. It was being refused at the cap like anything else, which is backwards: it is the one request that shrinks a session's footprint. Nothing deadlocked (`close()` and `Drop` go through a `Completion` and reserve nothing), but an event-driven adapter would have been unable to ask a full session to end. The exemption is exactly one — a second close while the first is undrained is refused — so the class costs one event per session.
+
+Per session the queue therefore holds at most `2 × max_outstanding_requests + max_unsolicited_per_session + 3` events (`R + 1` replies, `R` `Executing`s, `U + 1` unsolicited, one `Terminal`), whatever a producer does.
 
 ### B3 — Non-blocking open and the session registry
 
@@ -274,19 +292,21 @@ Six milestones. M1 is the de-risking gate and nothing downstream starts until it
 
 **Goal.** Prove the whole Qt↔Rust path end to end at scale before any product feature is built, and accept or kill ADR-0003 on evidence.
 
-**Exit gate (demonstrable).** A QML window shows a `TableView` scrolling 1,000,000 mock rows fed through the real `reldex-ffi` and a real `QAbstractTableModel`; the S15 measurement report records frame time (p50/p99), first-row latency, RSS, and per-batch boundary cost against the K1–K7 thresholds; ADR-0003's status is updated — moved to Accepted, or re-opened with the owner — on that evidence; CI builds the CMake+Corrosion+Qt project and runs offscreen tests on windows/ubuntu/macos.
+**Exit gate (demonstrable).** A QML window shows a `TableView` scrolling 1,000,000 mock rows fed through the real `reldex-ffi` and a real `QAbstractTableModel`; the S15 measurement report records frame time (p50/p99), first-row latency, RSS, and per-batch boundary cost against the K1–K7 thresholds; ADR-0003's status is updated on that evidence; CI builds the CMake+Corrosion+Qt project and runs offscreen tests on windows/ubuntu/macos.
+
+**M1 exit-gate result (2026-09-20).** The demonstrable part is done: S15's report has a measured number and a verdict for every K1–K7 threshold, and CI is green on all three OS. The status update is not "moved to Accepted, or re-opened with the owner" as originally framed — no criterion's failure is located in the boundary, so re-opening the design is not warranted, but the lead does not accept ADR-0003 unilaterally either. ADR-0003 stays **Proposed**, now carrying the S15 evidence and three rulings requested from the owner (M1.9).
 
 | ID | Status | Title | Owner | Inputs | Outputs | Deps | Acceptance | Size |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| M1.1 | `[!]` blocked — owner approval of the toolchain install (C.3 #1) | Owner approval + toolchain install (Qt, CMake, Ninja, cbindgen) | owner + `sonnet` | §C.0 list | Installed toolchain; `docs/exec-plans/active/phase-1-toolchain.md` recording exact versions and paths | — | `cmake --version`, `ninja --version`, `qmake -query` all report; a stock Qt Quick hello-world builds and runs | S |
+| M1.1 | `[x]` done 2026-09-20 — owner approved; Qt 6.8.3, CMake, Ninja, cbindgen installed (`phase-1-toolchain.md`) | Owner approval + toolchain install (Qt, CMake, Ninja, cbindgen) | owner + `sonnet` | §C.0 list | Installed toolchain; `docs/exec-plans/active/phase-1-toolchain.md` recording exact versions and paths | — | `cmake --version`, `ninja --version`, `qmake -query` all report; a stock Qt Quick hello-world builds and runs | S |
 | M1.2 ★ | `[x]` done — ADR-0003 drafted as **Proposed** by this change | Draft ADR-0003 (this section A) | `opus` | §A | `docs/decisions/0003-qt-rust-integration.md` (Proposed) | — | Reviewed by a second `opus`; alternatives and kill criteria present | M |
-| M1.3 ★ | `[ ]` todo | `crates/ffi` skeleton: hub, session open/execute/fetch, batch views, errors, waker | `opus` | ADR-0003 D2–D7; `db-core` public API | `crates/ffi` + `crates/ffi/include/reldex.h` | M1.2 | `cbindgen --verify` clean; clippy `-D warnings`; every `unsafe` has SAFETY; Miri green on the crate's tests | L |
-| M1.4 | `[ ]` todo | C smoke harness (`ui/tests/ffi_smoke`), no Qt, mock driver, ASan on Linux | `sonnet` | M1.3 header | A C program exercising open→execute→fetch→close | M1.3 | Runs green on all 3 CI OS; ASan/UBSan clean on Linux | M |
-| M1.5 | `[ ]` todo | CMake + Corrosion + Qt project skeleton; QML module for the adapter | `sonnet` | M1.1, M1.3 | `ui/CMakeLists.txt`, `ui/adapter`, `ui/app` | M1.1, M1.3 | One-command build on Windows; `QT_QPA_PLATFORM=offscreen` test target runs | M |
-| M1.6 ★ | `[ ]` todo | `ResultTableModel : QAbstractTableModel` over borrowed batch views; `Bridge` waker→`invokeMethod` drain | `opus` | ADR-0003 D4/D5 | Adapter classes + `QAbstractItemModelTester` suite | M1.5 | Model tester green; K5 teardown test (10k iterations, ASan) green; no FFI call inside `data()` beyond pointer reads | L |
-| M1.7 | `[ ]` todo | Mock driver: 1M-row generator of the S14 shape with controllable latency and a 10 s blocking statement | `sonnet` | `crates/drivers/mock` | New `Scenario` cases | — (parallel with M1.3–M1.6) | Deterministic; DB-free; used by M1.4 and M1.8 | S |
-| M1.8 ★ | `[ ]` todo | Spike S15 measurement run + report | `opus` | M1.6, M1.7 | `docs/exec-plans/active/phase-1-s15-ffi-spike.md` with method, environment, numbers | M1.6, M1.7 | Every K1–K7 threshold has a measured number and a verdict; method recorded per `AGENTS.md` "Performance" | M |
-| M1.9 | `[ ]` todo | Accept or re-open ADR-0003; update `ARCHITECTURE.md` §13 items 2/3/10, `TASKS.md`, `Task.html` | `sonnet` | M1.8 | Updated docs | M1.8 | Status changed with evidence links; dashboard not stale | S |
+| M1.3 ★ | `[x]` done 2026-09-20 — `reldex-ffi`, ABI 3, two independent reviews | `crates/ffi` skeleton: hub, session open/execute/fetch, batch views, errors, waker | `opus` | ADR-0003 D2–D7; `db-core` public API | `crates/ffi` + `crates/ffi/include/reldex.h` | M1.2 | `cbindgen --verify` clean; clippy `-D warnings`; every `unsafe` has SAFETY; Miri green on the crate's tests | L |
+| M1.4 | `[x]` done 2026-09-20 — C11/C++17 harness, ASan/UBSan on Linux CI, `ui.yml` on three OS | C smoke harness (`ui/tests/ffi_smoke`), no Qt, mock driver, ASan on Linux | `sonnet` | M1.3 header | A C program exercising open→execute→fetch→close | M1.3 | Runs green on all 3 CI OS; ASan/UBSan clean on Linux | M |
+| M1.5 | `[x]` done 2026-09-20 — `ui/` skeleton, Corrosion v0.6.1 pinned | CMake + Corrosion + Qt project skeleton; QML module for the adapter | `sonnet` | M1.1, M1.3 | `ui/CMakeLists.txt`, `ui/adapter`, `ui/app` | M1.1, M1.3 | One-command build on Windows; `QT_QPA_PLATFORM=offscreen` test target runs | M |
+| M1.6 ★ | `[x]` done 2026-09-20 — Bridge / SessionController / ResultTableModel, independently reviewed | `ResultTableModel : QAbstractTableModel` over borrowed batch views; `Bridge` waker→`invokeMethod` drain | `opus` | ADR-0003 D4/D5 | Adapter classes + `QAbstractItemModelTester` suite | M1.5 | Model tester green; K5 teardown test (10k iterations, ASan) green; no FFI call inside `data()` beyond pointer reads | L |
+| M1.7 | `[x]` done 2026-09-20 — `GeneratedQuerySpec`, 1M rows in ~0.55 s | Mock driver: 1M-row generator of the S14 shape with controllable latency and a 10 s blocking statement | `sonnet` | `crates/drivers/mock` | New `Scenario` cases | — (parallel with M1.3–M1.6) | Deterministic; DB-free; used by M1.4 and M1.8 | S |
+| M1.8 ★ | `[x]` done 2026-09-20 | Spike S15 measurement run + report | `opus` | M1.6, M1.7 | `docs/exec-plans/active/phase-1-s15-ffi-spike.md` with method, environment, numbers | M1.6, M1.7 | Every K1–K7 threshold has a measured number and a verdict; method recorded per `AGENTS.md` "Performance" — met: K1/K3/K4/K5/K6/K7 pass (K1/K5 with a named gap); **K2 fails as written** (cold first paint 903.55 ms vs 150 ms; warm path 15.85 ms passes by ~9×), cause outside the boundary | M |
+| M1.9 | `[~]` in progress — S15 recorded; awaiting owner ruling | Accept or re-open ADR-0003; update `ARCHITECTURE.md` §13 items 2/3/10, `TASKS.md`, `Task.html` | `sonnet` | M1.8 | Updated docs | M1.8 | Status changed with evidence links; dashboard not stale — done: ADR-0003, `ARCHITECTURE.md`, `TASKS.md`, `Task.html` updated with the S15 result and the three open rulings; not done: the owner has not yet ruled, so ADR-0003 stays Proposed rather than Accepted | S |
 
 **Parallelism.** M1.7 runs alongside M1.3–M1.6. M1.4 and M1.6 can run in parallel once M1.3's header is stable. M1.2 must land before M1.3 begins coding.
 
@@ -304,7 +324,7 @@ Six milestones. M1 is the de-risking gate and nothing downstream starts until it
 | M2.2 | `[x]` done 2026-09-20 — carried over from Phase 0 (independently reviewed); M2 consumes the result | Driver: `CREATE TRIGGER` `:NEW`/`:OLD` auto-rewrite (U-18), on by default, reported as a warning with the submitted text, per-connection off switch | `sonnet` | SPEC §8 owner decision | Driver change + live test + canary update | — | Rewrite works; warning carries the exact statement sent; off switch restores the explanatory refusal | M |
 | M2.3 ★ | `[x]` done 2026-09-20 — carried over from Phase 0 (independently reviewed); M2 consumes the result | Contract: `take_connect_warnings` (C-6) + ADR-0002 amendment | `opus` | `phase-0-spike-results.md` §7 C-6 | `db-driver-api` + `db-core` + mock + oracle-thin | M2.1 | Warnings collected once after connect; TCPS `SSL_SERVER_DN_MATCH` warning reaches the caller | S |
 | M2.4 | `[x]` done 2026-09-20; round-1 adversarial-review safety fixes 2026-09-21 (panic + mis-split MUST-FIXes, ADR-0002 amendment J4); round-2 adversarial review 2026-09-21 rejected that fix for a deeper depth-tracking defect + 3 more MUST-FIXes, now fixed with a grammar-based differential test as the new acceptance gate (ADR-0002 amendment J5) | `crates/sql-text`: lexer + statement splitter driven by a `SqlDialect` descriptor the driver supplies | `sonnet` | SPEC §15; ADR-0002 D8 | New crate (`reldex-sql-text`) + Oracle dialect descriptor in `oracle-thin` | — | A corpus of Oracle scripts (PL/SQL blocks, nested BEGIN, `/`, `q'[…]'`, comments, strings, Thai text) splits correctly; `tokenize_block(text, in_state) -> (tokens, out_state)` shaped for `QSyntaxHighlighter`; a lone `/` line is authoritative regardless of nesting depth (S1); `statement_at` never panics at any byte offset; **round-2 additions:** a lone `/` line with no statement text pending produces no span at all, never an empty or re-run one (ADR-0002 J5); a call-spec (`LANGUAGE`/`EXTERNAL`) is recognized only on a full phrase match, never a single word, because a missed call-spec merely over-swallows text while a false one carves a real body out from under the statement that owns it — the fail-safe direction always favors the larger span | L |
-| M2.5 ★ | `[ ]` todo | `EventQueue`/`EventSink`/`SessionEvent`/`Waker` + `ReplyTo` refactor of the worker | `opus` | §B2 | `db-core` change | — | Ordering rules 1–5 each have a test; exactly-once `Terminal` test; drop-count reporting test; existing suite runs on both paths | L |
+| M2.5 ★ | `[x]` done 2026-09-21 — reviewed twice; see `phase-1-m2-5-event-queue.md` | `EventQueue`/`EventSink`/`SessionEvent`/`Waker` + `ReplyTo` refactor of the worker | `opus` | §B2 | `db-core` change | — | Ordering rules 1–5 each have a test; exactly-once `Terminal` test; drop-count reporting test; existing suite runs on both paths | L |
 | M2.6 ★ | `[ ]` todo | `SessionRegistry` + non-blocking `open`, `abandon` semantics | `opus` | §B3 | `db-core` change | M2.5 | `open` returns without blocking; abandon-before-open yields exactly one `OpenFailed{Cancelled}` and closes the late connection; ADR-0002 amendment recorded | M |
 | M2.7 ★ | `[ ]` todo | Server output capability (DBMS_OUTPUT) in contract + driver + core polling when enabled | `opus` | §B4.2 | Contract + driver + core | M2.5 | Thai text survives byte-exact (S5 precedent); no round trip when the pane is off | M |
 | M2.8 | `[ ]` todo | Metadata catalog descriptor (`MetadataCatalog`) + Oracle dictionary SQL for the 9 object groups | `sonnet` | SPEC §16; spike S12 | Contract + driver | M2.3 | Each group returns a declared column contract; server-side name filter and row cap; permission failures classify as `ErrorKind::Permission`, not driver failure | M |
@@ -314,6 +334,14 @@ Six milestones. M1 is the de-risking gate and nothing downstream starts until it
 
 **Parallelism.** M2.1/M2.2 (driver), M2.4 (sql-text), M2.9/M2.10 (settings/secrets) and M2.5/M2.6 (events) are four independent tracks. M2.11 gates on all of them.
 **Mandatory review:** M2.1, M2.3, M2.5, M2.6, M2.7, M2.9, M2.10 — concurrency, contract change, and security.
+
+**M2.5 notes.** The implementation notes for the event queue live in
+[`phase-1-m2-5-event-queue.md`](phase-1-m2-5-event-queue.md): the before/after performance numbers
+(1M rows through `crates/ffi`; per-event cost at 1 and 8 producer sessions; allocations per event),
+the exact `SessionEvent` → `ReldexEvent` mapping M2.11 has to write — the C ABI is **unchanged** by
+M2.5, and `reldex.h` is byte-identical — and every place the implementation had to interpret §B2.
+The decision record is [ADR-0002](../../decisions/0002-driver-api-and-concurrency-model.md)
+amendment E1–E6.
 
 ---
 
@@ -375,8 +403,9 @@ Six milestones. M1 is the de-risking gate and nothing downstream starts until it
 | M5.5 | `[ ]` todo | CLOB/BLOB viewers over `read_lob_chunk`, paged, with a size warning | `sonnet` | `db-core` LOB API | QML | M5.2 | 100 MB CLOB opens with bounded memory (S7 method); NCLOB Thai/non-BMP byte-exact (S11 method) | M |
 | M5.6 ★ | `[ ]` todo | **Fetch-batch benchmark** across row shapes and a real network; pick and record the shipped default | `opus` | spike S14 | `docs/exec-plans/active/phase-1-fetch-benchmark.md` | M5.2 | ≥3 row shapes × ≥4 batch sizes × local and a latency-injected link; method and environment recorded; the default is a *setting* with a bounded range, and the number is justified by the data (S14 showed throughput is not monotonic) | M |
 | M5.7 | `[ ]` todo | Perf gate re-run on the real database; record against M1's numbers | `sonnet` | M1.8 method | Updated measurement report | M5.3 | Frame time, first-row latency, RSS, fetch throughput all recorded; regressions vs M1 explained | S |
+| M5.8 ★ | `[ ]` todo | Scrolling while a result is still streaming drops ≈ 0.3% of frames (GUI-thread bound: drains + view work) — budget the drain per frame / insert coalescing | `opus` | S15 `streamscroll` phase (`phase-1-s15-ffi-spike.md` K6) | `db-core`/adapter change + re-measurement | M5.2 | The worst frame in the `streamscroll` phase (49.53 ms, 2/601 over 33 ms) is reduced to the machine's own background rate (~0.02%, per K1's idle control); boundary's own share of a drain stays under 1% | M |
 
-**Parallelism.** M5.3–M5.5 run in parallel after M5.2; M5.6 runs alongside them. **Review:** M5.1, M5.2, M5.6.
+**Parallelism.** M5.3–M5.5 run in parallel after M5.2; M5.6 runs alongside them; M5.8 follows M5.2. **Review:** M5.1, M5.2, M5.6, M5.8.
 
 ---
 
@@ -396,8 +425,9 @@ Six milestones. M1 is the de-risking gate and nothing downstream starts until it
 | M6.6 ★ | `[ ]` todo | Windows packaging: `windeployqt6`, unsigned installer, first-run layout | `opus` | §C.0 licence position | Installer + `docs/packaging.md` | M6.1–M6.4 | Qt linked dynamically; DLLs replaceable; no GPL-only module present (verified by an inventory step); installs and runs on a machine with no dev tools | M |
 | M6.7 | `[ ]` todo | CI: build the Qt project on all three OS; run offscreen QML/QTest and the C smoke harness; cache Qt and cargo | `sonnet` | M1.5 | `.github/workflows/ui.yml` | M1.5 | Cold job under the agreed time budget; `QT_QPA_PLATFORM=offscreen`; keeps the existing fast hermetic Rust job untouched | M |
 | M6.8 ★ | `[ ]` todo | Phase 1 DoD review against `SPEC.md` §24, honest status per item; update `TASKS.md`, `phase-1.md`, `Task.html` | `opus` | everything | Exit assessment | all | Every DoD item marked met / met-with-limits / not-met with evidence; §24.8 Cancel stays **not met**; nothing softened | S |
+| M6.9 | `[ ]` todo | Cold first paint ≈ 800–900 ms (D3D11 device creation ≈ 250 ms + first delegate-instantiation polish ≈ 551 ms) vs `SPEC.md` §19 startup target — investigate fix candidates named in the S15 report | `sonnet` | S15 K2 diagnosis (`phase-1-s15-ffi-spike.md`) | Adapter/QML startup change + re-measurement | M1 gate | Cold execute → first painted frame materially under 903.55 ms, ideally toward `SPEC.md` §19's <1 s desirable / <2 s acceptable warm-startup target; warm-path number (15.85 ms) unaffected | M |
 
-**Parallelism.** M6.1/M6.2 (features) run alongside M6.3/M6.4 (non-functional) and M6.5/M6.7 (build). **Review:** M6.6, M6.8.
+**Parallelism.** M6.1/M6.2 (features) run alongside M6.3/M6.4 (non-functional), M6.5/M6.7 (build) and M6.9 (startup). **Review:** M6.6, M6.8.
 
 ## C.3 — Owner decisions required (numbered; recommendation for each; current status per the 2026-09-20 facts)
 
@@ -420,7 +450,7 @@ Six milestones. M1 is the de-risking gate and nothing downstream starts until it
 9. **Telemetry and logging.** — *Recommend* no telemetry at all in Phase 1; local rotating log file, default level `info`, SQL text logged only at `debug` behind an explicit opt-in, secrets redacted by construction and asserted by test.
    **Status:** Approved 2026-09-20 as recommended.
 10. **Fetch-batch default (M5.6).** — *Recommend* the owner signs off the number the benchmark produces rather than pre-committing one. S14 showed 10,000 rows/batch was ~3.5× *slower* than the best of 100 and 1,000, so intuition is actively wrong here.
-    **Status:** Open — not yet decided (deferred to the M5.6 benchmark by design).
+    **Status:** Open — not yet decided (deferred to the M5.6 benchmark by design). **Evidence added by S15's fetch-size sweep (2026-09-20, headless + in-app, `phase-1-s15-ffi-spike.md` "Sweeps"):** as information for the owner, not a decision — 1,000 rows/fetch with 2 fetches in flight is the fastest-or-tied-fastest stream, the lowest per-row memory, and the lowest per-batch boundary cost among the sizes that stream well; 100 rows/fetch costs ~20 MB/million rows more; 50,000 rows/fetch costs 30.64 ms of first-row latency; more than 2 fetches in flight buys nothing (n=3 repeats: the four settings' medians span 14 ms against a 16–40 ms per-cell spread). Every number has **zero network latency in it** and must be re-measured on a real network in M5.7, per the report's own recommendation.
 11. **Wording sign-off for the no-Cancel UX and "no limit" (M4.6).** — *Recommend* the owner reads and approves the exact strings, because this is the product's honesty commitment in user-visible form. Proposed: Cancel is absent, not disabled; the run bar shows "Time limit 10 min (from profile)"; "no limit" reads *"A statement with no limit can only be ended by disconnecting this worksheet, which loses its transaction."*
     **Status:** Open — not yet decided.
 12. **Phase-0 leftovers carried into M2 (C-5, U-18, C-6).** — *Recommend* treating them as Phase 1 M2 tasks (as planned above) rather than blocking the Phase 1 start on them. Confirm.
@@ -438,9 +468,9 @@ Six milestones. M1 is the de-risking gate and nothing downstream starts until it
 
 | # | Risk | Impact | Mitigation | Earliest task that retires it |
 | --- | --- | --- | --- | --- |
-| R1 | Qt Quick `TableView` + a custom model cannot hold 60 FPS over 1M rows on the dev machine | The whole UI choice is wrong; Phase 1 has no foundation | Measure it first, with the real boundary, before any feature exists; kill criteria K1/K3 stated in advance | **M1.8** |
-| R2 | The waker → `invokeMethod` path has a lifetime or reentrancy defect that only appears under load or on shutdown | Intermittent crashes that are expensive to find later | Contract rules in ADR-0003 D5; `set_waker` blocks on in-flight wakes; 10k-iteration ASan teardown test | **M1.6 / M1.8 (K5)** |
-| R3 | Hand-written FFI introduces UB that tests do not catch | Memory corruption in the most critical layer | One crate, no logic, SAFETY comments, Miri, ASan C harness, mandatory independent review of every FFI change | **M1.3 + M1.4** |
+| R1 | Qt Quick `TableView` + a custom model cannot hold 60 FPS over 1M rows on the dev machine | The whole UI choice is wrong; Phase 1 has no foundation | Measure it first, with the real boundary, before any feature exists; kill criteria K1/K3 stated in advance — **retired by S15 evidence (2026-09-20):** K1 worst frame-production p50 5.72 ms / worst app CPU 5.24 ms against an 8 ms threshold, and 8 of 36,008 vsync-on frames over 33 ms (0.022%); K3 rows cost +172.5–172.7 MB against a 200 MB threshold. Reduced, not fully retired: K1's p99 wording and K3's baseline/metric still need an owner ruling (ADR-0003) | **M1.8** |
+| R2 | The waker → `invokeMethod` path has a lifetime or reentrancy defect that only appears under load or on shutdown | Intermittent crashes that are expensive to find later | Contract rules in ADR-0003 D5; `set_waker` blocks on in-flight wakes; 10k-iteration ASan teardown test — **retired by S15 evidence (2026-09-20):** K5, 10,000-iteration flood teardown, no hang/crash/leak in 3 Windows runs, plus ASan+UBSan+LSan clean over the whole adapter suite on Linux CI (job `35508957508`), live counts back to baseline every time | **M1.6 / M1.8 (K5)** |
+| R3 | Hand-written FFI introduces UB that tests do not catch | Memory corruption in the most critical layer | One crate, no logic, SAFETY comments, Miri, ASan C harness, mandatory independent review of every FFI change — **reduced by S15 evidence (2026-09-20):** two independent FFI reviews (M1.3's, producing amendments A10–A18; the first-consumers review, producing A19–A25) plus the ASan/UBSan/LSan harness on Linux CI clean over the whole adapter suite; **Miri still not run** (ADR-0003 A9 — no nightly toolchain on the dev machine), so this risk is reduced, not fully retired | **M1.3 + M1.4** |
 | R4 | `QQuickTextEdit` is unusable for real SQL files (large documents, Thai shaping, IME) | The editor — the product's core surface — needs a rewrite mid-phase | Measure the limit in M4.1 with Thai and non-BMP corpora before building features on it; documented fallback is a custom `QQuickItem` editor with a Rust-side text model, costed as an L task | **M4.1** |
 | R5 | A blocked worker with "no limit" accumulates detached threads and sockets | Slow resource leak that looks like a hang to the user | 600 s default; `abandon` detaches within 500 ms (K5); detached-worker counter surfaced in diagnostics; C-5 bounds the connect half | **M2.1 + M2.6** |
 | R6 | The event refactor (`ReplyTo`) regresses one of ADR-0002's hard-won correctness properties (K1, K4, K5, K7, K8) | Silent commit, lost transaction, or a handle on the wrong thread — the failures `SPEC.md` §2 ranks worst | Run the **existing** `db-core` suite parameterized over both reply paths; no new semantics, only a new delivery channel; mandatory independent review | **M2.5** |
