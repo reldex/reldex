@@ -1,0 +1,172 @@
+name: UI
+
+# Separate from the fast, hermetic Rust workflow (ci.yml): this one builds
+# the C/C++ side (M1.4, M1.5, ADR-0003), which is slower (a real C/C++
+# toolchain, and for `qt-build`, a real Qt install) and only needs to run
+# when the UI or the FFI boundary it links against actually changed.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ui/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ui.yml"
+  pull_request:
+    paths:
+      - "ui/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ui.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ADR-0003 D10 item 2 / M1.4: a plain C/C++ program linking reldex-ffi's
+  # cdylib directly and driving the mock driver end to end. NO Qt install
+  # here at all -- that is the whole point of this job existing separately
+  # from qt-build below, and it is why this job is fast enough to run the
+  # ASan/UBSan leg without the 25-minute Qt-install budget being at risk.
+  ffi-smoke:
+    name: ffi-smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest GitHub-hosted runners are Apple Silicon (ARM64),
+        # matching ci.yml's own note.
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        # dtolnay/rust-toolchain has no version tags; @stable is a moving
+        # branch in that repo, so it is pinned here by the commit within
+        # master's history that was current when this workflow was written,
+        # with the toolchain selected explicitly via the `toolchain:` input
+        # (the pattern the action's own README recommends for SHA pinning).
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-20)
+        with:
+          toolchain: stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ffi-smoke-${{ matrix.os }}
+
+      - name: bash ui/tests/ffi_smoke/run.sh
+        # Reuses the exact script a developer runs locally rather than
+        # re-implementing its configure/build/ctest sequence here: run.sh
+        # already sources tools/dev-env/env.sh on Windows (bringing MSVC
+        # onto PATH via vswhere) and does configure+build+test in one script
+        # invocation, which matters because a GitHub Actions "run:" step's
+        # environment does not carry over to the next step -- splitting
+        # this into separate Configure/Build/Test steps would lose the
+        # vcvars environment env.sh just set up before the Build step ran.
+        #
+        # K5/D2: ASan+UBSan on the C/C++ harness only, ubuntu leg only
+        # (reldex-ffi's Rust code is never instrumented, but ASan still
+        # intercepts its malloc/free calls from this process; one OS is
+        # enough to prove the boundary is sanitizer-clean, and ubuntu's
+        # GCC/Clang make it the natural choice). detect_leaks=1: if this
+        # ever reports a leak, ADR-0003 A17 already documents one
+        # intentional leak class (a session pump parked in an
+        # uninterruptible statement, never exercised by this harness) --
+        # anything else found here must be investigated and reported, not
+        # blanket-suppressed (M1.4 brief). run.sh's own --sanitize flag
+        # sets ASAN_OPTIONS itself; nothing extra is needed here.
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            bash ui/tests/ffi_smoke/run.sh --sanitize
+          else
+            bash ui/tests/ffi_smoke/run.sh
+          fi
+
+  # M1.5 / K7: the full Qt Quick UI, built against a real Qt 6.8 LTS
+  # install, offscreen. This is the job the 25-minute cold-job budget in
+  # ADR-0003's spike criterion K7 is about.
+  qt-build:
+    name: qt-build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-20)
+        with:
+          toolchain: stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: qt-build-${{ matrix.os }}
+
+      - name: Install Qt runtime dependencies (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        # Qt Quick needs these to load its platform/graphics plugins even
+        # under the offscreen QPA backend (no real display is used, but the
+        # plugins themselves still dlopen these libraries). Kept to the
+        # minimum observed necessary rather than a large "just in case" list.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libegl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+
+      - name: Install Qt 6.8 (LGPL, no extra GPL modules)
+        # AGENTS.md naming/licensing: open-source LGPL Qt only, and only the
+        # modules ui/CMakeLists.txt actually finds (Core Gui Qml Quick Test,
+        # all part of the base install, plus qtshadertools -- matching
+        # docs/exec-plans/active/phase-1-toolchain.md's own local install).
+        # No GPL-only module (qtcharts, qtwebengine, ...) is requested.
+        uses: jurplel/install-qt-action@bcb88e3bed2e992f5f9e24c0f9e364a231d278eb # v4.4.0
+        with:
+          version: "6.8.3"
+          modules: "qtshadertools"
+          cache: true
+
+      - name: Work around QTBUG-137687 (Qt 6.8.3 links a removed AGL framework on the macOS 26 SDK)
+        # macos-latest now ships the macOS 26 (Tahoe) / Xcode 26 SDK, which
+        # dropped the AGL framework; Qt 6.8.3's FindWrapOpenGL.cmake still
+        # falls back to `-framework AGL` unconditionally, so every Qt Quick
+        # target fails to link. Fixed upstream in Qt 6.8.4/6.9.2
+        # (https://bugreports.qt.io/browse/QTBUG-137687), but 6.8.4 is not yet
+        # published to aqtinstall's open-source macOS channel and moving to
+        # the 6.9 minor line is a version-policy call beyond M1.4's scope
+        # (reported in that task's report, not decided here). See
+        # .github/scripts/patch-macos-qt-agl.py for exactly what this changes
+        # and why it fails loudly instead of silently no-op'ing.
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: python3 .github/scripts/patch-macos-qt-agl.py "${QT_ROOT_DIR}/lib/cmake/Qt6/FindWrapOpenGL.cmake"
+
+      - name: Point CMake at the installed Qt
+        # Belt and suspenders: install-qt-action's own docs say the Qt bin
+        # directory being on PATH is normally enough for CMake to find Qt6,
+        # but also document QT_ROOT_DIR as the reliable escape hatch. Setting
+        # CMAKE_PREFIX_PATH explicitly removes any doubt for
+        # find_package(Qt6 ...) in ui/CMakeLists.txt.
+        shell: bash
+        run: echo "CMAKE_PREFIX_PATH=${QT_ROOT_DIR}" >> "$GITHUB_ENV"
+
+      - name: bash ui/build.sh --test
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: bash ui/build.sh --test

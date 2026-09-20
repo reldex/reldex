@@ -138,8 +138,15 @@ pub struct ReldexError {
     cause: Option<OwnedStr>,
 }
 
+impl Drop for ReldexError {
+    fn drop(&mut self) {
+        crate::counters::destroyed(crate::counters::Kind::Error);
+    }
+}
+
 impl ReldexError {
     pub(crate) fn from_db_error(error: &DbError) -> Self {
+        crate::counters::created(crate::counters::Kind::Error);
         let mut cause = String::new();
         let mut source = error.source();
         while let Some(current) = source {

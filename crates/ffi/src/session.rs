@@ -45,14 +45,14 @@ use reldex_db_core::{
     ErrorKind, ExecuteOutcome, FetchedBatch, ResultId, Statement,
 };
 
-use crate::batch::{ReldexBatch, ResultColumns};
+use crate::batch::{ReldexBatch, ReldexColumnInfo, ResultColumns};
 use crate::error::{ReldexError, ReldexSessionState, set_last_argument_error, set_last_error};
 use crate::event::{QueuedEvent, ReldexEventKind};
 use crate::format::ReldexTextArena;
 use crate::hub::{ReldexHub, with_hub};
 use crate::mock::{BlockControl, ReldexMockScenarioConfig, build_driver, release_block};
-use crate::status::{ReldexStatus, entry};
-use crate::strings::{CStruct, ReldexStr, read_in_struct};
+use crate::status::{ReldexStatus, entry, entry_value};
+use crate::strings::{CStruct, ReldexStr, read_in_struct, write_out_struct};
 
 /// Identifies one session for this hub's lifetime. Never reused.
 pub type ReldexSessionId = u64;
@@ -187,6 +187,51 @@ struct SessionSlot {
     commands: Option<mpsc::Sender<PumpCommand>>,
     results: HashMap<u64, ResultEntry>,
     next_result_id: u64,
+    /// Column descriptions the pump took out of `results` **because the caller
+    /// asked it to** — it processed a `close_result`, or a `close`.
+    ///
+    /// The caller's pointers into these died when it submitted that close
+    /// ([`reldex_session_result_column`]), so this is not about extending
+    /// their life. It is about *where* the last claim is dropped: without it,
+    /// a `reldex_session_result_column` call that raced the close could hold
+    /// the only remaining clone and free the strings by returning, handing the
+    /// caller an `out` full of freed pointers. Drained on the caller's own
+    /// thread, by [`SessionEntry::take_released_columns`].
+    released: Vec<Arc<ResultColumns>>,
+    /// Column descriptions of results that were still open when the session
+    /// was **lost** — the pump panicked and its containment tore the session
+    /// down (ADR-0003 A14).
+    ///
+    /// The caller submitted nothing, so none of the three documented
+    /// invalidators happened and the strings must stay readable. They are
+    /// freed only by a caller-initiated teardown: a submitted
+    /// `reldex_session_close`, or `reldex_hub_destroy`.
+    lost: Vec<Arc<ResultColumns>>,
+}
+
+impl SessionSlot {
+    /// Moves every open result's shared column description out of `results`
+    /// and into `where_to`, instead of dropping it here.
+    ///
+    /// Every caller of this is on the **pump** thread, which is the whole
+    /// point: the pump must never drop the last claim on strings the caller
+    /// may still be reading.
+    fn retire_results(&mut self, where_to: Retired) {
+        let columns = self.results.drain().map(|(_, open)| open.columns);
+        match where_to {
+            Retired::Released => self.released.extend(columns),
+            Retired::Lost => self.lost.extend(columns),
+        }
+    }
+}
+
+/// Which holder a retired result's columns belong in; see [`SessionSlot`].
+#[derive(Clone, Copy)]
+enum Retired {
+    /// The caller submitted the close that removed it.
+    Released,
+    /// Nothing the caller submitted removed it.
+    Lost,
 }
 
 /// A request handed to the pump thread, with the completion it must wait on.
@@ -199,6 +244,8 @@ enum PumpCommand {
         request: u64,
         completion: Completion<FetchedBatch>,
         columns: Arc<ResultColumns>,
+        /// The caller-facing result id, echoed on the reply.
+        key: u64,
     },
     CloseResult {
         request: u64,
@@ -221,17 +268,30 @@ impl PumpCommand {
     ///
     /// Used both on the normal path and by the panic handler, so a contained
     /// panic cannot answer with a different kind than a success would have.
-    fn reply_shape(&self) -> (ReldexEventKind, u64) {
+    /// The result id that reply must carry, per the header's per-kind table:
+    /// `FETCHED` and `RESULT_CLOSED` always name their result, `EXECUTED`
+    /// learns one only if the statement opens it, and no other kind has one.
+    ///
+    /// Returned alongside the kind so the panic path cannot answer with a
+    /// *differently shaped* event than a success would have — an adapter that
+    /// routes on `event.result` must not have to special-case failures.
+    fn reply_shape(&self) -> ReplyShape {
         match self {
-            Self::Execute { request, .. } => (ReldexEventKind::Executed, *request),
-            Self::Fetch { request, .. } => (ReldexEventKind::Fetched, *request),
-            Self::CloseResult { request, .. } => (ReldexEventKind::ResultClosed, *request),
-            Self::Close { request, .. } => (ReldexEventKind::SessionClosed, *request),
+            Self::Execute { request, .. } => (ReldexEventKind::Executed, *request, None),
+            Self::Fetch { request, key, .. } => (ReldexEventKind::Fetched, *request, Some(*key)),
+            Self::CloseResult { request, key, .. } => {
+                (ReldexEventKind::ResultClosed, *request, Some(*key))
+            }
+            Self::Close { request, .. } => (ReldexEventKind::SessionClosed, *request, None),
             #[cfg(feature = "mock-driver")]
-            Self::PanicForTest { request } => (ReldexEventKind::Executed, *request),
+            Self::PanicForTest { request } => (ReldexEventKind::Executed, *request, None),
         }
     }
 }
+
+/// What one accepted request will be answered with: the event kind, the
+/// request id, and the result id that kind carries (if any).
+type ReplyShape = (ReldexEventKind, u64, Option<u64>);
 
 /// One session's registry entry: everything the caller's thread and the pump
 /// thread share.
@@ -244,6 +304,12 @@ pub(crate) struct SessionEntry {
     block: Option<BlockControl>,
 }
 
+impl Drop for SessionEntry {
+    fn drop(&mut self) {
+        crate::counters::destroyed(crate::counters::Kind::Session);
+    }
+}
+
 impl SessionEntry {
     fn lock(&self) -> std::sync::MutexGuard<'_, SessionSlot> {
         self.slot
@@ -254,13 +320,21 @@ impl SessionEntry {
     /// Closes the session without committing and lets the pump finish on its
     /// own, so hub teardown never blocks on a statement that cannot be
     /// interrupted.
+    ///
+    /// Reached from two places: `reldex_hub_destroy`, on the caller's thread,
+    /// and the pump's own panic containment, on the pump thread. Open results'
+    /// column descriptions are therefore **retired, not dropped** — the pump
+    /// path has no caller-initiated invalidation behind it, and freeing there
+    /// would break the lifetime `reldex_session_result_column` promises.
+    /// `reldex_hub_destroy` takes them back with
+    /// [`Self::take_lost_columns`] and drops them on its own thread.
     pub(crate) fn shut_down(&self) {
         let session = {
             let mut slot = self.lock();
             slot.phase = Phase::Closed;
             // Dropping the sender ends the pump's loop once it is idle.
             slot.commands = None;
-            slot.results.clear();
+            slot.retire_results(Retired::Lost);
             slot.session.take()
         };
         if let Some(block) = &self.block {
@@ -274,6 +348,31 @@ impl SessionEntry {
         }
     }
 
+    /// Takes the column descriptions the pump retired after a caller-submitted
+    /// close, so the **caller's** thread drops them.
+    ///
+    /// Called at the top of every session entry point the caller can reach.
+    /// The caller is inside a call when this runs, which is exactly when it is
+    /// not reading a `ReldexColumnInfo` it was handed, and those strings were
+    /// out of contract from the moment it submitted the close.
+    fn take_released_columns(&self) -> Vec<Arc<ResultColumns>> {
+        let mut slot = self.lock();
+        if slot.released.is_empty() {
+            return Vec::new();
+        }
+        std::mem::take(&mut slot.released)
+    }
+
+    /// Takes the column descriptions of results that were open when the
+    /// session was lost. Only `reldex_hub_destroy` and a caller-submitted
+    /// session close may call this; see [`SessionSlot::lost`].
+    pub(crate) fn take_lost_columns(&self) -> Vec<Arc<ResultColumns>> {
+        let mut slot = self.lock();
+        let mut taken = std::mem::take(&mut slot.lost);
+        taken.append(&mut slot.released);
+        taken
+    }
+
     /// Releases a parked mock statement; see
     /// [`crate::reldex_mock_release_block`].
     pub(crate) fn release_block(&self) -> ReldexStatus {
@@ -284,6 +383,20 @@ impl SessionEntry {
             }
             None => ReldexStatus::InvalidState,
         }
+    }
+
+    /// The shared column descriptions of one open result set.
+    ///
+    /// Cloning the `Arc` under the lock and reading it afterwards is what keeps
+    /// the descriptions alive for the duration of the read even if the pump
+    /// closes the result meanwhile — the caller's *pointers*, however, live
+    /// only as long as its own claim on the result; see
+    /// [`reldex_session_result_column`].
+    fn result_columns(&self, result: u64) -> Option<Arc<ResultColumns>> {
+        self.lock()
+            .results
+            .get(&result)
+            .map(|open| Arc::clone(&open.columns))
     }
 
     /// Takes the session and the pump's sender for a submission, refusing if
@@ -320,10 +433,54 @@ impl SessionEntry {
 /// Runs `body` with the entry for `session`, reporting a stale or unknown id
 /// rather than dereferencing anything.
 ///
+/// Also frees whatever the pump retired after a caller-submitted close — here,
+/// on the caller's **own** thread, while it is inside a call and therefore not
+/// reading a `ReldexColumnInfo` it was handed. See [`SessionSlot::released`].
+///
 /// # Safety
 ///
 /// `hub` must be null, or a live hub.
 pub(crate) unsafe fn with_session(
+    hub: *mut ReldexHub,
+    session: ReldexSessionId,
+    body: impl FnOnce(&Arc<SessionEntry>) -> ReldexStatus,
+) -> ReldexStatus {
+    // SAFETY: delegated to this function's contract.
+    unsafe {
+        with_session_inner(hub, session, |entry| {
+            let released = entry.take_released_columns();
+            let status = body(entry);
+            // After `body`, so the drop is never inside the slot lock.
+            drop(released);
+            status
+        })
+    }
+}
+
+/// [`with_session`], for a call that may arrive on **any** thread.
+///
+/// Identical except that it frees nothing: a cancel (ADR-0003 A10) can come
+/// from a thread that is not the one reading column descriptions, and a free
+/// racing that read is exactly what retirement exists to prevent.
+///
+/// # Safety
+///
+/// As [`with_session`].
+pub(crate) unsafe fn with_session_from_any_thread(
+    hub: *mut ReldexHub,
+    session: ReldexSessionId,
+    body: impl FnOnce(&Arc<SessionEntry>) -> ReldexStatus,
+) -> ReldexStatus {
+    // SAFETY: delegated to this function's contract.
+    unsafe { with_session_inner(hub, session, body) }
+}
+
+/// The session lookup both of the above share.
+///
+/// # Safety
+///
+/// As [`with_session`].
+unsafe fn with_session_inner(
     hub: *mut ReldexHub,
     session: ReldexSessionId,
     body: impl FnOnce(&Arc<SessionEntry>) -> ReldexStatus,
@@ -410,6 +567,7 @@ pub unsafe extern "C" fn reldex_hub_open_session(
                 .next_session_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let (tx, rx) = mpsc::channel();
+            crate::counters::created(crate::counters::Kind::Session);
             let entry = Arc::new(SessionEntry {
                 id,
                 slot: Mutex::new(SessionSlot {
@@ -418,6 +576,8 @@ pub unsafe extern "C" fn reldex_hub_open_session(
                     commands: Some(tx),
                     results: HashMap::new(),
                     next_result_id: 1,
+                    released: Vec::new(),
+                    lost: Vec::new(),
                 }),
                 block: choice.block,
             });
@@ -549,9 +709,18 @@ pub unsafe extern "C" fn reldex_session_execute(
 
 /// Submits a fetch of at most `max_rows` more rows of `result`.
 ///
-/// The reply is a `RELDEX_EVENT_KIND_FETCHED` event carrying `request`; on
-/// success it owns a `ReldexBatch*`, and a batch with **no rows** means the
-/// result is exhausted.
+/// The reply is a `RELDEX_EVENT_KIND_FETCHED` event carrying `request` and
+/// `result`; on success it owns a `ReldexBatch*`, and a batch with **no rows**
+/// means the result is exhausted.
+///
+/// `max_rows` is `uint32_t`, not `size_t`, and it is the one deliberate
+/// exception to the ADR-0003 A11 rule that a count of things in this process
+/// is `size_t`: it is not a count of anything that exists, it is a **cap the
+/// caller chooses**, and a batch above four billion rows is a bug in the
+/// caller rather than a use case. Fixing the width also keeps the meaning of a
+/// call identical on a 32-bit host, which the mobile target may be. It must be
+/// above zero; the batch that comes back is at most this many rows, and may be
+/// smaller — including empty, which is how exhaustion is reported.
 ///
 /// # Safety
 ///
@@ -582,6 +751,7 @@ pub unsafe extern "C" fn reldex_session_fetch(
                             request,
                             completion,
                             columns,
+                            key: result,
                         },
                         (),
                     ))
@@ -592,8 +762,181 @@ pub unsafe extern "C" fn reldex_session_fetch(
     })
 }
 
+/// How many columns the open result `result` has.
+///
+/// The same number the `EXECUTED` event reported in `column_count`, available
+/// again for as long as the result is open.
+///
+/// # When it returns 0
+///
+/// Three cases, and **each one records a thread-local last error** you can take
+/// with `reldex_last_error_take()` — this call has no status of its own to
+/// report them with:
+///
+/// * `hub` is null or unaligned, or `session` is not open on it;
+/// * `result` is not an open result of that session — it was never opened, it
+///   belongs to another session, or it has been closed;
+/// * the call came from inside a waker callback, which the ADR-0003 D5
+///   contract forbids (the same refusal `RELDEX_STATUS_REENTRANT` reports
+///   elsewhere).
+///
+/// A result that genuinely has no columns is not one of them: a statement that
+/// produces no result set produces no result id either, so there is nothing to
+/// ask about.
+///
+/// # Safety
+///
+/// `hub` must be null (reported as 0) or a live hub.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reldex_session_result_column_count(
+    hub: *mut ReldexHub,
+    session: ReldexSessionId,
+    result: ReldexResultId,
+) -> usize {
+    entry_value(0, || {
+        let mut count = 0;
+        // SAFETY: delegated to this function's contract for `hub`.
+        let _ = unsafe {
+            with_session(hub, session, |entry| match entry.result_columns(result) {
+                Some(columns) => {
+                    count = columns.len();
+                    ReldexStatus::Ok
+                }
+                None => {
+                    // Recorded rather than swallowed: without a status to
+                    // return, the last error is the only way this call can say
+                    // *why* it answered zero (the round-1 rule that every
+                    // failure describes itself).
+                    set_last_error(DbError::internal(format!(
+                        "reldex-ffi: reldex_session_result_column_count: session {session} has no open result {result}"
+                    )));
+                    ReldexStatus::NotFound
+                }
+            })
+        };
+        count
+    })
+}
+
+/// Describes column `column` of the open result `result` from the metadata the
+/// statement reported — **without a batch**.
+///
+/// # Why this exists
+///
+/// `reldex_batch_column_info` can only answer once rows have arrived, so a
+/// grid that wants headers has to either wait for the first batch or build
+/// them twice; and a result with columns and no rows never produces a batch to
+/// ask at all. This answers from the moment the `EXECUTED` event naming
+/// `result` is drained, which is when a UI wants to put its header row up.
+///
+/// The description is the one the whole result shares: built once, when the
+/// statement was executed, and reported identically by every batch of it.
+/// Calling this allocates nothing.
+///
+/// # The one difference from the batch version
+///
+/// `kind` here is the storage family the column's **declared** type maps to.
+/// `reldex_batch_column_info` reports the storage a *particular batch* actually
+/// used. They agree for every type the driver contract can represent; where a
+/// driver had to fall back — an unrepresentable native type crossing as text —
+/// the batch is the one telling the truth about the bytes, so a cell reader
+/// must use the batch's `kind`, never this one.
+///
+/// # Lifetime of the strings
+///
+/// `out->name` and `out->native_type_name` point into storage owned by the
+/// result set; they are **not** copied into `out`. They stay valid, and
+/// NUL-terminated, until the first of:
+///
+/// * the caller submits `reldex_session_close_result` for this `result`;
+/// * the caller submits `reldex_session_close` for this session;
+/// * the caller calls `reldex_hub_destroy`.
+///
+/// **Only those three.** Nothing Reldex does on its own ends the lifetime: a
+/// statement that fails, a fetch that fails, a cancel, and a session *lost* to
+/// an internal panic all leave the strings readable, because the caller — who
+/// may still be holding the pointers — did nothing to say otherwise. That is a
+/// guarantee, not an accident of timing: a result the caller never closed has
+/// its description retired rather than freed.
+///
+/// Note what that does **not** promise. On a lost session the result itself is
+/// gone — nothing can be fetched from it — so this call reports
+/// `RELDEX_STATUS_NOT_FOUND` for it. The two are separate on purpose: what was
+/// already handed out stays readable, and what was not is not invented.
+///
+/// A caller that wants the names past those three points must copy them, which
+/// is what a Qt model does anyway, building its header `QString`s once with
+/// `QString::fromUtf8(info.name.ptr, info.name.len)`.
+///
+/// Two consequences worth stating, because both are easy to get wrong:
+///
+/// * The rule is "valid **at least** until you submit", not "invalid from the
+///   moment you submit". Right after `reldex_session_close_result` this call
+///   may still succeed for a while; that is not a signal that the close has
+///   not landed, and the `RESULT_CLOSED` event remains the only such signal.
+///   Do not read the strings after submitting — but do not treat a successful
+///   read as meaning anything either.
+/// * `reldex_hub_destroy` frees them **synchronously, on the thread that
+///   called it**, before it returns. There is no window after it during which
+///   a stale pointer still happens to work.
+///
+/// A batch held past the close keeps its own claim on the description alive,
+/// so `reldex_batch_column_info` on that batch keeps working. These are not
+/// the same pointers.
+///
+/// # A second execute does not close the first result
+///
+/// Submitting another statement on this session leaves every earlier result
+/// **open and describable**. Nothing is closed implicitly, because closing a
+/// result the caller might still be paging through is not a decision this
+/// library may take on its own. A caller that re-runs a query without calling
+/// `reldex_session_close_result` therefore accumulates open results — each
+/// holding its cursor and its rows on the server — until the session closes.
+///
+/// # Safety
+///
+/// `hub` must be null, or a live hub; `out` must be null, or point at a
+/// writable `ReldexColumnInfo` with its `struct_size` set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reldex_session_result_column(
+    hub: *mut ReldexHub,
+    session: ReldexSessionId,
+    result: ReldexResultId,
+    column: usize,
+    out: *mut ReldexColumnInfo,
+) -> ReldexStatus {
+    entry(|| {
+        // SAFETY: delegated to this function's contract for `hub`.
+        unsafe {
+            with_session(hub, session, |entry| {
+                let Some(columns) = entry.result_columns(result) else {
+                    set_last_error(DbError::internal(format!(
+                        "reldex-ffi: reldex_session_result_column: session {session} has no open result {result}"
+                    )));
+                    return ReldexStatus::NotFound;
+                };
+                let Some(info) = columns.info(column) else {
+                    set_last_error(DbError::internal(format!(
+                        "reldex-ffi: reldex_session_result_column: column {column} is out of range; the result has {}",
+                        columns.len()
+                    )));
+                    return ReldexStatus::NotFound;
+                };
+                // SAFETY: delegated to this function's contract for `out`.
+                if write_out_struct(out, info) {
+                    ReldexStatus::Ok
+                } else {
+                    set_last_argument_error(
+                        "reldex_session_result_column: `out` is null, unaligned, or too small",
+                    )
+                }
+            })
+        }
+    })
+}
+
 /// Releases a result set and every large object taken from it. The reply is a
-/// `RELDEX_EVENT_KIND_RESULT_CLOSED` event carrying `request`.
+/// `RELDEX_EVENT_KIND_RESULT_CLOSED` event carrying `request` and `result`.
 ///
 /// # Safety
 ///
@@ -761,7 +1104,7 @@ pub unsafe extern "C" fn reldex_session_request_cancel(
             }
         };
         // SAFETY: delegated to this function's contract for `hub`.
-        unsafe { with_session(hub, session, cancel) }
+        unsafe { with_session_from_any_thread(hub, session, cancel) }
     })
 }
 
@@ -840,7 +1183,7 @@ fn report(outcome: Result<(), ReldexStatus>, what: &str) -> ReldexStatus {
 /// pushed. Without it, a panic between the two would silently eat a reply and
 /// break rule 5 — and the adapter would wait forever for an event that is
 /// never coming.
-type OwedReply = Mutex<Option<(ReldexEventKind, u64)>>;
+type OwedReply = Mutex<Option<ReplyShape>>;
 
 /// One session's thread, with the panic containment ADR-0003 D2 requires of
 /// every path that can reach a driver.
@@ -859,7 +1202,7 @@ fn pump_main(
     params: reldex_db_core::ConnectionParams,
     open_request: u64,
 ) {
-    let owed: OwedReply = Mutex::new(Some((ReldexEventKind::Opened, open_request)));
+    let owed: OwedReply = Mutex::new(Some((ReldexEventKind::Opened, open_request, None)));
     // `AssertUnwindSafe`: everything reachable here is either behind a mutex
     // (which this crate always recovers from poisoning, since a panicked
     // session is exactly the case being handled) or owned by this thread.
@@ -895,27 +1238,31 @@ fn answer_after_panic(
     // and the loop below sees the whole remaining queue and then the end of it.
     entry.shut_down();
     let id = entry.id;
-    let answer = |kind: ReldexEventKind, request: u64| {
+    // The reply keeps the *shape* a success would have had, result id
+    // included: an adapter that routes a `FETCHED` by `event.result` must not
+    // have to special-case the failure path (ADR-0003 A21).
+    let answer = |(kind, request, result): ReplyShape| {
         let error = ReldexError::from_db_error(
             &DbError::new(ErrorKind::DriverInternal, message.clone())
                 .with_session_state(reldex_db_core::SessionState::Lost),
         );
-        hub.push_event(
-            QueuedEvent::new(kind, id, request)
-                .with_error(error)
-                .with_session_state(ReldexSessionState::Lost),
-        );
+        let mut event = QueuedEvent::new(kind, id, request)
+            .with_error(error)
+            .with_session_state(ReldexSessionState::Lost);
+        if let Some(result) = result {
+            event = event.with_result(result);
+        }
+        hub.push_event(event);
     };
     let in_flight = owed
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
-    if let Some((kind, request)) = in_flight {
-        answer(kind, request);
+    if let Some(shape) = in_flight {
+        answer(shape);
     }
     while let Ok(command) = rx.try_recv() {
-        let (kind, request) = command.reply_shape();
-        answer(kind, request);
+        answer(command.reply_shape());
     }
 }
 
@@ -974,10 +1321,10 @@ fn pump_body(
     }
 }
 
-fn set_owed(owed: &OwedReply, kind: ReldexEventKind, request: u64) {
+fn set_owed(owed: &OwedReply, shape: ReplyShape) {
     *owed
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((kind, request));
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(shape);
 }
 
 fn clear_owed(owed: &OwedReply) {
@@ -995,8 +1342,7 @@ fn run_command(
     command: PumpCommand,
     owed: &OwedReply,
 ) -> bool {
-    let (owed_kind, owed_request) = command.reply_shape();
-    set_owed(owed, owed_kind, owed_request);
+    set_owed(owed, command.reply_shape());
     let finished = run_command_inner(hub, entry, session, command);
     clear_owed(owed);
     finished
@@ -1050,6 +1396,7 @@ fn run_command_inner(
             request,
             completion,
             columns,
+            key,
         } => {
             let event = match completion.wait() {
                 Ok(batch) => {
@@ -1059,7 +1406,8 @@ fn run_command_inner(
                 }
                 Err(error) => QueuedEvent::new(ReldexEventKind::Fetched, id, request)
                     .with_error(ReldexError::from_db_error(&error)),
-            };
+            }
+            .with_result(key);
             hub.push_event(event.with_session_state(session.session_state().into()));
             false
         }
@@ -1069,12 +1417,22 @@ fn run_command_inner(
             key,
         } => {
             let outcome = completion.wait();
-            entry.lock().results.remove(&key);
+            {
+                // Retired, not dropped: a `reldex_session_result_column` call
+                // that raced this close could otherwise hold the last clone
+                // and free the strings by returning. The caller's thread frees
+                // them on its next call (`SessionSlot::released`).
+                let mut slot = entry.lock();
+                if let Some(open) = slot.results.remove(&key) {
+                    slot.released.push(open.columns);
+                }
+            }
             let event = match outcome {
                 Ok(()) => QueuedEvent::new(ReldexEventKind::ResultClosed, id, request),
                 Err(error) => QueuedEvent::new(ReldexEventKind::ResultClosed, id, request)
                     .with_error(ReldexError::from_db_error(&error)),
-            };
+            }
+            .with_result(key);
             hub.push_event(event.with_session_state(session.session_state().into()));
             false
         }
@@ -1096,7 +1454,12 @@ fn run_command_inner(
                 let mut slot = entry.lock();
                 slot.phase = Phase::Closed;
                 slot.commands = None;
-                slot.results.clear();
+                // A caller-submitted close ends the documented lifetime of
+                // every description this session handed out, including any
+                // retired earlier because the session was lost.
+                slot.retire_results(Retired::Released);
+                let lost = std::mem::take(&mut slot.lost);
+                slot.released.extend(lost);
             }
             let state = if still_open {
                 session.session_state().into()

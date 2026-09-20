@@ -34,6 +34,13 @@ endif()
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CompilerWarnings)
 
+# Captured here (this file's own scope), not read directly inside
+# reldex_deploy_ffi_dll() below: CMAKE_CURRENT_SOURCE_DIR inside a function
+# body reflects the CALLER's directory (e.g. ui/app when ui/app/CMakeLists.txt
+# calls it), not this file's -- using it directly there resolved to a
+# nonexistent ui/app/cmake/CopyIfDifferentRetry.cmake (M1.4 CI finding).
+set(RELDEX_UI_CMAKE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
 # ---------------------------------------------------------------------------
 # Qt 6.8 -- LGPL modules only. No Qt Creator, no GPL-only module.
 # ---------------------------------------------------------------------------
@@ -102,12 +109,20 @@ endif()
 # ---------------------------------------------------------------------------
 # Helper: copy the reldex_ffi shared library next to a target's binary so it
 # runs without installing anything system-wide (Windows has no rpath).
+#
+# Goes through ui/cmake/CopyIfDifferentRetry.cmake (a plain retrying
+# copy_if_different) rather than calling `cmake -E copy_if_different`
+# directly: M1.4's CI (ui.yml, qt-build, macos-latest) hit a transient
+# "source not found" from this exact copy under enough ninja parallelism
+# (see that script's header comment for what was and was not established
+# about the cause). Not reproduced on windows-latest/ubuntu-latest.
 # ---------------------------------------------------------------------------
 function(reldex_deploy_ffi_dll target)
     add_custom_command(TARGET ${target} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "$<TARGET_FILE:reldex_ffi-shared>"
-                "$<TARGET_FILE_DIR:${target}>"
+        COMMAND ${CMAKE_COMMAND}
+                "-DSRC=$<TARGET_FILE:reldex_ffi-shared>"
+                "-DDST=$<TARGET_FILE_DIR:${target}>"
+                -P "${RELDEX_UI_CMAKE_DIR}/CopyIfDifferentRetry.cmake"
         COMMENT "Deploying reldex_ffi shared library next to ${target}"
         VERBATIM
     )

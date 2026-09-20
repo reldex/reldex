@@ -133,7 +133,16 @@ pub struct ReldexEvent {
     pub session: u64,
     /// The `request_id` the caller passed to the submitting call.
     pub request: u64,
-    /// `Executed`: the result set's id, when `has_result`.
+    /// The result set this event is about, when `has_result`:
+    ///
+    /// * `Executed` — the id the statement opened, to fetch and close with;
+    /// * `Fetched` — the id the fetch was submitted for, so a caller does not
+    ///   have to keep its own request-to-result map;
+    /// * `ResultClosed` — the id that has just been closed. It is **no longer
+    ///   valid** by the time this event is drained: it names what ended.
+    ///
+    /// Zero and `has_result == false` on every other kind, and on a failure of
+    /// an `Executed` that never opened one.
     pub result: u64,
     /// `Executed`: rows changed, when `has_rows_affected`.
     pub rows_affected: u64,
@@ -156,13 +165,16 @@ pub struct ReldexEvent {
     pub cancel_kind: i32,
     /// `SessionClosed`: a [`ReldexCloseOutcome`].
     pub close_outcome: i32,
-    /// `Executed`: how many columns the result has; read their names with
-    /// `reldex_batch_column_info` on any batch from it.
+    /// `Executed`: how many columns the result has. Their names and types are
+    /// available from this moment with `reldex_session_result_column`, without
+    /// waiting for a batch — a result with columns and no rows never produces
+    /// one to ask. `reldex_batch_column_info` reports the same description per
+    /// batch.
     pub column_count: usize,
     /// `Opened`: how many connect-time warnings the session reported. Read
     /// them with [`crate::reldex_session_connect_warnings`].
     pub warning_count: usize,
-    /// `Executed`: whether the statement produced a result set.
+    /// Whether `result` names a result set; see that field.
     pub has_result: bool,
     /// `Executed`: whether `rows_affected` is meaningful.
     pub has_rows_affected: bool,
@@ -269,6 +281,16 @@ impl QueuedEvent {
     pub(crate) fn with_batch(mut self, batch: Box<ReldexBatch>, row_count: usize) -> Self {
         self.batch = Some(batch);
         self.row_count = row_count;
+        self
+    }
+
+    /// Names the result set this reply is about, on a kind other than
+    /// `Executed` — where [`Self::with_execute_outcome`] sets it instead.
+    ///
+    /// Set even when the request failed: which result failed to fetch is
+    /// exactly what the caller needs in order to report it.
+    pub(crate) const fn with_result(mut self, result: u64) -> Self {
+        self.result = Some(result);
         self
     }
 

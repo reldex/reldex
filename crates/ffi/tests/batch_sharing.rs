@@ -21,7 +21,8 @@ use std::sync::{Arc, Barrier};
 use reldex_ffi::{
     ReldexBatch, ReldexColumnInfo, ReldexColumnKind, ReldexColumnView, ReldexEventKind,
     ReldexMockScenarioConfig, ReldexMockStatement, ReldexStatus, ReldexStr, reldex_batch_column,
-    reldex_batch_column_count, reldex_batch_column_info, reldex_batch_row_count,
+    reldex_batch_column_count, reldex_batch_column_fixed, reldex_batch_column_info,
+    reldex_batch_row_count,
 };
 
 use support::{Harness, OwnedBatch};
@@ -59,6 +60,15 @@ fn info(batch: *const ReldexBatch, column: usize) -> ReldexColumnInfo {
     let status = unsafe { reldex_batch_column_info(batch, column, std::ptr::from_mut(&mut info)) };
     assert_eq!(status, ReldexStatus::Ok);
     info
+}
+
+/// The mirror-building view: the only call that populates `fixed`.
+fn fixed_view(batch: *const ReldexBatch, column: usize) -> ReldexColumnView {
+    let mut view = ReldexColumnView::default();
+    // SAFETY: as `info`.
+    let status = unsafe { reldex_batch_column_fixed(batch, column, std::ptr::from_mut(&mut view)) };
+    assert_eq!(status, ReldexStatus::Ok);
+    view
 }
 
 fn view(batch: *const ReldexBatch, column: usize) -> ReldexColumnView {
@@ -177,10 +187,11 @@ fn several_threads_may_describe_the_same_batch_at_once() {
         handles.push(std::thread::spawn(move || {
             let shared = shared;
             barrier.wait();
-            // Column 0 is NUMBER and column 2 is TIMESTAMP: the two kinds that
-            // build a mirror. Column 1 is text and borrows directly.
-            let numbers = view(shared.0, 0);
-            let timestamps = view(shared.0, 2);
+            // Column 0 is NUMBER and column 2 is TIMESTAMP: the two kinds
+            // with a mirror to build, which only `..._column_fixed` builds.
+            // Column 1 is text and borrows directly.
+            let numbers = fixed_view(shared.0, 0);
+            let timestamps = fixed_view(shared.0, 2);
             let name = info(shared.0, 0);
             (
                 numbers.fixed as usize,
@@ -211,9 +222,23 @@ fn several_threads_may_describe_the_same_batch_at_once() {
     }
 
     // And the batch is still usable from this thread afterwards.
-    let after = view(batch.0, 0);
+    let after = fixed_view(batch.0, 0);
     assert_eq!(after.fixed as usize, first.0);
     assert_eq!(after.kind, ReldexColumnKind::Number as i32);
+
+    // The plain view never builds or hands back the mirror, whoever asked for
+    // it first: that is what keeps a grid that ignores `fixed` from paying for
+    // it (ADR-0003 A19).
+    let plain = view(batch.0, 0);
+    assert!(
+        plain.fixed.is_null(),
+        "the plain view must not expose the mirror"
+    );
+    assert_eq!(plain.fixed_len, 0);
+    assert_eq!(
+        plain.fixed_stride, after.fixed_stride,
+        "the stride is reported either way"
+    );
 }
 
 #[test]
