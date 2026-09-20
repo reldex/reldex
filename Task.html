@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-21T04:16:00+07:00",
+  "updatedAt": "2026-09-21T04:20:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -518,6 +518,12 @@
     "M2 core work (events/async-open/settings/SQL text/driver leftovers) is next and proceeds regardless, per the owner's standing instruction — nothing there depends on how the ADR-0003 ruling comes out"
   ],
   "blockers": [
+    {
+      "title": "CI cannot run: GitHub Actions jobs are not started (account billing / spending limit) — merges frozen since 2026-09-21",
+      "detail": "From 2026-09-21 every GitHub Actions job on the repository ends in about 2 seconds with the annotation 'The job was not started because recent account payments have failed or your spending limit needs to be increased'. The last run that executed was PR #23 (M2.4). Green CI is the gate for every merge, and a run that never started is not green, so PR #22 (M2.6) and everything after it stays unmerged. Work continues on branches stacked on the unmerged ones, with the full local gates on Windows; Linux and macOS are unverified until CI returns. Probable cause: the private repository's included minutes are used up (13 jobs per pull request, several on macOS at the 10x multiplier).",
+      "severity": "medium",
+      "since": "2026-09-21"
+    },
     {
       "title": "ADR-0003 not yet accepted: K2 fails as written (cold first paint 903.55 ms vs 150 ms; warm 15.85 ms; cause outside the boundary)",
       "detail": "Spike S15 (M1.8, 2026-09-20) measured all seven kill criteria against the real boundary. No criterion's failure is located in the boundary itself, and both the measurement author and an independent reviewer recommend acceptance — but K2 has no warm/cold qualifier as written, and its cold-process reading fails by ~6x (903.55 ms vs a 150 ms threshold), while the warm path (15.85 ms) passes by ~9x. K1's p99 clause and K3's baseline/metric also need a ruling. The lead does not accept ADR-0003 unilaterally and does not re-open the design; three rulings are requested from the owner instead.",
@@ -1648,6 +1654,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-21",
+      "text": "Blocker: GitHub Actions stopped starting jobs (account billing / spending limit). PR #22 (M2.6) passed every local gate but cannot be merged — green CI is the merge gate and the checks never ran. Work continues on stacked branches (M2.7 on top of M2.6, M2.8 alongside); nothing merges until the owner restores CI."
+    },
     {
       "date": "2026-09-21",
       "text": "M2.6 done: SessionRegistry with non-blocking open and abandon. Independent review found no leaked connection in 960 randomized sessions and clean lock discipline, and 3 must-fix, all about not hiding transaction loss or blocking shutdown: abandon() reported 'no transaction lost' from a caller-thread snapshot while a queued INSERT was still to run and be rolled back; registry teardown waited N x 500 ms serially although the ADR claimed the waits overlapped (now one deadline: ~0.51 s for 8 stuck sessions); and a DML that dies with its connection re-read the dead connection's cached 'inactive' state. The authoritative answer is now Terminal.transaction_possibly_lost, computed on the worker when the session really ends. The C ABI is unchanged; M2.11 switches the FFI to this path and must carry the new field to the user. CI then exposed a latent M2.5 race (3 in 1,000 runs on main): after a lost session, a second close could answer 'closed cleanly'. Fixed at the root — how a session ended (cleanly / unresolved) is recorded once on the worker and every idempotent close answers from that record; a repeated close on a lost session now reports the loss again (ADR-0002 E7). 3,000-iteration loops, 0 failures."
