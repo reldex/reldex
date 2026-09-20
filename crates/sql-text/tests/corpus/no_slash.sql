@@ -1,0 +1,5 @@
+BEGIN
+    NULL;
+END;
+
+SELECT 1 FROM dual;
