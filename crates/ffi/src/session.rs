@@ -45,14 +45,14 @@ use reldex_db_core::{
     ErrorKind, ExecuteOutcome, FetchedBatch, ResultId, Statement,
 };
 
-use crate::batch::{ReldexBatch, ResultColumns};
+use crate::batch::{ReldexBatch, ReldexColumnInfo, ResultColumns};
 use crate::error::{ReldexError, ReldexSessionState, set_last_argument_error, set_last_error};
 use crate::event::{QueuedEvent, ReldexEventKind};
 use crate::format::ReldexTextArena;
 use crate::hub::{ReldexHub, with_hub};
 use crate::mock::{BlockControl, ReldexMockScenarioConfig, build_driver, release_block};
-use crate::status::{ReldexStatus, entry};
-use crate::strings::{CStruct, ReldexStr, read_in_struct};
+use crate::status::{ReldexStatus, entry, entry_value};
+use crate::strings::{CStruct, ReldexStr, read_in_struct, write_out_struct};
 
 /// Identifies one session for this hub's lifetime. Never reused.
 pub type ReldexSessionId = u64;
@@ -199,6 +199,8 @@ enum PumpCommand {
         request: u64,
         completion: Completion<FetchedBatch>,
         columns: Arc<ResultColumns>,
+        /// The caller-facing result id, echoed on the reply.
+        key: u64,
     },
     CloseResult {
         request: u64,
@@ -244,6 +246,12 @@ pub(crate) struct SessionEntry {
     block: Option<BlockControl>,
 }
 
+impl Drop for SessionEntry {
+    fn drop(&mut self) {
+        crate::counters::destroyed(crate::counters::Kind::Session);
+    }
+}
+
 impl SessionEntry {
     fn lock(&self) -> std::sync::MutexGuard<'_, SessionSlot> {
         self.slot
@@ -284,6 +292,20 @@ impl SessionEntry {
             }
             None => ReldexStatus::InvalidState,
         }
+    }
+
+    /// The shared column descriptions of one open result set.
+    ///
+    /// Cloning the `Arc` under the lock and reading it afterwards is what keeps
+    /// the descriptions alive for the duration of the read even if the pump
+    /// closes the result meanwhile — the caller's *pointers*, however, live
+    /// only as long as its own claim on the result; see
+    /// [`reldex_session_result_column`].
+    fn result_columns(&self, result: u64) -> Option<Arc<ResultColumns>> {
+        self.lock()
+            .results
+            .get(&result)
+            .map(|open| Arc::clone(&open.columns))
     }
 
     /// Takes the session and the pump's sender for a submission, refusing if
@@ -410,6 +432,7 @@ pub unsafe extern "C" fn reldex_hub_open_session(
                 .next_session_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let (tx, rx) = mpsc::channel();
+            crate::counters::created(crate::counters::Kind::Session);
             let entry = Arc::new(SessionEntry {
                 id,
                 slot: Mutex::new(SessionSlot {
@@ -549,9 +572,18 @@ pub unsafe extern "C" fn reldex_session_execute(
 
 /// Submits a fetch of at most `max_rows` more rows of `result`.
 ///
-/// The reply is a `RELDEX_EVENT_KIND_FETCHED` event carrying `request`; on
-/// success it owns a `ReldexBatch*`, and a batch with **no rows** means the
-/// result is exhausted.
+/// The reply is a `RELDEX_EVENT_KIND_FETCHED` event carrying `request` and
+/// `result`; on success it owns a `ReldexBatch*`, and a batch with **no rows**
+/// means the result is exhausted.
+///
+/// `max_rows` is `uint32_t`, not `size_t`, and it is the one deliberate
+/// exception to the ADR-0003 A11 rule that a count of things in this process
+/// is `size_t`: it is not a count of anything that exists, it is a **cap the
+/// caller chooses**, and a batch above four billion rows is a bug in the
+/// caller rather than a use case. Fixing the width also keeps the meaning of a
+/// call identical on a 32-bit host, which the mobile target may be. It must be
+/// above zero; the batch that comes back is at most this many rows, and may be
+/// smaller — including empty, which is how exhaustion is reported.
 ///
 /// # Safety
 ///
@@ -582,6 +614,7 @@ pub unsafe extern "C" fn reldex_session_fetch(
                             request,
                             completion,
                             columns,
+                            key: result,
                         },
                         (),
                     ))
@@ -592,8 +625,123 @@ pub unsafe extern "C" fn reldex_session_fetch(
     })
 }
 
+/// How many columns the open result `result` has, or `0` if this session has
+/// no such result.
+///
+/// The same number the `EXECUTED` event reported in `column_count`, available
+/// again for as long as the result is open.
+///
+/// # Safety
+///
+/// `hub` must be null (reported as 0) or a live hub.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reldex_session_result_column_count(
+    hub: *mut ReldexHub,
+    session: ReldexSessionId,
+    result: ReldexResultId,
+) -> usize {
+    entry_value(0, || {
+        let mut count = 0;
+        // SAFETY: delegated to this function's contract for `hub`.
+        let _ = unsafe {
+            with_session(hub, session, |entry| {
+                count = entry
+                    .result_columns(result)
+                    .map_or(0, |columns| columns.len());
+                ReldexStatus::Ok
+            })
+        };
+        count
+    })
+}
+
+/// Describes column `column` of the open result `result` from the metadata the
+/// statement reported — **without a batch**.
+///
+/// # Why this exists
+///
+/// `reldex_batch_column_info` can only answer once rows have arrived, so a
+/// grid that wants headers has to either wait for the first batch or build
+/// them twice; and a result with columns and no rows never produces a batch to
+/// ask at all. This answers from the moment the `EXECUTED` event naming
+/// `result` is drained, which is when a UI wants to put its header row up.
+///
+/// The description is the one the whole result shares: built once, when the
+/// statement was executed, and reported identically by every batch of it.
+/// Calling this allocates nothing.
+///
+/// # The one difference from the batch version
+///
+/// `kind` here is the storage family the column's **declared** type maps to.
+/// `reldex_batch_column_info` reports the storage a *particular batch* actually
+/// used. They agree for every type the driver contract can represent; where a
+/// driver had to fall back — an unrepresentable native type crossing as text —
+/// the batch is the one telling the truth about the bytes, so a cell reader
+/// must use the batch's `kind`, never this one.
+///
+/// # Lifetime of the strings
+///
+/// `out->name` and `out->native_type_name` point into storage owned by the
+/// result set; they are **not** copied into `out`. They stay valid, and
+/// NUL-terminated, until the first of:
+///
+/// * the caller submits `reldex_session_close_result` for this `result`;
+/// * the caller submits `reldex_session_close` for this session;
+/// * the caller calls `reldex_hub_destroy`.
+///
+/// Each of those may free the storage from another thread as soon as it is
+/// submitted, so a caller that wants the names past that point must copy them
+/// — which is what a Qt model does anyway, building its header `QString`s once
+/// with `QString::fromUtf8(info.name.ptr, info.name.len)`.
+///
+/// A batch held past the close keeps its own claim on the description alive,
+/// so `reldex_batch_column_info` on that batch keeps working. These are not
+/// the same pointers.
+///
+/// # Safety
+///
+/// `hub` must be null, or a live hub; `out` must be null, or point at a
+/// writable `ReldexColumnInfo` with its `struct_size` set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reldex_session_result_column(
+    hub: *mut ReldexHub,
+    session: ReldexSessionId,
+    result: ReldexResultId,
+    column: usize,
+    out: *mut ReldexColumnInfo,
+) -> ReldexStatus {
+    entry(|| {
+        // SAFETY: delegated to this function's contract for `hub`.
+        unsafe {
+            with_session(hub, session, |entry| {
+                let Some(columns) = entry.result_columns(result) else {
+                    set_last_error(DbError::internal(format!(
+                        "reldex-ffi: reldex_session_result_column: session {session} has no open result {result}"
+                    )));
+                    return ReldexStatus::NotFound;
+                };
+                let Some(info) = columns.info(column) else {
+                    set_last_error(DbError::internal(format!(
+                        "reldex-ffi: reldex_session_result_column: column {column} is out of range; the result has {}",
+                        columns.len()
+                    )));
+                    return ReldexStatus::NotFound;
+                };
+                // SAFETY: delegated to this function's contract for `out`.
+                if write_out_struct(out, info) {
+                    ReldexStatus::Ok
+                } else {
+                    set_last_argument_error(
+                        "reldex_session_result_column: `out` is null, unaligned, or too small",
+                    )
+                }
+            })
+        }
+    })
+}
+
 /// Releases a result set and every large object taken from it. The reply is a
-/// `RELDEX_EVENT_KIND_RESULT_CLOSED` event carrying `request`.
+/// `RELDEX_EVENT_KIND_RESULT_CLOSED` event carrying `request` and `result`.
 ///
 /// # Safety
 ///
@@ -1050,6 +1198,7 @@ fn run_command_inner(
             request,
             completion,
             columns,
+            key,
         } => {
             let event = match completion.wait() {
                 Ok(batch) => {
@@ -1059,7 +1208,8 @@ fn run_command_inner(
                 }
                 Err(error) => QueuedEvent::new(ReldexEventKind::Fetched, id, request)
                     .with_error(ReldexError::from_db_error(&error)),
-            };
+            }
+            .with_result(key);
             hub.push_event(event.with_session_state(session.session_state().into()));
             false
         }
@@ -1074,7 +1224,8 @@ fn run_command_inner(
                 Ok(()) => QueuedEvent::new(ReldexEventKind::ResultClosed, id, request),
                 Err(error) => QueuedEvent::new(ReldexEventKind::ResultClosed, id, request)
                     .with_error(ReldexError::from_db_error(&error)),
-            };
+            }
+            .with_result(key);
             hub.push_event(event.with_session_state(session.session_state().into()));
             false
         }

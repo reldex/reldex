@@ -122,6 +122,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 mod batch;
+mod counters;
 mod error;
 mod event;
 mod format;
@@ -134,8 +135,10 @@ mod strings;
 pub use batch::{
     RELDEX_NUMBER_MAX_DIGITS, ReldexBatch, ReldexColumnInfo, ReldexColumnKind, ReldexColumnView,
     ReldexNullable, ReldexNumber, ReldexTimestamp, reldex_batch_column, reldex_batch_column_count,
-    reldex_batch_column_info, reldex_batch_release, reldex_batch_row_count,
+    reldex_batch_column_fixed, reldex_batch_column_info, reldex_batch_release,
+    reldex_batch_row_count,
 };
+pub use counters::{ReldexLiveCounts, reldex_live_counts};
 pub use error::{
     ReldexError, ReldexErrorKind, ReldexErrorView, ReldexSessionState, reldex_error_free,
     reldex_error_view, reldex_last_error_clear, reldex_last_error_take,
@@ -159,6 +162,7 @@ pub use session::{
     ReldexRequestId, ReldexResultId, ReldexSessionId, reldex_hub_open_session,
     reldex_session_close, reldex_session_close_result, reldex_session_connect_warnings,
     reldex_session_execute, reldex_session_fetch, reldex_session_request_cancel,
+    reldex_session_result_column, reldex_session_result_column_count,
 };
 pub use status::ReldexStatus;
 pub use strings::{RELDEX_UTF16_OFFSET_INVALID, ReldexStr, reldex_utf16_offset};
@@ -169,12 +173,16 @@ pub use strings::{RELDEX_UTF16_OFFSET_INVALID, ReldexStr, reldex_utf16_offset};
 /// meaning or **layout**, or an existing enum value changes. The adapter
 /// refuses to start on a mismatch (ADR-0003 D7).
 ///
-/// `2` because M1.3's independent review changed `ReldexEvent`'s layout:
-/// `column_count` and `warning_count` became `size_t` (ADR-0003 amendment
-/// A11). Version 1 was never accepted and never shipped — ADR-0003 is still
-/// Proposed — so the number moves once, here, rather than pretending a
-/// recompiled adapter would still be compatible.
-pub const RELDEX_ABI_VERSION_MAJOR: u32 = 2;
+/// `3` because the first two consumers — the Qt adapter (M1.6) and the C smoke
+/// harness (M1.4) — found the boundary charging for work neither wanted:
+/// `reldex_batch_column` no longer builds the `NUMBER`/`TIMESTAMP` mirror, so
+/// `fixed` is now NULL there and the new `reldex_batch_column_fixed` is the
+/// only way to get one (ADR-0003 amendment A19). Existing code compiles and
+/// reads NULL, which is exactly the kind of silent change a major bump exists
+/// for. Versions 1 and 2 were never accepted and never shipped — ADR-0003 is
+/// still Proposed — so the number moves rather than pretending a recompiled
+/// adapter would still be compatible.
+pub const RELDEX_ABI_VERSION_MAJOR: u32 = 3;
 
 /// Minor part of the ABI version reported by [`reldex_abi_version`].
 ///

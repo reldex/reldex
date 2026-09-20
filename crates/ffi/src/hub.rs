@@ -36,6 +36,14 @@ use crate::strings::{check_out_struct, write_out_struct};
 /// `QMetaObject::invokeMethod(bridge, &Bridge::drain, Qt::QueuedConnection)`.
 ///
 /// It is called from a Reldex thread, never from the caller's.
+///
+/// The header's typedef for this is **hand-written** in `cbindgen.toml`'s
+/// `after_includes`, not generated: cbindgen emits its typedefs above the
+/// `extern "C"` block it opens for the functions, which in C++ would make this
+/// a pointer to a C++-linkage function while `reldex_hub_set_waker` takes a
+/// C-linkage one. If the parameter list here changes, change it there too —
+/// `tests/header.rs` checks that the header declares it, not that the two
+/// agree.
 pub type ReldexWakeFn = Option<extern "C" fn(user_data: *mut c_void)>;
 
 struct WakerSlot {
@@ -65,8 +73,15 @@ pub struct ReldexHub {
     destroyed: AtomicBool,
 }
 
+impl Drop for ReldexHub {
+    fn drop(&mut self) {
+        crate::counters::destroyed(crate::counters::Kind::Hub);
+    }
+}
+
 impl ReldexHub {
     fn new() -> Self {
+        crate::counters::created(crate::counters::Kind::Hub);
         Self {
             events: Mutex::new(VecDeque::new()),
             waker: RwLock::new(None),

@@ -86,6 +86,17 @@ pub enum ReldexColumnKind {
     /// A type the contract cannot represent, rendered by the driver as
     /// best-effort text: `data` + `offsets`, borrowed. Not text — never show
     /// it as character data.
+    ///
+    /// **What a grid should do:** route the column through
+    /// [`crate::reldex_batch_format_column`] like any other non-text kind,
+    /// rather than reading `data`/`offsets` directly as UTF-8. The bytes are
+    /// the driver's rendering, not necessarily valid UTF-8 and not necessarily
+    /// the user's idea of the value, so the formatter's escaping — and the
+    /// fact that it yields the same "cannot be shown faithfully" form
+    /// everywhere — is what keeps a `SELECT *` over a table with one
+    /// `INTERVAL` or `XMLType` column honest instead of silently wrong. The
+    /// column's `native_type_name` is what to show the user when asked what
+    /// the type actually is.
     Unsupported = 10,
 }
 
@@ -240,12 +251,23 @@ pub struct ReldexColumnView {
     /// Text/JSON/bytes/unsupported: `row_count + 1` byte offsets into `data`,
     /// so row `i` is `data[offsets[i]..offsets[i + 1]]`.
     pub offsets: *const usize,
-    /// Fixed-width kinds: the element array.
+    /// The element array, for a fixed-width kind whose Rust storage already
+    /// *is* a C array: `BOOLEAN` (`bool[]`), `FLOAT` (`float[]`), `DOUBLE`
+    /// (`double[]`). Borrowed, zero-copy, no allocation.
+    ///
+    /// **NULL for `NUMBER` and `TIMESTAMP`**, whose Rust storage is not
+    /// C-compatible and has to be mirrored. Describing a column never builds
+    /// that mirror; ask for it explicitly with
+    /// [`reldex_batch_column_fixed`], which says what it costs (ADR-0003
+    /// A19). Most callers should not: the bulk formatter reads the *source*
+    /// column and needs no mirror at all.
     pub fixed: *const std::ffi::c_void,
-    /// The size of one element of `fixed`. Compare with `sizeof` of the
-    /// matching type before reading.
+    /// The size of one element of `fixed`. Reported for `NUMBER` and
+    /// `TIMESTAMP` too, even though `fixed` is NULL there, so a caller can
+    /// check it against its own `sizeof` before asking for the elements.
     pub fixed_stride: usize,
-    /// How many elements `fixed` covers; equals `row_count`.
+    /// How many elements `fixed` covers; equals `row_count` when `fixed` is
+    /// set, and `0` when it is NULL.
     pub fixed_len: usize,
 }
 
@@ -381,6 +403,75 @@ impl ResultColumns {
     fn get(&self, index: usize) -> Option<&ColumnDescription> {
         self.columns.get(index)
     }
+
+    pub(crate) fn len(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// Describes column `index` from the metadata alone.
+    ///
+    /// `kind` is the storage family the column's **declared** type maps to.
+    /// [`reldex_batch_column_info`] reports the storage the driver actually
+    /// used for one batch; the two agree for every type the ADR-0002 contract
+    /// can represent, and where they cannot — a driver that fell back to
+    /// `Unsupported` text for a column it declared as something else — the
+    /// batch is the one telling the truth about the bytes.
+    pub(crate) fn info(&self, index: usize) -> Option<ReldexColumnInfo> {
+        let described = self.get(index)?;
+        let metadata = &described.metadata;
+        Some(ReldexColumnInfo {
+            kind: ReldexColumnKind::from(metadata.sql_type()) as i32,
+            nullable: match metadata.nullable() {
+                Some(true) => ReldexNullable::Yes as i32,
+                Some(false) => ReldexNullable::No as i32,
+                None => ReldexNullable::Unknown as i32,
+            },
+            precision: metadata.precision().map_or(0, i32::from),
+            has_precision: metadata.precision().is_some(),
+            scale: metadata.scale().map_or(0, i32::from),
+            has_scale: metadata.scale().is_some(),
+            max_size_bytes: metadata.max_size_bytes().unwrap_or(0),
+            has_max_size_bytes: metadata.max_size_bytes().is_some(),
+            name: described.name.as_reldex_str(),
+            // An `Unsupported` column with no native name is a driver that did
+            // not keep its side of the ADR-0002 contract. The empty string is
+            // the honest answer: the UI shows "unknown type" rather than
+            // inventing one.
+            native_type_name: described
+                .native_type_name
+                .as_ref()
+                .map_or_else(ReldexStr::empty, OwnedStr::as_reldex_str),
+            ..ReldexColumnInfo::default()
+        })
+    }
+}
+
+/// The storage family a declared type maps to.
+///
+/// Used only where there is no batch to ask — [`crate::
+/// reldex_session_result_column`], which answers as soon as `EXECUTED` is
+/// drained and therefore before any rows exist.
+impl From<reldex_db_driver_api::SqlType> for ReldexColumnKind {
+    fn from(sql_type: reldex_db_driver_api::SqlType) -> Self {
+        use reldex_db_driver_api::SqlType;
+        match sql_type {
+            SqlType::Boolean => Self::Boolean,
+            SqlType::Number => Self::Number,
+            SqlType::BinaryFloat => Self::Float,
+            SqlType::BinaryDouble => Self::Double,
+            SqlType::Text { .. } => Self::Text,
+            SqlType::Date | SqlType::Timestamp | SqlType::TimestampWithTimeZone => Self::Timestamp,
+            SqlType::Raw => Self::Bytes,
+            SqlType::CharacterLob { .. } | SqlType::BinaryLob => Self::Lob,
+            SqlType::Json => Self::Json,
+            // A `REF CURSOR` column has no cell data of its own, and an
+            // unrepresentable type crosses as the driver's best-effort text.
+            SqlType::Cursor => Self::Unknown,
+            SqlType::Unsupported => Self::Unsupported,
+            // `SqlType` is `#[non_exhaustive]`.
+            _ => Self::Unknown,
+        }
+    }
 }
 
 /// One fetched batch, owned by the caller from the moment its event is handed
@@ -410,9 +501,16 @@ const _: () = {
     assert_sync::<ReldexBatch>();
 };
 
+impl Drop for ReldexBatch {
+    fn drop(&mut self) {
+        crate::counters::destroyed(crate::counters::Kind::Batch);
+    }
+}
+
 impl ReldexBatch {
     pub(crate) fn new(batch: FetchedBatch, columns: Arc<ResultColumns>) -> Self {
         let column_count = batch.column_count();
+        crate::counters::created(crate::counters::Kind::Batch);
         Self {
             batch,
             columns,
@@ -427,9 +525,13 @@ impl ReldexBatch {
     /// Builds (once) and borrows the `#[repr(C)]` mirror of a fixed-width
     /// column, as a raw pointer and an element count.
     ///
+    /// Called **only** from [`reldex_batch_column_fixed`]. Describing a column
+    /// must never reach here: that is what made viewing a batch cost 62 bytes
+    /// a row for elements nobody read (ADR-0003 A19).
+    ///
     /// Concurrent first calls are sound: `OnceLock::get_or_init` runs the
     /// initializer on exactly one thread and every caller gets that value, so
-    /// two threads describing the same column see the same pointer.
+    /// two threads asking for the same column see the same pointer.
     fn mirror_of(&self, index: usize, column: &Column) -> Option<(*const std::ffi::c_void, usize)> {
         let slot = self.mirrors.get(index)?;
         let mirror = slot.get_or_init(|| match column.data() {
@@ -487,17 +589,16 @@ impl ReldexBatch {
                 view.fixed_stride = size_of::<f64>();
                 view.fixed_len = values.len();
             }
+            // The two mirrored kinds. `fixed` stays NULL here and the
+            // mirror is *not* built: see `reldex_batch_column_fixed`, which is
+            // the only thing that builds one. The stride is still reported, so
+            // a caller that is about to ask for the elements can check its
+            // `sizeof` first.
             ColumnData::Number(_) => {
-                let (ptr, len) = self.mirror_of(index, column)?;
-                view.fixed = ptr;
                 view.fixed_stride = size_of::<ReldexNumber>();
-                view.fixed_len = len;
             }
             ColumnData::Timestamp(_) => {
-                let (ptr, len) = self.mirror_of(index, column)?;
-                view.fixed = ptr;
                 view.fixed_stride = size_of::<ReldexTimestamp>();
-                view.fixed_len = len;
             }
             // A LOB column carries no data across: its locators were parked on
             // the worker thread and the cells read as *taken*. An unknown kind
@@ -507,35 +608,33 @@ impl ReldexBatch {
         Some(view)
     }
 
+    /// [`view_of`](Self::view_of), plus the mirror for the two kinds that
+    /// need one. The only path that allocates.
+    fn view_with_mirror(&self, index: usize) -> Option<ReldexColumnView> {
+        let mut view = self.view_of(index)?;
+        let column = self.batch.column(index)?;
+        match column.data() {
+            ColumnData::Number(_) | ColumnData::Timestamp(_) => {
+                let (ptr, len) = self.mirror_of(index, column)?;
+                view.fixed = ptr;
+                view.fixed_len = len;
+            }
+            // Every other kind is already whatever it is going to be: the
+            // C-compatible fixed kinds were borrowed directly by `view_of`,
+            // and text, bytes and LOB have no element array at all.
+            _ => {}
+        }
+        Some(view)
+    }
+
     fn info_of(&self, index: usize) -> Option<ReldexColumnInfo> {
         let column = self.batch.column(index)?;
-        let mut info = ReldexColumnInfo {
-            kind: ReldexColumnKind::from(column.kind()) as i32,
-            ..ReldexColumnInfo::default()
-        };
-        if let Some(described) = self.columns.get(index) {
-            let metadata = &described.metadata;
-            info.nullable = match metadata.nullable() {
-                Some(true) => ReldexNullable::Yes as i32,
-                Some(false) => ReldexNullable::No as i32,
-                None => ReldexNullable::Unknown as i32,
-            };
-            info.precision = metadata.precision().map_or(0, i32::from);
-            info.has_precision = metadata.precision().is_some();
-            info.scale = metadata.scale().map_or(0, i32::from);
-            info.has_scale = metadata.scale().is_some();
-            info.max_size_bytes = metadata.max_size_bytes().unwrap_or(0);
-            info.has_max_size_bytes = metadata.max_size_bytes().is_some();
-            info.name = described.name.as_reldex_str();
-            // An `Unsupported` column with no native name is a driver that did
-            // not keep its side of the ADR-0002 contract. The empty string is
-            // already the default, so there is nothing to do but leave it:
-            // the UI shows "unknown type" rather than inventing one.
-            info.native_type_name = described
-                .native_type_name
-                .as_ref()
-                .map_or_else(ReldexStr::empty, OwnedStr::as_reldex_str);
-        }
+        // The shared description if the result has one, else just the kind:
+        // the same answer `reldex_session_result_column` gives, except that
+        // `kind` is this batch's *actual* storage rather than the declared
+        // type's mapping.
+        let mut info = self.columns.info(index).unwrap_or_default();
+        info.kind = ReldexColumnKind::from(column.kind()) as i32;
         Some(info)
     }
 }
@@ -645,6 +744,14 @@ pub unsafe extern "C" fn reldex_batch_column_info(
 /// [`reldex_batch_release`]. Read a cell by consulting `null_bits` first, then
 /// `offsets`/`data` or `fixed` according to `kind`.
 ///
+/// **This allocates nothing and retains nothing.** Every pointer it hands back
+/// already existed inside the batch. `NUMBER` and `TIMESTAMP` therefore come
+/// back with `fixed == NULL`: their C mirror is built only by
+/// [`reldex_batch_column_fixed`], which is where its cost is stated. Viewing
+/// every column of every batch used to build those mirrors and keep them, at
+/// 62 bytes a row nobody read — enough on its own to breach spike criterion
+/// K3's 200 MB budget for a million rows (ADR-0003 A19).
+///
 /// # Safety
 ///
 /// `batch` must be a live batch and `out` a writable [`ReldexColumnView`] with
@@ -673,6 +780,71 @@ pub unsafe extern "C" fn reldex_batch_column(
                 } else {
                     set_last_argument_error(
                         "reldex_batch_column: `out` is null, unaligned, or too small",
+                    )
+                }
+            }
+        }
+    })
+}
+
+/// Builds — and from then on retains — the `#[repr(C)]` element array for a
+/// `NUMBER` or `TIMESTAMP` column, and points `out->fixed` at it.
+///
+/// # Read this before calling it
+///
+/// **This is the only function here that allocates**, and what it allocates it
+/// keeps until the batch is released:
+///
+/// | kind | bytes per row |
+/// | --- | --- |
+/// | `RELDEX_COLUMN_KIND_NUMBER` | `sizeof(ReldexNumber)` (46) |
+/// | `RELDEX_COLUMN_KIND_TIMESTAMP` | `sizeof(ReldexTimestamp)` (16) |
+///
+/// For a million-row result held in memory that is 46 MB for one `NUMBER`
+/// column, on top of the rows themselves. Built once per column per batch and
+/// cached, so calling it repeatedly costs nothing more — but there is no way
+/// to give the memory back short of releasing the batch.
+///
+/// **Most callers want the bulk formatter instead.**
+/// [`crate::reldex_batch_format_column`] renders a window from the *source*
+/// column and builds no mirror at all, which is why the Qt adapter never calls
+/// this. Reach for it when you genuinely need the raw exact decimal or the
+/// raw date parts — an export, a chart, a comparison — and preferably for the
+/// visible window rather than for every batch you are holding.
+///
+/// For every other kind this is exactly [`reldex_batch_column`]: the
+/// C-compatible fixed kinds (`BOOLEAN`, `FLOAT`, `DOUBLE`) are already
+/// zero-copy there and nothing is built, and a text or bytes column comes back
+/// with `fixed == NULL` as usual.
+///
+/// # Safety
+///
+/// `batch` must be a live batch and `out` a writable [`ReldexColumnView`] with
+/// `struct_size` set. The returned pointers must not be used after the batch
+/// is released.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reldex_batch_column_fixed(
+    batch: *const ReldexBatch,
+    column: usize,
+    out: *mut ReldexColumnView,
+) -> ReldexStatus {
+    entry(|| {
+        // SAFETY: delegated to this function's contract for `batch`.
+        let view = unsafe {
+            with_batch(batch, |batch| {
+                (batch.view_with_mirror(column), batch.rows().column_count())
+            })
+        };
+        match view {
+            None => set_last_argument_error("reldex_batch_column_fixed: `batch` is null"),
+            Some((None, count)) => column_not_found("reldex_batch_column_fixed", column, count),
+            Some((Some(view), _)) => {
+                // SAFETY: delegated to this function's contract for `out`.
+                if unsafe { write_out_struct(out, view) } {
+                    ReldexStatus::Ok
+                } else {
+                    set_last_argument_error(
+                        "reldex_batch_column_fixed: `out` is null, unaligned, or too small",
                     )
                 }
             }
