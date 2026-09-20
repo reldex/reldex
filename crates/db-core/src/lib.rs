@@ -66,12 +66,32 @@
 //! [`DatabaseSession::read_lob_chunk`]. With that, the invariant ADR-0002 D1
 //! states is literally true: of everything a fetch produces, only plain data
 //! crosses a thread boundary.
+//!
+//! # Two ways to be answered
+//!
+//! Every request can be answered either through its own [`Completion`] — the
+//! blocking shape, kept for tests, tools and the device-check binary — or as a
+//! typed [`SessionEvent`] pushed into a shared [`EventQueue`] with an
+//! edge-triggered [`Waker`] (`docs/exec-plans/active/phase-1.md` §B2). Both
+//! are the same worker command with a different reply channel, so a request's
+//! semantics never depend on which one the caller chose, and no thread is
+//! parked per outstanding request on the event path. [`EventQueue`],
+//! [`EventCaps`] and [`Waker`] carry the ordering guarantees, the
+//! back-pressure policy and the waker contract in full.
 
+#![forbid(unsafe_code)]
+
+mod events;
 mod ids;
+mod reply;
 mod session;
 mod shared;
 mod worker;
 
+pub use events::{
+    CompletedOperation, EventCaps, EventQueue, EventSink, RequestId, SessionEvent, Waker,
+    event_channel,
+};
 pub use ids::{LobHandle, ResultId, SessionId};
 pub use session::{
     CloseDisposition, CloseError, Completion, DROP_SHUTDOWN_TIMEOUT, DatabaseSession,

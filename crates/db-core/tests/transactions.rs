@@ -14,11 +14,10 @@ fn insert_action(row: &str) -> Action {
     }
 }
 
-#[test]
-fn commit_resolves_the_transaction() {
+fn commit_resolves_the_transaction(path: support::ReplyPath) {
     let scenario = support::scenario();
     scenario.on_sql("INSERT INTO t VALUES ('a')", insert_action("a"));
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
 
     assert!(!session.has_possibly_active_transaction());
     session
@@ -32,11 +31,10 @@ fn commit_resolves_the_transaction() {
     assert_eq!(scenario.committed_rows("t").len(), 1);
 }
 
-#[test]
-fn rollback_resolves_the_transaction_and_discards_it() {
+fn rollback_resolves_the_transaction_and_discards_it(path: support::ReplyPath) {
     let scenario = support::scenario();
     scenario.on_sql("INSERT INTO t VALUES ('a')", insert_action("a"));
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
 
     session
         .execute(Statement::new("INSERT INTO t VALUES ('a')"))
@@ -49,8 +47,7 @@ fn rollback_resolves_the_transaction_and_discards_it() {
     assert!(scenario.committed_rows("t").is_empty());
 }
 
-#[test]
-fn savepoint_and_rollback_to_savepoint_undo_only_later_work() {
+fn savepoint_and_rollback_to_savepoint_undo_only_later_work(path: support::ReplyPath) {
     let scenario = support::scenario();
     for row in ["a", "b", "c"] {
         scenario.on_sql(
@@ -58,7 +55,7 @@ fn savepoint_and_rollback_to_savepoint_undo_only_later_work() {
             insert_action(row),
         );
     }
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
 
     session
         .execute(Statement::new("INSERT INTO t VALUES ('a')"))
@@ -96,10 +93,9 @@ fn savepoint_and_rollback_to_savepoint_undo_only_later_work() {
     );
 }
 
-#[test]
-fn rollback_to_a_savepoint_that_does_not_exist_is_reported() {
+fn rollback_to_a_savepoint_that_does_not_exist_is_reported(path: support::ReplyPath) {
     let scenario = support::scenario();
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     let sp = SavepointName::new("never_created").expect("valid name");
     let error = session
         .rollback_to_savepoint(sp)
@@ -108,12 +104,11 @@ fn rollback_to_a_savepoint_that_does_not_exist_is_reported() {
     assert_eq!(error.kind(), reldex_db_driver_api::ErrorKind::Transaction);
 }
 
-#[test]
-fn ddl_reports_implicit_commit_and_resets_tracking() {
+fn ddl_reports_implicit_commit_and_resets_tracking(path: support::ReplyPath) {
     let scenario = support::scenario();
     scenario.on_sql("INSERT INTO t VALUES ('a')", insert_action("a"));
     scenario.on_sql("CREATE TABLE u (x NUMBER)", Action::Ddl);
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
 
     session
         .execute(Statement::new("INSERT INTO t VALUES ('a')"))
@@ -135,8 +130,7 @@ fn ddl_reports_implicit_commit_and_resets_tracking() {
     assert_eq!(scenario.committed_rows("t").len(), 1);
 }
 
-#[test]
-fn an_imprecise_driver_still_yields_a_conservative_combined_answer() {
+fn an_imprecise_driver_still_yields_a_conservative_combined_answer(path: support::ReplyPath) {
     // `Capabilities::exact_transaction_state == false` (ADR-0002 D4): the
     // driver alone can only ever say `Unknown`. Core-side tracking from
     // `StatementKind` must still make `has_possibly_active_transaction` swing
@@ -144,7 +138,7 @@ fn an_imprecise_driver_still_yields_a_conservative_combined_answer() {
     let scenario = support::scenario();
     scenario.set_capabilities(Capabilities::none().with_exact_transaction_state(false));
     scenario.on_sql("INSERT INTO t VALUES ('a')", insert_action("a"));
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
 
     session
         .execute(Statement::new("INSERT INTO t VALUES ('a')"))
@@ -158,8 +152,7 @@ fn an_imprecise_driver_still_yields_a_conservative_combined_answer() {
     assert!(!session.has_possibly_active_transaction());
 }
 
-#[test]
-fn a_default_constructed_state_is_the_safe_unknown_default() {
+fn a_default_constructed_state_is_the_safe_unknown_default(path: support::ReplyPath) {
     // `TransactionState::default()` is `Unknown`, not `Inactive`
     // (ADR-0002, amendment S2) — the safe answer for a connection nobody has
     // classified yet. `db-core` asks the driver for its real state as soon as
@@ -169,7 +162,7 @@ fn a_default_constructed_state_is_the_safe_unknown_default() {
     assert!(TransactionState::default().may_be_open());
 
     let scenario = support::scenario();
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     assert!(
         !session.has_possibly_active_transaction(),
         "an exact driver that has done nothing yet is not possibly active"
@@ -181,7 +174,7 @@ fn a_default_constructed_state_is_the_safe_unknown_default() {
     // exercised in `an_imprecise_driver_still_yields_a_conservative_combined_answer`.
     let imprecise_scenario = support::scenario();
     imprecise_scenario.set_capabilities(Capabilities::none().with_exact_transaction_state(false));
-    let imprecise_session = support::open(&imprecise_scenario);
+    let imprecise_session = support::open_on(&imprecise_scenario, path);
     assert!(
         imprecise_session.has_possibly_active_transaction(),
         "an imprecise driver must not be trusted to say Inactive on its own"
@@ -196,8 +189,7 @@ fn a_default_constructed_state_is_the_safe_unknown_default() {
 /// silently discarded row locks and an open transaction. No statement kind can
 /// distinguish this from a plain `SELECT`, so the core has to be conservative
 /// and only dismiss a query when the driver says `Inactive` afterwards.
-#[test]
-fn a_locking_query_keeps_the_transaction_flag_even_on_an_exact_driver() {
+fn a_locking_query_keeps_the_transaction_flag_even_on_an_exact_driver(path: support::ReplyPath) {
     let scenario = support::scenario();
     let plan = reldex_driver_mock::QueryPlan::new(
         vec![reldex_driver_mock::ColumnSpec::new(
@@ -223,7 +215,7 @@ fn a_locking_query_keeps_the_transaction_flag_even_on_an_exact_driver() {
         },
     );
 
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
 
     // A plain query on an exact driver leaves nothing open.
     session
@@ -259,8 +251,7 @@ fn a_locking_query_keeps_the_transaction_flag_even_on_an_exact_driver() {
 /// A commit can invalidate every cursor and LOB locator it left open, and
 /// `db-core` must surface that rather than return a short result that looks
 /// complete.
-#[test]
-fn handles_invalidated_by_a_commit_report_rather_than_looking_exhausted() {
+fn handles_invalidated_by_a_commit_report_rather_than_looking_exhausted(path: support::ReplyPath) {
     let scenario = support::scenario();
     scenario.set_invalidate_handles_on_transaction_end(true);
     scenario.on_sql("INSERT INTO t VALUES ('a')", insert_action("a"));
@@ -277,7 +268,7 @@ fn handles_invalidated_by_a_commit_report_rather_than_looking_exhausted() {
         )),
     );
 
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     let outcome = session
         .execute(Statement::new("SELECT id FROM t"))
         .wait()
@@ -302,4 +293,16 @@ fn handles_invalidated_by_a_commit_report_rather_than_looking_exhausted() {
         .wait()
         .expect_err("a result invalidated by the commit must report, not look exhausted");
     assert!(error.message().contains("result handle"), "{error}");
+}
+
+support::both_paths! {
+    commit_resolves_the_transaction,
+    rollback_resolves_the_transaction_and_discards_it,
+    savepoint_and_rollback_to_savepoint_undo_only_later_work,
+    rollback_to_a_savepoint_that_does_not_exist_is_reported,
+    ddl_reports_implicit_commit_and_resets_tracking,
+    an_imprecise_driver_still_yields_a_conservative_combined_answer,
+    a_default_constructed_state_is_the_safe_unknown_default,
+    a_locking_query_keeps_the_transaction_flag_even_on_an_exact_driver,
+    handles_invalidated_by_a_commit_report_rather_than_looking_exhausted,
 }

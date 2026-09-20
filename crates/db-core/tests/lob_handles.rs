@@ -49,7 +49,7 @@ fn scenario_with_two_lobs() -> std::sync::Arc<reldex_driver_mock::Scenario> {
     scenario
 }
 
-fn read_all(session: &reldex_db_core::DatabaseSession, lob: LobHandle) -> String {
+fn read_all(session: &support::Session, lob: LobHandle) -> String {
     let mut collected = Vec::new();
     loop {
         let chunk = session
@@ -64,10 +64,11 @@ fn read_all(session: &reldex_db_core::DatabaseSession, lob: LobHandle) -> String
     String::from_utf8(collected).expect("character LOB chunks are valid UTF-8")
 }
 
-#[test]
-fn only_plain_data_crosses_threads_even_when_batches_and_handles_are_dropped_elsewhere() {
+fn only_plain_data_crosses_threads_even_when_batches_and_handles_are_dropped_elsewhere(
+    path: support::ReplyPath,
+) {
     let scenario = scenario_with_two_lobs();
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     let connection_id = session.connection_id();
 
     let outcome = session
@@ -106,10 +107,13 @@ fn only_plain_data_crosses_threads_even_when_batches_and_handles_are_dropped_els
     assert_eq!(read_all(&session, third), CONTENT_B);
 
     // Release one from another thread; the other is left for the session to
-    // reclaim. `DatabaseSession` is `Sync`, so this is the documented shape.
+    // reclaim. `DatabaseSession` is `Sync`, so this is the documented shape —
+    // and it is the *session* that is shared here, not this file's per-path
+    // harness, which is single-threaded on purpose.
+    let shared: &reldex_db_core::DatabaseSession = &session;
     thread::scope(|scope| {
         scope.spawn(|| {
-            session.close_lob(first).wait().expect("close_lob");
+            shared.close_lob(first).wait().expect("close_lob");
         });
     });
 
@@ -123,10 +127,9 @@ fn only_plain_data_crosses_threads_even_when_batches_and_handles_are_dropped_els
     assert_ne!(seen[0], thread::current().id());
 }
 
-#[test]
-fn a_lob_handle_dies_with_the_result_it_came_from() {
+fn a_lob_handle_dies_with_the_result_it_came_from(path: support::ReplyPath) {
     let scenario = scenario_with_two_lobs();
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     let outcome = session
         .execute(Statement::new(SELECT_DOCS))
         .wait()
@@ -149,15 +152,14 @@ fn a_lob_handle_dies_with_the_result_it_came_from() {
     session.close_lob(lob).wait().expect("idempotent");
 }
 
-#[test]
-fn a_lob_handle_from_another_session_is_rejected_as_foreign() {
+fn a_lob_handle_from_another_session_is_rejected_as_foreign(path: support::ReplyPath) {
     // Before handles were core-owned and session-scoped, a locator taken from
     // session A's batch could be handed to session B, which happily ran the
     // read on *its* worker thread — driver code on the wrong connection's
     // thread, which is exactly the hazard the whole design exists to prevent.
     let scenario = scenario_with_two_lobs();
-    let owner = support::open(&scenario);
-    let other = support::open(&scenario);
+    let owner = support::open_on(&scenario, path);
+    let other = support::open_on(&scenario, path);
 
     let outcome = owner
         .execute(Statement::new(SELECT_DOCS))
@@ -194,8 +196,7 @@ fn a_lob_handle_from_another_session_is_rejected_as_foreign() {
     assert_eq!(read_all(&owner, lob), CONTENT_A);
 }
 
-#[test]
-fn a_large_object_returned_through_an_out_bind_is_also_a_handle() {
+fn a_large_object_returned_through_an_out_bind_is_also_a_handle(path: support::ReplyPath) {
     let scenario = support::scenario();
     scenario.on_sql(
         "BEGIN :doc := load_doc; END;",
@@ -205,7 +206,7 @@ fn a_large_object_returned_through_an_out_bind_is_also_a_handle() {
             bytes: CONTENT_A.as_bytes().to_vec(),
         },
     );
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     let connection_id = session.connection_id();
 
     let outcome = session
@@ -223,12 +224,14 @@ fn a_large_object_returned_through_an_out_bind_is_also_a_handle() {
     assert_ne!(seen[0], thread::current().id());
 }
 
-#[test]
-fn a_read_larger_than_the_configured_limit_is_capped_rather_than_allocated() {
+fn a_read_larger_than_the_configured_limit_is_capped_rather_than_allocated(
+    path: support::ReplyPath,
+) {
     let scenario = scenario_with_two_lobs();
-    let session = support::open_with_limits(
+    let session = support::open_on_with_limits(
         &scenario,
         reldex_db_core::SessionLimits::new().with_max_lob_chunk_bytes(support::n(8)),
+        path,
     );
     let outcome = session
         .execute(Statement::new(SELECT_DOCS))
@@ -252,4 +255,12 @@ fn a_read_larger_than_the_configured_limit_is_capped_rather_than_allocated() {
         chunk.len()
     );
     assert_eq!(&chunk, &CONTENT_A.as_bytes()[..chunk.len()]);
+}
+
+support::both_paths! {
+    only_plain_data_crosses_threads_even_when_batches_and_handles_are_dropped_elsewhere,
+    a_lob_handle_dies_with_the_result_it_came_from,
+    a_lob_handle_from_another_session_is_rejected_as_foreign,
+    a_large_object_returned_through_an_out_bind_is_also_a_handle,
+    a_read_larger_than_the_configured_limit_is_capped_rather_than_allocated,
 }

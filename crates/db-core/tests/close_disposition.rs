@@ -16,20 +16,18 @@ fn insert_action(row: &str) -> Action {
     }
 }
 
-#[test]
-fn close_without_a_disposition_is_fine_when_nothing_is_active() {
+fn close_without_a_disposition_is_fine_when_nothing_is_active(path: support::ReplyPath) {
     let scenario = support::scenario();
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     session
         .close(None)
         .expect("nothing is active, so this must succeed");
 }
 
-#[test]
-fn close_demands_a_decision_when_a_transaction_may_be_active() {
+fn close_demands_a_decision_when_a_transaction_may_be_active(path: support::ReplyPath) {
     let scenario = support::scenario();
     scenario.on_sql("INSERT INTO t VALUES ('a')", insert_action("a"));
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     session
         .execute(Statement::new("INSERT INTO t VALUES ('a')"))
         .wait()
@@ -47,11 +45,10 @@ fn close_demands_a_decision_when_a_transaction_may_be_active() {
         .expect("closing with a disposition now succeeds");
 }
 
-#[test]
-fn close_commit_disposition_commits_before_closing() {
+fn close_commit_disposition_commits_before_closing(path: support::ReplyPath) {
     let scenario = support::scenario();
     scenario.on_sql("INSERT INTO t VALUES ('a')", insert_action("a"));
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     session
         .execute(Statement::new("INSERT INTO t VALUES ('a')"))
         .wait()
@@ -63,11 +60,10 @@ fn close_commit_disposition_commits_before_closing() {
     assert_eq!(scenario.committed_rows("t").len(), 1);
 }
 
-#[test]
-fn close_rollback_disposition_discards_the_transaction() {
+fn close_rollback_disposition_discards_the_transaction(path: support::ReplyPath) {
     let scenario = support::scenario();
     scenario.on_sql("INSERT INTO t VALUES ('a')", insert_action("a"));
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     session
         .execute(Statement::new("INSERT INTO t VALUES ('a')"))
         .wait()
@@ -79,10 +75,9 @@ fn close_rollback_disposition_discards_the_transaction() {
     assert!(scenario.committed_rows("t").is_empty());
 }
 
-#[test]
-fn close_is_idempotent() {
+fn close_is_idempotent(path: support::ReplyPath) {
     let scenario = support::scenario();
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     session.close(None).expect("first close");
     session
         .close(None)
@@ -92,10 +87,9 @@ fn close_is_idempotent() {
         .expect("even with a disposition, closing again is a no-op success");
 }
 
-#[test]
-fn requests_after_close_fail_fast_instead_of_hanging() {
+fn requests_after_close_fail_fast_instead_of_hanging(path: support::ReplyPath) {
     let scenario = support::scenario();
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     session.close(None).expect("close");
 
     let error = session
@@ -105,10 +99,9 @@ fn requests_after_close_fail_fast_instead_of_hanging() {
     assert_eq!(error.kind(), ErrorKind::Connection);
 }
 
-#[test]
-fn a_closed_session_reports_closed_rather_than_usable() {
+fn a_closed_session_reports_closed_rather_than_usable(path: support::ReplyPath) {
     let scenario = support::scenario();
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     assert_eq!(session.session_state(), SessionLifecycle::Usable);
 
     session.close(None).expect("close");
@@ -180,11 +173,10 @@ fn close_without_a_disposition_decides_after_the_queued_statements_have_run() {
 }
 
 /// A commit that fails during `close` must not cost the user the transaction.
-#[test]
-fn a_failed_commit_during_close_keeps_the_transaction_and_the_session() {
+fn a_failed_commit_during_close_keeps_the_transaction_and_the_session(path: support::ReplyPath) {
     let scenario = support::scenario();
     scenario.on_sql("INSERT INTO t VALUES ('a')", insert_action("a"));
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     session
         .execute(Statement::new("INSERT INTO t VALUES ('a')"))
         .wait()
@@ -224,11 +216,10 @@ fn a_failed_commit_during_close_keeps_the_transaction_and_the_session() {
     assert_eq!(scenario.committed_rows("t").len(), 1);
 }
 
-#[test]
-fn a_failed_rollback_during_close_also_leaves_the_session_open() {
+fn a_failed_rollback_during_close_also_leaves_the_session_open(path: support::ReplyPath) {
     let scenario = support::scenario();
     scenario.on_sql("INSERT INTO t VALUES ('a')", insert_action("a"));
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
     session
         .execute(Statement::new("INSERT INTO t VALUES ('a')"))
         .wait()
@@ -247,11 +238,10 @@ fn a_failed_rollback_during_close_also_leaves_the_session_open() {
         .expect("retrying now succeeds");
 }
 
-#[test]
-fn a_failing_connection_close_is_reported_but_the_session_is_gone() {
+fn a_failing_connection_close_is_reported_but_the_session_is_gone(path: support::ReplyPath) {
     let scenario = support::scenario();
     scenario.fail_close(ScriptedError::new(ErrorKind::Other, "close failed"));
-    let session = support::open(&scenario);
+    let session = support::open_on(&scenario, path);
 
     let error = session.close(None).expect_err("the close itself failed");
     assert!(matches!(error, CloseError::Failed(_)));
@@ -260,4 +250,17 @@ fn a_failing_connection_close_is_reported_but_the_session_is_gone() {
         "a failed close still ends the session; only the report survives"
     );
     session.close(None).expect("closing again is a no-op");
+}
+
+support::both_paths! {
+    close_without_a_disposition_is_fine_when_nothing_is_active,
+    close_demands_a_decision_when_a_transaction_may_be_active,
+    close_commit_disposition_commits_before_closing,
+    close_rollback_disposition_discards_the_transaction,
+    close_is_idempotent,
+    requests_after_close_fail_fast_instead_of_hanging,
+    a_closed_session_reports_closed_rather_than_usable,
+    a_failed_commit_during_close_keeps_the_transaction_and_the_session,
+    a_failed_rollback_during_close_also_leaves_the_session_open,
+    a_failing_connection_close_is_reported_but_the_session_is_gone,
 }

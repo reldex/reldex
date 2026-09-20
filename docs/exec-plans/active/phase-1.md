@@ -129,13 +129,23 @@ pub enum SessionEvent {
 
 **Ordering guarantees (the contract the adapter may rely on):**
 
-1. Per session, events are delivered in the order the worker produced them.
+1. Per session, events are delivered in the order they were **produced**. Production order is not acceptance order, and M2.5 made that explicit: at a terminal transition a submit can synthesise its own failure on the caller's thread while the worker is draining and failing the commands it already had, so those failures interleave. A consumer must route strictly by `RequestId` and must **not** infer "every earlier request of this session is answered" from a reply; session state is retired on `Terminal` only.
 2. Every accepted request produces **exactly one** reply event for its `RequestId` — never zero, never two — including when the session is already `Lost` or `Closed` (the reply is then the failure, carrying the original kind and native code per K8).
 3. `Terminal` is delivered **exactly once** per session, after every reply for requests accepted before the transition. Requests submitted after it still get their one failure reply, which may follow `Terminal`.
 4. `Executing` precedes the matching `Executed` and follows any earlier request's reply on that session.
 5. **No ordering is promised across sessions.** The hub interleaves freely.
 
 **Back-pressure.** Reply events are bounded by outstanding requests, which is bounded by a new `SessionLimits::max_outstanding_requests` (default 1,024). Exceeding it is the **one synchronous failure** in the submit API — `Err(DbError)` with `ErrorKind::Resource`, no event — because producing an event for it would be circular. Unsolicited events (`ServerOutput`, `TransactionStateChanged`) use a bounded per-session ring with coalescing; drops are *counted and reported* on the next event (`dropped`) so the UI can say "output truncated" rather than silently lying. This mirrors K9: the command queue stays unbounded, the resources do not.
+
+**Back-pressure, as implemented (M2.5, after review).** Four things above needed pinning down, because the first implementation was bounded only on paper:
+
+* A request's slot is released when the **consumer drains its reply**, not when the worker produces it. Releasing on production bounds nothing — the worker answers a `ping` in microseconds, so a submitter retrying on `Resource` grew an undrained queue to 5,000 events with the counter reading zero. `DatabaseSession::outstanding_requests()` therefore means "accepted and not yet drained".
+* Dropping the `EventQueue` ends the stream: everything in it is discarded, every slot it held is released, and later events are discarded on arrival. Sessions keep working (one may have a close to run) and are then bounded by what their worker has not yet reached.
+* `TransactionStateChanged` is not subject to the cap at all: it coalesces in place when one is queued and is **admitted over the cap** when none is, so the class costs at most one event per session and a state change can never be lost behind a `ServerOutput` burst. `ServerOutput` is the only class that is dropped; its line count rides out on the next delivered `ServerOutput`, or is read with `EventQueue::pending_dropped_lines(session)` when there is no next one.
+
+* `submit_close` reserves against **one more** than the limit. It was being refused at the cap like anything else, which is backwards: it is the one request that shrinks a session's footprint. Nothing deadlocked (`close()` and `Drop` go through a `Completion` and reserve nothing), but an event-driven adapter would have been unable to ask a full session to end. The exemption is exactly one — a second close while the first is undrained is refused — so the class costs one event per session.
+
+Per session the queue therefore holds at most `2 × max_outstanding_requests + max_unsolicited_per_session + 3` events (`R + 1` replies, `R` `Executing`s, `U + 1` unsolicited, one `Terminal`), whatever a producer does.
 
 ### B3 — Non-blocking open and the session registry
 
@@ -314,7 +324,7 @@ Six milestones. M1 is the de-risking gate and nothing downstream starts until it
 | M2.2 | `[x]` done 2026-09-20 — carried over from Phase 0 (independently reviewed); M2 consumes the result | Driver: `CREATE TRIGGER` `:NEW`/`:OLD` auto-rewrite (U-18), on by default, reported as a warning with the submitted text, per-connection off switch | `sonnet` | SPEC §8 owner decision | Driver change + live test + canary update | — | Rewrite works; warning carries the exact statement sent; off switch restores the explanatory refusal | M |
 | M2.3 ★ | `[x]` done 2026-09-20 — carried over from Phase 0 (independently reviewed); M2 consumes the result | Contract: `take_connect_warnings` (C-6) + ADR-0002 amendment | `opus` | `phase-0-spike-results.md` §7 C-6 | `db-driver-api` + `db-core` + mock + oracle-thin | M2.1 | Warnings collected once after connect; TCPS `SSL_SERVER_DN_MATCH` warning reaches the caller | S |
 | M2.4 | `[ ]` todo | `crates/sql-text`: lexer + statement splitter driven by a `SqlDialect` descriptor the driver supplies | `sonnet` | SPEC §15; ADR-0002 D8 | New crate + Oracle dialect descriptor in the driver | — | A corpus of Oracle scripts (PL/SQL blocks, nested BEGIN, `/`, `q'[…]'`, comments, strings, Thai text) splits correctly; `tokenize_block(text, in_state) -> (tokens, out_state)` shaped for `QSyntaxHighlighter` | L |
-| M2.5 ★ | `[ ]` todo | `EventQueue`/`EventSink`/`SessionEvent`/`Waker` + `ReplyTo` refactor of the worker | `opus` | §B2 | `db-core` change | — | Ordering rules 1–5 each have a test; exactly-once `Terminal` test; drop-count reporting test; existing suite runs on both paths | L |
+| M2.5 ★ | `[x]` done 2026-09-21 — reviewed twice; see `phase-1-m2-5-event-queue.md` | `EventQueue`/`EventSink`/`SessionEvent`/`Waker` + `ReplyTo` refactor of the worker | `opus` | §B2 | `db-core` change | — | Ordering rules 1–5 each have a test; exactly-once `Terminal` test; drop-count reporting test; existing suite runs on both paths | L |
 | M2.6 ★ | `[ ]` todo | `SessionRegistry` + non-blocking `open`, `abandon` semantics | `opus` | §B3 | `db-core` change | M2.5 | `open` returns without blocking; abandon-before-open yields exactly one `OpenFailed{Cancelled}` and closes the late connection; ADR-0002 amendment recorded | M |
 | M2.7 ★ | `[ ]` todo | Server output capability (DBMS_OUTPUT) in contract + driver + core polling when enabled | `opus` | §B4.2 | Contract + driver + core | M2.5 | Thai text survives byte-exact (S5 precedent); no round trip when the pane is off | M |
 | M2.8 | `[ ]` todo | Metadata catalog descriptor (`MetadataCatalog`) + Oracle dictionary SQL for the 9 object groups | `sonnet` | SPEC §16; spike S12 | Contract + driver | M2.3 | Each group returns a declared column contract; server-side name filter and row cap; permission failures classify as `ErrorKind::Permission`, not driver failure | M |
@@ -324,6 +334,14 @@ Six milestones. M1 is the de-risking gate and nothing downstream starts until it
 
 **Parallelism.** M2.1/M2.2 (driver), M2.4 (sql-text), M2.9/M2.10 (settings/secrets) and M2.5/M2.6 (events) are four independent tracks. M2.11 gates on all of them.
 **Mandatory review:** M2.1, M2.3, M2.5, M2.6, M2.7, M2.9, M2.10 — concurrency, contract change, and security.
+
+**M2.5 notes.** The implementation notes for the event queue live in
+[`phase-1-m2-5-event-queue.md`](phase-1-m2-5-event-queue.md): the before/after performance numbers
+(1M rows through `crates/ffi`; per-event cost at 1 and 8 producer sessions; allocations per event),
+the exact `SessionEvent` → `ReldexEvent` mapping M2.11 has to write — the C ABI is **unchanged** by
+M2.5, and `reldex.h` is byte-identical — and every place the implementation had to interpret §B2.
+The decision record is [ADR-0002](../../decisions/0002-driver-api-and-concurrency-model.md)
+amendment E1–E6.
 
 ---
 
