@@ -308,3 +308,76 @@ touched any file outside this scratch directory / `C:\Qt`.
 - `tools/dev-env/env.ps1` — optional PowerShell twin, dot-sourced from the repository root.
 - The hello-world Qt Quick project and QuickTest used for the proof above were throwaway scratch files and are
   not kept; milestone task M1.5 adds the real `ui/` CMake project, which supersedes them.
+
+## 12. M1.5 gotchas (CMake + Corrosion + Qt Quick project)
+
+Discovered while building `ui/` (see `ui/README.md` for the design decisions
+these gotchas produced).
+
+1. **A statically-linked QML *entry-point* module (loaded via
+   `loadFromModule`, never `import`-ed by another `.qml` file) only
+   self-registers when it is compiled directly into the binary that loads
+   it.** Putting `Main.qml` in its own small static library
+   (`reldex_app_qml`) linked by both `Reldex` and `tst_coreinfo` seemed like
+   the obvious way to share it, and it built with zero warnings — then
+   failed at *runtime* with `No module named "Reldex.App" found`, because
+   nothing in `main.cpp` references a symbol from that library, so the
+   linker drops the whole archive. Qt's own static-plugin-import machinery
+   (`qt6_import_qml_plugins`, run automatically for every `qt_add_executable`
+   target) only forces a plugin to link when its *use* is discovered by
+   `qmlimportscanner` scanning an `import` statement — an entry point is
+   never imported, so that machinery never sees it. **Fix:** attach the QML
+   module directly to each executable that loads it (`qt_add_qml_module`
+   called once per executable, same source file, no intermediate library).
+2. **A *library*-backed QML module's default `OUTPUT_DIRECTORY` breaks
+   `qmlimportscanner`-based static-plugin discovery for its consumers, not
+   just `qmllint`.** Without `QT_QML_OUTPUT_DIRECTORY` set,
+   `qt_add_qml_module()` on a `STATIC` library target defaults
+   `OUTPUT_DIRECTORY` to `CMAKE_CURRENT_BINARY_DIR` with **no target-path
+   suffix** (only executables get the automatic suffix). This alone is
+   merely a configure-time warning ("uses an OUTPUT_DIRECTORY ... which
+   should end in the same target path"). The real cost: a consumer's
+   `import Reldex.Adapter` then builds and links with **zero errors or
+   warnings**, and fails at *runtime* with `module "Reldex.Adapter" plugin
+   "reldex_adapterplugin" not found`, because `qmlimportscanner` cannot
+   locate the module's `qmldir` under any import path it was given, so it
+   never force-links the plugin. **Fix:** set `QT_QML_OUTPUT_DIRECTORY`
+   project-wide (`ui/CMakeLists.txt`); it makes every library module's
+   output directory end in its own target path *and* gets added to every
+   consumer's import path automatically. Two executables sharing one QML
+   URI (see gotcha 1) then need an explicit per-target `OUTPUT_DIRECTORY`
+   override to avoid colliding on that shared base.
+3. **`qt_add_executable(... WIN32_EXECUTABLE ...)` is not a real keyword.**
+   `WIN32_EXECUTABLE` is a *target property* name; the `add_executable()`
+   keyword (which `qt_add_executable()` passes straight through) is
+   `WIN32`, mirrored by `MACOSX_BUNDLE` on Apple. Passing
+   `WIN32_EXECUTABLE` as an argument makes CMake try to compile a source
+   file literally named `WIN32_EXECUTABLE` and fail with "Cannot find
+   source file." Likewise `OUTPUT_NAME` is not a `qt_add_executable()`
+   keyword (unlike `qt_add_library`/`qt_add_plugin`) — when the target name
+   already matches the desired binary name, nothing extra is needed.
+4. **Redirected output from a Windows GUI-subsystem (`WIN32`) executable is
+   unreliable to capture from Git Bash.** `./Reldex.exe > out.log 2>&1`
+   sometimes reports exit code `127` even though the binary exists and
+   runs fine (confirmed via `Get-Process`/PowerShell `Start-Process` in
+   parallel), and `qWarning()`/`qFatal()` output that should go to stderr
+   does not reliably show up in the redirected file for a `WIN32` target,
+   even though the same message handler reliably writes to a *console*
+   (`CUI`) target's redirected stderr. Console-subsystem (no `WIN32`
+   keyword) executables like `tst_coreinfo.exe` do not have this problem.
+   **Workaround used here:** verify a `WIN32` binary's behaviour either
+   through a console-subsystem test binary that exercises the same code
+   path (that is what `tst_coreinfo` is for), or, when the `.exe` itself
+   must be checked, launch/inspect it via PowerShell's `Start-Process
+   -RedirectStandardOutput/-RedirectStandardError` and `Get-Process`/
+   `Stop-Process` rather than Git Bash job control.
+5. **MSVC-style tools (`cl`, `link`, `dumpbin`) need `MSYS_NO_PATHCONV=1`
+   from Git Bash whenever an argument starts with a single `/`** (`/W4`,
+   `/EHsc`, `/HEADERS`, ...) — MSYS's automatic path conversion silently
+   rewrites `/nologo` to a POSIX-style path under `C:\Program Files\Git\`
+   and the tool then fails with a confusing "cannot open input file"
+   instead of an argument error. CMake/Ninja invoke these tools directly
+   (not through a shell that would need this), so ordinary builds are
+   unaffected; this only bites when invoking `cl`/`dumpbin`/etc. by hand
+   from Git Bash for diagnosis, exactly as `cygpath`/`MSYS_NO_PATHCONV`
+   are already called out in §6's `env.sh` notes for other tools.

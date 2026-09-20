@@ -1,0 +1,120 @@
+cmake_minimum_required(VERSION 3.24)
+
+project(ReldexUi
+    DESCRIPTION "Reldex Qt Quick UI (thin adapter over the reldex-ffi C ABI)"
+    LANGUAGES CXX C
+)
+
+# ---------------------------------------------------------------------------
+# Basics
+# ---------------------------------------------------------------------------
+# AGENTS.md "Keep the C++/Qt adapter thin" -- C++17 is enough for a thin
+# adapter; nothing here needs newer-standard features.
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Qt's moc/rcc/uic integration.
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
+set(CMAKE_AUTOUIC OFF) # no .ui files in this project
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    # RelWithDebInfo, not Debug: this is a Rust+C++ mixed build and an
+    # unoptimized Rust `dev` build of reldex-ffi is noticeably slower for
+    # anything beyond a trivial mock scenario (M1.6+ will fetch real batches).
+    # RelWithDebInfo keeps optimizations plus symbols for both languages,
+    # which matters most for the day-to-day inner loop this skeleton is for.
+    # `ui/build.sh --release` switches to a pure Release build; Corrosion maps
+    # CMAKE_BUILD_TYPE to a matching cargo profile automatically (Debug ->
+    # `dev`, everything else -> `release`).
+    set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING "Build type" FORCE)
+endif()
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(CompilerWarnings)
+
+# ---------------------------------------------------------------------------
+# Qt 6.8 -- LGPL modules only. No Qt Creator, no GPL-only module.
+# ---------------------------------------------------------------------------
+find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Qml Quick Test)
+
+qt_standard_project_setup(REQUIRES 6.8)
+
+# Every QML module's OUTPUT_DIRECTORY is placed under a common base and made
+# to end in its own target path (e.g. .../qml/Reldex/Adapter). Two things
+# depend on this, confirmed by hand while bringing the pieces together:
+#   1. Without it, a *library*-backed module (reldex_adapter) defaults its
+#      OUTPUT_DIRECTORY to CMAKE_CURRENT_BINARY_DIR with no target-path
+#      suffix, which is merely a qmllint warning on its own -- but it is also
+#      what a *consuming* target's qmlimportscanner-based static-plugin
+#      linking uses to resolve `import Reldex.Adapter`. Without a matching
+#      base import path, the consumer builds and links clean but fails at
+#      *runtime* with `module "Reldex.Adapter" plugin "reldex_adapterplugin"
+#      not found` -- the static plugin was simply never linked in.
+#   2. Setting QT_QML_OUTPUT_DIRECTORY is what makes `_qt_internal_collect_
+#      qml_import_paths()` add this base to every consuming target's import
+#      path automatically, which is what actually resolves point 1.
+# ui/app and ui/tests both separately attach the same Main.qml under the
+# same "Reldex.App" URI (see ui/tests/CMakeLists.txt for why), so ui/tests
+# overrides OUTPUT_DIRECTORY explicitly to keep the two from colliding on
+# this shared base.
+set(QT_QML_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/qml")
+
+# ---------------------------------------------------------------------------
+# Corrosion -- CMake drives cargo (ADR-0003 D8), fetched at a pinned tag.
+# See ui/README.md "Dependencies" for why Corrosion is required and why this
+# pin was chosen.
+# ---------------------------------------------------------------------------
+include(FetchContent)
+
+set(CORROSION_GIT_TAG "v0.6.1") # pinned; see ui/README.md
+set(CORROSION_GIT_COMMIT "1499b14e4906a2890f5cee1547c8848db261753d") # tag's commit, for FetchContent's own record
+
+FetchContent_Declare(
+    Corrosion
+    GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
+    GIT_TAG ${CORROSION_GIT_COMMIT}
+)
+FetchContent_MakeAvailable(Corrosion)
+
+# The reldex-ffi crate lives in the Cargo workspace one directory up.
+set(RELDEX_WORKSPACE_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/../Cargo.toml")
+set(RELDEX_FFI_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../crates/ffi/include")
+
+corrosion_import_crate(
+    MANIFEST_PATH ${RELDEX_WORKSPACE_MANIFEST}
+    CRATES reldex-ffi
+)
+
+# `reldex-ffi`'s [lib] name is `reldex_ffi` (crates/ffi/Cargo.toml), so
+# Corrosion names the imported targets `reldex_ffi-static` / `reldex_ffi-shared`.
+# ADR-0003 D8/D9: link the cdylib on desktop (dynamic); the staticlib is for
+# the iOS target later, where the app links it directly with no packaging
+# step of its own. Nothing in this skeleton uses `reldex_ffi-static` yet.
+if(NOT TARGET reldex_ffi-shared)
+    message(FATAL_ERROR
+        "Corrosion did not create the `reldex_ffi-shared` target. Check that "
+        "crates/ffi/Cargo.toml still declares `crate-type = [\"cdylib\", ...]` "
+        "and that CRATES above matches its package name.")
+endif()
+
+# ---------------------------------------------------------------------------
+# Helper: copy the reldex_ffi shared library next to a target's binary so it
+# runs without installing anything system-wide (Windows has no rpath).
+# ---------------------------------------------------------------------------
+function(reldex_deploy_ffi_dll target)
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:reldex_ffi-shared>"
+                "$<TARGET_FILE_DIR:${target}>"
+        COMMENT "Deploying reldex_ffi shared library next to ${target}"
+        VERBATIM
+    )
+endfunction()
+
+enable_testing()
+
+add_subdirectory(adapter)
+add_subdirectory(app)
+add_subdirectory(tests)
