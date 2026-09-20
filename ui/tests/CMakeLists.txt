@@ -1,5 +1,11 @@
 qt_add_executable(tst_coreinfo
     tst_coreinfo.cpp
+    AdapterTestSupport.h
+)
+# See reldex_add_adapter_test() below for why the console subsystem is forced.
+set_target_properties(tst_coreinfo PROPERTIES
+    WIN32_EXECUTABLE FALSE
+    MACOSX_BUNDLE FALSE
 )
 
 # Re-attaches the *same* ../app/Main.qml file (not a copy) under the same
@@ -60,3 +66,47 @@ set_tests_properties(tst_coreinfo PROPERTIES
 # already imported/set; see ui/tests/ffi_smoke/CMakeLists.txt for the guard
 # that keeps this from double-importing Corrosion when built standalone.
 add_subdirectory(ffi_smoke)
+
+# ---------------------------------------------------------------------------
+# M1.6 adapter tests (Bridge / SessionController / ResultTableModel).
+#
+# These are console-subsystem QTest binaries with no QML and no window
+# (QTEST_GUILESS_MAIN), so they need no platform plugin and run identically
+# on a CI runner and on a desktop. The QML half of M1.6 -- Main.qml's
+# TableView over ResultTableModel -- is covered by tst_coreinfo above, which
+# loads that exact file offscreen and fails on any QML warning.
+# ---------------------------------------------------------------------------
+function(reldex_add_adapter_test name)
+    qt_add_executable(${name} ${name}.cpp AdapterTestSupport.h)
+    # qt_add_executable() sets WIN32_EXECUTABLE TRUE by default, which makes a
+    # Windows binary GUI-subsystem -- and a GUI-subsystem process has no
+    # console, so QTest's report and every qInfo() (including K5's iteration
+    # count and timing) vanish instead of reaching CTest's log. These are test
+    # binaries: force the console subsystem so their output is readable.
+    #
+    # MACOSX_BUNDLE FALSE is the same fix on the other platform: qt_add_executable()
+    # also defaults it to TRUE, and a .app bundle puts the binary somewhere
+    # `add_test(COMMAND ${name})` does not look.
+    set_target_properties(${name} PROPERTIES
+        WIN32_EXECUTABLE FALSE
+        MACOSX_BUNDLE FALSE
+    )
+    target_link_libraries(${name}
+        PRIVATE
+            Qt6::Core
+            Qt6::Test
+            reldex_adapter
+    )
+    reldex_enable_warnings(${name})
+    reldex_deploy_ffi_dll(${name})
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+reldex_add_adapter_test(tst_bridge)
+reldex_add_adapter_test(tst_resultmodel)
+reldex_add_adapter_test(tst_teardown)
+
+# K5 is 10,000 teardown iterations plus 2,000 connect-teardown iterations; the
+# default CTest timeout of 1500 s is generous but this is the one test that
+# could plausibly approach it on a slow machine, so it says what it needs.
+set_tests_properties(tst_teardown PROPERTIES TIMEOUT 1800)
