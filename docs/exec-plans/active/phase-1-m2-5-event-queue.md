@@ -60,6 +60,14 @@ as it stood before the refactor; "after" is the event path, from
 | 1 session | 2,043 / 2,080 / 2,215 | 432 / 507 / 537 |
 | 8 sessions, concurrent | 328 / 386 / 410 | 351 / 382 / 391 |
 
+> **This table predates the reply-slot accounting** (review round 1, §5): it was taken when a reply
+> was released on production and the queue carried no slot. Post-change figures, information only
+> and not comparable across machines or load: mine, on a machine running an unrelated build,
+> 606 / 629 / 643 ns at one producer and 431 / 442 / 456 ns at eight; the reviewer's four runs, on
+> a quiet machine, 412–563 ns at one producer and 408–436 ns at eight. The eight-producer figure is
+> ~10% above this table's, which is what the slot costs: one `Arc` clone on the push, one `Arc`
+> drop and one `fetch_update` on the pop. Allocations per event are unchanged at 0.033.
+
 The single-session figure is the one that matters and it is ~4× better, because the submitter no
 longer parks on a reply channel: the cost that disappears is a thread round trip per request. The
 eight-session figures are the same within noise, because there the mock's own work and the single
@@ -220,6 +228,16 @@ must-fixes and a list of should-fixes; all are applied.
    Tests: `event_backpressure.rs::a_consumer_that_never_drains_stops_the_submitter_rather_than_the_queue_growing`,
    `…::dropping_the_queue_releases_every_slot_it_was_holding`,
    `…::a_session_that_ends_with_undrained_replies_frees_its_slots_when_they_are_drained`.
+   **Delta review follow-up:** `submit_close` reserves against `limit + 1`, because it was being
+   refused at the cap like any other request — backwards for the one request that shrinks a
+   session's footprint. Nothing deadlocked (`close()` and `Drop` use a `Completion` and reserve
+   nothing), but an event-driven adapter could not have ended a full session. The exemption is
+   exactly one: a second close while the first is undrained is refused. The published bound is
+   therefore `2R + U + 3` — `R + 1` replies, `R` `Executing`s, `U + 1` unsolicited, one `Terminal`
+   — updated in `events.rs`, `session.rs`, §B2 and ADR-0002 E2/E5. Test:
+   `…::a_close_is_accepted_at_the_cap_and_the_exemption_is_exactly_one`. `RequestSlots::release`
+   also gained a `debug_assert!` that a slot was actually held (release builds still saturate:
+   panicking there would take out a worker thread over bookkeeping).
 3. **A flaky waker test.** The consumer returns from `wait_timeout` on the condvar notify issued
    inside the push, while the producer calls the waker only after releasing the emit lock — which
    is the contract — so asserting the count the instant the drain returned was a race (reproduced
@@ -277,6 +295,12 @@ Decided here, while the reasons are in front of us, so neither task re-litigates
   and `bind_events` is already independent of the worker, so the change is a parameter swap. It was
   **not** done in M2.5: `spawn` still blocks on its ready channel, and splitting that is M2.6's
   actual work, so moving the signature now would be a change with no test to hold it.
+* **HARD requirement: `abandon` must never be refused for lack of a slot.** It is the registry's
+  teardown path and the only way to stop a session that is still connecting, so it follows
+  `submit_close`'s exemption — reserve above the limit, or do not reserve at all and account for the
+  one `OpenFailed` it produces. Whichever M2.6 picks, say so where the bound is published
+  (`events.rs` module docs, `session.rs`, §B2, ADR-0002 E2/E5) and keep the arithmetic exact; the
+  bound is currently `2R + U + 3` per session and a reviewer checks it against an adversarial probe.
 * Give the connect reply the `ReplyTo` treatment. `abandon` then yields exactly one
   `OpenFailed { Cancelled }` from the same `Drop` mechanism as every other request, instead of a
   second bespoke path — and reserve the open request through `reserve_request` so it is bounded

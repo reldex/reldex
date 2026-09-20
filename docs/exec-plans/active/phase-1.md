@@ -129,13 +129,15 @@ pub enum SessionEvent {
 
 **Back-pressure.** Reply events are bounded by outstanding requests, which is bounded by a new `SessionLimits::max_outstanding_requests` (default 1,024). Exceeding it is the **one synchronous failure** in the submit API — `Err(DbError)` with `ErrorKind::Resource`, no event — because producing an event for it would be circular. Unsolicited events (`ServerOutput`, `TransactionStateChanged`) use a bounded per-session ring with coalescing; drops are *counted and reported* on the next event (`dropped`) so the UI can say "output truncated" rather than silently lying. This mirrors K9: the command queue stays unbounded, the resources do not.
 
-**Back-pressure, as implemented (M2.5, after review).** Three things above needed pinning down, because the first implementation was bounded only on paper:
+**Back-pressure, as implemented (M2.5, after review).** Four things above needed pinning down, because the first implementation was bounded only on paper:
 
 * A request's slot is released when the **consumer drains its reply**, not when the worker produces it. Releasing on production bounds nothing — the worker answers a `ping` in microseconds, so a submitter retrying on `Resource` grew an undrained queue to 5,000 events with the counter reading zero. `DatabaseSession::outstanding_requests()` therefore means "accepted and not yet drained".
 * Dropping the `EventQueue` ends the stream: everything in it is discarded, every slot it held is released, and later events are discarded on arrival. Sessions keep working (one may have a close to run) and are then bounded by what their worker has not yet reached.
 * `TransactionStateChanged` is not subject to the cap at all: it coalesces in place when one is queued and is **admitted over the cap** when none is, so the class costs at most one event per session and a state change can never be lost behind a `ServerOutput` burst. `ServerOutput` is the only class that is dropped; its line count rides out on the next delivered `ServerOutput`, or is read with `EventQueue::pending_dropped_lines(session)` when there is no next one.
 
-Per session the queue therefore holds at most `2 × max_outstanding_requests + max_unsolicited_per_session + 2` events, whatever a producer does.
+* `submit_close` reserves against **one more** than the limit. It was being refused at the cap like anything else, which is backwards: it is the one request that shrinks a session's footprint. Nothing deadlocked (`close()` and `Drop` go through a `Completion` and reserve nothing), but an event-driven adapter would have been unable to ask a full session to end. The exemption is exactly one — a second close while the first is undrained is refused — so the class costs one event per session.
+
+Per session the queue therefore holds at most `2 × max_outstanding_requests + max_unsolicited_per_session + 3` events (`R + 1` replies, `R` `Executing`s, `U + 1` unsolicited, one `Terminal`), whatever a producer does.
 
 ### B3 — Non-blocking open and the session registry
 

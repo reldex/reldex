@@ -446,7 +446,9 @@ impl SessionLimits {
     /// [`crate::EventQueue`]: a request takes a slot when it is accepted and
     /// gives it back when the consumer takes its reply *out of* the queue, so
     /// a consumer that stops draining stops the submitter rather than letting
-    /// the queue grow. 1,024 is far more than a worksheet ever has in flight
+    /// the queue grow. [`DatabaseSession::submit_close`] is the one exemption
+    /// and gets one slot above the limit, because a session at its limit must
+    /// still be able to end. 1,024 is far more than a worksheet ever has in flight
     /// (a handful of fetches, at most) and small enough that a runaway
     /// submitter is reported rather than allowed to grow the queue without
     /// limit.
@@ -944,17 +946,31 @@ impl DatabaseSession {
     /// the worker thread; the worker finishes on its own once it has answered
     /// everything that was queued behind the close.
     ///
+    /// A close reserves against **one more** than
+    /// [`SessionLimits::max_outstanding_requests`], so a session at its limit
+    /// can still be told to end: refusing the one request that shrinks a
+    /// session's footprint because the session has too much outstanding is the
+    /// wrong way round. The exemption is exactly one — a *second* close while
+    /// the first is still undrained is refused like anything else — so the
+    /// published bound grows by one event per session and no further.
+    ///
     /// # Errors
     ///
-    /// As [`DatabaseSession::submit_execute`].
+    /// As [`DatabaseSession::submit_execute`], with the `Resource` limit one
+    /// higher. Teardown never depends on this: [`DatabaseSession::close`] and
+    /// `Drop` answer through a [`Completion`] and reserve nothing.
     pub fn submit_close(
         &self,
         request: RequestId,
         disposition: Option<CloseDisposition>,
     ) -> DbResult<()> {
         self.check_event_route()?;
-        self.shared
-            .reserve_request(self.limits.max_outstanding_requests().get())?;
+        self.shared.reserve_request(
+            self.limits
+                .max_outstanding_requests()
+                .get()
+                .saturating_add(1),
+        )?;
         let reply = CloseReplyTo::event(Arc::clone(&self.shared), self.id, request);
         if self.shared.has_ended() {
             // Idempotent, exactly like `DatabaseSession::close`: a session

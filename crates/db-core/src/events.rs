@@ -59,6 +59,12 @@
 //!    failure instead. "Accepted" means the submit returned `Ok`; the one
 //!    synchronous failure — [`crate::SessionLimits::max_outstanding_requests`]
 //!    — accepts nothing and produces no event.
+//!
+//!    The reply is produced either way; whether anyone *sees* it is a separate
+//!    question. Once the [`EventQueue`] has been dropped there is no consumer,
+//!    and events are discarded as they arrive (see [`EventQueue`]) — so rule 2
+//!    is a promise about production, and a consumer that wants a request's
+//!    answer keeps its queue alive until it has drained it.
 //! 3. **[`SessionEvent::Terminal`] is delivered exactly once per session**,
 //!    after the reply of every request that was queued when the transition was
 //!    observed. A request submitted after that still gets its one failure
@@ -75,13 +81,16 @@
 //! than hoped for. Per session, at any instant:
 //!
 //! * **Reply events** are bounded by
-//!   [`crate::SessionLimits::max_outstanding_requests`]. A request reserves a
-//!   slot when it is accepted and releases it when the **consumer takes its
-//!   reply out of the queue** — not when the worker produces it — so a consumer
-//!   that stops draining stops the submitter too. Going over the limit is the
-//!   one synchronous failure the submit API has
+//!   [`crate::SessionLimits::max_outstanding_requests`] **+ 1**. A request
+//!   reserves a slot when it is accepted and releases it when the **consumer
+//!   takes its reply out of the queue** — not when the worker produces it — so
+//!   a consumer that stops draining stops the submitter too. Going over the
+//!   limit is the one synchronous failure the submit API has
 //!   ([`reldex_db_driver_api::ErrorKind::Resource`]); reporting it as an event
-//!   would be circular.
+//!   would be circular. The `+ 1` is
+//!   [`crate::DatabaseSession::submit_close`]: a session at its limit must
+//!   still be able to end, so a close reserves against one more than the
+//!   limit — once, not repeatedly.
 //! * **[`SessionEvent::Executing`]** is bounded by the same number: the worker
 //!   emits at most one per outstanding execute, and it is never dropped.
 //! * **Unsolicited events** ([`SessionEvent::ServerOutput`],
@@ -93,7 +102,8 @@
 //!   dropped.
 //!
 //! So one session can hold at most `2 × max_outstanding_requests +
-//! max_unsolicited_per_session + 2` events in the queue, and no producer can
+//! max_unsolicited_per_session + 3` events in the queue — `R + 1` replies, `R`
+//! `Executing`s, `U + 1` unsolicited and one `Terminal` — and no producer can
 //! exceed that however fast it runs.
 //!
 //! Dropping the [`EventQueue`] ends the stream: see [`EventQueue`] for what
@@ -555,14 +565,24 @@ impl RequestSlots {
         }
     }
 
-    /// Gives one slot back. Saturating: releasing more than was reserved is a
-    /// core bug, and leaving the count at zero is the harmless way to be wrong.
+    /// Gives one slot back.
+    ///
+    /// Releasing more than was reserved is a core bug — the slot rides on its
+    /// own event, so it can only happen if some path answers a request twice.
+    /// In a debug build this says so; in release it saturates at zero, because
+    /// a wrong count that never underflows is the harmless way to be wrong and
+    /// panicking here would take out a worker thread over bookkeeping.
     pub(crate) fn release(&self) {
-        let _ = self
-            .outstanding
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |taken| {
-                if taken == 0 { None } else { Some(taken - 1) }
-            });
+        let released =
+            self.outstanding
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |taken| {
+                    if taken == 0 { None } else { Some(taken - 1) }
+                });
+        debug_assert!(
+            released.is_ok(),
+            "reldex-db-core: a reply slot was released that was never reserved; a request has \
+             been answered twice (ordering rule 2)"
+        );
     }
 
     /// How many slots are taken right now.
@@ -997,8 +1017,11 @@ impl EventQueue {
     /// [`Waker`] instead and never blocks at all.
     ///
     /// A `timeout` the monotonic clock cannot represent — [`Duration::MAX`] —
-    /// means "no deadline": this then blocks until an event arrives, rather
-    /// than giving up immediately on an arithmetic overflow.
+    /// means "no deadline". **This then blocks indefinitely**, until an event
+    /// arrives, rather than giving up immediately on an arithmetic overflow as
+    /// it used to. Nothing else wakes it: dropping every [`EventSink`] does not
+    /// close the queue, so a caller that may outlive its producers should pass
+    /// a real timeout.
     #[must_use]
     pub fn wait_timeout(&self, timeout: Duration) -> Option<SessionEvent> {
         let deadline = std::time::Instant::now().checked_add(timeout);

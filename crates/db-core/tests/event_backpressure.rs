@@ -199,6 +199,61 @@ fn a_consumer_that_never_drains_stops_the_submitter_rather_than_the_queue_growin
     let _ = session.close(Some(CloseDisposition::Rollback));
 }
 
+/// A close is never refused for lack of a slot.
+///
+/// It reserves against one *more* than the limit, because refusing the one
+/// request that shrinks a session's footprint — when the complaint is that the
+/// session has too much outstanding — is backwards. The exemption is exactly
+/// one: a second close while the first is still undrained is refused like
+/// anything else, so the published bound grows by one event per session and no
+/// further.
+#[test]
+fn a_close_is_accepted_at_the_cap_and_the_exemption_is_exactly_one() {
+    const LIMIT: usize = 4;
+
+    let scenario = support::scenario();
+    let (session, queue) = support::open_events_with(&scenario, limits(LIMIT), EventCaps::new());
+
+    for request in 1..=LIMIT as u64 {
+        session.submit_ping(RequestId(request)).expect("accepted");
+    }
+    support::wait_for("the session reaches its limit", || {
+        session.outstanding_requests() == LIMIT
+    });
+    assert_eq!(
+        session
+            .submit_ping(RequestId(50))
+            .expect_err("an ordinary request is refused at the limit")
+            .kind(),
+        ErrorKind::Resource
+    );
+
+    session
+        .submit_close(RequestId(100), Some(CloseDisposition::Rollback))
+        .expect("a close is never refused for lack of a slot");
+    assert_eq!(
+        session
+            .submit_close(RequestId(101), Some(CloseDisposition::Rollback))
+            .expect_err("but the exemption is one, not unlimited")
+            .kind(),
+        ErrorKind::Resource
+    );
+
+    let seen = support::drain_to_terminal(&queue);
+    assert_eq!(
+        support::reply_requests(&seen),
+        vec![1, 2, 3, 4, 100],
+        "every accepted request answered once; the refused ones produced nothing"
+    );
+    assert!(
+        seen.len() <= 2 * LIMIT + EventCaps::new().max_unsolicited_per_session().get() + 3,
+        "the published bound holds with the close exemption in it: {} events",
+        seen.len()
+    );
+    assert_eq!(session.outstanding_requests(), 0);
+    assert_eq!(queue.len(), 0);
+}
+
 /// Dropping the queue ends the stream, so nothing is waiting to be drained and
 /// every slot it held comes back. A session whose consumer walked away is not
 /// left permanently unable to submit — it may still have a close to run.

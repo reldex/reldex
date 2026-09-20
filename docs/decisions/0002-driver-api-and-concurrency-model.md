@@ -1060,6 +1060,16 @@ slot it held is released, and later events are discarded on arrival rather than 
 nobody can read them. A session that outlives its consumer keeps working (it may still have a close
 to run) and is bounded, from then on, by what its worker has genuinely not reached yet.
 
+`submit_close` is the **one exemption**: it reserves against `max_outstanding_requests + 1`. Refusing
+the single request that *shrinks* a session's footprint, on the grounds that the session has too much
+outstanding, is backwards — and while nothing deadlocks without the exemption (`DatabaseSession::close`
+and `Drop` answer through a `Completion` and reserve nothing), an event-driven adapter would have been
+told it cannot ask a session to end. The exemption is exactly one: a second close while the first is
+still undrained is refused like any other request, so the class grows the bound by one event per
+session and no further. Per session, the queue therefore holds at most
+`2 × max_outstanding_requests + max_unsolicited_per_session + 3` events — `R + 1` replies, `R`
+`Executing`s, `U + 1` unsolicited and one `Terminal`.
+
 Closing is idempotent, and stays idempotent when closes race. Only one of several concurrent closes
 finds a worker to run; the rest reach a session that has already ended and are answered by `Drop`.
 They asked the same question and the true answer is the same — the session is closed — so they
@@ -1107,8 +1117,10 @@ row and cannot tell why.
 
 ### E5 — the drop policy, and what may never be dropped
 
-A reply event, `Executing` and `Terminal` are never dropped and never coalesced. Only the
-unsolicited classes are capped, per session, at `EventCaps::max_unsolicited_per_session` (256):
+A reply event, `Executing` and `Terminal` are never dropped and never coalesced — they are bounded
+instead, by E2's slot accounting (`R + 1` replies, counting the close exemption, and `R` `Executing`s
+per session). Only the unsolicited classes are capped, per session, at
+`EventCaps::max_unsolicited_per_session` (256):
 
 * `TransactionStateChanged` reports a *state*, so an undelivered one for that session is updated in
   place to the newer value, and when the session has none queued the new one is admitted **even at
@@ -1143,6 +1155,14 @@ the `unsafe_code` opt-out to the FFI boundary) measures **0.033 allocations per 
 all of it the command channel's own block amortisation: carrying an event through the queue
 allocates nothing beyond the event. The full numbers, and the 1M-row FFI figures either side of the
 refactor, are in `docs/exec-plans/active/phase-1.md` beside M2.5.
+
+Those per-event figures **predate the reply-slot accounting** added in review round 1 (see E2). With
+the slot on the queued event, independent runs on a quiet machine measure 412–563 ns at one producer
+and 408–436 ns at eight — the eight-producer case ~10% above the number above, which is what the
+slot costs: one `Arc` clone on the push, one `Arc` drop and one `fetch_update` on the pop. Runs on a
+loaded machine came out proportionally higher across *every* benchmark, including ones M2.5 never
+touched, so treat all of these as shape rather than as figures to compare across machines.
+Allocations per event are unchanged at 0.033. Still information only, still not a claim.
 
 ## Notes for driver implementers
 
