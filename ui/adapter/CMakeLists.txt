@@ -43,4 +43,3 @@ target_link_libraries(reldex_adapter
 )
 
 reldex_enable_warnings(reldex_adapter)
-reldex_enable_sanitizers(reldex_adapter)
