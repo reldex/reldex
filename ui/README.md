@@ -44,9 +44,12 @@ On Windows, `ui/build.sh` sources `tools/dev-env/env.sh` itself (detected via
 `uname -s` matching `MINGW*`/`MSYS*`/`CYGWIN*`) — you do not need to source
 it yourself first. On Linux/macOS the script assumes `cmake`/`ninja` are
 already on `PATH` and Qt 6.8 is discoverable via `CMAKE_PREFIX_PATH` or
-`Qt6_DIR`; **that path has not been exercised** by whoever last verified
-this file — only Windows was available. If something is wrong with it,
-that is the first thing to check.
+`Qt6_DIR`. This path is now exercised on every PR by `.github/workflows/ui.yml`
+(`qt-build`, M1.4), which installs Qt via `jurplel/install-qt-action` and runs
+this exact script on `ubuntu-latest` and `macos-latest` with
+`QT_QPA_PLATFORM=offscreen` — so it is no longer untested, though nobody has
+run it on a Linux/macOS **developer workstation** (as opposed to a fresh CI
+runner) yet.
 
 ## Layout
 
@@ -212,11 +215,14 @@ module (`Qt6Charts`, `Qt6WebEngineCore`, etc.) is present.
 
 ## Known limitations
 
-- **Linux/macOS are untested.** The CMake is written to work there (Qt
-  discovered via `CMAKE_PREFIX_PATH`/`Qt6_DIR`, Corrosion is
-  platform-agnostic, `ui/build.sh` has a non-Windows branch), but nobody
-  has run it — only a Windows 11 + MSVC 2022 + Qt 6.8.3 machine was
-  available. CI for all three OSes is M6.7, not this task.
+- **Linux/macOS are CI-tested, not developer-workstation-tested.** M1.4
+  added `.github/workflows/ui.yml`, which builds and runs this whole tree
+  (`ffi-smoke` standalone, `qt-build` full Qt Quick build + `ctest`,
+  offscreen) on `windows-latest`/`ubuntu-latest`/`macos-latest` on every PR.
+  That proves the non-Windows CMake path (Qt via `CMAKE_PREFIX_PATH`,
+  Corrosion, `ui/build.sh`'s non-Windows branch) works on a fresh CI runner;
+  nobody has yet run it by hand on a real Linux/macOS development machine
+  (only Windows 11 + MSVC 2022 + Qt 6.8.3 was available for that).
 - **No `windeployqt` / packaging step.** Qt DLLs are found via `PATH` in
   this dev environment; a real installer/package needs `windeployqt` (or
   the CMake `qt_generate_deploy_app_script()` equivalent), which is out of

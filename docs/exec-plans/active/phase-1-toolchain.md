@@ -461,14 +461,33 @@ project's third-party-action policy.
 
 ### Cold/warm job times
 
-_Filled in from the first real runs on the `phase-1/m1-4-ffi-smoke` PR;
-updated once warm-cache numbers are available from a second run._
+Measured on PR #16 (`phase-1/m1-4-ffi-smoke`): "cold" is the first-ever run
+of this workflow (run `35492858488`, no `Swatinem/rust-cache` or
+`jurplel/install-qt-action` cache yet existed); "warm" is the third run
+(run `35494036735`, the first fully green one, benefiting from both caches
+populated by the first two runs). Total job wall time, `Set up job` through
+`Complete job`.
 
 | Job | OS | Cold | Warm | Budget |
 | --- | --- | --- | --- | --- |
-| `ffi-smoke` | windows-latest | TBD | TBD | (no formal budget; K7 is `qt-build` only) |
-| `ffi-smoke` | ubuntu-latest (+ASan/UBSan) | TBD | TBD | — |
-| `ffi-smoke` | macos-latest | TBD | TBD | — |
-| `qt-build` | windows-latest | TBD | TBD | 25 min (K7) |
-| `qt-build` | ubuntu-latest | TBD | TBD | 25 min (K7) |
-| `qt-build` | macos-latest | TBD | TBD | 25 min (K7) |
+| `ffi-smoke` | windows-latest | n/a¹ | 1m27s | (no formal budget; K7 is `qt-build` only) |
+| `ffi-smoke` | ubuntu-latest (+ASan/UBSan) | 38s | 33s | — |
+| `ffi-smoke` | macos-latest | 28s | 24s | — |
+| `qt-build` | windows-latest | 3m2s | 2m35s | 25 min (K7) |
+| `qt-build` | ubuntu-latest | 2m10s | 1m26s | 25 min (K7) |
+| `qt-build` | macos-latest | n/a² | 54s | 25 min (K7) |
+
+¹ The cold run used an earlier `ffi-smoke` design (a `Visual Studio 17 2022`
+CMake generator, to avoid touching vcvars) that failed outright on
+`windows-latest` (`could not find any instance of Visual Studio`) before
+this job existed in its current form (`run.sh` + `env.sh` + Ninja, same as
+`qt-build`) — no cold timing exists for the current implementation.
+² The cold run's `qt-build`/macos-latest failed at `bash ui/build.sh --test`
+(the dylib-copy race `ui/cmake/CopyIfDifferentRetry.cmake` now absorbs, see
+§12), before the QTBUG-137687 workaround above even existed. Its `Install
+Qt 6.8` step alone (genuinely cold, no cache) took 76s, vs. 19s once warm —
+the only cold data point available for that step on this OS.
+
+Every `qt-build` leg finishes in under 3m5s against K7's 25-minute budget —
+no OS is close to the limit; Qt install (cold) plus `ui/build.sh --test`
+account for nearly all of it.
