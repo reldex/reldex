@@ -53,6 +53,11 @@ trap 'rm -f "${tmp}"' EXIT
 cbindgen --config "${config}" --crate reldex-ffi --output "${tmp}" --quiet
 
 if [ "${check_only}" = "yes" ]; then
+  # A plain byte diff, which relies on the committed header having LF endings
+  # in the working tree as well as in the index. The repository's
+  # `.gitattributes` sets `* text=auto eol=lf`, so a checkout on Windows keeps
+  # LF and this does not become a line-ending failure. If that line is ever
+  # dropped or narrowed, this comparison is what breaks first.
   if ! diff -u "${output}" "${tmp}"; then
     echo >&2
     echo "error: ${output} is stale. Run crates/ffi/gen-header.sh and commit the result." >&2

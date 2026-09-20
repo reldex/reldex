@@ -62,6 +62,13 @@ pub enum ReldexMockStatement {
     /// disposition must come back as `DECISION_REQUIRED` rather than
     /// committing anything (`SPEC.md` §10).
     Dml = 5,
+    /// Panics inside the session's own **pump thread**, which no
+    /// `catch_unwind` on an `extern "C"` body can reach. The pump contains it,
+    /// marks the session lost, and answers this request *and everything queued
+    /// behind it* with one failure event each.
+    ///
+    /// Mock-only, and compiled in only with the `mock-driver` feature.
+    PumpPanic = 6,
 }
 
 /// How a mock session's scripted world is parameterised.
@@ -132,6 +139,8 @@ pub extern "C" fn reldex_mock_statement(kind: i32) -> ReldexStr {
             statements::PANICKING
         } else if kind == ReldexMockStatement::Dml as i32 {
             statements::DML
+        } else if kind == ReldexMockStatement::PumpPanic as i32 {
+            statements::PUMP_PANIC
         } else {
             return ReldexStr::empty();
         };
@@ -148,12 +157,18 @@ pub(crate) mod statements {
     pub(crate) const FAILING: &str = "SELECT * FROM reldex_missing\0";
     pub(crate) const PANICKING: &str = "SELECT reldex_panic FROM dual\0";
     pub(crate) const DML: &str = "UPDATE reldex_rows SET n = n + 1\0";
+    /// Reserved: makes the session's **pump thread** panic, which is the only
+    /// way to test that the pump's containment answers the requests behind it
+    /// (ADR-0003 D2). It never reaches a driver, and it is compiled only with
+    /// the `mock-driver` feature, so no production build can be made to panic
+    /// by statement text.
+    pub(crate) const PUMP_PANIC: &str = "BEGIN reldex_pump_panic; END;\0";
 
     /// The text without its trailing NUL, for Rust callers.
     ///
-    /// Only the scenario builder needs this, and that is feature-gated; the
-    /// exported `reldex_mock_statement` reports the same text as a length and
-    /// a pointer instead.
+    /// Only the scenario builder and the pump-panic check need this, and both
+    /// are feature-gated; the exported `reldex_mock_statement` reports the
+    /// same text as a length and a pointer instead.
     #[cfg(feature = "mock-driver")]
     pub(crate) fn text(statement: &'static str) -> &'static str {
         statement.trim_end_matches('\0')

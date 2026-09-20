@@ -158,13 +158,31 @@ impl ReldexFormatOptions {
     }
 }
 
+/// Reusable working space, so rendering a cell allocates **nothing**.
+///
+/// Two buffers that live with the arena rather than with a call: one for a
+/// value's canonical `Display` form (`Number` and `Timestamp` know how to
+/// render themselves, and re-implementing 40-digit decimal here to save a
+/// `write!` would be the wrong trade), and one for digit work during
+/// rounding. Both keep their capacity between cells and between calls, so
+/// after the first window the steady state is zero allocations.
+#[derive(Default)]
+struct Scratch {
+    canonical: String,
+    digits: Vec<u8>,
+}
+
 /// Somewhere for formatted text to land: one buffer plus offsets, reusable.
 ///
 /// Opaque. Create one per grid (not per call), [`reldex_text_arena_clear`] it
 /// before each window, and release it with [`reldex_text_arena_release`].
+///
+/// Single-threaded: [`reldex_batch_format_column`] takes it by `&mut`, so two
+/// threads formatting at once need two arenas.
 pub struct ReldexTextArena {
     buffer: String,
     offsets: Vec<usize>,
+    scratch: Scratch,
 }
 
 impl ReldexTextArena {
@@ -172,6 +190,7 @@ impl ReldexTextArena {
         Self {
             buffer: String::new(),
             offsets: vec![0],
+            scratch: Scratch::default(),
         }
     }
 
@@ -193,7 +212,16 @@ impl ReldexTextArena {
 
     fn view(&self) -> ReldexArenaView {
         ReldexArenaView {
-            data: self.buffer.as_ptr(),
+            // Never null, even when empty: an empty `String`'s pointer is a
+            // dangling alignment value (`0x1` on most targets), which is not
+            // something a C caller should ever be handed or asked to
+            // special-case. An empty arena points at a readable NUL instead,
+            // so `data[0]` is always safe to read and `data_len` is 0.
+            data: if self.buffer.is_empty() {
+                crate::strings::EMPTY_NUL.as_ptr()
+            } else {
+                self.buffer.as_ptr()
+            },
             data_len: self.buffer.len(),
             offsets: self.offsets.as_ptr(),
             count: self.count(),
@@ -213,7 +241,8 @@ pub struct ReldexArenaView {
     /// `sizeof(ReldexArenaView)` on the way in; how much is valid on the way
     /// out.
     pub struct_size: u32,
-    /// The one contiguous UTF-8 buffer.
+    /// The one contiguous UTF-8 buffer. Never null, even when `data_len` is
+    /// zero (it then points at a readable NUL byte).
     pub data: *const u8,
     /// How many bytes `data` covers.
     pub data_len: usize,
@@ -384,62 +413,119 @@ pub unsafe extern "C" fn reldex_batch_format_column(
         // SAFETY: the strings in `options` are promised readable for this call,
         // and `resolved` does not outlive it.
         let resolved = unsafe { options.resolve() };
-        // SAFETY: the caller promises `batch` and `arena` are live and, per D5
-        // rule 3, that no other thread is using them.
+        // SAFETY: the caller promises `batch` and `arena` are live and that no
+        // other thread is using them; the arena is taken by `&mut`.
         let (batch, arena) = unsafe { (&*batch, &mut *arena) };
-        if column >= batch.rows().column_count() {
-            return ReldexStatus::NotFound;
+        let columns = batch.rows().column_count();
+        if column >= columns {
+            return set_last_column_error(column, columns);
         }
         let kind = batch
             .rows()
             .column(column)
             .map(reldex_db_driver_api::Column::kind);
         let rows = batch.rows().row_count();
+        // Destructured so the value can be rendered straight into the output
+        // buffer while the scratch buffers stay borrowed alongside it. Every
+        // cell below appends to `buffer` and pushes one offset; nothing
+        // allocates once these three have grown.
+        let ReldexTextArena {
+            buffer,
+            offsets,
+            scratch,
+        } = arena;
         for row in row_start..row_start.saturating_add(row_count).min(rows) {
-            let text = match batch.rows().value(row, column) {
-                None => resolved.null_text.to_owned(),
-                Some(value) => format_value(&value, kind, &resolved),
-            };
-            arena.push(&text);
+            match batch.rows().value(row, column) {
+                None => buffer.push_str(resolved.null_text),
+                Some(value) => format_value_into(buffer, scratch, &value, kind, &resolved),
+            }
+            offsets.push(buffer.len());
         }
         ReldexStatus::Ok
     })
 }
 
-fn format_value(
+/// Records why a column index was refused, so `reldex_last_error_take()` does
+/// not report a stale failure from some earlier call.
+fn set_last_column_error(column: usize, count: usize) -> ReldexStatus {
+    crate::error::set_last_error(reldex_db_core::DbError::internal(format!(
+        "reldex-ffi: reldex_batch_format_column: column {column} is out of range; the batch has \
+         {count}"
+    )));
+    ReldexStatus::NotFound
+}
+
+/// Renders one cell directly into `out`.
+///
+/// Nothing here returns an owned `String`. This is the per-cell path for
+/// `NUMBER` and `TIMESTAMP` — the two types a grid of financial data is mostly
+/// made of — and spike S15's K4 budgets 200 ns per cell, which a heap
+/// allocation and free spend a meaningful fraction of on their own.
+fn format_value_into(
+    out: &mut String,
+    scratch: &mut Scratch,
     value: &ValueRef<'_>,
     kind: Option<reldex_db_driver_api::ColumnKind>,
     options: &Resolved<'_>,
-) -> String {
+) {
+    use std::fmt::Write as _;
+
     match value {
-        ValueRef::Null => options.null_text.to_owned(),
-        ValueRef::Taken => options.taken_text.to_owned(),
-        ValueRef::Boolean(value) => (if *value { "true" } else { "false" }).to_owned(),
-        ValueRef::Number(number) => format_number(&number.to_string(), options),
-        ValueRef::Float(value) => format_number(&value.to_string(), options),
-        ValueRef::Double(value) => format_number(&value.to_string(), options),
-        ValueRef::Text(text) | ValueRef::Json(text) | ValueRef::Unsupported(text) => {
-            (*text).to_owned()
+        ValueRef::Null => out.push_str(options.null_text),
+        ValueRef::Taken => out.push_str(options.taken_text),
+        ValueRef::Boolean(value) => out.push_str(if *value { "true" } else { "false" }),
+        ValueRef::Number(number) => {
+            scratch.canonical.clear();
+            // Writing into a `String` with spare capacity does not allocate;
+            // the capacity is the arena's and survives every cell.
+            let _ = write!(scratch.canonical, "{number}");
+            format_number_into(out, &scratch.canonical, options, &mut scratch.digits);
         }
-        ValueRef::Bytes(bytes) => format_bytes(bytes, options),
-        ValueRef::Timestamp(timestamp) => format_timestamp(&timestamp.to_string(), options),
+        ValueRef::Float(value) => {
+            scratch.canonical.clear();
+            let _ = write!(scratch.canonical, "{value}");
+            format_number_into(out, &scratch.canonical, options, &mut scratch.digits);
+        }
+        ValueRef::Double(value) => {
+            scratch.canonical.clear();
+            let _ = write!(scratch.canonical, "{value}");
+            format_number_into(out, &scratch.canonical, options, &mut scratch.digits);
+        }
+        ValueRef::Text(text) | ValueRef::Json(text) | ValueRef::Unsupported(text) => {
+            out.push_str(text);
+        }
+        ValueRef::Bytes(bytes) => format_bytes_into(out, bytes, options),
+        ValueRef::Timestamp(timestamp) => {
+            scratch.canonical.clear();
+            let _ = write!(scratch.canonical, "{timestamp}");
+            format_timestamp_into(out, &scratch.canonical, options);
+        }
         // `ValueRef` is `#[non_exhaustive]`, and a LOB cell that still holds a
         // locator cannot reach here (`db-core` parks them). Say what it is
         // rather than inventing a value.
-        _ => match kind {
-            Some(reldex_db_driver_api::ColumnKind::Lob) => options.taken_text.to_owned(),
-            _ => String::new(),
-        },
+        _ => {
+            if kind == Some(reldex_db_driver_api::ColumnKind::Lob) {
+                out.push_str(options.taken_text);
+            }
+        }
     }
 }
 
 /// Applies the caller's separators and fraction limit to a canonical decimal
 /// rendering (`-1234.5`, never scientific — `Number`'s `Display` normalizes
-/// that away).
-fn format_number(canonical: &str, options: &Resolved<'_>) -> String {
-    let (sign, rest) = match canonical.strip_prefix('-') {
-        Some(rest) => ("-", rest),
-        None => ("", canonical),
+/// that away), writing the result straight into `out`.
+///
+/// `digits` is reusable scratch space; its contents on entry are irrelevant
+/// and its capacity is what keeps this allocation-free.
+fn format_number_into(
+    out: &mut String,
+    canonical: &str,
+    options: &Resolved<'_>,
+    digits: &mut Vec<u8>,
+) {
+    let (negative, rest) = match canonical.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, canonical),
     };
     let (integer, fraction) = match rest.split_once('.') {
         Some((integer, fraction)) => (integer, fraction),
@@ -451,23 +537,36 @@ fn format_number(canonical: &str, options: &Resolved<'_>) -> String {
     if !integer.bytes().all(|byte| byte.is_ascii_digit())
         || !fraction.bytes().all(|byte| byte.is_ascii_digit())
     {
-        return canonical.to_owned();
+        out.push_str(canonical);
+        return;
     }
-    let fraction = match options.max_fraction_digits {
-        Some(limit) if fraction.len() > limit => round_fraction(integer, fraction, limit),
-        _ => RoundedFraction {
-            integer: integer.to_owned(),
-            fraction: fraction.to_owned(),
-        },
+
+    // One rendering path: `digits` always ends up holding the ASCII digits to
+    // print, integer part first. The rounding branch is the only one that can
+    // change their number, and it also trims the trailing zeros rounding
+    // creates.
+    let (integer_len, fraction_len) = match options.max_fraction_digits {
+        Some(limit) if fraction.len() > limit => round_into(digits, integer, fraction, limit),
+        _ => {
+            digits.clear();
+            digits.extend_from_slice(integer.as_bytes());
+            digits.extend_from_slice(fraction.as_bytes());
+            (integer.len(), fraction.len())
+        }
     };
-    let mut out = String::with_capacity(canonical.len() + 8);
-    out.push_str(sign);
+
+    if negative {
+        out.push('-');
+    }
+    let whole = &digits[..integer_len];
+    if whole.is_empty() {
+        out.push('0');
+    }
     match options.grouping {
-        None => out.push_str(&fraction.integer),
+        None => out.push_str(std::str::from_utf8(whole).unwrap_or_default()),
         Some(separator) => {
-            let digits = fraction.integer.as_bytes();
-            for (index, digit) in digits.iter().enumerate() {
-                let remaining = digits.len() - index;
+            for (index, digit) in whole.iter().enumerate() {
+                let remaining = whole.len() - index;
                 if index > 0 && options.grouping_size > 0 && remaining % options.grouping_size == 0
                 {
                     out.push(separator);
@@ -476,107 +575,130 @@ fn format_number(canonical: &str, options: &Resolved<'_>) -> String {
             }
         }
     }
-    if !fraction.fraction.is_empty() {
+    if fraction_len > 0 {
         out.push(options.decimal);
-        out.push_str(&fraction.fraction);
+        let part = &digits[integer_len..integer_len + fraction_len];
+        out.push_str(std::str::from_utf8(part).unwrap_or_default());
     }
-    out
 }
 
-struct RoundedFraction {
-    integer: String,
-    fraction: String,
-}
-
-/// Rounds a decimal digit string half-away-from-zero at `limit` fraction
-/// digits.
+/// Rounds half-away-from-zero at `limit` fraction digits, leaving the ASCII
+/// digits to print in `digits` and reporting how they split.
 ///
 /// Truncating would be the cheaper answer and a quietly wrong one: a grid that
 /// shows `0.1` for `0.19` is misreporting the database.
-fn round_fraction(integer: &str, fraction: &str, limit: usize) -> RoundedFraction {
-    let mut digits: Vec<u8> = integer
-        .bytes()
-        .chain(fraction.bytes().take(limit))
-        .map(|byte| byte - b'0')
-        .collect();
-    let round_up = fraction
+fn round_into(digits: &mut Vec<u8>, integer: &str, fraction: &str, limit: usize) -> (usize, usize) {
+    digits.clear();
+    digits.extend_from_slice(integer.as_bytes());
+    digits.extend(fraction.bytes().take(limit));
+    let mut integer_len = integer.len();
+
+    if fraction
         .as_bytes()
         .get(limit)
-        .is_some_and(|byte| *byte >= b'5');
-    if round_up {
+        .is_some_and(|byte| *byte >= b'5')
+    {
         let mut index = digits.len();
         loop {
             if index == 0 {
-                digits.insert(0, 1);
-                return split_digits(&digits, integer.len() + 1, limit);
+                // Every digit was a nine: `9.99` at one digit becomes `10`.
+                // `insert` moves bytes inside the existing capacity, so this
+                // does not allocate after the first window either.
+                digits.insert(0, b'1');
+                integer_len += 1;
+                break;
             }
             index -= 1;
-            if digits[index] == 9 {
-                digits[index] = 0;
+            if digits[index] == b'9' {
+                digits[index] = b'0';
             } else {
                 digits[index] += 1;
                 break;
             }
         }
     }
-    split_digits(&digits, integer.len(), limit)
-}
 
-fn split_digits(digits: &[u8], integer_len: usize, limit: usize) -> RoundedFraction {
-    let render =
-        |slice: &[u8]| -> String { slice.iter().map(|digit| char::from(b'0' + digit)).collect() };
-    let integer_len = integer_len.min(digits.len());
-    let integer = render(&digits[..integer_len]);
-    let fraction = render(&digits[integer_len..(integer_len + limit).min(digits.len())]);
-    RoundedFraction {
-        integer: if integer.is_empty() {
-            "0".to_owned()
-        } else {
-            integer
-        },
-        fraction: fraction.trim_end_matches('0').to_owned(),
+    let mut fraction_len = digits.len() - integer_len;
+    while fraction_len > 0 && digits[integer_len + fraction_len - 1] == b'0' {
+        fraction_len -= 1;
     }
+    (integer_len, fraction_len)
 }
 
-fn format_bytes(bytes: &[u8], options: &Resolved<'_>) -> String {
+const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+
+fn format_bytes_into(out: &mut String, bytes: &[u8], options: &Resolved<'_>) {
     let shown = bytes.len().min(options.max_bytes);
-    let mut out = String::with_capacity(shown * 2 + 8);
+    // A table lookup, not `format!("{byte:02X}")`: the formatting machinery
+    // allocates a `String` per *byte*, which made a 32-byte `RAW` cell cost 32
+    // allocations.
+    let table = if options.bytes_upper {
+        HEX_UPPER
+    } else {
+        HEX_LOWER
+    };
     for byte in &bytes[..shown] {
-        if options.bytes_upper {
-            out.push_str(&format!("{byte:02X}"));
-        } else {
-            out.push_str(&format!("{byte:02x}"));
-        }
+        out.push(char::from(table[usize::from(*byte >> 4)]));
+        out.push(char::from(table[usize::from(*byte & 0x0F)]));
     }
     if shown < bytes.len() {
         out.push('…');
     }
-    out
 }
 
-/// Reshapes the contract's canonical ISO-8601 rendering.
+/// Reshapes the contract's canonical ISO-8601 rendering into `out`.
 ///
 /// The canonical form is what `Timestamp`'s `Display` produces, which already
 /// handles the historical mixed calendar and the zone; this only applies the
 /// caller's *style*, so no date arithmetic happens in C++ or here.
-fn format_timestamp(canonical: &str, options: &Resolved<'_>) -> String {
+fn format_timestamp_into(out: &mut String, canonical: &str, options: &Resolved<'_>) {
     if options.timestamp_style == ReldexTimestampStyle::DateOnly as i32 {
-        return canonical
-            .split_once('T')
-            .map_or_else(|| canonical.to_owned(), |(date, _)| date.to_owned());
+        out.push_str(
+            canonical
+                .split_once('T')
+                .map_or(canonical, |(date, _)| date),
+        );
+        return;
     }
-    if options.timestamp_style == ReldexTimestampStyle::Iso8601Space as i32 {
-        return canonical.replacen('T', " ", 1);
+    if options.timestamp_style == ReldexTimestampStyle::Iso8601Space as i32
+        && let Some((date, time)) = canonical.split_once('T')
+    {
+        out.push_str(date);
+        out.push(' ');
+        out.push_str(time);
+        return;
     }
-    canonical.to_owned()
+    out.push_str(canonical);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ReldexBytesStyle, ReldexFormatOptions, ReldexTimestampStyle, Resolved, format_bytes,
-        format_number, format_timestamp,
+        ReldexBytesStyle, ReldexFormatOptions, ReldexTimestampStyle, Resolved, format_bytes_into,
+        format_number_into, format_timestamp_into,
     };
+
+    /// The rendering functions write into a caller's buffer now, so the tests
+    /// ask for the string they produce.
+    fn format_number(canonical: &str, options: &Resolved<'_>) -> String {
+        let mut out = String::new();
+        let mut digits = Vec::new();
+        format_number_into(&mut out, canonical, options, &mut digits);
+        out
+    }
+
+    fn format_bytes(bytes: &[u8], options: &Resolved<'_>) -> String {
+        let mut out = String::new();
+        format_bytes_into(&mut out, bytes, options);
+        out
+    }
+
+    fn format_timestamp(canonical: &str, options: &Resolved<'_>) -> String {
+        let mut out = String::new();
+        format_timestamp_into(&mut out, canonical, options);
+        out
+    }
 
     fn options() -> Resolved<'static> {
         Resolved {

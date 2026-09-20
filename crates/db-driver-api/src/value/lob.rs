@@ -73,7 +73,21 @@ impl LobKind {
 ///   ordinary [`crate::DbError`] (`ErrorKind::Transaction` when the server says
 ///   so). `db-core` therefore treats an open locator as transaction-scoped and
 ///   must not promise the user otherwise.
-pub trait LobStream: Send {
+///
+/// `Sync` as well as `Send`: every method that changes a stream takes
+/// `&mut self`, so the bound costs an implementor nothing it was not already
+/// doing (all four implementors in this workspace satisfied it unchanged), and
+/// it is what lets a `RowBatch` — which may hold parked locators — be shared
+/// between threads at all. The FFI boundary depends on that: it documents
+/// concurrent read-only access to a fetched batch as sound (ADR-0003 D4,
+/// ADR-0002 amendment I3), and without `Sync` here that promise would be a
+/// false one about `&RowBatch`.
+///
+/// This does **not** weaken the single-thread rule above: `db-core` still
+/// touches a stream only on the worker thread that owns its connection.
+/// `Sync` says a shared reference may cross a thread boundary, not that a read
+/// may.
+pub trait LobStream: Send + Sync {
     /// The connection this stream reads over.
     ///
     /// `db-core` asserts that a stream is only touched on the worker thread that

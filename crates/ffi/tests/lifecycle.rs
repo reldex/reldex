@@ -232,8 +232,13 @@ fn an_undersized_event_struct_is_refused_without_consuming_the_event() {
         harness.fetch(session, 5, executed.result, 5),
         ReldexStatus::Ok
     );
+    // Filled with a recognisable value so the refusal can be shown to leave it
+    // alone: a `false` return must mean "`*out` untouched", not "partly
+    // overwritten with an empty event".
     let mut small = ReldexEvent {
         struct_size: 8,
+        request: 0xDEAD_BEEF,
+        session: 0xFEED_FACE,
         ..ReldexEvent::default()
     };
     // Give the pump time to produce the event first, so the refusal below is
@@ -253,6 +258,11 @@ fn an_undersized_event_struct_is_refused_without_consuming_the_event() {
     // which is exactly what this asserts is caught.
     let taken = unsafe { reldex_hub_next_event(harness.hub(), std::ptr::from_mut(&mut small)) };
     assert!(!taken, "a struct too small to hold the event is refused");
+    assert_eq!(
+        (small.struct_size, small.request, small.session),
+        (8, 0xDEAD_BEEF, 0xFEED_FACE),
+        "a refused call must not write to `out` at all"
+    );
     let error = reldex_last_error_take();
     assert!(!error.is_null(), "the refusal says why");
     free_error(error);
@@ -280,6 +290,20 @@ fn an_undersized_event_struct_is_refused_without_consuming_the_event() {
         "the caller is told how much of its struct is valid"
     );
     OwnedBatch(large.batch);
+
+    // And `false` means "untouched" when the queue is simply empty, too.
+    let mut probe = ReldexEvent {
+        request: 0x1234_5678,
+        ..ReldexEvent::default()
+    };
+    // SAFETY: `probe` is a real, correctly sized `ReldexEvent`; the queue is
+    // empty because everything submitted above has been taken.
+    let taken = unsafe { reldex_hub_next_event(harness.hub(), std::ptr::from_mut(&mut probe)) };
+    assert!(!taken, "nothing is queued");
+    assert_eq!(
+        probe.request, 0x1234_5678,
+        "an empty queue must leave `out` untouched"
+    );
 }
 
 #[test]
@@ -379,4 +403,83 @@ fn null_and_unaligned_arguments_are_refused_rather_than_dereferenced() {
         reldex_ffi::reldex_hub_destroy(std::ptr::null_mut());
     }
     free_error(reldex_last_error_take());
+}
+
+#[test]
+fn a_request_submitted_before_the_opened_event_is_either_refused_or_answered() {
+    // The header used to say "nothing may be submitted until OPENED arrives",
+    // while the code marked the session open *before* pushing that event. Both
+    // outcomes are correct; what would not be is a third one where a request is
+    // accepted and never answered. This pins the two:
+    //
+    //   * INVALID_STATE  -> nothing accepted, no event follows;
+    //   * OK             -> accepted, and its EXECUTED event arrives.
+    //
+    // The race is real but not controllable, so the test accepts either and
+    // checks the consequence, rather than sleeping to force one.
+    let harness = Harness::without_waker();
+    let options = ReldexOpenOptions {
+        mock: ReldexMockScenarioConfig {
+            rows: 4,
+            ..ReldexMockScenarioConfig::default()
+        },
+        ..ReldexOpenOptions::default()
+    };
+    let mut session = 0_u64;
+    // SAFETY: the hub is live and the locals are real.
+    assert_eq!(
+        unsafe {
+            reldex_ffi::reldex_hub_open_session(
+                harness.hub(),
+                std::ptr::from_ref(&options),
+                1,
+                std::ptr::from_mut(&mut session),
+            )
+        },
+        ReldexStatus::Ok
+    );
+
+    // Submitted immediately, with no wait for OPENED at all.
+    let early = harness.execute(session, 2, ReldexMockStatement::GeneratedQuery);
+    let accepted = match early {
+        ReldexStatus::Ok => true,
+        ReldexStatus::InvalidState => {
+            // The refusal must say why rather than leave a stale error.
+            let error = reldex_ffi::reldex_last_error_take();
+            assert!(!error.is_null(), "a refusal records why");
+            support::free_error(error);
+            false
+        }
+        other => panic!("unexpected status {other:?}"),
+    };
+
+    // Drain until the session has answered everything it owes: the OPENED
+    // event always, plus the execute if it was accepted.
+    let expected = 1 + usize::from(accepted);
+    let mut requests = Vec::new();
+    support::wait_until("the session to answer everything it accepted", || {
+        while let Some(event) = harness.poll_event() {
+            support::release_batch(&event);
+            if !event.error.is_null() {
+                // SAFETY: the error came from the event and is freed once.
+                unsafe { reldex_ffi::reldex_error_free(event.error) };
+            }
+            requests.push((event.kind, event.request));
+        }
+        requests.len() >= expected
+    });
+
+    assert_eq!(requests[0], (ReldexEventKind::Opened as i32, 1));
+    if accepted {
+        assert_eq!(
+            requests[1],
+            (ReldexEventKind::Executed as i32, 2),
+            "an accepted early request must still get its one reply"
+        );
+    }
+    assert_eq!(
+        requests.len(),
+        expected,
+        "and nothing beyond what was accepted: {requests:?}"
+    );
 }

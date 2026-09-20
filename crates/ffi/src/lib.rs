@@ -40,6 +40,27 @@
 //!    events for one session are delivered in the order that session produced
 //!    them. A request that is **rejected** (a non-`RELDEX_STATUS_OK` return
 //!    from the submitting call) was never accepted and produces no event.
+//!    This holds even when the library itself fails: a panic in a session's
+//!    pump thread is caught, the session is marked lost, and every request
+//!    still owed a reply — the one in flight and everything queued behind it —
+//!    gets one failure event.
+//!
+//! # Errors
+//!
+//! Every function that returns a non-`RELDEX_STATUS_OK` status sets the
+//! thread-local last error **before** returning, so
+//! [`reldex_last_error_take`] immediately after a failure always describes
+//! *that* failure and never a stale one from an earlier call. A successful
+//! call leaves the slot alone; a caller that wants to be certain can
+//! [`reldex_last_error_clear`] first.
+//!
+//! The slot is **per thread**: an error recorded by a call on the Qt main
+//! thread is not visible to a worker thread that called
+//! [`reldex_session_request_cancel`], and vice versa. Take the error on the
+//! thread that made the failing call.
+//!
+//! An error attached to an *event* is different: it is owned, it crosses on
+//! the queue, and it belongs to whoever drains the event.
 //!
 //! # What is interim here
 //!
@@ -145,9 +166,15 @@ pub use strings::{RELDEX_UTF16_OFFSET_INVALID, ReldexStr, reldex_utf16_offset};
 /// Major part of the ABI version reported by [`reldex_abi_version`].
 ///
 /// Bumped when an existing symbol's meaning, an existing struct field's
-/// meaning, or an existing enum value changes. The adapter refuses to start on
-/// a mismatch (ADR-0003 D7).
-pub const RELDEX_ABI_VERSION_MAJOR: u32 = 1;
+/// meaning or **layout**, or an existing enum value changes. The adapter
+/// refuses to start on a mismatch (ADR-0003 D7).
+///
+/// `2` because M1.3's independent review changed `ReldexEvent`'s layout:
+/// `column_count` and `warning_count` became `size_t` (ADR-0003 amendment
+/// A11). Version 1 was never accepted and never shipped — ADR-0003 is still
+/// Proposed — so the number moves once, here, rather than pretending a
+/// recompiled adapter would still be compatible.
+pub const RELDEX_ABI_VERSION_MAJOR: u32 = 2;
 
 /// Minor part of the ABI version reported by [`reldex_abi_version`].
 ///
@@ -164,7 +191,12 @@ pub const RELDEX_ABI_VERSION_MINOR: u32 = 0;
 /// UI ship in one binary (ADR-0003 D7).
 #[unsafe(no_mangle)]
 pub extern "C" fn reldex_abi_version() -> u32 {
-    (RELDEX_ABI_VERSION_MAJOR << 16) | RELDEX_ABI_VERSION_MINOR
+    // Through the same wrapper as every other export, even though nothing here
+    // can panic or re-enter: "every `extern "C"` body is wrapped" is only a
+    // useful claim if it has no exceptions for a reviewer to check.
+    status::entry_value(0, || {
+        (RELDEX_ABI_VERSION_MAJOR << 16) | RELDEX_ABI_VERSION_MINOR
+    })
 }
 
 #[cfg(test)]

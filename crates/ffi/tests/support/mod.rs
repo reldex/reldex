@@ -353,3 +353,24 @@ pub(crate) fn iterations(variable: &str, default: usize) -> usize {
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
 }
+
+/// Waits until `condition` holds, failing with `what` if [`HANG_GUARD`]
+/// elapses first.
+///
+/// The point of spelling this out: a spin count is **not** a timeout. A loop
+/// that gives up after 10,000 `yield_now`s passes on an idle laptop and fails
+/// on a CI runner that descheduled the thread once — it measures scheduling,
+/// not the property under test. A deadline fails only when something is
+/// genuinely stuck, and it asserts no upper bound on how *fast* anything must
+/// be: `HANG_GUARD` is 60 seconds precisely so that it never becomes a
+/// performance assertion.
+pub(crate) fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + HANG_GUARD;
+    while !condition() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out after {HANG_GUARD:?} waiting for: {what}"
+        );
+        std::thread::yield_now();
+    }
+}

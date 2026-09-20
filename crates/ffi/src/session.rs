@@ -41,11 +41,11 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use reldex_db_core::{
-    CancelKind, CancelOutcome, CloseDisposition, CloseError, ColumnMetadata, Completion,
-    DatabaseSession, DbError, ErrorKind, ExecuteOutcome, FetchedBatch, ResultId, Statement,
+    CancelKind, CancelOutcome, CloseDisposition, CloseError, Completion, DatabaseSession, DbError,
+    ErrorKind, ExecuteOutcome, FetchedBatch, ResultId, Statement,
 };
 
-use crate::batch::ReldexBatch;
+use crate::batch::{ReldexBatch, ResultColumns};
 use crate::error::{ReldexError, ReldexSessionState, set_last_argument_error, set_last_error};
 use crate::event::{QueuedEvent, ReldexEventKind};
 use crate::format::ReldexTextArena;
@@ -178,7 +178,7 @@ enum Phase {
 /// describe.
 struct ResultEntry {
     id: ResultId,
-    columns: Arc<[ColumnMetadata]>,
+    columns: Arc<ResultColumns>,
 }
 
 struct SessionSlot {
@@ -198,7 +198,7 @@ enum PumpCommand {
     Fetch {
         request: u64,
         completion: Completion<FetchedBatch>,
-        columns: Arc<[ColumnMetadata]>,
+        columns: Arc<ResultColumns>,
     },
     CloseResult {
         request: u64,
@@ -209,6 +209,28 @@ enum PumpCommand {
         request: u64,
         disposition: Option<CloseDisposition>,
     },
+    /// Panics inside the pump, to prove the containment below actually answers
+    /// the requests behind it. Reachable only through the mock driver's
+    /// reserved statement text; see [`crate::mock::statements::PUMP_PANIC`].
+    #[cfg(feature = "mock-driver")]
+    PanicForTest { request: u64 },
+}
+
+impl PumpCommand {
+    /// The one event this request will be answered with, whatever happens.
+    ///
+    /// Used both on the normal path and by the panic handler, so a contained
+    /// panic cannot answer with a different kind than a success would have.
+    fn reply_shape(&self) -> (ReldexEventKind, u64) {
+        match self {
+            Self::Execute { request, .. } => (ReldexEventKind::Executed, *request),
+            Self::Fetch { request, .. } => (ReldexEventKind::Fetched, *request),
+            Self::CloseResult { request, .. } => (ReldexEventKind::ResultClosed, *request),
+            Self::Close { request, .. } => (ReldexEventKind::SessionClosed, *request),
+            #[cfg(feature = "mock-driver")]
+            Self::PanicForTest { request } => (ReldexEventKind::Executed, *request),
+        }
+    }
 }
 
 /// One session's registry entry: everything the caller's thread and the pump
@@ -445,11 +467,31 @@ pub unsafe extern "C" fn reldex_hub_open_session(
 /// cannot interrupt a running call, only disconnecting the worksheet can end
 /// it, and that loses its transaction.
 ///
+/// # Submitting before the session's `OPENED` event
+///
+/// There is no window in which a request is silently dropped. Either:
+///
+/// * the session is still connecting, and this returns
+///   `RELDEX_STATUS_INVALID_STATE` having accepted nothing — no event follows;
+/// * the connect failed, and this returns `RELDEX_STATUS_INVALID_STATE` for
+///   the same reason (the failure itself arrives as the `OPENED` event's
+///   error); or
+/// * the connect has already succeeded, and the request is accepted and
+///   answered normally — **even if the caller has not drained the `OPENED`
+///   event yet**. The session becomes usable when it connects, not when the
+///   caller notices.
+///
+/// The simple rule for an adapter is still "wait for `OPENED`", because that
+/// is the first moment it can be sure; the rule for this library is the three
+/// cases above, and `exactly one reply per accepted request` holds in all of
+/// them.
+///
 /// Binds are not exported yet (M2.11).
 ///
 /// # Safety
 ///
 /// `hub` must be a live hub, and `sql` must point at `sql.len` readable bytes.
+/// It need not be NUL-terminated.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reldex_session_execute(
     hub: *mut ReldexHub,
@@ -465,6 +507,23 @@ pub unsafe extern "C" fn reldex_session_execute(
                 "reldex_session_execute: `sql` is null or is not valid UTF-8",
             );
         };
+        // The mock driver's reserved statement for proving the pump's panic
+        // containment. Compiled only with the mock, so no production build can
+        // be made to panic by statement text.
+        #[cfg(feature = "mock-driver")]
+        if text == crate::mock::statements::text(crate::mock::statements::PUMP_PANIC) {
+            // SAFETY: delegated to this function's contract for `hub`.
+            return unsafe {
+                with_session(hub, session, |entry| {
+                    report(
+                        entry.submit(|_session, _slot| {
+                            Ok((PumpCommand::PanicForTest { request }, ()))
+                        }),
+                        "execute",
+                    )
+                })
+            };
+        }
         let mut statement = Statement::new(text);
         if deadline_ms > 0 {
             statement = statement.with_deadline(Duration::from_millis(deadline_ms));
@@ -628,10 +687,35 @@ pub unsafe extern "C" fn reldex_session_close(
 /// interrupt a running call this reports `NOT_INTERRUPTIBLE`, and the UI must
 /// say so rather than show a cancel in progress.
 ///
+/// # The ordering rule this imposes on teardown
+///
+/// "Callable from any thread" and "the hub may be destroyed" are two rules
+/// that have to be sequenced by the **caller**, because this library has no
+/// internal synchronisation for it and the ABI gives it nowhere to put one:
+/// `hub` is a raw pointer, and a cancel that arrives after
+/// [`crate::reldex_hub_destroy`] has freed it dereferences freed memory. The
+/// rule, stated as a contract rather than left implied:
+///
+/// > Every thread that may call `reldex_session_request_cancel` must have
+/// > **returned from that call** — be joined, or otherwise proven quiescent —
+/// > before `reldex_hub_destroy` is called.
+///
+/// A stale *session id* is safe: ids are never reused, so a cancel naming a
+/// session that has since been closed reports `RELDEX_STATUS_NOT_FOUND`
+/// against a live hub. It is only the **hub pointer** that must be sequenced.
+/// In a Qt adapter this falls out naturally — the worker that offers Cancel is
+/// stopped before the bridge is torn down — but it must be done on purpose.
+///
+/// The structural alternative is a refcounted cancel handle
+/// (`reldex_session_cancel_handle` / `reldex_cancel_handle_release`) that
+/// keeps what it needs alive independently of the hub. That is deliberately
+/// **not** built yet: nothing needs it, and ADR-0003's amendment A10 records
+/// it as the fix if a real cross-thread cancel appears.
+///
 /// # Safety
 ///
-/// `hub` must be a live hub; `out_outcome` must be null or point at a writable
-/// `int32_t`.
+/// `hub` must be a live hub that no other thread is concurrently destroying
+/// (see above); `out_outcome` must be null or point at a writable `int32_t`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reldex_session_request_cancel(
     hub: *mut ReldexHub,
@@ -649,6 +733,9 @@ pub unsafe extern "C" fn reldex_session_request_cancel(
             // cancel must not wait behind a submission.
             let session = entry.lock().session.clone();
             let Some(session) = session else {
+                set_last_error(DbError::internal(
+                    "reldex-ffi: reldex_session_request_cancel: the session is still opening or                      already closed; there is nothing to cancel",
+                ));
                 return ReldexStatus::InvalidState;
             };
             match session.cancel() {
@@ -686,9 +773,14 @@ pub unsafe extern "C" fn reldex_session_request_cancel(
 /// `warning_count` says how many to expect. They are constant for the
 /// session's life, so reading them late is not the same as losing them.
 ///
+/// **This appends to the arena**, like the formatter, so it invalidates every
+/// `ReldexArenaView` taken from that arena before the call. Either read the
+/// warnings into their own arena or re-take the view afterwards.
+///
 /// # Safety
 ///
-/// `hub` must be a live hub and `arena` a live arena.
+/// `hub` must be a live hub and `arena` a live arena that no other thread is
+/// using (it is taken by `&mut`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reldex_session_connect_warnings(
     hub: *mut ReldexHub,
@@ -704,6 +796,9 @@ pub unsafe extern "C" fn reldex_session_connect_warnings(
         let collect = |entry: &Arc<SessionEntry>| {
             let session = entry.lock().session.clone();
             let Some(session) = session else {
+                set_last_error(DbError::internal(
+                    "reldex-ffi: reldex_session_connect_warnings: the session is still opening or                      already closed",
+                ));
                 return ReldexStatus::InvalidState;
             };
             // SAFETY: the caller promises `arena` is a live arena this library
@@ -739,8 +834,23 @@ fn report(outcome: Result<(), ReldexStatus>, what: &str) -> ReldexStatus {
     }
 }
 
-/// One session's thread: opens the connection, then turns completions into
-/// events until there is nothing left to answer.
+/// The reply the pump currently owes, so a panic can still answer it.
+///
+/// Set before every blocking wait, cleared when that request's event is
+/// pushed. Without it, a panic between the two would silently eat a reply and
+/// break rule 5 — and the adapter would wait forever for an event that is
+/// never coming.
+type OwedReply = Mutex<Option<(ReldexEventKind, u64)>>;
+
+/// One session's thread, with the panic containment ADR-0003 D2 requires of
+/// every path that can reach a driver.
+///
+/// `catch_unwind` on every `extern "C"` body cannot help here: this thread is
+/// *ours*, and an unwind out of it would leave every outstanding request
+/// unanswered — the UI's spinner would simply never stop. So a panic is caught
+/// here, the session is marked lost, and **every** accepted request still owed
+/// a reply gets one failure event: the one in flight, then everything still
+/// queued behind it.
 fn pump_main(
     hub: &Arc<ReldexHub>,
     entry: &Arc<SessionEntry>,
@@ -748,6 +858,77 @@ fn pump_main(
     driver: Arc<dyn reldex_db_core::DatabaseDriver>,
     params: reldex_db_core::ConnectionParams,
     open_request: u64,
+) {
+    let owed: OwedReply = Mutex::new(Some((ReldexEventKind::Opened, open_request)));
+    // `AssertUnwindSafe`: everything reachable here is either behind a mutex
+    // (which this crate always recovers from poisoning, since a panicked
+    // session is exactly the case being handled) or owned by this thread.
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pump_body(hub, entry, rx, driver, params, open_request, &owed);
+    }));
+    if let Err(payload) = panicked {
+        answer_after_panic(hub, entry, rx, &owed, &payload);
+    }
+}
+
+/// Reads a panic payload's message, for the error the caller is handed.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    let detail = payload
+        .downcast_ref::<&'static str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".to_owned());
+    format!("reldex-ffi: the session's event pump panicked ({detail}); the session is lost")
+}
+
+/// Answers every request the pump still owed when it panicked, exactly once
+/// each, and closes the session.
+fn answer_after_panic(
+    hub: &Arc<ReldexHub>,
+    entry: &Arc<SessionEntry>,
+    rx: &mpsc::Receiver<PumpCommand>,
+    owed: &OwedReply,
+    payload: &Box<dyn std::any::Any + Send>,
+) {
+    let message = panic_message(payload);
+    // Closes the phase and drops the sender, so nothing further is accepted
+    // and the loop below sees the whole remaining queue and then the end of it.
+    entry.shut_down();
+    let id = entry.id;
+    let answer = |kind: ReldexEventKind, request: u64| {
+        let error = ReldexError::from_db_error(
+            &DbError::new(ErrorKind::DriverInternal, message.clone())
+                .with_session_state(reldex_db_core::SessionState::Lost),
+        );
+        hub.push_event(
+            QueuedEvent::new(kind, id, request)
+                .with_error(error)
+                .with_session_state(ReldexSessionState::Lost),
+        );
+    };
+    let in_flight = owed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some((kind, request)) = in_flight {
+        answer(kind, request);
+    }
+    while let Ok(command) = rx.try_recv() {
+        let (kind, request) = command.reply_shape();
+        answer(kind, request);
+    }
+}
+
+/// Opens the connection, then turns completions into events until there is
+/// nothing left to answer.
+fn pump_body(
+    hub: &Arc<ReldexHub>,
+    entry: &Arc<SessionEntry>,
+    rx: &mpsc::Receiver<PumpCommand>,
+    driver: Arc<dyn reldex_db_core::DatabaseDriver>,
+    params: reldex_db_core::ConnectionParams,
+    open_request: u64,
+    owed: &OwedReply,
 ) {
     let id = entry.id;
     let session = match hub.manager.open_session(driver, params) {
@@ -773,28 +954,55 @@ fn pump_main(
     let mut opened = QueuedEvent::new(ReldexEventKind::Opened, id, open_request);
     opened.connection_id = session.connection_id().get();
     opened.cancel_kind = session.cancel_kind().into();
-    opened.warning_count = u32::try_from(session.connect_warnings().len()).unwrap_or(u32::MAX);
+    opened.warning_count = session.connect_warnings().len();
     opened.session_state = session.session_state().into();
+    clear_owed(owed);
     hub.push_event(opened);
 
     while let Ok(command) = rx.recv() {
-        let finished = run_command(hub, entry, &session, command);
+        let finished = run_command(hub, entry, &session, command, owed);
         if finished {
             // The session is gone. Everything still queued was accepted before
             // it went, so each one still gets its single reply — `db-core`
             // answers them with the session's terminal error — and only then
             // does the pump stop.
             while let Ok(pending) = rx.try_recv() {
-                run_command(hub, entry, &session, pending);
+                run_command(hub, entry, &session, pending, owed);
             }
             break;
         }
     }
 }
 
+fn set_owed(owed: &OwedReply, kind: ReldexEventKind, request: u64) {
+    *owed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((kind, request));
+}
+
+fn clear_owed(owed: &OwedReply) {
+    *owed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
 /// Runs one submitted request and pushes its single reply. Returns whether the
 /// session ended.
 fn run_command(
+    hub: &Arc<ReldexHub>,
+    entry: &Arc<SessionEntry>,
+    session: &Arc<DatabaseSession>,
+    command: PumpCommand,
+    owed: &OwedReply,
+) -> bool {
+    let (owed_kind, owed_request) = command.reply_shape();
+    set_owed(owed, owed_kind, owed_request);
+    let finished = run_command_inner(hub, entry, session, command);
+    clear_owed(owed);
+    finished
+}
+
+fn run_command_inner(
     hub: &Arc<ReldexHub>,
     entry: &Arc<SessionEntry>,
     session: &Arc<DatabaseSession>,
@@ -807,7 +1015,9 @@ fn run_command(
             completion,
         } => {
             let event = match completion.wait() {
-                Ok(outcome) => {
+                Ok(mut outcome) => {
+                    // Read before the columns are moved out below.
+                    let column_count = outcome.columns.len();
                     let result = outcome.result.map(|result| {
                         let mut slot = entry.lock();
                         let key = slot.next_result_id;
@@ -816,13 +1026,19 @@ fn run_command(
                             key,
                             ResultEntry {
                                 id: result,
-                                columns: Arc::from(outcome.columns.clone()),
+                                // Moved, not cloned: the names are copied into
+                                // their NUL-terminated form exactly once per
+                                // result set and shared by every batch of it.
+                                columns: ResultColumns::new(std::mem::take(&mut outcome.columns)),
                             },
                         );
                         key
                     });
-                    QueuedEvent::new(ReldexEventKind::Executed, id, request)
-                        .with_execute_outcome(&outcome, result)
+                    QueuedEvent::new(ReldexEventKind::Executed, id, request).with_execute_outcome(
+                        &outcome,
+                        result,
+                        column_count,
+                    )
                 }
                 Err(error) => QueuedEvent::new(ReldexEventKind::Executed, id, request)
                     .with_error(ReldexError::from_db_error(&error)),
@@ -889,6 +1105,10 @@ fn run_command(
             };
             hub.push_event(event.with_session_state(state));
             !still_open
+        }
+        #[cfg(feature = "mock-driver")]
+        PumpCommand::PanicForTest { request } => {
+            panic!("reldex-ffi: deliberate pump panic for request {request}");
         }
     }
 }

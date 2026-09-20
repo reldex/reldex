@@ -6,12 +6,13 @@ ADR-0001 Phase 0 spikes, see "Amendments after the Phase 0 spikes"; amended agai
 independent review of the `db-core` session layer, see "Amendments after the db-core session review";
 amended again by the owner's connect-time-warning decision, see "Amendment: the connect-time warning
 channel"; amended again to say where a connection is *created*, see "Amendment: a connection is
-created on a helper thread"; amended again to make a batch's column storage readable, see
-"Amendment: a batch's column storage is readable, not only indexable"
+created on a helper thread"; amended again to make a batch's column storage readable and shareable,
+see "Amendment: a batch's column storage is readable, not only indexable"
 **Date:** 2026-09-19
 **Amended:** 2026-09-19 (API review), 2026-09-19 (Phase 0 spikes), 2026-09-19 (db-core session
 review), 2026-09-20 (owner confirmation), 2026-09-20 (connect-time warning channel, C-6),
-2026-09-20 (connection created on a helper thread, C-5), 2026-09-20 (column storage readable, M1.3)
+2026-09-20 (connection created on a helper thread, C-5), 2026-09-20 (column storage readable, M1.3),
+2026-09-20 (`LobStream: Sync` and `ExecuteOutcome` non-exhaustive, M1.3 review)
 
 ## Context
 
@@ -942,8 +943,9 @@ anything.
 
 ## Amendment: a batch's column storage is readable, not only indexable (2026-09-20, from M1.3)
 
-Numbering: `I`. Prompted by building `crates/ffi` (ADR-0003), which needs to hand C the *same*
-buffers the driver filled, not copies of them.
+Numbering: `I`. Items I1–I2 were prompted by building `crates/ffi` (ADR-0003), which needs to hand C
+the *same* buffers the driver filled, not copies of them; I3–I4 by the independent review of that
+work the same day.
 
 ### I1 — `Column`, `TextColumn`, `BytesColumn` and `NullMask` expose their layout
 
@@ -978,6 +980,31 @@ intended trade: the million-row path has no marshalling layer precisely because 
 It does **not** commit anything about lifetime or ownership beyond Rust's own borrow rules. The
 borrow ends with the `RowBatch`, and the FFI keeps the batch alive for exactly as long as the
 adapter holds the `ReldexBatch*` it was handed.
+
+### I3 — `LobStream` requires `Sync` as well as `Send` (2026-09-20, from the M1.3 review)
+
+A fetched `RowBatch` can hold parked LOB locators, so `RowBatch` was `!Sync` and `&RowBatch` could
+not cross a thread boundary at all. That blocked a guarantee the FFI boundary needs: ADR-0003 A12
+documents concurrent read-only access to one fetched batch as sound, and without this bound that
+promise would have been a false statement about `&RowBatch` rather than a supported one.
+
+`LobStream: Send + Sync`. The bound costs an implementor nothing it was not already doing — every
+method that changes a stream takes `&mut self`, and all four implementors in this workspace
+(`EmptyLob`, `SliceLob`, `MockLobStream`, `OracleLobStream`) satisfied it with no change at all.
+What it forbids is a stream built on `Rc` or `Cell`, which a `Send` type mostly cannot use anyway.
+
+It does **not** weaken D1/D2's single-thread rule: `db-core` still touches a stream only on the
+worker thread that owns its connection. `Sync` says a shared reference may cross a thread
+boundary; it does not say a read may happen from two places, and nothing in `db-core` or the FFI
+reads a locator off its owning thread. A driver whose locator genuinely cannot tolerate a shared
+reference existing elsewhere should say so here, because this bound is now part of the contract.
+
+### I4 — `ExecuteOutcome` is `#[non_exhaustive]`
+
+M1.3 added a field (`columns`, see ADR-0003 A6) and M2.5's event queue will want at least one more.
+Nothing outside `db-core` constructs an `ExecuteOutcome` — the worker thread is its only producer —
+so the attribute costs nothing today and makes the next field an additive change rather than a
+breaking one.
 
 ## Notes for driver implementers
 

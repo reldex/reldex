@@ -17,18 +17,41 @@
 //! constraining ADR-0002's contract types to a C layout.
 //!
 //! `bool`, `f32` and `f64` columns need neither: `Vec<f64>` *is* a `double[]`.
+//!
+//! # What is thread-safe about a batch, exactly
+//!
+//! A `ReldexBatch*` is **`Sync`**, and the assertion below makes the compiler
+//! keep it that way. Concurrently calling the read-only functions
+//! ([`reldex_batch_row_count`], [`reldex_batch_column_count`],
+//! [`reldex_batch_column_info`], [`reldex_batch_column`]) on one batch from
+//! several threads is sound, including the first call on a `NUMBER` or
+//! `TIMESTAMP` column, which builds that column's mirror: the mirrors are
+//! `OnceLock`s, so exactly one thread builds each and every thread gets the
+//! same pointer.
+//!
+//! What is **not** safe, and what the adapter must serialize:
+//!
+//! * [`reldex_batch_release`] against any other use of the same batch. Release
+//!   consumes it; a call racing it is a use-after-free like any other.
+//! * [`crate::reldex_batch_format_column`] against another call on the same
+//!   **arena**: it takes the arena by `&mut`. Two threads may format from one
+//!   batch at the same time only if each has its own arena.
+//!
+//! ADR-0003 D5 rule 3 still says the adapter makes these calls from the Qt
+//! main thread. This paragraph is about what the library *guarantees*, so that
+//! a worker thread rendering into its own arena is a design choice rather than
+//! a latent race.
 
-use std::cell::RefCell;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use reldex_db_core::{ColumnMetadata, FetchedBatch};
 use reldex_db_driver_api::{
-    Column, ColumnData, ColumnKind, MAX_SIGNIFICANT_DIGITS, Number, SqlType, Timestamp,
+    Column, ColumnData, ColumnKind, MAX_SIGNIFICANT_DIGITS, Number, Timestamp,
 };
 
-use crate::error::set_last_argument_error;
+use crate::error::{set_last_argument_error, set_last_error};
 use crate::status::{ReldexStatus, entry, entry_value};
-use crate::strings::{CStruct, ReldexStr, write_out_struct};
+use crate::strings::{CStruct, OwnedStr, ReldexStr, write_out_struct};
 
 /// The storage family of a column, which decides which fields of
 /// [`ReldexColumnView`] are set.
@@ -317,26 +340,83 @@ enum Mirror {
     Timestamps(Box<[ReldexTimestamp]>),
 }
 
+/// One column's description, with its strings already copied into the
+/// NUL-terminated form the boundary promises.
+struct ColumnDescription {
+    metadata: ColumnMetadata,
+    /// `ColumnMetadata::name()` borrows a `Box<str>`, which is **not**
+    /// NUL-terminated — reading `ptr[len]` on one is a byte past the
+    /// allocation. The copy happens here, once per result set, and every batch
+    /// that result produces shares it through an `Arc`.
+    name: OwnedStr,
+    native_type_name: Option<OwnedStr>,
+}
+
+/// One result set's columns, built when the statement executes and shared by
+/// every batch it produces.
+///
+/// The sharing is the point: a million-row result arrives as a thousand
+/// batches, and the column names are copied **once** for all of them, not once
+/// per batch and certainly not once per cell.
+pub(crate) struct ResultColumns {
+    columns: Box<[ColumnDescription]>,
+}
+
+impl ResultColumns {
+    pub(crate) fn new(metadata: Vec<ColumnMetadata>) -> Arc<Self> {
+        Arc::new(Self {
+            columns: metadata
+                .into_iter()
+                .map(|metadata| ColumnDescription {
+                    name: OwnedStr::new(metadata.name().to_owned()),
+                    native_type_name: metadata
+                        .native_type_name()
+                        .map(|native| OwnedStr::new(native.to_owned())),
+                    metadata,
+                })
+                .collect(),
+        })
+    }
+
+    fn get(&self, index: usize) -> Option<&ColumnDescription> {
+        self.columns.get(index)
+    }
+}
+
 /// One fetched batch, owned by the caller from the moment its event is handed
 /// out until [`reldex_batch_release`].
 ///
 /// Opaque. Every pointer any function here returns borrows from it.
 pub struct ReldexBatch {
     batch: FetchedBatch,
-    columns: Arc<[ColumnMetadata]>,
-    /// Lazily built `#[repr(C)]` copies of the fixed-width columns. Each is a
-    /// separate allocation, so handing out a pointer into one and then
-    /// building another cannot move the first.
-    mirrors: RefCell<Vec<Option<Mirror>>>,
+    columns: Arc<ResultColumns>,
+    /// Lazily built `#[repr(C)]` copies of the fixed-width columns.
+    ///
+    /// A `OnceLock` per column rather than one `RefCell<Vec<_>>`: every
+    /// read-only entry point takes `&ReldexBatch` and C has no way to promise
+    /// it called from one thread, so the cache has to be sound under
+    /// concurrent first use, not merely unlikely to be hit. Each mirror is
+    /// also its own allocation, so building a later one cannot move a pointer
+    /// already handed out for an earlier one.
+    mirrors: Box<[OnceLock<Option<Mirror>>]>,
 }
 
+// The `Sync` bound is load-bearing (see this module's docs): the read-only
+// entry points take `&ReldexBatch` and are documented as safe to call
+// concurrently. If a future field is not `Sync`, this stops compiling rather
+// than quietly making that documentation false.
+const _: () = {
+    const fn assert_sync<T: Sync>() {}
+    assert_sync::<ReldexBatch>();
+};
+
 impl ReldexBatch {
-    pub(crate) fn new(batch: FetchedBatch, columns: Arc<[ColumnMetadata]>) -> Self {
+    pub(crate) fn new(batch: FetchedBatch, columns: Arc<ResultColumns>) -> Self {
         let column_count = batch.column_count();
         Self {
             batch,
             columns,
-            mirrors: RefCell::new((0..column_count).map(|_| None).collect()),
+            mirrors: (0..column_count).map(|_| OnceLock::new()).collect(),
         }
     }
 
@@ -346,21 +426,22 @@ impl ReldexBatch {
 
     /// Builds (once) and borrows the `#[repr(C)]` mirror of a fixed-width
     /// column, as a raw pointer and an element count.
+    ///
+    /// Concurrent first calls are sound: `OnceLock::get_or_init` runs the
+    /// initializer on exactly one thread and every caller gets that value, so
+    /// two threads describing the same column see the same pointer.
     fn mirror_of(&self, index: usize, column: &Column) -> Option<(*const std::ffi::c_void, usize)> {
-        let mut mirrors = self.mirrors.borrow_mut();
-        let slot = mirrors.get_mut(index)?;
-        if slot.is_none() {
-            *slot = match column.data() {
-                ColumnData::Number(values) => Some(Mirror::Numbers(
-                    values.iter().map(ReldexNumber::from).collect(),
-                )),
-                ColumnData::Timestamp(values) => Some(Mirror::Timestamps(
-                    values.iter().map(ReldexTimestamp::from).collect(),
-                )),
-                _ => return None,
-            };
-        }
-        match slot.as_ref()? {
+        let slot = self.mirrors.get(index)?;
+        let mirror = slot.get_or_init(|| match column.data() {
+            ColumnData::Number(values) => Some(Mirror::Numbers(
+                values.iter().map(ReldexNumber::from).collect(),
+            )),
+            ColumnData::Timestamp(values) => Some(Mirror::Timestamps(
+                values.iter().map(ReldexTimestamp::from).collect(),
+            )),
+            _ => None,
+        });
+        match mirror.as_ref()? {
             Mirror::Numbers(values) => Some((values.as_ptr().cast(), values.len())),
             Mirror::Timestamps(values) => Some((values.as_ptr().cast(), values.len())),
         }
@@ -428,12 +509,12 @@ impl ReldexBatch {
 
     fn info_of(&self, index: usize) -> Option<ReldexColumnInfo> {
         let column = self.batch.column(index)?;
-        let metadata = self.columns.get(index);
         let mut info = ReldexColumnInfo {
             kind: ReldexColumnKind::from(column.kind()) as i32,
             ..ReldexColumnInfo::default()
         };
-        if let Some(metadata) = metadata {
+        if let Some(described) = self.columns.get(index) {
+            let metadata = &described.metadata;
             info.nullable = match metadata.nullable() {
                 Some(true) => ReldexNullable::Yes as i32,
                 Some(false) => ReldexNullable::No as i32,
@@ -445,14 +526,15 @@ impl ReldexBatch {
             info.has_scale = metadata.scale().is_some();
             info.max_size_bytes = metadata.max_size_bytes().unwrap_or(0);
             info.has_max_size_bytes = metadata.max_size_bytes().is_some();
-            info.name = ReldexStr::borrow_bytes(metadata.name().as_bytes());
-            if let Some(native) = metadata.native_type_name() {
-                info.native_type_name = ReldexStr::borrow_bytes(native.as_bytes());
-            } else if metadata.sql_type() == SqlType::Unsupported {
-                // The contract requires a native name here; say so rather than
-                // leaving the UI to guess what it is showing.
-                info.native_type_name = ReldexStr::empty();
-            }
+            info.name = described.name.as_reldex_str();
+            // An `Unsupported` column with no native name is a driver that did
+            // not keep its side of the ADR-0002 contract. The empty string is
+            // already the default, so there is nothing to do but leave it:
+            // the UI shows "unknown type" rather than inventing one.
+            info.native_type_name = described
+                .native_type_name
+                .as_ref()
+                .map_or_else(ReldexStr::empty, OwnedStr::as_reldex_str);
         }
         Some(info)
     }
@@ -471,10 +553,23 @@ unsafe fn with_batch<T>(
     if batch.is_null() || !batch.is_aligned() {
         return None;
     }
-    // SAFETY: the caller promises the pointer is live and not released; the
-    // borrow ends with this call, and ADR-0003 D5 rule 3 keeps the caller
-    // single-threaded, so nothing can release it meanwhile.
+    // SAFETY: the caller promises the pointer is live and not released, and
+    // the borrow ends with this call. A *shared* borrow is all this takes, and
+    // `ReldexBatch: Sync` (asserted above), so another thread holding one at
+    // the same time is sound; what the caller's contract rules out is a
+    // concurrent `reldex_batch_release`, which no amount of internal
+    // synchronisation could make safe.
     Some(body(unsafe { &*batch }))
+}
+
+/// Records why a column index was refused, so a caller that got
+/// `RELDEX_STATUS_NOT_FOUND` can find out from `reldex_last_error_take()`
+/// rather than reading whatever error was left over from an earlier call.
+fn column_not_found(what: &str, column: usize, count: usize) -> ReldexStatus {
+    set_last_error(reldex_db_core::DbError::internal(format!(
+        "reldex-ffi: {what}: column {column} is out of range; the batch has {count}"
+    )));
+    ReldexStatus::NotFound
 }
 
 /// How many rows the batch holds. Zero means the result is exhausted.
@@ -505,7 +600,9 @@ pub unsafe extern "C" fn reldex_batch_column_count(batch: *const ReldexBatch) ->
 
 /// Describes column `column`: its name, declared type and storage kind.
 ///
-/// The strings borrow from the batch.
+/// `name` and `native_type_name` borrow from the batch and are
+/// NUL-terminated, so they can be handed straight to `QString::fromUtf8` with
+/// or without the length.
 ///
 /// # Safety
 ///
@@ -519,11 +616,15 @@ pub unsafe extern "C" fn reldex_batch_column_info(
 ) -> ReldexStatus {
     entry(|| {
         // SAFETY: delegated to this function's contract for `batch`.
-        let info = unsafe { with_batch(batch, |batch| batch.info_of(column)) };
+        let info = unsafe {
+            with_batch(batch, |batch| {
+                (batch.info_of(column), batch.rows().column_count())
+            })
+        };
         match info {
             None => set_last_argument_error("reldex_batch_column_info: `batch` is null"),
-            Some(None) => ReldexStatus::NotFound,
-            Some(Some(info)) => {
+            Some((None, count)) => column_not_found("reldex_batch_column_info", column, count),
+            Some((Some(info), _)) => {
                 // SAFETY: delegated to this function's contract for `out`.
                 if unsafe { write_out_struct(out, info) } {
                     ReldexStatus::Ok
@@ -557,11 +658,15 @@ pub unsafe extern "C" fn reldex_batch_column(
 ) -> ReldexStatus {
     entry(|| {
         // SAFETY: delegated to this function's contract for `batch`.
-        let view = unsafe { with_batch(batch, |batch| batch.view_of(column)) };
+        let view = unsafe {
+            with_batch(batch, |batch| {
+                (batch.view_of(column), batch.rows().column_count())
+            })
+        };
         match view {
             None => set_last_argument_error("reldex_batch_column: `batch` is null"),
-            Some(None) => ReldexStatus::NotFound,
-            Some(Some(view)) => {
+            Some((None, count)) => column_not_found("reldex_batch_column", column, count),
+            Some((Some(view), _)) => {
                 // SAFETY: delegated to this function's contract for `out`.
                 if unsafe { write_out_struct(out, view) } {
                     ReldexStatus::Ok
