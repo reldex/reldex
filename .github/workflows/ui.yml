@@ -63,43 +63,35 @@ jobs:
         with:
           shared-key: ffi-smoke-${{ matrix.os }}
 
-      - name: Configure
+      - name: bash ui/tests/ffi_smoke/run.sh
+        # Reuses the exact script a developer runs locally rather than
+        # re-implementing its configure/build/ctest sequence here: run.sh
+        # already sources tools/dev-env/env.sh on Windows (bringing MSVC
+        # onto PATH via vswhere) and does configure+build+test in one script
+        # invocation, which matters because a GitHub Actions "run:" step's
+        # environment does not carry over to the next step -- splitting
+        # this into separate Configure/Build/Test steps would lose the
+        # vcvars environment env.sh just set up before the Build step ran.
+        #
+        # K5/D2: ASan+UBSan on the C/C++ harness only, ubuntu leg only
+        # (reldex-ffi's Rust code is never instrumented, but ASan still
+        # intercepts its malloc/free calls from this process; one OS is
+        # enough to prove the boundary is sanitizer-clean, and ubuntu's
+        # GCC/Clang make it the natural choice). detect_leaks=1: if this
+        # ever reports a leak, ADR-0003 A17 already documents one
+        # intentional leak class (a session pump parked in an
+        # uninterruptible statement, never exercised by this harness) --
+        # anything else found here must be investigated and reported, not
+        # blanket-suppressed (M1.4 brief). run.sh's own --sanitize flag
+        # sets ASAN_OPTIONS itself; nothing extra is needed here.
         shell: bash
         run: |
           set -euo pipefail
-          args=()
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            # No Qt here, so avoid needing vcvars sourced at all: the
-            # Visual Studio generator finds MSVC itself via vswhere.
-            args+=(-G "Visual Studio 17 2022" -A x64)
-          else
-            args+=(-DCMAKE_BUILD_TYPE=RelWithDebInfo)
-          fi
-          # K5/D2: ASan+UBSan on the C/C++ harness only (reldex-ffi's Rust
-          # code is never instrumented, but ASan still intercepts its
-          # malloc/free calls from this process). One OS is enough to prove
-          # the boundary is sanitizer-clean; ubuntu's GCC/Clang make it the
-          # natural choice.
           if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
-            args+=(-DRELDEX_SANITIZE=ON)
+            bash ui/tests/ffi_smoke/run.sh --sanitize
+          else
+            bash ui/tests/ffi_smoke/run.sh
           fi
-          cmake -S ui/tests/ffi_smoke -B build "${args[@]}"
-
-      - name: Build
-        shell: bash
-        run: cmake --build build --config RelWithDebInfo
-
-      - name: Test
-        shell: bash
-        env:
-          # Only meaningful on the sanitized ubuntu leg; harmless elsewhere.
-          # detect_leaks=1: if this ever reports a leak, ADR-0003 A17 already
-          # documents one intentional leak class (a session pump parked in an
-          # uninterruptible statement, never exercised by this harness) --
-          # anything else found here must be investigated and reported, not
-          # blanket-suppressed (M1.4 brief).
-          ASAN_OPTIONS: ${{ matrix.os == 'ubuntu-latest' && 'detect_leaks=1' || '' }}
-        run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
 
   # M1.5 / K7: the full Qt Quick UI, built against a real Qt 6.8 LTS
   # install, offscreen. This is the job the 25-minute cold-job budget in

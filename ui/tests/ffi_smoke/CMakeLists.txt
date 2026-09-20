@@ -125,11 +125,15 @@ function(reldex_ffi_smoke_add_target target_name)
 
     # Windows has no rpath: reldex_ffi.dll must sit next to the executable
     # (mirrors ui/CMakeLists.txt's reldex_deploy_ffi_dll, duplicated here so
-    # this directory has no hard dependency on the parent existing).
+    # this directory has no hard dependency on the parent existing -- but
+    # goes through the same shared, retrying copy script; see
+    # ui/cmake/CopyIfDifferentRetry.cmake for why a plain copy_if_different
+    # is not reliable enough under this directory's own build either).
     add_custom_command(TARGET ${target_name} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "$<TARGET_FILE:reldex_ffi-shared>"
-                "$<TARGET_FILE_DIR:${target_name}>"
+        COMMAND ${CMAKE_COMMAND}
+                "-DSRC=$<TARGET_FILE:reldex_ffi-shared>"
+                "-DDST=$<TARGET_FILE_DIR:${target_name}>"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/CopyIfDifferentRetry.cmake"
         COMMENT "Deploying reldex_ffi shared library next to ${target_name}"
         VERBATIM
     )

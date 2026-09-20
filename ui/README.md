@@ -52,7 +52,7 @@ that is the first thing to check.
 
 ```text
 ui/CMakeLists.txt   Top-level: Qt, Corrosion/reldex-ffi, shared helpers
-ui/cmake/           CompilerWarnings.cmake (the only CMake helper module)
+ui/cmake/           CompilerWarnings.cmake, CopyIfDifferentRetry.cmake
 ui/adapter/         reldex_adapter: thin static lib + QML module
                      (Reldex.Adapter) — CoreInfo singleton only
 ui/app/             Reldex executable + Main.qml (Reldex.App QML module)
@@ -182,12 +182,15 @@ directly, per D9.
 Windows has no rpath, so `reldex_ffi.dll` (and its `.pdb`) must sit next to
 every executable that (transitively) links `reldex_ffi-shared`. A small
 CMake function in `ui/CMakeLists.txt`, `reldex_deploy_ffi_dll(<target>)`,
-adds a `POST_BUILD` step doing
-`cmake -E copy_if_different $<TARGET_FILE:reldex_ffi-shared> $<TARGET_FILE_DIR:target>`;
-it is called once each for `Reldex` and `tst_coreinfo`. Qt's own DLLs are
-resolved via `PATH` (`tools/dev-env/env.sh` puts Qt's `bin/` there); no
-`windeployqt` step exists yet because this is a dev-build skeleton, not
-packaging (that is a later M6 task).
+adds a `POST_BUILD` step that copies it via
+`ui/cmake/CopyIfDifferentRetry.cmake` (a plain `copy_if_different` wrapped
+with a retry — M1.4's CI hit a transient "source not found" from a bare
+`copy_if_different` under enough ninja parallelism on macOS once
+`ui/tests/ffi_smoke` added two more targets doing the same copy; see that
+script's header comment); it is called once each for `Reldex` and
+`tst_coreinfo`. Qt's own DLLs are resolved via `PATH` (`tools/dev-env/env.sh`
+puts Qt's `bin/` there); no `windeployqt` step exists yet because this is a
+dev-build skeleton, not packaging (that is a later M6 task).
 
 Rust's own build artefacts (the actual `target/` cargo uses) live inside
 the CMake build tree, under `build/ui-<config>/cargo/`, which is Corrosion's
