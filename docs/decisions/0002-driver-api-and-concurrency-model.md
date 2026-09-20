@@ -6,11 +6,12 @@ ADR-0001 Phase 0 spikes, see "Amendments after the Phase 0 spikes"; amended agai
 independent review of the `db-core` session layer, see "Amendments after the db-core session review";
 amended again by the owner's connect-time-warning decision, see "Amendment: the connect-time warning
 channel"; amended again to say where a connection is *created*, see "Amendment: a connection is
-created on a helper thread"
+created on a helper thread"; amended again to make a batch's column storage readable, see
+"Amendment: a batch's column storage is readable, not only indexable"
 **Date:** 2026-09-19
 **Amended:** 2026-09-19 (API review), 2026-09-19 (Phase 0 spikes), 2026-09-19 (db-core session
 review), 2026-09-20 (owner confirmation), 2026-09-20 (connect-time warning channel, C-6),
-2026-09-20 (connection created on a helper thread, C-5)
+2026-09-20 (connection created on a helper thread, C-5), 2026-09-20 (column storage readable, M1.3)
 
 ## Context
 
@@ -938,6 +939,45 @@ anything.
 `a_session_that_arrives_after_the_limit_is_closed_on_its_own_thread` and
 `a_waiter_that_unwinds_still_leaves_nothing_adopted_or_leaked`, the last two driving the shipped
 `within` rather than a copy of it.
+
+## Amendment: a batch's column storage is readable, not only indexable (2026-09-20, from M1.3)
+
+Numbering: `I`. Prompted by building `crates/ffi` (ADR-0003), which needs to hand C the *same*
+buffers the driver filled, not copies of them.
+
+### I1 — `Column`, `TextColumn`, `BytesColumn` and `NullMask` expose their layout
+
+This ADR's result contract already *documents* the layout — "one contiguous buffer plus a `Vec<usize>`
+of offsets", "a null bit per row, LSB-first within each `u64`" — because that layout is the reason
+`RowBatch` is column-oriented at all (D5, S2). But the types only offered per-cell access
+(`Column::value(row)`, `Column::is_null(row)`), so the one consumer the layout exists for could not
+reach it. The following read-only accessors are added; no field is made public and nothing gains a
+way to mutate a batch:
+
+```rust
+impl NullMask    { pub fn words(&self) -> &[u64]; }
+impl TextColumn  { pub fn buffer(&self) -> &str;  pub fn offsets(&self) -> &[usize]; }
+impl BytesColumn { pub fn buffer(&self) -> &[u8]; pub fn offsets(&self) -> &[usize]; }
+impl Column      { pub const fn data(&self) -> &ColumnData; pub const fn nulls(&self) -> &NullMask; }
+```
+
+Additive and non-breaking: every existing method keeps its behaviour, and the unit test
+`a_column_exposes_the_layout_it_documents` asserts the accessors and `value`/`is_null` describe the
+same cells, so the two views cannot drift.
+
+### I2 — what this commits the contract to, and what it does not
+
+It commits a driver to the *documented* representation: a text column really is one UTF-8 buffer
+with `row_count + 1` offsets into it, and a null mask really is bits LSB-first within `u64` words.
+That was already the contract; it is now observable, which means a driver cannot quietly satisfy the
+per-cell API with some other arrangement. A future storage change — dictionary encoding, a chunked
+buffer, an arena shared between columns — is now a breaking change to `db-driver-api` rather than an
+internal one, and would have to be carried through `ReldexColumnView` (ADR-0003 D4). That is the
+intended trade: the million-row path has no marshalling layer precisely because the shape is fixed.
+
+It does **not** commit anything about lifetime or ownership beyond Rust's own borrow rules. The
+borrow ends with the `RowBatch`, and the FFI keeps the batch alive for exactly as long as the
+adapter holds the `ReldexBatch*` it was handed.
 
 ## Notes for driver implementers
 

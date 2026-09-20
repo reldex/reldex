@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/db-driver-api",
     "crates/db-core",
+    "crates/ffi",
     "crates/drivers/mock",
     "crates/drivers/oracle-thin",
     "crates/reldex-core-poc",

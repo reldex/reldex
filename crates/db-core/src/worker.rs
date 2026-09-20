@@ -553,11 +553,24 @@ impl Worker {
         // caller is no longer listening.
         let mut registered: Vec<ResultSetId> = Vec::new();
 
+        let mut columns = Vec::new();
         let result = match outcome.take_cursor() {
             None => None,
             Some(cursor) => match self.register_cursor(cursor) {
                 Ok(id) => {
                     registered.push(id.result());
+                    // Plain data, copied here on the worker thread: the cursor
+                    // itself never leaves it, so this is the only chance to
+                    // learn the column names the caller's grid needs.
+                    if let Some(cursor) = self.cursors.get(&id.result()) {
+                        // Through `call` like every other driver call: the
+                        // contract says `columns()` is a cheap accessor, but a
+                        // panic here must not unwind the worker. A torn cursor
+                        // reports no columns rather than failing a statement
+                        // that already ran on the server.
+                        columns =
+                            call(&self.torn, || Ok(cursor.columns().to_vec())).unwrap_or_default();
+                    }
                     Some(id)
                 }
                 Err(err) => {
@@ -588,6 +601,7 @@ impl Worker {
 
         let value = ExecuteOutcome {
             result,
+            columns,
             rows_affected: outcome.rows_affected(),
             statement_kind,
             committed_implicitly,

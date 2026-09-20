@@ -47,3 +47,43 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace
+
+      # ADR-0003 A8: a cargo feature must never change the ABI, and a shipping
+      # build carries no mock. Cheap to prove here and easy to break silently.
+      - name: cargo clippy -p reldex-ffi --no-default-features
+        run: cargo clippy -p reldex-ffi --no-default-features -- -D warnings
+
+  # `crates/ffi/include/reldex.h` is generated output that is committed, so the
+  # C++ build never needs cbindgen (ADR-0003 D7). That only works if a stale
+  # header cannot land: this job regenerates it and diffs. One runner is
+  # enough — the header does not vary by platform — and it is separate from
+  # `test` so installing cbindgen does not slow the matrix down.
+  #
+  # `cargo test --workspace` also runs `crates/ffi/tests/header.rs`, which
+  # checks every export reaches the header without needing cbindgen; this job
+  # is the exact check.
+  header:
+    name: reldex.h is not stale
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: header
+
+      - name: Install cbindgen
+        # Pinned: cbindgen's output changes between releases, so an unpinned
+        # install would fail this job on a formatting change nobody made.
+        run: cargo install cbindgen --locked --version 0.29.4
+
+      - name: crates/ffi/gen-header.sh --check
+        # Invoked through `bash` rather than as `./…` so the job does not
+        # depend on the executable bit surviving a checkout made on Windows
+        # (this repository has `core.fileMode=false`).
+        run: bash crates/ffi/gen-header.sh --check
