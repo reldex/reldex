@@ -206,9 +206,17 @@ fn per_fetch_latency_occupies_the_calling_thread_on_every_fetch() {
 
 #[test]
 fn first_batch_latency_applies_once_on_top_of_any_per_fetch_latency() {
-    let first_batch = Duration::from_millis(30);
-    let per_fetch = Duration::from_millis(10);
-    let spec = GeneratedQuerySpec::s14_shape(20, 0)
+    // No upper bound on any single fetch: a loaded CI runner can turn a 10ms
+    // sleep into 90ms (see the flake this replaced), so a tight
+    // `second_elapsed < first_batch` check on one sample is not safe at any
+    // realistic margin. Instead: widely separated durations, plus a vote
+    // across several later fetches — a stall would have to hit *every one*
+    // of them to produce a false failure, which a generic scheduler stall
+    // does not do.
+    let first_batch = Duration::from_millis(200);
+    let per_fetch = Duration::from_millis(5);
+    const LATER_FETCHES: usize = 5;
+    let spec = GeneratedQuerySpec::s14_shape(100, 0)
         .with_first_batch_latency(first_batch)
         .with_per_fetch_latency(per_fetch);
     let (_connection, mut cursor) = run("SELECT * FROM big", spec);
@@ -221,17 +229,30 @@ fn first_batch_latency_applies_once_on_top_of_any_per_fetch_latency() {
         "the first fetch should pay both latencies: took {first_elapsed:?}"
     );
 
-    let started = Instant::now();
-    cursor.fetch_batch(one(10)).expect("second batch");
-    let second_elapsed = started.elapsed();
+    let mut later_elapsed = Vec::with_capacity(LATER_FETCHES);
+    for _ in 0..LATER_FETCHES {
+        let started = Instant::now();
+        cursor.fetch_batch(one(10)).expect("later batch");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= per_fetch,
+            "every fetch pays the per-fetch latency: took {elapsed:?}"
+        );
+        later_elapsed.push(elapsed);
+    }
+
+    let fastest_later = later_elapsed
+        .iter()
+        .copied()
+        .min()
+        .expect("LATER_FETCHES is non-zero");
     assert!(
-        second_elapsed >= per_fetch,
-        "later fetches pay only the per-fetch latency: took {second_elapsed:?}"
+        fastest_later < first_batch,
+        "the fastest of {LATER_FETCHES} later fetches ({fastest_later:?}) was not faster than \
+         the first-batch latency ({first_batch:?}); the first-batch latency looks like it is \
+         being paid again instead of only once. All later fetch times: {later_elapsed:?}"
     );
-    assert!(
-        second_elapsed < first_batch,
-        "later fetches must not pay the first-batch latency again: took {second_elapsed:?}"
-    );
+
     cursor.close().expect("close");
 }
 

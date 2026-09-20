@@ -56,42 +56,39 @@ fn a_statement_blocked_for_a_fixed_duration_then_succeeds() {
 }
 
 #[test]
-fn a_pre_armed_deadline_shorter_than_the_block_still_fires_as_a_timeout() {
+fn a_pre_armed_deadline_fires_even_though_the_block_would_otherwise_run_forever() {
     // ADR-0002 D2: a `PreArmedDeadline` driver cannot interrupt a running
     // call, but a deadline armed *before* the call still stops it at the
-    // deadline. This must keep working exactly as it does today even when the
-    // block would otherwise resolve on its own after a longer, fixed
-    // duration — the deadline does not know or care that the block was going
-    // to succeed eventually.
+    // deadline — the deadline does not know or care whether the block was
+    // ever going to resolve on its own.
+    //
+    // Deliberately no controller thread here, and so no race between two
+    // timers: nothing ever calls `BlockGate::release` or requests
+    // cancellation, so the deadline is the *only* way this call can return.
+    // An earlier version of this test raced a 30ms deadline against a 200ms
+    // release on another thread; that is exactly the shape of assertion that
+    // flaked under CI load (see the sibling flake in
+    // `generated_query.rs`'s `first_batch_latency_applies_once_...`), and
+    // the race added nothing this test needs — the "the gate really would
+    // have released it" half of the claim is already covered by
+    // `a_statement_blocked_for_a_fixed_duration_then_succeeds` above.
     let scenario = reldex_driver_mock::Scenario::new();
     scenario.set_capabilities(
         reldex_db_driver_api::Capabilities::none()
             .with_cancel(reldex_db_driver_api::CancelKind::PreArmedDeadline),
     );
     let gate = BlockGate::new();
-    let block_for = Duration::from_millis(200);
-    let deadline = Duration::from_millis(30);
-    assert!(
-        deadline < block_for,
-        "the deadline must be the one that fires first"
-    );
-
     scenario.on_sql(
         "BEGIN DBMS_SESSION.SLEEP(10); END;",
-        Action::Block(BlockSpec::new(Arc::clone(&gate))),
+        Action::Block(BlockSpec::new(gate)),
     );
-
-    // The controller still releases the gate eventually; the deadline must
-    // win the race regardless.
-    let controller = Arc::clone(&gate);
-    std::thread::spawn(move || {
-        std::thread::sleep(block_for);
-        controller.release();
-    });
 
     let mut connection = connect(&scenario);
     let error = connection
-        .execute(&Statement::new("BEGIN DBMS_SESSION.SLEEP(10); END;").with_deadline(deadline))
-        .expect_err("the pre-armed deadline should fire before the gate is released");
+        .execute(
+            &Statement::new("BEGIN DBMS_SESSION.SLEEP(10); END;")
+                .with_deadline(Duration::from_millis(30)),
+        )
+        .expect_err("the pre-armed deadline should fire");
     assert_eq!(error.kind(), ErrorKind::Timeout);
 }
