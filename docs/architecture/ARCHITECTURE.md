@@ -211,6 +211,24 @@ Database Cursor -> Batch Fetch -> Result Store -> Virtual Table Model -> Visible
 - All metadata loading is lazy and flows through the generic `MetadataProvider`; vendor dictionary
   SQL lives in the vendor provider. A local SQLite metadata cache may be used with TTL, refresh,
   invalidation, and per-database identity isolation (`SPEC.md` §16).
+- **Metadata catalog descriptor (M2.8).** `DatabaseDriver::metadata_catalog()` (`db-driver-api`,
+  `metadata` module) returns a `&dyn MetadataCatalog` that, for each vendor-neutral request
+  (`Schemas`, `ObjectsOfKind`, `ColumnsOf`), builds an ordinary `Statement` plus a declared column
+  contract; `db-core` runs it through the normal execute/fetch path like any other query — there is
+  no separate metadata result type, no paging, and no caching at this layer. Vendor dictionary SQL
+  stays in the driver crate (Oracle's lives in `oracle-thin`'s `metadata` module, over `ALL_*`
+  views); the column contract (names, order, logical types) is fixed and identical across drivers,
+  built from shared functions in `db-driver-api` so drivers cannot drift from it. An optional name
+  filter is always a bound parameter — case-insensitive "contains", with `%`/`_`/escape-char
+  wildcard characters in the filter text escaped so they match literally, never string-concatenated
+  into SQL. The mandatory row-cap `limit` is enforced server-side by requesting `limit + 1` rows;
+  getting back exactly `limit + 1` is the caller's signal that the result was truncated. A
+  dictionary query that fails for lack of privilege is reclassified via
+  `MetadataCatalog::classify_error` into `ErrorKind::Permission` (Oracle: the catalog's own queries
+  against `ALL_*` views hitting ORA-00942/01031/00990-family codes); the hook only reclassifies the
+  catalog's own queries and does not change how the same ambiguous codes are classified for
+  ordinary user SQL. This descriptor is the narrow driver-level contract; the lazy/cached
+  `MetadataProvider` described above remains a separate, not-yet-built `db-core`-level consumer.
 - SQLite local persistence covers profiles (without plaintext secrets), workspace, query history,
   metadata cache, favorites, snippets, settings, UI layout, feature state (`SPEC.md` §20).
 - Credentials use platform secure storage (Windows Credential Manager, Apple Keychain, Android
