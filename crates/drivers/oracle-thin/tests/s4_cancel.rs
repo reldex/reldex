@@ -266,13 +266,72 @@ fn a_statement_that_finishes_inside_its_deadline_is_unaffected() {
     drop(outcome);
 
     // And the armed deadline does not leak into the next statement.
-    let started = Instant::now();
-    exec(connection.as_mut(), "BEGIN DBMS_SESSION.SLEEP(3); END;");
-    assert!(
-        started.elapsed() >= Duration::from_secs(3),
-        "the previous statement's deadline was still armed"
+    //
+    // **House rule: no absolute timing bounds — and this one was worse than
+    // that, it was a test defect, not a driver bug.** Investigated 2026-09-24
+    // after this assertion (previously `elapsed >= Duration::from_secs(3)`
+    // around a bare `DBMS_SESSION.SLEEP(3)`) failed 3/5 whole-file runs. Two
+    // problems, found by instrumenting the old assertion to print the actual
+    // elapsed time before removing it:
+    //
+    // 1. **The pairing could never have caught the bug it claims to test.**
+    //    The statement above arms a 10s deadline; even if that value leaked
+    //    into the call below completely unnoticed, 10s is longer than the 3s
+    //    this sleep asked for, so "leaked" and "correctly cleared" were
+    //    observationally identical — both let a 3s sleep finish normally. A
+    //    leak can only be caught by pairing a *shorter* deadline with a
+    //    *longer*, undeadlined call after it, so a real leak produces an
+    //    unambiguous error instead of a coincidence of timing.
+    // 2. **The boundary had no margin against real timer behaviour, solo or
+    //    not.** `DBMS_SESSION.SLEEP(3)`, measured client-side on this
+    //    container: 5/5 solo runs (`--test-threads=1`, this test alone, no
+    //    contention possible) landed at 2.985-2.999s and failed the old
+    //    assertion every time; 2/2 whole-file runs landed at 3.004s and
+    //    passed. No run in either mode ever produced an error — only a clean
+    //    completion a few milliseconds either side of the 3.000s line. That
+    //    is deterministic timer-precision straddling a boundary with ~0
+    //    margin, not "the rest of the suite" adding load-dependent noise: the
+    //    solo runs alone falsify the original comment's theory, since nothing
+    //    else was running to leak anything into them.
+    //
+    // The driver itself is not implicated: `apply_deadline`
+    // (`crates/drivers/oracle-thin/src/conn.rs:795-802`) is called
+    // unconditionally on every `execute()` with `statement.deadline()` and
+    // disarms to `None` before a call that asks for none, and no timeout
+    // error was observed in any of the 7 runs above — a genuinely leaked
+    // *shorter* deadline could not produce a clean early success, only an
+    // error.
+    //
+    // So: arm a short deadline that the first statement still finishes well
+    // inside, then run something *longer* than that deadline with none of its
+    // own armed. If the short deadline leaked, the longer call fails long
+    // before it would otherwise finish — an unambiguous error — which needs
+    // no wall-clock lower bound at all.
+    let leak_probe_deadline = Duration::from_secs(1);
+    let outcome = connection
+        .execute(&Statement::new("SELECT 1 FROM dual").with_deadline(leak_probe_deadline))
+        .expect("a fast statement must not be disturbed by a deadline it finishes well inside");
+    assert!(outcome.has_cursor());
+    drop(outcome);
+
+    let leak_probe_started = Instant::now();
+    connection
+        .execute(&Statement::new("BEGIN DBMS_SESSION.SLEEP(5); END;"))
+        .unwrap_or_else(|error| {
+            panic!(
+                "the previous statement's {leak_probe_deadline:?} deadline leaked into this \
+                 unrelated, undeadlined 5s sleep and cut it short after {:.3?}: {error}",
+                leak_probe_started.elapsed()
+            )
+        });
+    measurement(
+        "s4.leak_probe_undeadlined_sleep5_elapsed",
+        format!("{:.3?}", leak_probe_started.elapsed()),
     );
-    observation("a generous deadline passed cleanly and did not leak into the next call");
+    observation(format!(
+        "a {leak_probe_deadline:?} deadline on the previous statement did not leak into an \
+         unrelated, undeadlined 5s sleep after it (no error, whatever it took)"
+    ));
     connection.close().expect("close");
 }
 
@@ -546,13 +605,54 @@ fn a_privileged_cancel_reaches_the_server_but_not_the_client() {
 
     // Half of this works. `ALTER SYSTEM CANCEL SQL` is accepted in a couple of
     // milliseconds and the server really does end the call: `V$SESSION` leaves
-    // ACTIVE almost immediately.
+    // ACTIVE well before the client would ever find out on its own.
+    //
+    // **No absolute timing bound here — house rule: a fixed wall-clock upper
+    // bound just moves the flake to a slower CI runner or a busier local DB.**
+    // An earlier version of this assertion tried `stopped < 5s`, then
+    // `stopped < 10s` after two back-to-back failures under
+    // `tools/gates.sh --only db` on 2026-09-24 (see
+    // `docs/exec-plans/active/phase-0-spike-results.md`, "S4 addendum
+    // (2026-09-24)", for the related-but-distinct candidate-1 finding this is
+    // NOT the same mechanism as — that one is the client's own pre-armed
+    // deadline firing mid-statement, not an externally issued cancel).
+    // Measured on this machine: run alone (`--test-threads=1`), `stopped` is a
+    // steady ~1.5s; run as part of this file at cargo's default parallelism —
+    // exactly what `tools/oracle-test-db/run-it.sh` and `tools/gates.sh
+    // --only db` use — several of this file's *other* tests
+    // (`a_deadline_stops_a_long_sql_statement_and_reports_the_session_honestly`,
+    // `killing_a_session_is_a_different_thing_with_different_consequences`)
+    // also drive CPU-bound work or their own `ALTER SYSTEM` command
+    // concurrently against the same single-instance container, and the server
+    // takes longer to notice and act on this test's own cancel: 6.1-6.6s
+    // across 4 such runs (3 whole-file + 1 full `gates.sh --only db`). Both
+    // absolute bounds (5s, then 10s) were just numbers that happened to have
+    // margin over what had been measured so far.
+    //
+    // What the test actually needs to prove does not require a wall-clock
+    // figure at all: the server really did end the call (`server_stopped_after`
+    // being `Some` already proves that — it only becomes `Some` inside the
+    // polling loop's own 12s observation window above, `for _ in 0..24 {
+    // sleep(500ms) }`; the `None` arm panics separately, below), and it did so
+    // *before* the client would ever have found out about the cancel on its
+    // own by timing out. That ordering is the actual contrast this test
+    // exists to show, it is a relative fact rather than an absolute one, and
+    // it holds with enormous margin under every load level measured so far:
+    // single-digit-second server reaction against the client's
+    // `SAFETY_DEADLINE`-driven ~24-29s recovery failure (this comparison is
+    // slightly conservative rather than exact — `stopped` is measured from
+    // when the cancel was issued, a few seconds after `ran_for`'s own clock
+    // started, so it understates the true gap between the two wall-clock
+    // moments; that only makes the assertion harder to satisfy, never easier).
     let stopped = result
         .server_stopped_after
         .unwrap_or_else(|| panic!("the server never stopped the statement"));
     assert!(
-        stopped < Duration::from_secs(5),
-        "the server took {stopped:.1?} to stop the statement"
+        stopped < result.ran_for,
+        "the server took {stopped:.1?} to stop the statement, which is not clearly ahead of \
+         the {:.1?} the client itself took to notice the cancel — the server-side stop is no \
+         longer a distinct, earlier event",
+        result.ran_for
     );
 
     // The other half does not. The client stays blocked in its read until its
