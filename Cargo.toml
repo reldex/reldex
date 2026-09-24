@@ -20,8 +20,12 @@ edition = "2024"
 rust-version = "1.85"
 publish = false
 version = "0.0.0"
-# No `license` field: licensing (Community/Pro) is intentionally undecided
-# (see TASKS.md "P0 — Repository bootstrap").
+# Community edition licence, decided 2026-09-24 (owner decision; see
+# docs/decisions/0005-public-repository-for-hosted-ci.md "Licence"): the
+# Community edition is GPL-3.0-or-later; Pro is licensed separately by the
+# copyright holder. See LICENSE and COPYRIGHT at the repository root.
+license = "GPL-3.0-or-later"
+repository = "https://github.com/reldex/reldex"
 
 # ---------------------------------------------------------------------------
 # Shared lint configuration. Individual crates opt in via

@@ -29,7 +29,7 @@ Android's bionic libc as well as for the driver.
 
 | | |
 | --- | --- |
-| Device | OPPO **CPH2399** (`ro.product.manufacturer` reports `OnePlus`), serial `U8ONT8ZLHQKZDAOJ` |
+| Device | OPPO **CPH2399** (`ro.product.manufacturer` reports `OnePlus`), serial `<device serial redacted>` [redacted 2026-09-24 for the public repository; the original serial remains in git history — see ADR-0005] |
 | Android | **16** (`ro.build.version.release`), API level **36** (`ro.build.version.sdk`), build `BP4A.251205.006` |
 | ABI | `arm64-v8a` |
 | Kernel | `Linux 4.19.191+ aarch64` |
