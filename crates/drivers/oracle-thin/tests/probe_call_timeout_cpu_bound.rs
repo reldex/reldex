@@ -101,7 +101,10 @@ use std::num::NonZeroUsize;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{connect, exec, exec_quietly, measurement, observation, scalar, system_params, try_connect, unique};
+use common::{
+    connect, exec, exec_quietly, measurement, observation, scalar, system_params, try_connect,
+    unique,
+};
 use reldex_db_driver_api::{
     ConnectionParams, DatabaseConnection, DbError, ErrorKind, NativeError, SessionState, Statement,
 };
@@ -116,7 +119,10 @@ const SHORT_DEADLINE: Duration = Duration::from_secs(2);
 /// result grid. Mirrors `s4_cancel.rs`'s helper of the same name: `execute`
 /// only describes (this driver asks for zero prefetched rows), so a query's
 /// actual server-side work happens on the first `fetch_batch`.
-fn run_to_first_batch(connection: &mut dyn DatabaseConnection, statement: &Statement) -> Result<(), DbError> {
+fn run_to_first_batch(
+    connection: &mut dyn DatabaseConnection,
+    statement: &Statement,
+) -> Result<(), DbError> {
     let mut outcome = connection.execute(statement)?;
     let Some(mut cursor) = outcome.take_cursor() else {
         return Ok(());
@@ -214,11 +220,18 @@ fn server_status_summary(history: &[(Duration, String)]) -> String {
     }
     match history.iter().find(|(_, status)| status != "ACTIVE") {
         Some((left_at, status)) => {
-            format!("left ACTIVE after {left_at:.1?} (now {status}); {} samples", history.len())
+            format!(
+                "left ACTIVE after {left_at:.1?} (now {status}); {} samples",
+                history.len()
+            )
         }
         None => {
             let last = history.last().expect("checked non-empty above");
-            format!("still ACTIVE after {:.1?} when observation stopped; {} samples", last.0, history.len())
+            format!(
+                "still ACTIVE after {:.1?} when observation stopped; {} samples",
+                last.0,
+                history.len()
+            )
         }
     }
 }
@@ -267,12 +280,23 @@ fn probe_call(sql: &'static str, deadline: Duration, want_cursor: bool) -> Probe
 
     let server_status = poll_server_status(&control_params, &tag, &worker);
     let (error, elapsed, still_usable_after) = worker.join().expect("probe worker must not panic");
-    Probe { error, elapsed, still_usable_after, server_status }
+    Probe {
+        error,
+        elapsed,
+        still_usable_after,
+        server_status,
+    }
 }
 
 fn report(scenario: &str, run: usize, probe: &Probe) {
-    let outcome = probe.error.as_ref().map_or_else(|| "no error (call succeeded)".to_owned(), describe);
-    measurement(&format!("probe23.{scenario}.elapsed"), format!("{:.1?}", probe.elapsed));
+    let outcome = probe
+        .error
+        .as_ref()
+        .map_or_else(|| "no error (call succeeded)".to_owned(), describe);
+    measurement(
+        &format!("probe23.{scenario}.elapsed"),
+        format!("{:.1?}", probe.elapsed),
+    );
     observation(format!(
         "{scenario} run {run}/{RUNS}: {outcome}; session afterwards: {}; server-side: {}",
         usable_text(&probe.still_usable_after),
@@ -290,10 +314,9 @@ fn scenario_1_control_a_sleep_10_dies_as_the_issue_describes() {
     for run in 1..=RUNS {
         let probe = probe_call("BEGIN DBMS_SESSION.SLEEP(10); END;", SHORT_DEADLINE, false);
         report("control_a_sleep10", run, &probe);
-        let error = probe
-            .error
-            .as_ref()
-            .unwrap_or_else(|| panic!("run {run}: sleep(10) with a 2s deadline must fire; it did not"));
+        let error = probe.error.as_ref().unwrap_or_else(|| {
+            panic!("run {run}: sleep(10) with a 2s deadline must fire; it did not")
+        });
         assert_deadline_kind_is_honest(error);
         assert!(
             probe.elapsed >= SHORT_DEADLINE,
@@ -321,10 +344,9 @@ fn scenario_2_control_b_sleep_3_tests_the_maintainers_prediction() {
     for run in 1..=RUNS {
         let probe = probe_call("BEGIN DBMS_SESSION.SLEEP(3); END;", SHORT_DEADLINE, false);
         report("control_b_sleep3", run, &probe);
-        let error = probe
-            .error
-            .as_ref()
-            .unwrap_or_else(|| panic!("run {run}: sleep(3) with a 2s deadline must fire; it did not"));
+        let error = probe.error.as_ref().unwrap_or_else(|| {
+            panic!("run {run}: sleep(3) with a 2s deadline must fire; it did not")
+        });
         assert_deadline_kind_is_honest(error);
         assert!(
             probe.elapsed >= SHORT_DEADLINE,
@@ -345,10 +367,9 @@ fn scenario_3_cpu_bound_plsql_loop() {
     for run in 1..=RUNS {
         let probe = probe_call(CPU_PLSQL_SQL, SHORT_DEADLINE, false);
         report("cpu_plsql", run, &probe);
-        let error = probe
-            .error
-            .as_ref()
-            .unwrap_or_else(|| panic!("run {run}: a 10s CPU loop with a 2s deadline must fire; it did not"));
+        let error = probe.error.as_ref().unwrap_or_else(|| {
+            panic!("run {run}: a 10s CPU loop with a 2s deadline must fire; it did not")
+        });
         assert_deadline_kind_is_honest(error);
         assert!(
             probe.elapsed >= SHORT_DEADLINE,
@@ -386,10 +407,9 @@ fn scenario_4_cpu_bound_sql_returning_rows_only_at_the_end() {
     for run in 1..=RUNS {
         let probe = probe_call(CPU_SQL, SHORT_DEADLINE, true);
         report("cpu_sql", run, &probe);
-        let error = probe
-            .error
-            .as_ref()
-            .unwrap_or_else(|| panic!("run {run}: a ~15s CPU join with a 2s deadline must fire; it did not"));
+        let error = probe.error.as_ref().unwrap_or_else(|| {
+            panic!("run {run}: a ~15s CPU join with a 2s deadline must fire; it did not")
+        });
         assert_deadline_kind_is_honest(error);
         assert!(
             probe.elapsed >= SHORT_DEADLINE,
@@ -429,7 +449,9 @@ fn probe_streaming(sql: String, deadline: Duration, max_rows_to_try: usize) -> S
                 connection.as_mut(),
                 &format!("BEGIN DBMS_APPLICATION_INFO.SET_CLIENT_INFO('{worker_tag}'); END;"),
             );
-            let statement = Statement::new(sql).with_deadline(deadline).with_fetch_rows(NonZeroUsize::MIN);
+            let statement = Statement::new(sql)
+                .with_deadline(deadline)
+                .with_fetch_rows(NonZeroUsize::MIN);
             let started = Instant::now();
             let mut rows_before_error = 0_usize;
             let mut error = None;
@@ -461,7 +483,13 @@ fn probe_streaming(sql: String, deadline: Duration, max_rows_to_try: usize) -> S
     let server_status = poll_server_status(&control_params, &tag, &worker);
     let (rows_before_error, error, elapsed, still_usable_after) =
         worker.join().expect("stream worker must not panic");
-    StreamProbe { rows_before_error, error, elapsed, still_usable_after, server_status }
+    StreamProbe {
+        rows_before_error,
+        error,
+        elapsed,
+        still_usable_after,
+        server_status,
+    }
 }
 
 #[test]
@@ -483,12 +511,21 @@ fn scenario_5_streaming_select_with_slow_rows() {
         let sql = format!("SELECT {function}(LEVEL) FROM dual CONNECT BY LEVEL <= 10");
         let probe = probe_streaming(sql, SHORT_DEADLINE, 10);
 
-        measurement("probe23.streaming.rows_before_error", probe.rows_before_error);
-        measurement("probe23.streaming.elapsed", format!("{:.1?}", probe.elapsed));
+        measurement(
+            "probe23.streaming.rows_before_error",
+            probe.rows_before_error,
+        );
+        measurement(
+            "probe23.streaming.elapsed",
+            format!("{:.1?}", probe.elapsed),
+        );
         observation(format!(
             "streaming run {run}/{RUNS}: {} rows fetched before {}; session afterwards: {}; server-side: {}",
             probe.rows_before_error,
-            probe.error.as_ref().map_or_else(|| "no error (all 10 rows arrived)".to_owned(), describe),
+            probe
+                .error
+                .as_ref()
+                .map_or_else(|| "no error (all 10 rows arrived)".to_owned(), describe),
             usable_text(&probe.still_usable_after),
             server_status_summary(&probe.server_status),
         ));
@@ -533,9 +570,11 @@ fn scenario_6_generous_deadline_on_cpu_bound_work_is_unaffected() {
             "run {run}: a 15s deadline on ~10s of CPU work must not fire: {}",
             probe.error.as_ref().map_or_else(String::new, describe)
         );
-        probe
-            .still_usable_after
-            .as_ref()
-            .unwrap_or_else(|error| panic!("run {run}: session should be unaffected: {}", describe(error)));
+        probe.still_usable_after.as_ref().unwrap_or_else(|error| {
+            panic!(
+                "run {run}: session should be unaffected: {}",
+                describe(error)
+            )
+        });
     }
 }
