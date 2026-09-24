@@ -612,6 +612,58 @@ fn output_sits_between_its_statements_executing_and_executed() {
 }
 
 #[test]
+fn output_of_a_statement_that_needs_validation_arrives_in_the_next_executes_window() {
+    // The second documented exception to "a statement's output sits in its
+    // own window": no read is made on a session that needs validation, so
+    // what the failed statement printed is read after the next execute,
+    // ahead of that execute's own lines — delayed and not attributable to
+    // the right statement, but not lost.
+    let scenario = scenario();
+    let flaky = "BEGIN time_out; END;";
+    scenario.on_sql(
+        flaky,
+        Action::Fail(
+            ScriptedError::new(ErrorKind::Timeout, "deadline elapsed")
+                .with_session_state(SessionState::NeedsValidation),
+        ),
+    );
+    scenario.on_sql_output(flaky, lines("printed by the timed-out block", 1));
+    let (session, queue) = support::open_events(&scenario);
+    session
+        .submit_set_server_output(RequestId(1), ON)
+        .expect("accepted");
+    let _ = support::drain_n(&queue, 1);
+
+    let failed = submit_and_collect(&session, &queue, 2, flaky);
+    let labels: Vec<&str> = failed
+        .iter()
+        .map(label)
+        .filter(|label| *label != "TransactionStateChanged")
+        .collect();
+    assert_eq!(labels, ["Executing", "Executed"], "no read before the ping");
+
+    let next = submit_and_collect(&session, &queue, 3, BLOCK);
+    let labels: Vec<&str> = next
+        .iter()
+        .map(label)
+        .filter(|label| *label != "TransactionStateChanged")
+        .collect();
+    assert_eq!(labels, ["Executing", "ServerOutput", "Executed"]);
+    let delivered: Vec<String> = next
+        .into_iter()
+        .filter_map(|event| match event {
+            SessionEvent::ServerOutput { lines, .. } => Some(lines),
+            _ => None,
+        })
+        .flatten()
+        .map(String::from)
+        .collect();
+    let mut expected = lines("printed by the timed-out block", 1);
+    expected.extend(lines("line", 3));
+    assert_eq!(delivered, expected);
+}
+
+#[test]
 fn a_statements_transaction_state_change_precedes_its_output() {
     // Exact transaction state (the mock default), so the INSERT flips
     // "possibly active" to true: that is recorded before the read, so the

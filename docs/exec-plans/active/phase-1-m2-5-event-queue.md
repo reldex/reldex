@@ -472,7 +472,7 @@ the interim pump as `RELDEX_EVENT_UNKNOWN`. What M2.11 has to add:
 
 | `SessionEvent` | `ReldexEventKind` | fields to fill |
 | --- | --- | --- |
-| `ServerOutput { session, lines, dropped, failure }` | **new** `SERVER_OUTPUT` | `line_count`; the lines behind an accessor or an arena as `(pointer, length)` UTF-8, **never** NUL-terminated, because a line may contain `\n` or NUL and an empty line is a real line; `dropped` (lines refused before this event, so "output truncated"); `error` from `failure` (a failed read, so "output incomplete, because …"). There is no `request`: every `ServerOutput` between an execute's `EXECUTING` and its `EXECUTED` belongs to that execute. |
+| `ServerOutput { session, lines, dropped, failure }` | **new** `SERVER_OUTPUT` | `line_count`; the lines behind an accessor or an arena as `(pointer, length)` UTF-8, **never** NUL-terminated, because a line may contain `\n` or NUL and an empty line is a real line; `dropped` (lines refused before this event, so "output truncated"); `error` from `failure` (a failed read, so "output incomplete, because …"). There is no `request`: a `ServerOutput` between an execute's `EXECUTING` and its `EXECUTED` belongs to that execute, except in the two cases under "Ordering" below. |
 | `ServerOutputConfigured { session, request, result }` | a reply: **new** `SERVER_OUTPUT_CONFIGURED`, or `COMPLETED` with a new `completed_operation` value | `request`, `error` when `Err`, and the setting **in force** — enabled, unlimited, and buffer bytes. Oracle clamps a requested size into 2,000..=1,000,000, and the pane must show the real one. |
 
 Entry point: one `reldex_session_set_server_output(session, request, mode, buffer_bytes)` onto
@@ -489,9 +489,14 @@ Rules the adapter must keep:
 * **Ordering.** For one execute: `EXECUTING`, then `TRANSACTION_STATE` if it changed, then zero or
   more `SERVER_OUTPUT`, then `EXECUTED`. A read that loses the connection gives `SERVER_OUTPUT`
   with an error, then the statement's `EXECUTED` (its own result, untouched), then `TERMINAL`
-  (`Lost`, `transaction_possibly_lost`). Output a function wrote during a *fetch* arrives inside
-  the **next** execute's window, ahead of that execute's own lines. The pane should not
-  attribute it more precisely than that.
+  (`Lost`, `transaction_possibly_lost`). **Two exceptions** land inside the **next** execute's
+  window, ahead of that execute's own lines. The first is output a function wrote during a
+  *fetch*, because a fetch is not followed by a read. The second is output of a statement whose
+  `EXECUTED` carried an error that left the session needing validation (e.g. a timeout), because
+  no read is made until the next command's ping. The pane must not attribute either more
+  precisely than "printed before this statement's own output". The second is mostly moot on
+  Oracle today, where a timeout in a blocked call loses the session. The adapter can still mark
+  the next window as possibly carrying the failed statement's lines.
 * **Budget.** One event carries at most `SessionLimits::server_output_chunk_lines` (4,096) lines
   and `server_output_chunk_bytes` (32 KiB) of text plus at most one more line (up to 32,767 bytes).
   With output on, the per-session queue bound is `3R + U + 3` (§B2), and a chatty PL/SQL run fills
@@ -502,5 +507,9 @@ Rules the adapter must keep:
   `EventQueue::pending_dropped_lines(session)` on `TERMINAL`.
 * **The completion path has no stream.** Anything that still runs a statement through a
   `Completion` (the interim pump) must call `DatabaseSession::take_server_output()` after it. That
-  is a bounded log (10,000 lines / 1 MiB, with `dropped` and `failure`/`failures`) and costs no
-  round trip.
+  is a bounded log (10,000 lines / 1 MiB, with `dropped` and `failure`/`failures`). It keeps a
+  prefix of the output and costs no round trip. It is per session, not per statement, so take it
+  after each `wait()`. Completions pipelined and taken once get their output mixed, with
+  `failure` not attributed to any of them.
+* **`SessionEvent::ServerOutput` is `#[non_exhaustive]`.** Match it with `..`, because its fields
+  are expected to grow (follow-up M2.13 may add a per-statement truncation report).

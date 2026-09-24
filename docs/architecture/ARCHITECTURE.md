@@ -228,7 +228,11 @@ loses the connection ends the session through the same loss path as any other ca
 consumer cannot keep up with is dropped and counted by the existing `ServerOutput` drop policy
 (ADR-0002 E5), never silently. While output is off the worker makes no call at all, and the driver
 adds nothing to `execute`. Nothing is read after a fetch, commit, rollback, savepoint, ping or
-close, so output written while rows are fetched arrives with the next statement's read.
+close, so output written while rows are fetched arrives with the next statement's read. The same
+happens to the output of a statement that failed and left the session needing validation: no read
+is made until the next command's ping, so its lines arrive with the next statement's read, ahead
+of that statement's own. Both exceptions are documented on `SessionEvent::ServerOutput` and in
+ADR-0002 T4.
 
 ## 7. FFI and Qt adapter boundary
 

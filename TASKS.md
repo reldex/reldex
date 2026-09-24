@@ -111,6 +111,8 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 - [ ] M2.9 ★ Settings model: three-level resolution with provenance; profile model; SQLite store (opus, review mandatory)
 - [ ] M2.10 ★ Credential store: `CredentialStore` trait + Windows Credential Manager implementation (opus, review mandatory)
 - [ ] M2.11 FFI surface for M2.5–M2.10 + regenerate and verify header (sonnet)
+- [ ] M2.12 Server output framing over `RAW`/`LENGTHB` with per-line UTF-8 decoding, so one invalid line loses only itself (sonnet; M2.7 review follow-up)
+- [ ] M2.13 Per-statement server-output drain bound (total cap reported, or a cancel flag checked between reads) (opus; M2.7 review follow-up)
 
 ### M3 — Connect: shell, connection manager, first real session
 

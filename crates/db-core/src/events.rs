@@ -483,15 +483,30 @@ pub enum SessionEvent {
     /// **Where it sits in the stream.** The worker reads output after the
     /// statement that produced it and emits it **before that statement's
     /// [`SessionEvent::Executed`]** — so every `ServerOutput` lies between an
-    /// execute's [`SessionEvent::Executing`] and its `Executed`, and belongs to
-    /// that execute. The one exception is output written while rows were
-    /// being *fetched* (a function in a select list that prints): fetches are
-    /// not followed by a read, so those lines arrive after the session's next
-    /// statement, inside that statement's window.
+    /// execute's [`SessionEvent::Executing`] and its `Executed`. Normally it
+    /// belongs to that execute. There are two exceptions, and in both the
+    /// lines arrive inside the **next** execute's window, ahead of that
+    /// execute's own lines:
+    ///
+    /// * output written while rows were being *fetched* (a function in a
+    ///   select list that prints), because a fetch is not followed by a read;
+    /// * output of a statement that failed and left the session needing
+    ///   validation (for example a timeout), because no read is attempted on
+    ///   such a session. The next command's ping restores it, and the next
+    ///   execute's read returns those lines. Reading straight away would need
+    ///   a ping first, and would hold back the error reply on a connection
+    ///   that may be dead. On the Oracle driver today this case is mostly
+    ///   moot: a call timeout during a blocked call loses the session, and a
+    ///   lost session's output is gone with it.
     ///
     /// One statement's output may arrive as several events, each bounded by
     /// [`crate::SessionLimits::server_output_chunk_lines`] and
     /// [`crate::SessionLimits::server_output_chunk_bytes`].
+    ///
+    /// `#[non_exhaustive]`, unlike the other variants: its fields are still
+    /// expected to grow (a per-statement truncation report, follow-up M2.13),
+    /// so a consumer — M2.11's mapping first — must match it with `..`.
+    #[non_exhaustive]
     ServerOutput {
         /// The session.
         session: SessionId,

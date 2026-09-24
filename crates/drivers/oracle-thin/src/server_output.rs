@@ -85,6 +85,11 @@ const PREFIX_WIDTH: usize = 5;
 /// packed lines, `:4` the tail line, `:5` whether there is a tail line, `:6`
 /// how many lines were taken, `:7` whether `GET_LINE` reported the buffer
 /// empty. Each output is assigned exactly once, at the end.
+///
+/// Every call here names the package as `SYS.DBMS_OUTPUT`. An unqualified
+/// name resolves through the user's own schema first, so a table, package or
+/// synonym called `DBMS_OUTPUT` there would capture it. The qualified name
+/// always reaches the real package.
 const TAKE_BLOCK: &str = "DECLARE
   l_line     VARCHAR2(32767);
   l_status   INTEGER;
@@ -99,7 +104,7 @@ const TAKE_BLOCK: &str = "DECLARE
   l_drained  PLS_INTEGER := 0;
 BEGIN
   WHILE l_count < l_max LOOP
-    DBMS_OUTPUT.GET_LINE(l_line, l_status);
+    SYS.DBMS_OUTPUT.GET_LINE(l_line, l_status);
     IF l_status <> 0 THEN
       l_drained := 1;
       EXIT;
@@ -128,13 +133,15 @@ pub(crate) fn set(
     setting: ServerOutputSetting,
 ) -> DbResult<ServerOutputSetting> {
     let result = match setting {
-        ServerOutputSetting::Disabled => connection.execute("BEGIN DBMS_OUTPUT.DISABLE; END;", &[]),
+        ServerOutputSetting::Disabled => {
+            connection.execute("BEGIN SYS.DBMS_OUTPUT.DISABLE; END;", &[])
+        }
         ServerOutputSetting::Enabled(ServerOutputBuffer::Unlimited) => {
-            connection.execute("BEGIN DBMS_OUTPUT.ENABLE(NULL); END;", &[])
+            connection.execute("BEGIN SYS.DBMS_OUTPUT.ENABLE(NULL); END;", &[])
         }
         ServerOutputSetting::Enabled(ServerOutputBuffer::Bytes(bytes)) => {
             let size = i64::from(clamp_buffer(bytes).get());
-            connection.execute("BEGIN DBMS_OUTPUT.ENABLE(:1); END;", &[&size])
+            connection.execute("BEGIN SYS.DBMS_OUTPUT.ENABLE(:1); END;", &[&size])
         }
     };
     result.map_err(|error| crate::error::map(&error))?;
@@ -204,7 +211,7 @@ pub(crate) fn take(
 /// lines than the server said it sent — is reported as an error rather than
 /// guessed at: a mis-split would hand the user lines that were never printed.
 fn unpack(packed: &str, expected: usize) -> DbResult<Vec<Box<str>>> {
-    let mut lines = Vec::with_capacity(expected);
+    let mut lines = Vec::with_capacity(expected.min(packed.len() / PREFIX_WIDTH + 1));
     let mut rest = packed;
     while !rest.is_empty() {
         let prefix = rest

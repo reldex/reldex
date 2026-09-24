@@ -346,6 +346,48 @@ fn overflow_is_the_statements_error_with_its_native_code_and_the_lines_before_it
 }
 
 #[test]
+fn lines_a_read_leaves_behind_are_purged_by_the_next_put_not_overflowed() {
+    // Why db-core reads to the end (ADR-0002 T6). A read that stops early
+    // does not make a sized buffer overflow later. Instead, the next PUT after
+    // a read purges what was left, with nothing counted, and a statement that
+    // prints nothing has the leftovers read after it, in its own window.
+    let mut connection = connect();
+    enable(connection.as_mut(), bytes(2_000));
+    let nineteen =
+        "BEGIN FOR i IN 1..19 LOOP DBMS_OUTPUT.PUT_LINE(RPAD('p', 100, 'p')); END LOOP; END;";
+    exec(connection.as_mut(), nineteen);
+    let chunk = connection
+        .take_server_output(nz(1), nz(CHUNK_BYTES))
+        .expect("take one line");
+    assert_eq!(chunk.len(), 1);
+    assert!(!chunk.is_drained());
+    // 18 lines are still buffered; 19 more would overflow 2,000 bytes if
+    // they were kept. They are not: the first PUT purges them.
+    exec(connection.as_mut(), nineteen);
+    let (lines, _) = drain(connection.as_mut(), CHUNK_LINES, CHUNK_BYTES);
+    assert_eq!(lines.len(), 19, "only the second statement's lines remain");
+
+    // A statement that prints nothing does not purge: the leftovers are read
+    // after it.
+    exec(
+        connection.as_mut(),
+        "BEGIN FOR i IN 1..5 LOOP DBMS_OUTPUT.PUT_LINE('left ' || i); END LOOP; END;",
+    );
+    let chunk = connection
+        .take_server_output(nz(1), nz(CHUNK_BYTES))
+        .expect("take one line");
+    assert_eq!(chunk.lines().len(), 1);
+    exec(connection.as_mut(), "BEGIN NULL; END;");
+    let (lines, _) = drain(connection.as_mut(), CHUNK_LINES, CHUNK_BYTES);
+    assert_eq!(lines, ["left 2", "left 3", "left 4", "left 5"]);
+    observation(
+        "a partial read's leftovers are purged by the next PUT (no overflow, nothing \
+         counted), and read after a statement that prints nothing",
+    );
+    connection.close().expect("close");
+}
+
+#[test]
 fn a_session_that_never_enabled_output_pays_nothing_for_it() {
     let mut connection = connect();
     // The driver issues DBMS_OUTPUT calls only from `set_server_output` and

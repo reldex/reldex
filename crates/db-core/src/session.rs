@@ -174,10 +174,13 @@ pub struct ExecuteOutcome {
 ///
 /// Bounded, and honest about it: at most
 /// [`ServerOutputLog::MAX_RETAINED_LINES`] lines and
-/// [`ServerOutputLog::MAX_RETAINED_BYTES`] bytes are kept between two takes;
-/// later lines are counted in [`ServerOutputLog::dropped`] instead. This path
-/// is for tools and tests — a UI uses the event path, whose bound is the
-/// consumer's own drain.
+/// [`ServerOutputLog::MAX_RETAINED_BYTES`] bytes are kept between two takes.
+/// The kept lines are always a **prefix** of the output: from the first line
+/// that does not fit, every later line is counted in
+/// [`ServerOutputLog::dropped`] instead, even one small enough to fit, until
+/// the next take. The log is per session, not per statement; see
+/// [`DatabaseSession::take_server_output`]. This path is for tools and tests.
+/// A UI uses the event path, whose bound is the consumer's own drain.
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct ServerOutputLog {
@@ -1313,6 +1316,14 @@ impl DatabaseSession {
     /// each statement, before answering it. This only hands over what it
     /// collected. Output of event-path requests is not here — it went out as
     /// [`crate::SessionEvent::ServerOutput`] instead.
+    ///
+    /// **One log per session, not per statement.** Taken after a single
+    /// `wait()`, it holds exactly that statement's output. A caller that
+    /// pipelines several completions and takes once afterwards gets their
+    /// output mixed in execution order, with nothing marking where one
+    /// statement's lines end. [`ServerOutputLog::failure`] is then the first
+    /// failed read among them, and it is not attributed to any statement. To
+    /// attribute output, take after each `wait()`, or use the event path.
     #[must_use]
     pub fn take_server_output(&self) -> ServerOutputLog {
         self.shared.take_collected_server_output()

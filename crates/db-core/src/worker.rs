@@ -862,18 +862,29 @@ impl Worker {
     /// Reads in bounded chunks until the driver says the buffer is empty, one
     /// round trip each, and delivers each chunk as it arrives so the worker
     /// never holds more than one chunk. It reads to the end even when the
-    /// consumer is not keeping up: the server's buffer has to be emptied, or a
-    /// sized buffer overflows on the user's *next* statement with old output,
-    /// and what the consumer cannot take is dropped and counted by the event
+    /// consumer is not keeping up, because what it leaves on the server is
+    /// not safely delayed. On Oracle, the next statement's first `PUT` after a
+    /// read purges whatever was left unread, so those lines would be lost
+    /// with nothing counted. A statement that prints nothing would instead
+    /// see them read after it, in its own window. Reading to the end means
+    /// every line is either delivered or dropped **and counted** by the event
     /// queue's existing policy ([`crate::EventCaps`]).
+    ///
+    /// The cost: the drain has no total bound, a driver that cannot interrupt
+    /// a call cannot cancel it (only an abandon stops it, between reads), and
+    /// the statement's reply waits until it finishes — 10 million lines is
+    /// about 2,500 round trips. A per-statement bound is recorded as
+    /// follow-up M2.13 in `phase-1.md`.
     ///
     /// Not attempted at all when:
     ///
     /// * output is off — no round trip, ever (ADR-0002 amendment T);
     /// * the session is not [`SessionLifecycle::Usable`] — a lost session has
     ///   no connection, and one that needs validation must be pinged before
-    ///   it is used again, which the next command does; the output stays on
-    ///   the server and is read after that command;
+    ///   it is used again, which the next command does. The output stays on
+    ///   the server and is read after the next execute, inside that execute's
+    ///   window (the second documented exception on
+    ///   [`SessionEvent::ServerOutput`]);
     /// * the session is being abandoned — checked before every read, so an
     ///   abandon arriving during a long drain stops it at the next round
     ///   trip.

@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-24T21:16:00+07:00",
+  "updatedAt": "2026-09-24T22:30:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1195,6 +1195,16 @@
             {
               "title": "M2.11 FFI surface for M2.5–M2.10 + regenerate and verify header (sonnet)",
               "status": "todo"
+            },
+            {
+              "title": "M2.12 Server output framing over RAW/LENGTHB with per-line UTF-8 decoding, so one invalid line loses only itself (sonnet; M2.7 review follow-up)",
+              "status": "todo",
+              "note": "Today a line that is not valid UTF-8 loses every line of its read (up to 4,096 good lines)."
+            },
+            {
+              "title": "M2.13 Per-statement server-output drain bound (total cap reported, or a cancel flag checked between reads) (opus; M2.7 review follow-up)",
+              "status": "todo",
+              "note": "Today the drain has no length bound, cannot be cancelled on Oracle, and holds Executed back until it finishes."
             }
           ]
         },
@@ -1655,6 +1665,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-24",
+      "text": "M2.7 (server output) in review on draft PR #28, status still todo: independent review ACCEPT-WITH-FOLLOW-UPS, no must-fix. Should-fixes landed. The completion-path log is now a strict prefix of the output. A failed statement that leaves the session needing validation delivers its output with the next statement, now documented as a second exception. The reason for draining to the end is corrected: the next PUT purges leftovers, measured on 19c. A lost drain over-reports transaction loss on exact-state drivers, documented as deliberate. Two follow-ups recorded. M2.12: per-line UTF-8 framing, because today one invalid line loses its whole read. M2.13: a per-statement drain bound, because today the drain is unbounded and uncancellable on Oracle and holds Executed back."
+    },
     {
       "date": "2026-09-21",
       "text": "M2.6 done: SessionRegistry with non-blocking open and abandon. Independent review found no leaked connection in 960 randomized sessions and clean lock discipline, and 3 must-fix, all about not hiding transaction loss or blocking shutdown: abandon() reported 'no transaction lost' from a caller-thread snapshot while a queued INSERT was still to run and be rolled back; registry teardown waited N x 500 ms serially although the ADR claimed the waits overlapped (now one deadline: ~0.51 s for 8 stuck sessions); and a DML that dies with its connection re-read the dead connection's cached 'inactive' state. The authoritative answer is now Terminal.transaction_possibly_lost, computed on the worker when the session really ends. The C ABI is unchanged; M2.11 switches the FFI to this path and must carry the new field to the user. CI then exposed a latent M2.5 race (3 in 1,000 runs on main): after a lost session, a second close could answer 'closed cleanly'. Fixed at the root — how a session ended (cleanly / unresolved) is recorded once on the worker and every idempotent close answers from that record; a repeated close on a lost session now reports the loss again (ADR-0002 E7). 3,000-iteration loops, 0 failures."
