@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-24T21:41:43+07:00",
+  "updatedAt": "2026-09-24T21:52:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1180,8 +1180,8 @@
               "status": "done"
             },
             {
-              "title": "M2.6 ★ SessionRegistry + non-blocking open, abandon semantics (opus, review mandatory)",
-              "status": "todo"
+              "title": "M2.6 ★ SessionRegistry + non-blocking open, abandon semantics (opus, review mandatory) — done 2026-09-21: SessionRegistry — open never blocks (one Opened/OpenFailed, one Terminal, last); abandon never blocks and is never refused, a late connect is closed by the worker (0 leaks in 960 randomized sessions); Terminal.transaction_possibly_lost computed on the worker covers abandon/retire/drop/lost; one-deadline teardown; independently reviewed twice (3 must-fix fixed); ADR-0002 amendment R",
+              "status": "done"
             },
             {
               "title": "M2.7 ★ Server output capability (DBMS_OUTPUT) in contract + driver + core polling when enabled (opus, review mandatory)",
@@ -1665,6 +1665,10 @@
     {
       "date": "2026-09-24",
       "text": "ADR-0005 (Repository public to keep hosted CI): the reldex account's Free-plan Actions minutes were exhausted 2026-09-21 (>=100 workflow runs since 09-19, billing error on every job since). Stated honestly: CI was dead from 2026-09-21 until this decision, and PRs #22, #24 and #25 were merged in that window on local verification only (cargo fmt/clippy/test and the relevant oracle-it suite run by hand), not on a green CI run. Rather than reduce the OS matrix, add a self-hosted runner, or stop using Actions (the owner's first choice earlier the same day), the owner chose to make the repository public once shown that a public repo gets Actions minutes free with no monthly cap — ci.yml/ui.yml/mobile-cross-compile.yml are unchanged and CI stays the merge gate. tools/gates.sh added as a local pre-push/pre-PR script (fmt, clippy, test, header, doc-lint, and, when discoverable, the Qt UI build and the real-database suite) with a Markdown summary for the PR body. The visibility flip is not yet executed, gated on a history exposure scan (run 2026-09-24: clean of credentials/keys/certs; one Android device serial in phase-0-android-device.md redacted at HEAD, present in history, accepted as low risk). Same day, the owner also decided the long-open Community/Pro licensing question: Community edition is GPL-3.0-or-later (LICENSE, COPYRIGHT, copyright (C) 2026 Supawit Nu-iat), Pro licensed separately by the copyright holder, external contributions will need a CLA. Every crate's Cargo.toml now carries license/repository; cargo build --workspace stays clean."
+    },
+    {
+      "date": "2026-09-21",
+      "text": "M2.6 done: SessionRegistry with non-blocking open and abandon. Independent review found no leaked connection in 960 randomized sessions and clean lock discipline, and 3 must-fix, all about not hiding transaction loss or blocking shutdown: abandon() reported 'no transaction lost' from a caller-thread snapshot while a queued INSERT was still to run and be rolled back; registry teardown waited N x 500 ms serially although the ADR claimed the waits overlapped (now one deadline: ~0.51 s for 8 stuck sessions); and a DML that dies with its connection re-read the dead connection's cached 'inactive' state. The authoritative answer is now Terminal.transaction_possibly_lost, computed on the worker when the session really ends. The C ABI is unchanged; M2.11 switches the FFI to this path and must carry the new field to the user. CI then exposed a latent M2.5 race (3 in 1,000 runs on main): after a lost session, a second close could answer 'closed cleanly'. Fixed at the root — how a session ended (cleanly / unresolved) is recorded once on the worker and every idempotent close answers from that record; a repeated close on a lost session now reports the loss again (ADR-0002 E7). 3,000-iteration loops, 0 failures."
     },
     {
       "date": "2026-09-23",

@@ -362,15 +362,35 @@ impl BlockGate {
     /// gate, `false` if `timeout` elapsed first.
     #[must_use]
     pub fn wait_until_blocked(&self, timeout: Duration) -> bool {
+        self.wait_until_parked(1, timeout)
+    }
+
+    /// Blocks until at least `count` statements are parked on this gate, or
+    /// `timeout` elapses.
+    ///
+    /// The many-sessions form of [`BlockGate::wait_until_blocked`]: a test that
+    /// needs *every* worker stuck before it measures something must be able to
+    /// wait for that without sleeping.
+    #[must_use]
+    pub fn wait_until_parked(&self, count: u32, timeout: Duration) -> bool {
         let guard = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_guard, result) = self
             .condvar
-            .wait_timeout_while(guard, timeout, |state| state.parked == 0)
+            .wait_timeout_while(guard, timeout, |state| state.parked < count)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         !result.timed_out()
+    }
+
+    /// How many statements are parked on this gate right now.
+    #[must_use]
+    pub fn parked(&self) -> u32 {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .parked
     }
 
     /// Parks until released, cancelled or `deadline`.
@@ -673,6 +693,9 @@ impl fmt::Debug for Matcher {
 enum Behavior {
     Succeed,
     Fail(ScriptedError),
+    /// A driver call that panics outright (spike U-4). Only `connect` scripts
+    /// this today; `execute` has [`Action::Panic`].
+    Panic(String),
 }
 
 impl Behavior {
@@ -680,6 +703,7 @@ impl Behavior {
         match self {
             Self::Succeed => Ok(()),
             Self::Fail(error) => Err(error.build()),
+            Self::Panic(message) => panic!("{message}"),
         }
     }
 }
@@ -691,18 +715,50 @@ pub struct Counts {
     pub cursors_opened: usize,
     /// How many of them had `Cursor::close` called on them.
     pub cursors_closed: usize,
+    /// How many `DatabaseDriver::connect` calls have **returned**, whether
+    /// they succeeded or failed.
+    ///
+    /// The synchronisation point a test needs when it parks a connect with
+    /// [`Scenario::block_connect`]: "the connect is over" is otherwise not
+    /// observable for one that failed, and waiting on
+    /// [`Counts::connections_live`] alone is vacuously true before the connect
+    /// has produced anything.
+    pub connects_finished: usize,
+    /// How many connections `DatabaseDriver::connect` handed out.
+    pub connections_opened: usize,
     /// How many connections had `DatabaseConnection::close` called on them.
     pub connections_closed: usize,
+}
+
+impl Counts {
+    /// How many connections this scenario handed out and has not been asked to
+    /// close.
+    ///
+    /// The number that matters for an abandoned connect: a `connect` that wins
+    /// its race with [`Scenario::block_connect`]'s release still produced a
+    /// live database session, and the only acceptable end for it is that
+    /// somebody closed it. `0` is the assertion "nothing was leaked"; anything
+    /// else is a session left open on the server.
+    #[must_use]
+    pub const fn connections_live(&self) -> usize {
+        self.connections_opened
+            .saturating_sub(self.connections_closed)
+    }
 }
 
 struct Inner {
     capabilities: Capabilities,
     connect: Behavior,
+    /// When set, every `connect` parks on this gate before its behaviour is
+    /// applied, so a test can hold a connect open for as long as it needs and
+    /// then decide whether it succeeds or fails.
+    connect_gate: Option<Arc<BlockGate>>,
     connect_warnings: Vec<Warning>,
     ping: Behavior,
     cancel: Behavior,
     commit: Behavior,
     rollback: Behavior,
+    savepoint: Behavior,
     close: Behavior,
     invalidate_handles_on_transaction_end: bool,
     late_cancel_lands_on_next_statement: bool,
@@ -736,11 +792,13 @@ impl Default for Scenario {
                     .with_lob_streaming(true)
                     .with_error_position(true),
                 connect: Behavior::Succeed,
+                connect_gate: None,
                 connect_warnings: Vec::new(),
                 ping: Behavior::Succeed,
                 cancel: Behavior::Succeed,
                 commit: Behavior::Succeed,
                 rollback: Behavior::Succeed,
+                savepoint: Behavior::Succeed,
                 close: Behavior::Succeed,
                 invalidate_handles_on_transaction_end: false,
                 late_cancel_lands_on_next_statement: false,
@@ -785,6 +843,44 @@ impl Scenario {
     /// Makes every future `connect` fail with `error`.
     pub fn fail_connect(&self, error: ScriptedError) {
         self.lock().connect = Behavior::Fail(error);
+    }
+
+    /// Lets every future `connect` succeed again.
+    pub fn allow_connect(&self) {
+        self.lock().connect = Behavior::Succeed;
+    }
+
+    /// Makes every future `connect` **panic**, the way a driver that reached a
+    /// state it considers impossible does (spike U-4).
+    ///
+    /// What is under test is the core's containment (ADR-0002 K6): a panic in
+    /// `connect` must become a reportable failure for that one session, not an
+    /// unwind across the worker boundary.
+    pub fn panic_connect(&self, message: impl Into<String>) {
+        self.lock().connect = Behavior::Panic(message.into());
+    }
+
+    /// Parks every future `connect` on `gate` until it is released.
+    ///
+    /// The connect-side twin of [`Action::Block`], and the only way to hold a
+    /// connect open deterministically: a test opens a session, waits for
+    /// [`BlockGate::wait_until_blocked`], does whatever it wanted to race
+    /// against the connect — abandon it, drop the registry — and only then
+    /// releases the gate, so the "late connection" case is forced rather than
+    /// hoped for. The behaviour scripted by [`Scenario::fail_connect`] /
+    /// [`Scenario::panic_connect`] is applied **after** the gate releases, so
+    /// the same gate covers a late success and a late failure.
+    ///
+    /// The gate is shared by every connect on this scenario; use a fresh
+    /// scenario, or a fresh gate, per interleaving being tested.
+    pub fn block_connect(&self, gate: Arc<BlockGate>) {
+        self.lock().connect_gate = Some(gate);
+    }
+
+    /// Stops parking `connect`; attempts already parked stay parked until the
+    /// gate they took is released.
+    pub fn unblock_connect(&self) {
+        self.lock().connect_gate = None;
     }
 
     /// Scripts the non-fatal findings every future connection reports through
@@ -838,6 +934,23 @@ impl Scenario {
     /// Makes every future `commit` succeed again.
     pub fn allow_commit(&self) {
         self.lock().commit = Behavior::Succeed;
+    }
+
+    /// Makes every future `savepoint` **and** `rollback to savepoint` fail with
+    /// `error`.
+    ///
+    /// Both go through one behaviour because they are the same driver call arm
+    /// in `db-core` (`Command::Savepoint` / `Command::RollbackToSavepoint`), and
+    /// what a test needs from here is to make that arm fail — most usefully
+    /// with `SessionState::Lost`, which is the case where the core must stop
+    /// trusting the driver's cached transaction state.
+    pub fn fail_savepoint(&self, error: ScriptedError) {
+        self.lock().savepoint = Behavior::Fail(error);
+    }
+
+    /// Makes every future savepoint call succeed again.
+    pub fn allow_savepoint(&self) {
+        self.lock().savepoint = Behavior::Succeed;
     }
 
     /// Makes every future `rollback` fail with `error`, leaving the
@@ -959,12 +1072,45 @@ impl Scenario {
         self.lock().counts.cursors_closed += 1;
     }
 
+    /// One `connect` returned a connection. Both counters move under the same
+    /// lock, so a test that waits on `connects_finished` can never observe it
+    /// ahead of the connection it counts.
+    pub(crate) fn record_connection_opened(&self) {
+        let mut inner = self.lock();
+        inner.counts.connections_opened += 1;
+        inner.counts.connects_finished += 1;
+    }
+
+    /// One `connect` returned without a connection.
+    pub(crate) fn record_connect_failed(&self) {
+        self.lock().counts.connects_finished += 1;
+    }
+
     pub(crate) fn record_connection_closed(&self) {
         self.lock().counts.connections_closed += 1;
     }
 
     pub(crate) fn connect_behavior(&self) -> Result<(), DbError> {
-        self.lock().connect.apply()
+        // Taken out of the lock before parking: holding the scenario's mutex
+        // across a park would stop every other connection in the scenario,
+        // including the test thread asking what it counted.
+        let gate = self.lock().connect_gate.clone();
+        if let Some(gate) = gate {
+            // No deadline and no cancel observation: a connect cannot be
+            // interrupted (ADR-0002 H1, spike U-15), which is the property
+            // the tests using this exist to exercise.
+            let _ = gate.park(None, false);
+        }
+        let behavior = self.lock().connect.clone();
+        if matches!(behavior, Behavior::Panic(_)) {
+            // Recorded *before* the panic, because after it there is no code
+            // left on this thread to record anything: a test that waits on
+            // `Counts::connects_finished` — the only way to know every connect
+            // has run without sleeping — would otherwise hang forever on the
+            // `panic_connect` scenario.
+            self.record_connect_failed();
+        }
+        behavior.apply()
     }
 
     pub(crate) fn ping_behavior(&self) -> Result<(), DbError> {
@@ -981,6 +1127,10 @@ impl Scenario {
 
     pub(crate) fn rollback_behavior(&self) -> Result<(), DbError> {
         self.lock().rollback.apply()
+    }
+
+    pub(crate) fn savepoint_behavior(&self) -> Result<(), DbError> {
+        self.lock().savepoint.apply()
     }
 
     pub(crate) fn close_behavior(&self) -> Result<(), DbError> {

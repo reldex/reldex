@@ -6,7 +6,7 @@
 //! and a plain [`std::sync::Mutex`] is enough — this is not a hot path.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use reldex_db_driver_api::{
@@ -136,6 +136,39 @@ impl LostReason {
     }
 }
 
+/// How a session ended — the one record every "this session is already over"
+/// answer is derived from.
+///
+/// Recorded once, on the worker thread, at the point the session actually
+/// ends. The distinction is the whole point: "a close has run" and "a close
+/// succeeded" are not the same thing, and only the second one lets a later
+/// close report success (`SPEC.md` §10, ADR-0002 K2/E7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndedAs {
+    /// An explicit [`crate::DatabaseSession::close`] ran on a live connection
+    /// and succeeded: the disposition the caller chose was carried out and the
+    /// connection was released. This is the only end that makes a later close
+    /// the documented no-op success.
+    Cleanly = 1,
+    /// The session ended without a close resolving anything: it was lost, it
+    /// was abandoned (which never commits and never rolls back explicitly,
+    /// ADR-0002 K5), or the close itself failed. A later close is told so.
+    Unresolved = 2,
+}
+
+impl EndedAs {
+    /// The stored code for a session that has not ended.
+    pub(crate) const NOT_ENDED: u8 = 0;
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Cleanly),
+            2 => Some(Self::Unresolved),
+            _ => None,
+        }
+    }
+}
+
 struct State {
     /// Where the session is in its lifecycle; see [`SessionLifecycle`].
     lifecycle: SessionLifecycle,
@@ -184,11 +217,32 @@ pub(crate) struct SessionShared {
     /// [`SessionEvent::Terminal`] is emitted exactly once however many paths
     /// observe the transition (ordering rule 3).
     terminal_emitted: AtomicBool,
-    /// Set once the worker has answered a close that actually ended the
-    /// session. A later close is then the documented no-op success, on either
-    /// path: on the completion path `DatabaseSession::close` sees no worker to
-    /// ask, and on the event path this is what says the same thing.
-    ended: AtomicBool,
+    /// How this session ended, as an [`EndedAs`] code, or
+    /// [`EndedAs::NOT_ENDED`] while it has not.
+    ///
+    /// The single authoritative record behind every idempotent close, on both
+    /// reply paths. It deliberately says *how* rather than merely *whether*:
+    /// only a close that actually ran to completion on a live connection makes
+    /// a later close the documented no-op success, and a session that was lost
+    /// or abandoned owes that later close the truth instead.
+    ended: AtomicU8,
+    /// Set by [`crate::SessionRegistry::abandon`] when it gives up on a connect
+    /// that has not finished. It only ever happens *before* a connection
+    /// exists, so there is no ambiguity about what it describes: the open was
+    /// cancelled, and [`SessionShared::terminal_error`] says so with
+    /// [`ErrorKind::Cancelled`] rather than the generic "this session is
+    /// closed" a deliberate close produces.
+    open_cancelled: AtomicBool,
+    /// Set on the worker thread when a [`crate::CloseDisposition`] the caller
+    /// chose actually succeeded, as part of the close that ends the session.
+    ///
+    /// This is what separates "the session ended and took an unresolved
+    /// transaction with it" from "the user said commit (or rollback) and it
+    /// worked". Only the second is not a loss, and only an explicit `close`
+    /// can produce it — `Drop` and
+    /// [`crate::SessionRegistry::abandon`] never resolve anything, which is
+    /// exactly why they are lossy (ADR-0002 K5).
+    transaction_resolved_at_end: AtomicBool,
     /// The slots event-path requests hold: taken when a request is accepted,
     /// given back when the consumer takes its reply **out of** the queue. That
     /// is what makes [`crate::SessionLimits::max_outstanding_requests`] bound
@@ -213,7 +267,9 @@ impl SessionShared {
             in_flight: AtomicUsize::new(0),
             events: Mutex::new(None),
             terminal_emitted: AtomicBool::new(false),
-            ended: AtomicBool::new(false),
+            ended: AtomicU8::new(EndedAs::NOT_ENDED),
+            open_cancelled: AtomicBool::new(false),
+            transaction_resolved_at_end: AtomicBool::new(false),
             requests: Arc::new(RequestSlots::default()),
         }
     }
@@ -350,15 +406,60 @@ impl SessionShared {
         self.requests.outstanding()
     }
 
-    /// Records that a close has ended this session, so a later one is a
-    /// no-op success rather than a failure from a channel nobody reads.
-    pub(crate) fn mark_ended(&self) {
-        self.ended.store(true, Ordering::Release);
+    /// Records **how** this session ended, once. The first writer wins.
+    ///
+    /// Called on the worker thread at the point the session actually ends, and
+    /// it is the only thing any later "this session is already over" answer is
+    /// derived from — see [`SessionShared::settled_close`].
+    pub(crate) fn mark_ended(&self, how: EndedAs) {
+        let _ = self.ended.compare_exchange(
+            EndedAs::NOT_ENDED,
+            how as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
-    /// Whether a close has already ended this session.
+    /// Whether this session has ended.
     pub(crate) fn has_ended(&self) -> bool {
-        self.ended.load(Ordering::Acquire)
+        self.ended.load(Ordering::Acquire) != EndedAs::NOT_ENDED
+    }
+
+    /// How this session ended, or `None` while it has not.
+    pub(crate) fn ended_as(&self) -> Option<EndedAs> {
+        EndedAs::from_code(self.ended.load(Ordering::Acquire))
+    }
+
+    /// The answer a close owes when the session is **already over**, or `None`
+    /// while it is not.
+    ///
+    /// Both idempotent-close paths go through this, so there is exactly one
+    /// place that decides it and exactly one thing it is decided from: the
+    /// record of how the session ended. Deriving it instead from "a close has
+    /// run" made a close on a *lost* session report success once the first
+    /// close had set that flag — the session really had ended, but nothing had
+    /// been committed, which is the loss `SPEC.md` §10 forbids hiding.
+    /// Idempotency answers "this session is already over", never "your commit
+    /// happened".
+    pub(crate) fn settled_close(&self) -> Option<DbResult<()>> {
+        match self.ended_as()? {
+            EndedAs::Cleanly => Some(Ok(())),
+            EndedAs::Unresolved => Some(Err(self.lost_transaction_error())),
+        }
+    }
+
+    /// Records that the open was given up on before the connect finished.
+    ///
+    /// Only [`crate::SessionRegistry::abandon`] (and the registry's own
+    /// teardown) calls this, and only while the session is still `Opening`, so
+    /// it describes exactly one thing: nobody is waiting for this connection
+    /// any more. It is what turns the one reply the open owes into
+    /// `OpenFailed { ErrorKind::Cancelled }` — including when that reply is
+    /// produced by [`crate::reply::ReplyTo`]'s `Drop` rather than by an
+    /// explicit answer, which is why the reason lives here rather than at the
+    /// call site.
+    pub(crate) fn mark_open_cancelled(&self) {
+        self.open_cancelled.store(true, Ordering::Release);
     }
 
     /// Emits [`SessionEvent::Terminal`], at most once for this session.
@@ -366,7 +467,12 @@ impl SessionShared {
     /// Called at the transition, by whichever path observed it. The lifecycle
     /// reported is whatever the session has reached by then, so a session that
     /// was lost and then closed says `Lost`.
-    pub(crate) fn emit_terminal(&self) {
+    ///
+    /// `transaction_possibly_lost` is the session's final word on whether it
+    /// took an unresolved transaction with it; see
+    /// [`SessionShared::transaction_lost_at_end`] for who may compute it and
+    /// when.
+    pub(crate) fn emit_terminal(&self, transaction_possibly_lost: bool) {
         if self
             .terminal_emitted
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -386,6 +492,7 @@ impl SessionShared {
             session: self.session,
             lifecycle,
             cause,
+            transaction_possibly_lost,
         });
     }
 
@@ -531,11 +638,64 @@ impl SessionShared {
         self.with_transaction_watch(|state| state.driver_transaction_state = driver_state);
     }
 
+    /// Records the driver's transaction state at connect time, **without**
+    /// announcing it.
+    ///
+    /// [`SessionEvent::TransactionStateChanged`] reports a *flip* of
+    /// [`SessionShared::has_possibly_active_transaction`]
+    /// (`docs/exec-plans/active/phase-1.md` §B2), and a session that did not
+    /// exist a moment ago has not flipped anything: this is its initial value.
+    /// Announcing it would also put an unsolicited event **before** that
+    /// session's [`SessionEvent::Opened`], which is the one thing a consumer
+    /// should be able to treat as a session's first word.
+    ///
+    /// A consumer therefore takes the initial value from
+    /// [`crate::DatabaseSession::has_possibly_active_transaction`] when it sees
+    /// `Opened` — which is authoritative anyway — and the event stream reports
+    /// every change from there. Assuming the conservative default until it
+    /// asks costs at most an extra close prompt, which ADR-0002 K7 already
+    /// accepts; the opposite mistake is a silent commit, which it does not.
+    pub(crate) fn seed_driver_transaction_state(&self, driver_state: TransactionState) {
+        self.lock().driver_transaction_state = driver_state;
+    }
+
     /// Whether a transaction may still be open, combining the driver's own
     /// report (which may be [`TransactionState::Unknown`]) with core-side
     /// tracking, per ADR-0002.
     pub(crate) fn has_possibly_active_transaction(&self) -> bool {
         self.lock().possibly_active()
+    }
+
+    /// Records that the [`crate::CloseDisposition`] the caller chose succeeded,
+    /// as part of the close that is ending this session.
+    ///
+    /// Only [`crate::worker::Worker::close`] calls this, on the worker thread,
+    /// after the disposition returned `Ok`. It is what makes a deliberate
+    /// `close(Commit)` — or a deliberate `close(Rollback)` — *not* a loss: the
+    /// user said what should happen to the transaction and it happened.
+    pub(crate) fn mark_transaction_resolved_at_end(&self) {
+        self.transaction_resolved_at_end
+            .store(true, Ordering::Release);
+    }
+
+    /// The value [`SessionEvent::Terminal`] carries as
+    /// `transaction_possibly_lost`.
+    ///
+    /// **Only the worker thread may call this, and only at the point the
+    /// session actually ends** — after every command queued ahead of the close
+    /// has run. Anywhere else the answer is a snapshot that a queued statement
+    /// can still invalidate, which is exactly the under-reporting this field
+    /// exists to remove: `abandon` sees "no transaction", the worker then runs
+    /// a queued `INSERT`, and the server rolls it back at close.
+    ///
+    /// Conservative in the only direction that matters (`SPEC.md` §10,
+    /// ADR-0002 K7): a driver that cannot rule a transaction out reports
+    /// [`TransactionState::Unknown`], which reads as "may be open", so the
+    /// answer is `true`. A session that never opened has nothing to lose and is
+    /// reported `false` by its caller rather than here.
+    pub(crate) fn transaction_lost_at_end(&self) -> bool {
+        !self.transaction_resolved_at_end.load(Ordering::Acquire)
+            && self.has_possibly_active_transaction()
     }
 
     /// The worker is about to run a command, so a cancel has something to aim
@@ -564,11 +724,20 @@ impl SessionShared {
     ///
     /// For a lost session this keeps the original [`ErrorKind`], native code
     /// and text, statement position and cause, so the UI can show *why* the
-    /// session went away rather than a flattened sentence.
+    /// session went away rather than a flattened sentence. A session whose
+    /// *open* was abandoned reports [`ErrorKind::Cancelled`]: nothing failed
+    /// and nothing was ever connected, so calling it a connection error would
+    /// be wrong in both directions.
     pub(crate) fn terminal_error(&self) -> DbError {
         let state = self.lock();
         match &state.lost_reason {
             Some(reason) => reason.to_error("session is lost; open a new session to reconnect"),
+            None if self.open_cancelled.load(Ordering::Acquire) => DbError::new(
+                ErrorKind::Cancelled,
+                "reldex-db-core: the session was abandoned before its connection was open, so \
+                 nothing was connected and nothing is adopted late",
+            )
+            .with_session_state(SessionState::Lost),
             None => DbError::new(ErrorKind::Connection, "reldex-db-core: session is closed")
                 .with_session_state(SessionState::Lost),
         }

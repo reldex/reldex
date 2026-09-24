@@ -384,3 +384,54 @@ fn binding_a_queue_after_the_session_ended_is_refused() {
         ErrorKind::DriverInternal
     );
 }
+
+/// Deterministic form of the same rule, and the interleaving that broke it.
+///
+/// The looping test above only *sometimes* hits the bug, because it depends on
+/// the worker reaching `mark_ended` between two submits on the test thread.
+/// Waiting for the first close's reply forces that ordering every time: by the
+/// time the second close is submitted, the session is recorded as ended, and
+/// the short-circuit in `submit_close` decides its answer from that record.
+#[test]
+fn a_second_close_after_a_lost_session_reports_the_loss_deterministically() {
+    let scenario = support::scenario();
+    scenario.on_sql(
+        "SELECT 1 FROM dual",
+        Action::Fail(ScriptedError::new(
+            ErrorKind::NetworkLost,
+            "connection reset",
+        )),
+    );
+    let (session, queue) = support::open_events(&scenario);
+
+    session
+        .submit_execute(RequestId(1), Statement::new("SELECT 1 FROM dual"))
+        .expect("accepted");
+    let _ = support::drain_to_terminal(&queue);
+
+    // The first close runs on the worker and ends the session.
+    session
+        .submit_close(RequestId(2), Some(CloseDisposition::Commit))
+        .expect("accepted");
+    let first = support::drain_until(&queue, |seen| !support::reply_requests(seen).is_empty());
+    match first.last().expect("a reply") {
+        SessionEvent::SessionClosed { result: Err(_), .. } => {}
+        other => panic!("the first close on a lost session must fail, got {other:?}"),
+    }
+
+    // Now the session is *recorded* as ended. A second close must still report
+    // the loss: idempotency answers "this session is already over", not "your
+    // commit happened".
+    session
+        .submit_close(RequestId(3), Some(CloseDisposition::Commit))
+        .expect("accepted");
+    let second = support::drain_until(&queue, |seen| !support::reply_requests(seen).is_empty());
+    match second.last().expect("a reply") {
+        SessionEvent::SessionClosed {
+            result: Err(_),
+            request,
+            ..
+        } => assert_eq!(*request, RequestId(3)),
+        other => panic!("a lost session never closes cleanly, got {other:?}"),
+    }
+}

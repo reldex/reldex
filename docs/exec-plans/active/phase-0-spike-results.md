@@ -1118,6 +1118,87 @@ deadline mid-call blocked 4.8 s of a 5.3 s statement. Meeting §24.8 needs
 honest interim position is that Reldex tells the user up front that a running
 statement can only be stopped by a limit set before it starts.
 
+### S4 addendum (2026-09-24)
+
+Upstream issue #23's maintainer explained the session-loss half of S4 as
+expected: `dbms_session.sleep` suspends the server, the server never looks at
+the in-band interrupt the client sends when a deadline fires, the client's own
+recovery read then times out too, and the socket is discarded. That is correct
+but narrower than S4's write-up implied by grouping "PL/SQL" against "SQL" —
+the real fault line is **suspended vs. CPU-bound**, not statement type. This
+addendum re-tests six scenarios (3+ runs each) with a 2 s deadline armed the
+same way as candidate 1 above:
+`crates/drivers/oracle-thin/tests/probe_call_timeout_cpu_bound.rs`.
+
+**What was measured and the distinction it found.** A session-level
+suspend/wait (`dbms_session.sleep(10)`) never services the interrupt: `Client::
+recover_from_error` (`client/mod.rs:214-219`) sends `MARKER_TYPE_INTERRUPT`
+and calls `reset` (`:226-237`), which reads the reply using the **same,
+already-expired** socket read timeout — no rearm. The server never answers
+inside that second window, the read times out again, `unrecoverable_error`
+(`:275-278`) closes the transport, and the client gets `NetworkLost` — 3/3
+runs, 4.0 s elapsed, the session independently confirmed unusable afterward
+(not just self-reported). CPU-bound server work — a tight PL/SQL loop (~10 s),
+a CPU-heavy SQL join (~15 s), and a query whose rows come from a slow per-row
+function (deadline firing mid-fetch, after several cheap rows already
+arrived) — behaves differently every time: a plain `Timeout`, session
+independently confirmed usable, and the call returns in **about 1x the
+deadline** (2.0-2.3 s), not 2x. That only happens if the `reset` read in
+`:226-237` got answered almost immediately — the server evidently does notice
+and respond to the in-band interrupt while busy on CPU, just not while parked
+in a session-level wait. A generous deadline (15 s) against the same ~10 s CPU
+loop produced no error in any run, ruling out a false-positive trigger.
+
+**What remains unknown.** Whether the server-side statement is actually
+*terminated* when a CPU-bound call recovers, rather than left running to
+completion in the background while the client moves on, is **inconclusive**
+for the CPU-bound scenarios. The probe's method — tag the session via
+`DBMS_APPLICATION_INFO.SET_CLIENT_INFO`, then poll `V$SESSION.STATUS` for that
+tag from a privileged connection — has a race: tagging and the timed statement
+are two separate round trips, and the poller sometimes samples the brief gap
+between them and misreads it as "left ACTIVE" before the timed work has even
+started. That race never produced a false reading for the *suspended* control
+(scenario 1's genuine late samples, 6.4-10.4 s, are well past its own 4.0 s
+client-side error and are trustworthy) or the no-error sanity check (scenario
+6's samples land at 10.4-10.5 s, matching its real ~10.3 s completion), but it
+undermines timing precision for the CPU-bound scenarios specifically. To make
+this conclusive next time: tag the session as part of the *same* round trip as
+the timed statement (e.g. a leading `DBMS_APPLICATION_INFO.SET_CLIENT_INFO`
+call inside the same PL/SQL block, not a separate execute), or poll
+`V$SQL`/`V$SESSION` joined on `SQL_EXEC_ID` (which changes per execution)
+instead of a session-level tag, so a stale sample cannot be mistaken for the
+statement that is actually timed.
+
+**What this does and does not change.** This does **not** reopen ADR-0001: the
+owner decision of 2026-09-19 stands, there is still no on-demand break/cancel
+API (U-10, upstream issue
+[#24](https://github.com/oracle/rust-oracledb/issues/24)), and
+`CancelKind::PreArmedDeadline` remains the only mechanism this driver can
+offer. What it changes is the **expected outcome** of a fired deadline for the
+common case a database IDE's users actually hit — cancelling a running query,
+not a raw sleep. M4.6's UI wording (`docs/exec-plans/active/phase-1.md`) needs
+to reflect that a fired time limit usually means "your statement was stopped
+at the time limit; the session is intact," with "the connection had to be
+dropped" as the suspended-work exception rather than the expected case.
+
+A draft reply to #23 (facts first, question last, no project name or
+hostnames):
+
+> Thanks — this matches our `sleep(10)`/`sleep(3)` results exactly (2 s
+> deadline: `sleep(10)` → connection lost after ~4 s, session does not
+> survive; `sleep(3)` → plain timeout after ~3.1 s, session survives; both 3/3
+> runs). We also re-ran the same 2 s deadline against CPU-bound work instead
+> of a sleep: a tight PL/SQL loop (~10 s), a CPU-heavy SQL join (~15 s), and a
+> query whose rows come from a slow per-row function (deadline firing
+> mid-fetch). All three consistently return a plain timeout with the session
+> intact, and the call returns in about 1x the deadline, not 2x as with a
+> suspended sleep — indicating the server does notice and answer the in-band
+> interrupt while busy on CPU, just not while parked in a session-level sleep.
+> That distinction matters for us: our users cancel running queries far more
+> often than they would hit a raw `SLEEP`. Sharing the data in case it is
+> useful — does "busy on CPU vs. suspended" match your own model of when the
+> interrupt gets serviced?
+
 ---
 
 ## 5. Upstream defects and gaps
@@ -2745,31 +2826,64 @@ public accessor.
 >
 > Environment: `oracledb` 26.0.0-beta.3 / `main` @ `6785e95`.
 
-### New draft — skeleton reply to #23 (CPU-bound re-test)
+### New draft — reply to #23 (CPU-bound re-test), 2026-09-24
 
-Placeholder — do not post until the CPU-bound re-test another worker is
-running now has a result to report. Fill in the bracketed section, then this
-becomes the actual reply.
+Re-tested with CPU-bound server work rather than only `dbms_session.sleep`,
+per the maintainer's 2026-09-20 explanation. Six scenarios, 2 s deadline
+(except the sanity check), 3+ runs each, against the Phase 0 test database.
+Full detail and upstream `client/mod.rs` citations: "S4 addendum (2026-09-24)"
+above. Test file:
+`crates/drivers/oracle-thin/tests/probe_call_timeout_cpu_bound.rs`.
 
-> Thanks for the detailed explanation — that matches what we're seeing with
-> `DBMS_SESSION.SLEEP`: the server is suspended and never observes the
-> interrupt, so the socket is correctly deemed unusable once the call timeout
-> fires without a reply. That part is clear now.
->
-> We re-ran the same shape of test with a **CPU-bound** PL/SQL block instead of
-> a sleep, on the theory that a server that is actively running (not
-> suspended) might observe the interrupt and let the call and the connection
-> recover cleanly within the call timeout, rather than needing the socket
-> discarded.
->
-> [PLACEHOLDER — fill in once the CPU-bound re-test completes:
-> statement used, call timeout armed, elapsed time, whether the connection
-> came back as `Usable`/`UnableToRecover`/other, and whether this changes our
-> read of the recommendation to always use a pool.]
->
-> Either way, using a pool as you suggest is a reasonable mitigation for us
-> and we'll design around that. Filing this as a data point in case it's
-> useful, not as a re-opened bug report.
+| Scenario | Error / native | Elapsed | Session after | Server kept running? | Runs |
+|---|---|---|---|---|---|
+| 1. `sleep(10)`, 2 s deadline | `NetworkLost`, none | 4.0 s | NOT usable | yes — genuine samples show `ACTIVE` at 6.4-10.4 s, past the client's own 4.0 s error | 3/3 |
+| 2. `sleep(3)`, 2 s deadline | `Timeout`, none | 3.1 s | usable | n/a (finishes inside the deadline) | 3/3 |
+| 3. CPU PL/SQL loop ~10 s | `Timeout`, none | 2.0 s flat | usable | inconclusive (tagging-race caveat below) | 3/3 |
+| 4. CPU SQL join ~15 s | `Timeout`, none | 2.0-2.2 s | usable | inconclusive | 3/3 |
+| 5. streaming, cheap→expensive rows | `Timeout`, none, after 5 rows | 2.3 s | usable | inconclusive | 3/3 |
+| 6. same loop as 3, 15 s deadline (sanity) | no error | 10.3 s | usable | — | 3/3 |
+
+Method for "server kept running": a privileged connection polls
+`V$SESSION.STATUS` for the worker's `DBMS_APPLICATION_INFO.CLIENT_INFO` tag,
+read-only, roughly every 250 ms. Caveat, stated honestly: tagging and the
+timed statement are two separate round trips, and the poller sometimes samples
+the brief gap between them and misreads it as "left `ACTIVE`" before the timed
+work has even started — this never produced a false reading for scenario 1 or
+6 (their late/settled samples line up with the client-observed timing), but it
+does undermine precision for scenarios 3-5, so that column is marked
+inconclusive by this method rather than asserted. The reliable signal for
+those three is the elapsed-time pattern instead: the call returns in about 1x
+the deadline, not 2x, which only happens if the recovery read got answered
+promptly.
+
+Mechanism, traced in
+`~/.cargo/registry/src/*/oracledb-26.0.0-beta.3/src/client/mod.rs`: a timed-out
+read (`receive_data_packet`, `:134-150`) calls `recover_from_error`
+(`:214-219`), which sends `MARKER_TYPE_INTERRUPT` and calls `reset`
+(`:226-237`) — a read that reuses the **same, already-expired** socket
+timeout, never rearmed. If that read also times out, `unrecoverable_error`
+(`:275-278`) closes the transport (`NetworkLost`); if it is answered in time,
+the original timeout surfaces as a plain `Timeout` and the session survives.
+Scenario 1's 4.0 s (deadline + a second failed ~2 s recovery read) and
+scenarios 3-5's ~1x-deadline elapsed (recovery read answered almost at once)
+are both explained by this one code path — the difference is only whether the
+server was in a position to answer it.
+
+> Thanks — this matches our `sleep(10)`/`sleep(3)` results exactly (2 s
+> deadline: `sleep(10)` → connection lost after ~4 s, session does not
+> survive; `sleep(3)` → plain timeout after ~3.1 s, session survives; both 3/3
+> runs). We also re-ran the same 2 s deadline against CPU-bound work instead
+> of a sleep: a tight PL/SQL loop (~10 s), a CPU-heavy SQL join (~15 s), and a
+> query whose rows come from a slow per-row function (deadline firing
+> mid-fetch). All three consistently return a plain timeout with the session
+> intact, and the call returns in about 1x the deadline, not 2x as with a
+> suspended sleep — indicating the server does notice and answer the in-band
+> interrupt while busy on CPU, just not while parked in a session-level sleep.
+> That distinction matters for us: our users cancel running queries far more
+> often than they would hit a raw `SLEEP`. Sharing the data in case it is
+> useful — does "busy on CPU vs. suspended" match your own model of when the
+> interrupt gets serviced?
 
 ---
 
