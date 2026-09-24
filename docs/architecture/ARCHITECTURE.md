@@ -133,6 +133,24 @@ lifecycle adds `Lost` (unrecoverable, terminal, no reconnect) and `Closed` (clos
 on top of the driver contract's own `SessionState`, so a closed or dead session is never mistaken for
 one still usable (ADR-0002 K8).
 
+Event-bound sessions are owned by a `SessionRegistry`, which is the single place an open, an
+abandon, a close and a worker's finishing `connect` are serialised against each other (ADR-0002
+R2, `phase-1.md` §B3). It registers a session in one of four states — `Opening`, `Open`, `Ending`,
+`Ended` — hands out the `Arc<DatabaseSession>` only while it is `Open`, and lets go of it only when
+the consumer retires it on that session's `Terminal`. Nothing there pools or replaces a session: a
+reconnect is a new `open` with a new `SessionId`, exactly as above. Giving up on a session is
+`abandon`, which never commits — it is `Drop`'s abandon without `Drop`'s wait (ADR-0002 R4).
+
+Whether that cost the user anything is reported on the session's `Terminal`, as
+`transaction_possibly_lost`, and §10 forbids hiding it. It is decided **on the worker thread at the
+point the session ends** — after every command queued ahead of the close has run, which is where K4
+already decides for `close` — because any answer a control thread can read is a snapshot that a
+queued statement may still invalidate. That covers every way a session can end: a `close` whose
+disposition succeeded reports no loss (a rollback the user chose is a decision, not a loss), and
+`abandon`, `retire` of an open session, a dropped handle, the registry's teardown and a lost
+connection all report one whenever a transaction may have been open. The value `abandon` itself
+returns is a conservative lower bound for warning the user immediately (ADR-0002 R6).
+
 ## 6. Concurrency and threading
 
 - No database or network I/O on the UI thread, ever (`SPEC.md` §11, §19).
@@ -175,6 +193,21 @@ requests were accepted, so a consumer routes by `RequestId` and retires a sessio
 `Terminal`. How much one session can have waiting in that queue is bounded, and the bound is on the
 queue rather than on the worker: a request holds a slot against
 `SessionLimits::max_outstanding_requests` until the consumer has **drained** its reply.
+
+Opening a session has the same two shapes. `SessionManager::open_session` blocks the caller until
+the connection is ready; `SessionRegistry::open` returns a `SessionId` immediately, runs the connect
+on the session's own worker thread, and answers with one `Opened` or `OpenFailed` (ADR-0002 R1).
+The asymmetry that shapes the design is that a `connect` **cannot be interrupted** — the driver
+already has to bound its own on a helper thread (ADR-0002 H1) — so giving up on one cannot mean
+waiting for it. `abandon` answers the open at once with `ErrorKind::Cancelled`, announces the
+session's `Terminal`, and **detaches** the worker thread rather than joining it; when the connect
+eventually returns, the worker finds no registration to adopt it and closes the connection on its
+own thread, which is the only thread allowed to touch it. A late success is therefore never adopted
+after its failure has been reported, and never leaves a live database session behind (ADR-0002 R4,
+ADR-0003 A17). The same holds for dropping the registry itself, which must be prompt at application
+exit: it issues every abandon first and then waits for all of them against **one** shared deadline,
+so shutting down N stuck sessions costs one `DROP_SHUTDOWN_TIMEOUT` in total rather than N of them,
+after which each remaining worker is detached and releases its connection when its call returns.
 
 ## 7. FFI and Qt adapter boundary
 
@@ -275,12 +308,21 @@ reviewed against the Phase 0 test database — see §13 item 10 for the still-op
 ```text
 crates/db-driver-api/          vendor-neutral driver contract + DbError
 crates/db-core/                sessions, transactions, query, results, metadata, workspace
+crates/sql-text/               reldex-sql-text: vendor-neutral SQL/PL-SQL lexer + statement splitter (M2.4)
 crates/drivers/oracle-thin/    thin driver: wraps Oracle's `oracledb` crate (ADR-0001); vendor code isolated here
 crates/drivers/mock/           test-support/mock driver for core tests
 crates/ffi/                    reldex-ffi: the stable C ABI (ADR-0003); the only crate allowed `unsafe`
 crates/reldex-core-poc/        Phase 0 validation harness (no full UI)
 docs/architecture/, docs/decisions/, docs/exec-plans/
 ```
+
+`crates/sql-text` (package `reldex-sql-text`, M2.4) sits beside `db-driver-api` rather than inside
+`db-core`: it has no dependency on either, its `SqlDialect` parameter is supplied by a driver
+(`reldex_driver_oracle_thin::sql_dialect()` for Oracle) as plain data, and `db-core`/the FFI layer
+may depend on it directly for the editor's highlighter and statement splitter without a driver in
+scope. See that crate's own `dialect` module doc and the ADR-0002 amendment "The `SqlDialect`
+descriptor" for the full reasoning, including why this differs from the placement
+`docs/exec-plans/active/phase-1.md` §B4 originally sketched.
 
 `crates/ffi` exists, is exercised against the mock driver, and has been independently reviewed
 (M1.3), but ADR-0003 is still **Proposed**: spike S15 ran on 2026-09-20 and measured the boundary's
@@ -400,5 +442,14 @@ Until then, no code should assume an answer.
     normalized to an offset, a documented limitation), explicit NULL via variant plus a per-column
     validity mask, and lazy `LobStream` for LOBs. Still open: per-type driver-mapping evidence against
     a real database, pending the Workstream D spikes (`phase-0.md`).
-12. **Script/statement boundary parsing.** Where the SQL/PL/SQL block-boundary parser lives and how
-    it is shared between core and editor (`SPEC.md` §15).
+12. **Script/statement boundary parsing — RESOLVED by M2.4 (ADR-0002 amendment "The `SqlDialect`
+    descriptor").** `crates/sql-text` (`reldex-sql-text`) is the vendor-neutral lexer and statement
+    splitter; it is shared between core and editor by being depended on directly by whichever of
+    them needs it, with no vendor code inside it. The Oracle-specific facts it needs (block-opening
+    keywords, quoting forms, `/`) are supplied as data — `reldex_driver_oracle_thin::sql_dialect()`
+    — rather than compiled into the crate. `tokenize_block(text, state, &dialect) ->
+    (Vec<Token>, LexState)` is shaped for `QSyntaxHighlighter`'s per-block, state-carrying model
+    (M4.1); `split_statements`/`statement_at` back "run statement/script" (M4.3). Known limitations
+    (a body-less `CREATE TRIGGER ... CALL ...;`, a body-less `CREATE TYPE ... AS OBJECT (...);`,
+    and 12c `WITH FUNCTION ... SELECT ...` inline PL/SQL) are documented on `reldex_sql_text::splitter`
+    with a failing-by-design, `#[ignore]`d test each.

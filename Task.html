@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-21T02:06:00+07:00",
+  "updatedAt": "2026-09-24T21:16:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -663,6 +663,13 @@
       "status": "Proposed — S15 complete, owner ruling requested. Spike S15 (2026-09-20) measured all seven kill criteria; no failure is located in the boundary, but K2 fails as written and K1/K3 need a wording/baseline ruling. Not accepted by the owner.",
       "date": "2026-09-20",
       "link": "docs/decisions/0003-qt-rust-integration.md"
+    },
+    {
+      "id": "OWNER-2026-09-23-UPSTREAM-SYNC",
+      "title": "Upstream oracledb issue reconciliation — maintainer replies and main-branch fixes recorded, no repo pin change",
+      "status": "Read-only reconciliation, 2026-09-23 (docs-only, no code change). All five filed issues (#21-#25) have maintainer replies: #21 (NUMBER x10) and the #22 poisoned-lock panic are fixed on upstream `main` (commits `efcda45`, `6785e95`) but not yet in our pinned beta.3; #22's other two panics (NUMBER index-out-of-bounds, region-encoded TIMESTAMP WITH TIME ZONE) are confirmed still present on `main` and two new issues are drafted per the maintainer's invitation; #23 (call-timeout recovery) was explained as expected DBMS_SESSION.SLEEP/no-OOB behaviour, a pool is recommended, a CPU-bound re-test is pending; #24 (break API) is a known limitation pending a future async API; #25 (TCPS) items 1 and 3 are accepted by the maintainer, item 2 (mutual TLS + private CA) awaits our clarification, drafted. Also found by reading `main`: U-8 (server error code/position discarded) is already fixed there (commit `04b96be`). Issues F and G stay unsubmitted per the 2026-09-19 owner decision; both refreshed against `main` and every fact confirmed unchanged. Full table and drafts: `docs/exec-plans/active/phase-0-spike-results.md` §6.",
+      "date": "2026-09-23",
+      "link": "docs/exec-plans/active/phase-0-spike-results.md"
     }
   ],
   "spikes": [
@@ -1158,16 +1165,16 @@
               "note": "Done 2026-09-20, independently reviewed."
             },
             {
-              "title": "M2.4 crates/sql-text: lexer + statement splitter driven by a SqlDialect descriptor the driver supplies (sonnet)",
-              "status": "todo"
+              "title": "M2.4 crates/sql-text: lexer + statement splitter driven by a SqlDialect descriptor the driver supplies (sonnet) — done 2026-09-21: reldex-sql-text (zero deps, no unsafe) — lexer + statement splitter driven by a driver-supplied SqlDialect; a lone / is authoritative, ambiguity fails safe, every span says how it ended (ended_by); adversarially reviewed three rounds (a panic and several mis-splits fixed); grammar-based differential test, 248,000 scripts; ADR-0002 amendment J",
+              "status": "done"
             },
             {
               "title": "M2.5 ★ EventQueue/EventSink/SessionEvent/Waker + ReplyTo refactor of the worker (opus, review mandatory) — done 2026-09-21: EventQueue/EventSink/SessionEvent/Waker + ReplyTo in db-core (no thread per session); ordering rules 1–5 and exactly-once Terminal tested; back-pressure bound 2R + U + 3 made true (slot released when the consumer pops); 42 session tests run on both reply paths; independently reviewed twice (3 must-fix fixed); FFI pump switch is M2.11 (phase-1-m2-5-event-queue.md)",
               "status": "done"
             },
             {
-              "title": "M2.6 ★ SessionRegistry + non-blocking open, abandon semantics (opus, review mandatory)",
-              "status": "todo"
+              "title": "M2.6 ★ SessionRegistry + non-blocking open, abandon semantics (opus, review mandatory) — done 2026-09-21: SessionRegistry — open never blocks (one Opened/OpenFailed, one Terminal, last); abandon never blocks and is never refused, a late connect is closed by the worker (0 leaks in 960 randomized sessions); Terminal.transaction_possibly_lost computed on the worker covers abandon/retire/drop/lost; one-deadline teardown; independently reviewed twice (3 must-fix fixed); ADR-0002 amendment R",
+              "status": "done"
             },
             {
               "title": "M2.7 ★ Server output capability (DBMS_OUTPUT) in contract + driver + core polling when enabled (opus, review mandatory)",
@@ -1648,6 +1655,22 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-21",
+      "text": "M2.6 done: SessionRegistry with non-blocking open and abandon. Independent review found no leaked connection in 960 randomized sessions and clean lock discipline, and 3 must-fix, all about not hiding transaction loss or blocking shutdown: abandon() reported 'no transaction lost' from a caller-thread snapshot while a queued INSERT was still to run and be rolled back; registry teardown waited N x 500 ms serially although the ADR claimed the waits overlapped (now one deadline: ~0.51 s for 8 stuck sessions); and a DML that dies with its connection re-read the dead connection's cached 'inactive' state. The authoritative answer is now Terminal.transaction_possibly_lost, computed on the worker when the session really ends. The C ABI is unchanged; M2.11 switches the FFI to this path and must carry the new field to the user. CI then exposed a latent M2.5 race (3 in 1,000 runs on main): after a lost session, a second close could answer 'closed cleanly'. Fixed at the root — how a session ended (cleanly / unresolved) is recorded once on the worker and every idempotent close answers from that record; a repeated close on a lost session now reports the loss again (ADR-0002 E7). 3,000-iteration loops, 0 failures."
+    },
+    {
+      "date": "2026-09-24",
+      "text": "CPU-bound re-test of upstream oracledb issue #23 (docs/exec-plans/active/phase-0-spike-results.md, \"S4 addendum (2026-09-24)\"), on branch probe/call-timeout-cpu-bound: confirmed the maintainer's explanation holds for a plain session-level sleep — a fired call-timeout kills the connection, 3/3 runs — but found it does NOT hold for CPU-bound work. A busy PL/SQL loop, a CPU-heavy SQL join, and a query fetching slow rows all recovered cleanly instead (a plain timeout, session intact, 3/3 runs each): the server does notice the client's interrupt while it is busy on CPU, just not while it is suspended in a sleep. Two of the new tests (crates/drivers/oracle-thin/tests/probe_call_timeout_cpu_bound.rs) are now deterministic canaries for U-6/U-7 in oracledb-upgrade-checklist.md, replacing the old load-dependent 'manual check' entries. This does not reopen ADR-0001 — there is still no on-demand cancel API and the owner's 2026-09-19 decision stands — but it changes what M4.6's honest-no-Cancel UI wording should say for the common case: a fired time limit usually means the statement stopped and the session is fine, not that the connection was lost. A factual reply draft for #23 is ready in phase-0-spike-results.md §6; not yet posted."
+    },
+    {
+      "date": "2026-09-23",
+      "text": "Upstream oracledb issue reconciliation (docs-only, no repo pin change, no code change): re-read all five filed issues (#21-#25) with their comments and diffed upstream `main` against our pinned =26.0.0-beta.3. #21 (NUMBER x10) and the #22 poisoned-lock panic are fixed on `main` (commits `efcda45`, `6785e95`); #22's other two panics (NUMBER index-out-of-bounds, region TIMESTAMP WITH TIME ZONE todo!()) are confirmed still present, and two new issues plus an acknowledgement reply are drafted per the maintainer's explicit invitation. #23 was explained as expected DBMS_SESSION.SLEEP/no-OOB behaviour (pool recommended); a skeleton reply awaits a pending CPU-bound re-test. #24 is a known limitation pending a future async API. #25's items 1 and 3 are accepted by the maintainer; item 2 (mutual TLS + a private CA in one ewallet.pem) got a clarification request back, answered with a precise repro drafted from the S8 evidence and a source read of transport.rs (unchanged on main). Also found: U-8 (server error code/position discarded) is already fixed on main (commit 04b96be), not yet in beta.3. Issues F and G were refreshed against main and every cited fact still holds; both stay unsubmitted per the 2026-09-19 owner decision. New issue drafts also prepared for U-5, U-9, U-11 (bundled) and the transaction-in-progress-flag request; U-8 needs no filing since it is already fixed. Nothing was posted upstream (read-only access); full reconciliation table and all drafts are in phase-0-spike-results.md §6."
+    },
+    {
+      "date": "2026-09-21",
+      "text": "M2.4 done: the SQL/PL-SQL lexer and statement splitter (crates/sql-text), driven by a dialect descriptor the Oracle driver supplies, so the core stays vendor-neutral. Three rounds of adversarial review found a panic and several mis-splits (a statement boundary in the wrong place can run the wrong SQL), all fixed; the safety rules are now explicit: a lone '/' line always ends the unit, an ambiguous construct never splits early, and every statement reports how it ended. A grammar-based differential test recovers 248,000 generated scripts exactly. Honest limit: two behaviours (a '/' inside an unterminated plain statement; a directive line inside a block) are not yet verified against SQL*Plus/SQLcl and are recorded for M4.3."
+    },
     {
       "date": "2026-09-21",
       "text": "M2.5 done: db-core event queue, sink and the ReplyTo refactor — replies go either through Completion (unchanged) or as typed SessionEvents into one queue with an edge-triggered waker, no thread per session. Independent review could not break exactly-once (200 x 91 requests racing a close, 300 double closes, 8-session fan-in) but found 3 must-fix: TransactionStateChanged could be dropped behind a ServerOutput burst at the cap, max_outstanding_requests did not bound the queue as four documents claimed (measured 5,000 queued against a limit of 1,024; now a slot rides on the queued reply and is released on pop), and a contention-flaky waker test. Also fixed: 7.7% spurious close errors under concurrent close, bind_events after Terminal, close refused at the cap. The FFI still uses its interim pump; M2.11 switches it (mapping recorded). Per-event cost ~430-640 ns vs ~2,000 ns on the Completion path at one producer."

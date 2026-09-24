@@ -64,7 +64,7 @@ use crate::reply::{CloseReplyTo, ReplyTo};
 use crate::session::{
     CloseDisposition, CloseError, ExecuteOutcome, FetchedBatch, OutValue, OutValues, SessionLimits,
 };
-use crate::shared::SessionShared;
+use crate::shared::{EndedAs, SessionShared};
 
 /// Why the worker is being asked to shut down.
 pub(crate) enum CloseIntent {
@@ -166,23 +166,54 @@ impl Command {
     }
 }
 
-/// Everything [`spawn`] hands back once the connection is open.
-pub(crate) struct WorkerHandle {
+/// Everything [`spawn`] hands back, the instant the thread exists.
+///
+/// Deliberately *not* the connection: [`spawn`] no longer waits for
+/// `connect`, so what it can promise is only the two things that exist before
+/// it — the channel commands go down, and the handle that owns the thread. The
+/// connect's own outcome arrives later, through the [`ReportOpen`] the caller
+/// supplied.
+pub(crate) struct Spawned {
     pub(crate) command_tx: Sender<Command>,
     pub(crate) join: thread::JoinHandle<()>,
-    pub(crate) shared: Arc<SessionShared>,
+}
+
+/// Everything a successful `connect` produced, handed to whoever asked for the
+/// session.
+pub(crate) struct Ready {
     pub(crate) cancel_handle: Arc<dyn CancelHandle>,
     pub(crate) cancel_kind: CancelKind,
     pub(crate) connection_id: ConnectionId,
     pub(crate) connect_warnings: Vec<Warning>,
 }
 
-struct Ready {
-    cancel_handle: Arc<dyn CancelHandle>,
-    cancel_kind: CancelKind,
-    connection_id: ConnectionId,
-    connect_warnings: Vec<Warning>,
+/// Whether anyone still wants the session whose `connect` just returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Adoption {
+    /// Somebody took the session; the worker enters its command loop and owns
+    /// the connection for the rest of its life.
+    Adopted,
+    /// Nobody did — the caller gave up, or
+    /// [`crate::SessionRegistry::abandon`] won the race. The worker
+    /// **closes the connection on its own thread**, which is the only thread
+    /// allowed to touch it (ADR-0002 D1/D2, H2), and exits. Nothing is adopted
+    /// late and no live database session is left behind.
+    Abandoned,
 }
+
+/// How a worker reports that its `connect` finished.
+///
+/// Called exactly once, on the worker thread, the moment `connect` returns —
+/// which is the one point at which a session can still be given up on without
+/// anything having been adopted. The blocking
+/// [`crate::SessionManager::open_session`] passes a closure that sends down a
+/// channel it is parked on; [`crate::SessionRegistry`] passes one that hands
+/// the outcome to the registry, which decides under its own lock whether the
+/// session is adopted or was abandoned while the connect ran.
+///
+/// It must not block for long: the worker is holding a live connection while
+/// it runs, and on the registry path it runs under the registry's mutex.
+pub(crate) type ReportOpen = Box<dyn FnOnce(DbResult<Ready>) -> Adoption + Send>;
 
 /// Calls into driver code, converting a panic into
 /// [`reldex_db_driver_api::ErrorKind::DriverInternal`] instead of unwinding
@@ -213,32 +244,33 @@ fn panic_to_error(payload: &(dyn std::any::Any + Send)) -> DbError {
         .with_session_state(SessionState::Lost)
 }
 
-/// Spawns the dedicated worker thread for one session and connects it,
-/// blocking the calling thread only on the reply channel — the connect call
-/// itself always runs on the new worker thread, never on the caller's
-/// (`SPEC.md` §11/§19).
+/// Spawns the dedicated worker thread for one session. **Returns as soon as
+/// the thread exists**; it does not wait for `connect`.
+///
+/// `shared` is built and — on the event path — bound to its sink by the
+/// caller, before the thread exists, so that whoever reports the open emits
+/// through the same per-session emit lock as everything else and ordering
+/// rule 1 holds for a session's very first events
+/// (`phase-1-m2-5-event-queue.md` §6).
+///
+/// The connect itself always runs on the new worker thread, never on the
+/// caller's (`SPEC.md` §11/§19); its outcome reaches the caller through
+/// `report`.
 pub(crate) fn spawn(
     driver: Arc<dyn DatabaseDriver>,
     params: ConnectionParams,
     session_id: SessionId,
     limits: SessionLimits,
-) -> DbResult<WorkerHandle> {
+    shared: Arc<SessionShared>,
+    report: ReportOpen,
+) -> DbResult<Spawned> {
     let (command_tx, command_rx) = mpsc::channel::<Command>();
-    let (ready_tx, ready_rx) = mpsc::channel::<DbResult<Ready>>();
-    let shared = Arc::new(SessionShared::new(session_id));
-    let shared_for_worker = Arc::clone(&shared);
 
     let join = thread::Builder::new()
         .name(format!("reldex-session-{}", session_id.get()))
         .spawn(move || {
             worker_main(
-                &driver,
-                &params,
-                command_rx,
-                &ready_tx,
-                shared_for_worker,
-                session_id,
-                limits,
+                &driver, &params, command_rx, report, shared, session_id, limits,
             );
         })
         .map_err(|err| {
@@ -247,36 +279,14 @@ pub(crate) fn spawn(
             ))
         })?;
 
-    match ready_rx.recv() {
-        Ok(Ok(ready)) => Ok(WorkerHandle {
-            command_tx,
-            join,
-            shared,
-            cancel_handle: ready.cancel_handle,
-            cancel_kind: ready.cancel_kind,
-            connection_id: ready.connection_id,
-            connect_warnings: ready.connect_warnings,
-        }),
-        Ok(Err(err)) => {
-            let _ = join.join();
-            Err(err)
-        }
-        Err(_) => {
-            let panicked = join.join().is_err();
-            Err(DbError::internal(if panicked {
-                "reldex-db-core: session worker thread panicked while connecting"
-            } else {
-                "reldex-db-core: session worker exited without connecting"
-            }))
-        }
-    }
+    Ok(Spawned { command_tx, join })
 }
 
 fn worker_main(
     driver: &Arc<dyn DatabaseDriver>,
     params: &ConnectionParams,
     command_rx: mpsc::Receiver<Command>,
-    ready_tx: &Sender<DbResult<Ready>>,
+    report: ReportOpen,
     shared: Arc<SessionShared>,
     session: SessionId,
     limits: SessionLimits,
@@ -285,7 +295,9 @@ fn worker_main(
     let mut connection = match call(&torn, || driver.connect(params)) {
         Ok(connection) => connection,
         Err(err) => {
-            let _ = ready_tx.send(Err(err));
+            // Nothing was opened, so there is nothing to close and nothing to
+            // adopt; the report's own answer is the session's one reply.
+            let _ = report(Err(err));
             return;
         }
     };
@@ -302,7 +314,7 @@ fn worker_main(
             // so it is dropped rather than closed (see the module
             // documentation), and the session never opens.
             drop(connection);
-            let _ = ready_tx.send(Err(err));
+            let _ = report(Err(err));
             return;
         }
     };
@@ -314,17 +326,41 @@ fn worker_main(
     // genuinely knows nothing is open yet (`Capabilities::exact_transaction_state`)
     // should say so immediately, so closing an untouched session does not
     // demand a disposition it cannot need.
-    shared.note_driver_transaction_state(connection.transaction_state());
+    //
+    // Silently, and that matters on the event path: this is the session's
+    // initial value, not a change, and announcing it here would put an
+    // unsolicited event ahead of the session's own `Opened`.
+    shared.seed_driver_transaction_state(connection.transaction_state());
     let ready = Ready {
         cancel_handle: Arc::clone(&cancel_handle),
         cancel_kind: cancel_handle.kind(),
         connection_id: connection.id(),
         connect_warnings,
     };
-    if ready_tx.send(Ok(ready)).is_err() {
-        // Nobody is waiting for this session any more (the caller gave up).
-        // Still close cleanly so nothing leaks.
+    // `report` is what records the session and emits its `Opened` — and it runs
+    // **here**, on this worker, *before* the command loop below. That ordering
+    // is the whole reason "`Opened` is a session's first event" is structural:
+    // this thread is the only producer of a reply for this session, and it
+    // cannot produce one until `report` has returned, so nothing this session
+    // ever says can overtake the `Opened`. It holds even for a consumer that
+    // ignores events and polls `SessionRegistry::get` instead, because the
+    // handle it would poll does not exist until `report` has recorded it.
+    // Moving any part of this after the loop starts would break that silently
+    // (see `registry_open.rs`, "a submit made the instant the session appears").
+    if matches!(report(Ok(ready)), Adoption::Abandoned) {
+        // Nobody is waiting for this session any more: the blocking caller
+        // gave up, or `SessionRegistry::abandon` won the race with this
+        // connect. Close the connection **here**, on the thread that opened
+        // it, so a late success never leaves a live database session behind
+        // and nothing is adopted after the fact (ADR-0002 H2, §B3).
         let _ = call(&torn, || connection.close());
+        // And emit **nothing**. Whoever refused this session has already
+        // answered its open and announced its `Terminal`, in that order
+        // (ADR-0002 R3/R4); a "backstop" announcement here would race that
+        // pair and could deliver `Terminal` *before* the `OpenFailed` it must
+        // follow, which is exactly what ordering rule 3 forbids. The blocking
+        // path reaches here only when its caller gave up, and has no sink
+        // bound, so there is nothing to announce to either.
         return;
     }
 
@@ -357,7 +393,17 @@ fn worker_main(
     // Covers the path no command took: the session handle was dropped without
     // an explicit close, so the channel simply ended.
     worker.shared.mark_closed();
-    worker.shared.emit_terminal();
+    // A session that got here without a close having ended it — its handle was
+    // dropped, or its command channel simply went away — ended without
+    // resolving anything. Recording that keeps "every ended session has a
+    // record of how" true; `mark_ended` is first-writer-wins, so a close that
+    // already ran keeps whatever it recorded.
+    worker.shared.mark_ended(EndedAs::Unresolved);
+    // Computed here, on the worker thread, once every command that was queued
+    // ahead of the end has run: this is the only point at which the answer
+    // cannot still be invalidated by work the caller had already submitted.
+    let transaction_possibly_lost = worker.shared.transaction_lost_at_end();
+    worker.shared.emit_terminal(transaction_possibly_lost);
 }
 
 enum Flow {
@@ -406,6 +452,34 @@ impl Worker {
             TransactionState::Unknown,
             |connection| connection.transaction_state(),
         )
+    }
+
+    /// Records the driver's transaction state after a command that may have
+    /// failed, **refusing to trust a connection the core has just declared
+    /// lost**.
+    ///
+    /// `DatabaseConnection::transaction_state` is a cached value the driver
+    /// last refreshed on a call that *returned*. When the call that just failed
+    /// is the one that died, that cache describes the world before the
+    /// statement the server may well have applied: an `INSERT` that reached the
+    /// server and then lost its connection leaves an exact driver still
+    /// reporting `Inactive`, and reading it here would let `Terminal` report
+    /// `transaction_possibly_lost: false` for work the server then rolled back.
+    /// `Unknown` is the honest answer, and it reads as "may be open" (K7).
+    ///
+    /// Deliberately **not** "lost implies a lost transaction": a session lost
+    /// while idle — the common dropped-connection case, discovered by the
+    /// revalidating ping, which does not touch the driver's transaction state —
+    /// still reports `false`, so a UI does not warn about work that never
+    /// existed. And deliberately not classified by statement kind either: the
+    /// kind lives on the `ExecuteOutcome` a failed call never produced, so the
+    /// core does not have it here.
+    fn note_transaction_state_after(&self, error: Option<&DbError>) {
+        let state = match error {
+            Some(err) if err.session_state() == SessionState::Lost => TransactionState::Unknown,
+            _ => self.transaction_state(),
+        };
+        self.shared.note_driver_transaction_state(state);
     }
 
     /// Runs one command, revalidating first when the last error asked for it,
@@ -486,7 +560,10 @@ impl Worker {
             }
             command.fail(self.shared.terminal_error());
         }
-        self.shared.emit_terminal();
+        // The session was lost rather than closed, so nothing resolved the
+        // transaction: whatever may have been open went with the connection.
+        let transaction_possibly_lost = self.shared.transaction_lost_at_end();
+        self.shared.emit_terminal(transaction_possibly_lost);
         flow
     }
 
@@ -539,8 +616,7 @@ impl Worker {
                     Ok(()) => self.release_results(),
                     Err(err) => self.shared.note_error(err),
                 }
-                let state = self.transaction_state();
-                self.shared.note_driver_transaction_state(state);
+                self.note_transaction_state_after(outcome.as_ref().err());
                 reply.answer(outcome);
                 Flow::Continue
             }
@@ -602,8 +678,7 @@ impl Worker {
             Ok(outcome) => outcome,
             Err(err) => {
                 self.shared.note_error(&err);
-                let state = self.transaction_state();
-                self.shared.note_driver_transaction_state(state);
+                self.note_transaction_state_after(Some(&err));
                 reply.answer(Err(err));
                 return Flow::Continue;
             }
@@ -1013,8 +1088,7 @@ impl Worker {
             }
             Err(err) => self.shared.note_error(err),
         }
-        let state = self.transaction_state();
-        self.shared.note_driver_transaction_state(state);
+        self.note_transaction_state_after(outcome.as_ref().err());
         reply.answer(outcome);
         Flow::Continue
     }
@@ -1028,11 +1102,18 @@ impl Worker {
             let error = self.shared.lost_transaction_error();
             self.release_results();
             self.shared.mark_closed();
-            self.shared.mark_ended();
+            // Ended, but nothing was resolved — so every *later* close is told
+            // the same thing this one is, instead of reading "a close has run"
+            // as "a close succeeded".
+            self.shared.mark_ended(EndedAs::Unresolved);
             reply.answer(Err(CloseError::Failed(error)));
             return Flow::Exit;
         }
 
+        // Captured before `intent` is consumed: only an *explicit* close can
+        // end a session cleanly. An abandon resolves nothing by design
+        // (ADR-0002 K5), so it must never make a later close report success.
+        let explicit = matches!(intent, CloseIntent::Explicit(_));
         let disposition = match intent {
             CloseIntent::Explicit(disposition) => {
                 if disposition.is_none() && self.shared.has_possibly_active_transaction() {
@@ -1066,12 +1147,37 @@ impl Worker {
                 return Flow::Continue;
             }
             self.shared.note_commit_or_rollback();
+            // The disposition the caller asked for succeeded, so this session
+            // is about to end with its transaction *resolved*: `Terminal` must
+            // say `transaction_possibly_lost: false` even for a driver that
+            // cannot rule a transaction out on its own
+            // (`TransactionState::Unknown` reads as "may be open" forever).
+            // Recorded as a fact about what happened rather than re-derived
+            // from the driver, which also keeps this path from emitting one
+            // last `TransactionStateChanged` between the reply and `Terminal`.
+            self.shared.mark_transaction_resolved_at_end();
         }
 
         self.release_results();
         let outcome = self.close_connection();
         self.shared.mark_closed();
-        self.shared.mark_ended();
+        // Reaching here on an *explicit* close means the caller's transaction
+        // was resolved or there was none: the only other way out of the
+        // disposition step above is `DecisionRequired`, `CommitFailed` or
+        // `RollbackFailed`, and all three leave the session open. So this is
+        // the one end that makes a later close the documented no-op success.
+        //
+        // `close_connection`'s own failure does not change that — it is a
+        // report about releasing the connection, not about the user's data, it
+        // was already delivered to *this* close, and repeating it forever
+        // would contradict "a failed close still ends the session; only the
+        // report survives". An abandon, by contrast, resolves nothing by
+        // design (ADR-0002 K5) and is never clean.
+        self.shared.mark_ended(if explicit {
+            EndedAs::Cleanly
+        } else {
+            EndedAs::Unresolved
+        });
         reply.answer(outcome.map_err(CloseError::Failed));
         Flow::Exit
     }

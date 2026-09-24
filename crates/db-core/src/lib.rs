@@ -78,11 +78,24 @@
 //! parked per outstanding request on the event path. [`EventQueue`],
 //! [`EventCaps`] and [`Waker`] carry the ordering guarantees, the
 //! back-pressure policy and the waker contract in full.
+//!
+//! # Two ways to open a session
+//!
+//! Opening has the same split. [`SessionManager::open_session`] blocks the
+//! caller until the connection is ready and hands back a [`DatabaseSession`];
+//! [`SessionRegistry::open`] returns a [`SessionId`] immediately, runs the
+//! connect on the session's own worker thread, and answers with one
+//! [`SessionEvent::Opened`] or [`SessionEvent::OpenFailed`]. The registry is
+//! also what can *stop* an open: [`SessionRegistry::abandon`] answers a
+//! pending connect at once and closes the connection that arrives afterwards,
+//! because a connect cannot be interrupted and waiting for one is exactly what
+//! a UI must not do (`docs/exec-plans/active/phase-1.md` §B3).
 
 #![forbid(unsafe_code)]
 
 mod events;
 mod ids;
+mod registry;
 mod reply;
 mod session;
 mod shared;
@@ -93,6 +106,7 @@ pub use events::{
     event_channel,
 };
 pub use ids::{LobHandle, ResultId, SessionId};
+pub use registry::{Abandoned, RegisteredSession, RegistryCounts, SessionRegistry};
 pub use session::{
     CloseDisposition, CloseError, Completion, DROP_SHUTDOWN_TIMEOUT, DatabaseSession,
     ExecuteOutcome, FetchedBatch, OutValue, OutValues, SessionLimits, SessionManager,

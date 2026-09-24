@@ -34,7 +34,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The package set spike S6 asks for: the two vendor-neutral crates, the
+  # The package set spike S6 asks for: the vendor-neutral crates, the
   # concrete Oracle thin driver (which pulls in `oracledb` -> `rustls` ->
   # `aws-lc-rs` -> `aws-lc-sys`), the link-check probe crate (produces a real
   # cdylib/staticlib so the *linker*, not just the compiler, is exercised),
@@ -49,9 +49,17 @@ env:
   # that will actually be linked belongs in this check, not only the S6 probe
   # that stands in for it. Cheap: its only dependencies (`db-core`, the mock
   # driver) are already built here.
+  # `reldex-sql-text` was added with M2.4: it is the vendor-neutral lexer/
+  # statement-splitter the shared editor (mobile and desktop alike, per
+  # `AGENTS.md` "Mobile and Desktop share the same database Core") will use,
+  # has zero dependencies of its own, and `reldex-driver-oracle-thin` already
+  # depends on it — listed explicitly anyway, the same way `reldex-db-core`
+  # is, so a break in it is attributed to itself rather than discovered only
+  # as a mysterious failure two crates downstream.
   S6_PACKAGES: >-
     -p reldex-db-driver-api
     -p reldex-db-core
+    -p reldex-sql-text
     -p reldex-driver-oracle-thin
     -p reldex-mobile-link-check
     -p reldex-ffi

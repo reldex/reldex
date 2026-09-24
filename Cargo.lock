@@ -652,6 +652,7 @@ version = "0.0.0"
 dependencies = [
  "oracledb",
  "reldex-db-driver-api",
+ "reldex-sql-text",
  "rustls",
 ]
 
@@ -671,6 +672,10 @@ dependencies = [
  "reldex-db-core",
  "reldex-driver-oracle-thin",
 ]
+
+[[package]]
+name = "reldex-sql-text"
+version = "0.0.0"
 
 [[package]]
 name = "ring"

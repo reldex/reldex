@@ -141,9 +141,24 @@ fn close_with_commit_on_a_lost_session_reports_the_loss_instead_of_succeeding(
         scenario.committed_rows("t").is_empty(),
         "and nothing may actually have been committed"
     );
-    // Resources are still released, and closing again is the usual no-op.
+    // Resources are still released. Closing again is still idempotent — it
+    // runs nothing and changes nothing — but it does **not** report success:
+    // idempotency answers "this session is already over", never "your commit
+    // happened". A second close that said `Ok(())` would hide exactly the loss
+    // the first one reported (`SPEC.md` §10, ADR-0002 E7).
     assert_eq!(scenario.counts().connections_closed, 1);
-    session.close(None).expect("closing again is a no-op");
+    let again = session
+        .close(None)
+        .expect_err("a lost session never closes cleanly, however many times it is asked");
+    let CloseError::Failed(cause) = &again else {
+        panic!("expected a failed close, got {again:?}");
+    };
+    assert_eq!(
+        cause.session_state(),
+        SessionState::Lost,
+        "and it keeps saying why, with the original classification"
+    );
+    assert_eq!(scenario.counts().connections_closed, 1, "nothing ran again");
 }
 
 /// `close(None)` on a lost session must report the loss, not ask for a decision
