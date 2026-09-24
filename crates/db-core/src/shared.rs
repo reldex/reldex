@@ -16,6 +16,7 @@ use reldex_db_driver_api::{
 
 use crate::events::{EventSink, RequestSlots, SessionEvent};
 use crate::ids::SessionId;
+use crate::session::ServerOutputLog;
 
 /// Where a session is in its lifecycle.
 ///
@@ -243,6 +244,15 @@ pub(crate) struct SessionShared {
     /// [`crate::SessionRegistry::abandon`] never resolve anything, which is
     /// exactly why they are lossy (ADR-0002 K5).
     transaction_resolved_at_end: AtomicBool,
+    /// Set the moment anything asks this session to go away without a close —
+    /// [`crate::SessionRegistry::abandon`], the registry's teardown, or the
+    /// handle's `Drop` — so the worker stops reading server output between
+    /// round trips instead of finishing a long drain nobody will see
+    /// (ADR-0002 amendment T). Never cleared.
+    abandon_requested: AtomicBool,
+    /// Server output collected for requests answered through a
+    /// [`crate::Completion`]; see [`ServerOutputLog`].
+    collected_output: Mutex<CollectedOutput>,
     /// The slots event-path requests hold: taken when a request is accepted,
     /// given back when the consumer takes its reply **out of** the queue. That
     /// is what makes [`crate::SessionLimits::max_outstanding_requests`] bound
@@ -270,6 +280,8 @@ impl SessionShared {
             ended: AtomicU8::new(EndedAs::NOT_ENDED),
             open_cancelled: AtomicBool::new(false),
             transaction_resolved_at_end: AtomicBool::new(false),
+            abandon_requested: AtomicBool::new(false),
+            collected_output: Mutex::new(CollectedOutput::default()),
             requests: Arc::new(RequestSlots::default()),
         }
     }
@@ -720,6 +732,59 @@ impl SessionShared {
         self.in_flight.load(Ordering::SeqCst) > 0
     }
 
+    /// Records that something asked this session to go away without a close.
+    ///
+    /// Read by the worker between server-output reads, so a drain stops at
+    /// the next round-trip boundary rather than running to the end of a large
+    /// buffer for a session nobody is listening to any more.
+    pub(crate) fn request_abandon(&self) {
+        self.abandon_requested.store(true, Ordering::Release);
+    }
+
+    /// Whether [`SessionShared::request_abandon`] has run.
+    pub(crate) fn abandon_requested(&self) -> bool {
+        self.abandon_requested.load(Ordering::Acquire)
+    }
+
+    /// Appends one read's worth of server output to the completion-path log,
+    /// within its bounds; see [`ServerOutputLog`].
+    ///
+    /// The log is always a **prefix** of the output: once one line has been
+    /// refused, every later line is refused and counted too, until the next
+    /// take — a small line is never kept after a bigger one was dropped, or
+    /// the log would read as complete output with a hole in it. Keeping the
+    /// oldest is the same "keep what is already promised, count the rest"
+    /// rule the event queue applies, because the start of a run is where an
+    /// error usually is.
+    pub(crate) fn collect_server_output(&self, lines: Vec<Box<str>>, failure: Option<DbError>) {
+        let mut collected = self
+            .collected_output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for line in lines {
+            collected.push(line);
+        }
+        if let Some(failure) = failure {
+            let log = &mut collected.log;
+            log.failures = log.failures.saturating_add(1);
+            if log.failure.is_none() {
+                log.failure = Some(failure);
+            }
+        }
+    }
+
+    /// Takes everything the completion-path log holds, leaving it empty and
+    /// accepting lines again.
+    pub(crate) fn take_collected_server_output(&self) -> ServerOutputLog {
+        std::mem::take(
+            &mut *self
+                .collected_output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .log
+    }
+
     /// The error every command gets once the session is lost or closed.
     ///
     /// For a lost session this keeps the original [`ErrorKind`], native code
@@ -766,9 +831,77 @@ impl SessionShared {
     }
 }
 
+/// The completion-path log plus the bookkeeping that keeps it bounded.
+///
+/// `bytes` is a running total, so appending is O(lines appended) rather than
+/// re-summing the whole log on every read; `refusing` is what keeps the log a
+/// prefix of the output once the bound has been hit.
+#[derive(Default)]
+struct CollectedOutput {
+    log: ServerOutputLog,
+    bytes: usize,
+    refusing: bool,
+}
+
+impl CollectedOutput {
+    fn push(&mut self, line: Box<str>) {
+        if !self.refusing {
+            let fits = self.log.lines.len() < ServerOutputLog::MAX_RETAINED_LINES
+                && self.bytes.saturating_add(line.len()) <= ServerOutputLog::MAX_RETAINED_BYTES;
+            if fits {
+                self.bytes += line.len();
+                self.log.lines.push(line);
+                return;
+            }
+            self.refusing = true;
+        }
+        self.log.dropped = self.log.dropped.saturating_add(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn line(bytes: usize, fill: char) -> Box<str> {
+        std::iter::repeat_n(fill, bytes)
+            .collect::<String>()
+            .into_boxed_str()
+    }
+
+    #[test]
+    fn the_completion_log_stays_a_prefix_once_a_line_is_refused() {
+        let shared = SessionShared::new(SessionId::allocate());
+        // The review's probe: a line that nearly fills the log, one that does
+        // not fit, then one small enough to fit on its own. Keeping the third
+        // would leave a hole where the second was.
+        let first = line(ServerOutputLog::MAX_RETAINED_BYTES - 10, 'a');
+        shared.collect_server_output(vec![first.clone(), line(100, 'b')], None);
+        shared.collect_server_output(vec![line(5, 'c')], None);
+        let log = shared.take_collected_server_output();
+        assert_eq!(log.lines, vec![first]);
+        assert_eq!(log.dropped, 2, "both later lines are counted");
+
+        // A take empties the log and it accepts lines again.
+        shared.collect_server_output(vec![line(5, 'd')], None);
+        let log = shared.take_collected_server_output();
+        assert_eq!(log.lines, vec![line(5, 'd')]);
+        assert_eq!(log.dropped, 0);
+    }
+
+    #[test]
+    fn the_completion_log_line_bound_also_keeps_a_prefix() {
+        let shared = SessionShared::new(SessionId::allocate());
+        let lines = (0..ServerOutputLog::MAX_RETAINED_LINES + 3)
+            .map(|n| n.to_string().into_boxed_str())
+            .collect();
+        shared.collect_server_output(lines, None);
+        shared.collect_server_output(vec![Box::from("late")], None);
+        let log = shared.take_collected_server_output();
+        assert_eq!(log.lines.len(), ServerOutputLog::MAX_RETAINED_LINES);
+        assert_eq!(log.lines.first().map(AsRef::as_ref), Some("0"));
+        assert_eq!(log.dropped, 4);
+    }
 
     #[test]
     fn starts_usable_with_no_possibly_active_transaction() {

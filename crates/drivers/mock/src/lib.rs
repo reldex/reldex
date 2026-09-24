@@ -52,6 +52,7 @@ mod cursor;
 mod generated;
 mod metadata;
 mod scenario;
+mod server_output;
 
 pub use connection::{MockConnection, MockDriver};
 pub use cursor::MockCursor;
@@ -63,3 +64,4 @@ pub use scenario::{
     Action, BlockGate, BlockSpec, ColumnSpec, Counts, Matcher, QueryPlan, QuerySource, Scenario,
     ScriptValue, ScriptedError,
 };
+pub use server_output::ServerOutputCounts;

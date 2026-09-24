@@ -106,16 +106,26 @@
 //!   [`EventCaps::max_unsolicited_per_session`] plus one — a transaction state
 //!   is never dropped; see [`EventCaps`] for the exact policy and for how a
 //!   drop is reported rather than hidden.
+//! * **A `ServerOutput` that carries a `failure`** (M2.7) is never dropped
+//!   either, and is bounded like `Executing`: the worker emits at most one
+//!   per execute, always *before* that execute's reply, and the reply holds a
+//!   request slot until the consumer drains it — which, the queue being a
+//!   FIFO, it cannot do without draining the failure first. So at most `R` of
+//!   them are ever waiting. At the cap such an event is admitted **without its
+//!   lines**, which are counted as dropped like any refused output.
 //! * **[`SessionEvent::Terminal`]** is one per session, ever, and is never
 //!   dropped.
 //!
-//! So one session can hold at most `2 × max_outstanding_requests +
+//! So one session can hold at most `3 × max_outstanding_requests +
 //! max_unsolicited_per_session + 3` events in the queue — `R + 1` replies, `R`
-//! `Executing`s, `U + 1` unsolicited and one `Terminal` — and no producer can
-//! exceed that however fast it runs. M2.6's open and abandon do not change
-//! that arithmetic: the open is one of the `R`, abandon reserves nothing, and
-//! `Terminal`'s `transaction_possibly_lost` is a field on an event that was
-//! already counted rather than a new event.
+//! `Executing`s, `R` failed-read `ServerOutput`s, `U + 1` other unsolicited
+//! events and one `Terminal` — and no producer can exceed that however fast
+//! it runs. (M2.5 published `2R + U + 3`; M2.7's failed reads are the third
+//! `R`, and they only exist on a session whose output pane is on.) M2.6's
+//! open and abandon do not change that arithmetic: the open is one of the
+//! `R`, abandon reserves nothing, and `Terminal`'s `transaction_possibly_lost`
+//! is a field on an event that was already counted rather than a new event.
+//! The [`SessionEvent::ServerOutputConfigured`] reply is one of the `R`.
 //!
 //! Dropping the [`EventQueue`] ends the stream: see [`EventQueue`] for what
 //! happens to the events and the slots that were still in it.
@@ -131,7 +141,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
-use reldex_db_driver_api::{CancelKind, ConnectionId, DbError, DbResult, ErrorKind, Warning};
+use reldex_db_driver_api::{
+    CancelKind, ConnectionId, DbError, DbResult, ErrorKind, ServerOutputSetting, Warning,
+};
 
 use crate::ids::{LobHandle, ResultId, SessionId};
 use crate::session::{CloseError, ExecuteOutcome, FetchedBatch};
@@ -226,6 +238,14 @@ pub trait Waker: Send + Sync {
 ///   `ServerOutput` to ride on stays readable through
 ///   [`EventQueue::pending_dropped_lines`]. [`EventQueue::dropped_unsolicited`]
 ///   counts the refused *events* for diagnostics, and never resets.
+/// * A `ServerOutput` whose `failure` is set — reading the server's output
+///   failed — is **never dropped**: at the cap its lines are dropped and
+///   counted exactly as above, and the event itself is admitted carrying only
+///   the failure and the drop count, because "the output is incomplete, and
+///   this is why" is the one thing about output a UI must not lose. It is not
+///   counted by `dropped_unsolicited`, since the event was not refused. The
+///   class is bounded by the reply slots, not by this cap; see the module
+///   documentation.
 ///
 /// A reply event, [`SessionEvent::Executing`] and [`SessionEvent::Terminal`]
 /// are never dropped and never coalesced.
@@ -422,6 +442,21 @@ pub enum SessionEvent {
         /// What the close did — see [`CloseError::session_is_still_open`].
         result: Result<(), CloseError>,
     },
+    /// The reply to [`crate::DatabaseSession::submit_set_server_output`].
+    ///
+    /// On success it carries the setting **actually in force**, which a
+    /// driver may have adjusted — a buffer size the server does not accept is
+    /// clamped into its range, and this says to what — so the UI shows the
+    /// real limit rather than the one it asked for. On failure nothing
+    /// changed: the session keeps reading output exactly as it did before.
+    ServerOutputConfigured {
+        /// The session.
+        session: SessionId,
+        /// The request.
+        request: RequestId,
+        /// The setting now in force, or why it could not be changed.
+        result: DbResult<ServerOutputSetting>,
+    },
 
     // --- progress / unsolicited ---
     /// The worker has **started** this statement: it is no longer queued, and
@@ -440,17 +475,60 @@ pub enum SessionEvent {
         /// UI shows the real limit rather than the one it hoped for.
         deadline: Option<Duration>,
     },
-    /// Lines the server produced out of band (M2.7).
+    /// Lines the server produced out of band — `DBMS_OUTPUT` and its kind —
+    /// read back by the worker after a statement, on a session whose output
+    /// was turned on with [`crate::DatabaseSession::submit_set_server_output`]
+    /// (ADR-0002 amendment T).
+    ///
+    /// **Where it sits in the stream.** The worker reads output after the
+    /// statement that produced it and emits it **before that statement's
+    /// [`SessionEvent::Executed`]** — so every `ServerOutput` lies between an
+    /// execute's [`SessionEvent::Executing`] and its `Executed`. Normally it
+    /// belongs to that execute. There are two exceptions, and in both the
+    /// lines arrive inside the **next** execute's window, ahead of that
+    /// execute's own lines:
+    ///
+    /// * output written while rows were being *fetched* (a function in a
+    ///   select list that prints), because a fetch is not followed by a read;
+    /// * output of a statement that failed and left the session needing
+    ///   validation (for example a timeout), because no read is attempted on
+    ///   such a session. The next command's ping restores it, and the next
+    ///   execute's read returns those lines. Reading straight away would need
+    ///   a ping first, and would hold back the error reply on a connection
+    ///   that may be dead. On the Oracle driver today this case is mostly
+    ///   moot: a call timeout during a blocked call loses the session, and a
+    ///   lost session's output is gone with it.
+    ///
+    /// One statement's output may arrive as several events, each bounded by
+    /// [`crate::SessionLimits::server_output_chunk_lines`] and
+    /// [`crate::SessionLimits::server_output_chunk_bytes`].
+    ///
+    /// `#[non_exhaustive]`, unlike the other variants: its fields are still
+    /// expected to grow (a per-statement truncation report, follow-up M2.13),
+    /// so a consumer — M2.11's mapping first — must match it with `..`.
+    #[non_exhaustive]
     ServerOutput {
         /// The session.
         session: SessionId,
-        /// The lines, in order.
+        /// The lines, in order. An empty line is an empty string.
         lines: Vec<Box<str>>,
         /// How many lines were dropped for this session since the previous
         /// delivered `ServerOutput`, because the session was at
         /// [`EventCaps::max_unsolicited_per_session`]. Zero normally; non-zero
         /// means the UI must say "output truncated".
         dropped: u32,
+        /// Reading the output failed, and this read ended. Lines read before
+        /// the failure went out on earlier events; this one carries none. The
+        /// lines the failed read had taken are lost, and what the server still
+        /// held may be (Oracle discards it at the next `PUT`), so the UI must
+        /// say the output is incomplete and why.
+        ///
+        /// The statement's own result is untouched: it arrives on its
+        /// `Executed` as usual, success or failure. A read that found the
+        /// connection gone is also the session's loss, reported on its
+        /// [`SessionEvent::Terminal`] like any other. An event carrying a
+        /// failure is **never dropped**, even at the cap; see [`EventCaps`].
+        failure: Option<DbError>,
     },
     /// [`crate::DatabaseSession::has_possibly_active_transaction`] flipped.
     ///
@@ -533,6 +611,7 @@ impl SessionEvent {
             | Self::LobChunk { session, .. }
             | Self::Completed { session, .. }
             | Self::SessionClosed { session, .. }
+            | Self::ServerOutputConfigured { session, .. }
             | Self::Executing { session, .. }
             | Self::ServerOutput { session, .. }
             | Self::TransactionStateChanged { session, .. }
@@ -551,6 +630,7 @@ impl SessionEvent {
             | Self::LobChunk { request, .. }
             | Self::Completed { request, .. }
             | Self::SessionClosed { request, .. }
+            | Self::ServerOutputConfigured { request, .. }
             | Self::Executing { request, .. } => Some(*request),
             Self::ServerOutput { .. }
             | Self::TransactionStateChanged { .. }
@@ -571,6 +651,7 @@ impl SessionEvent {
                 | Self::LobChunk { .. }
                 | Self::Completed { .. }
                 | Self::SessionClosed { .. }
+                | Self::ServerOutputConfigured { .. }
         )
     }
 
@@ -777,9 +858,17 @@ impl Shared {
             return Pushed::DISCARDED;
         }
         let was_empty = inner.queue.is_empty();
+        let mut event = event;
         if event.is_unsolicited() {
             match inner.admit_unsolicited(&event, self.caps) {
                 Admission::Enqueue => {}
+                Admission::EnqueueWithoutLines => {
+                    // The lines were counted as dropped; the failure the event
+                    // carries is what must not be lost, and it costs no lines.
+                    if let SessionEvent::ServerOutput { lines, .. } = &mut event {
+                        *lines = Vec::new();
+                    }
+                }
                 Admission::Coalesced => return Pushed::DISCARDED,
                 Admission::Dropped => {
                     self.dropped_unsolicited.fetch_add(1, Ordering::Relaxed);
@@ -840,6 +929,11 @@ impl Shared {
 enum Admission {
     /// Put it in the queue.
     Enqueue,
+    /// The session is at its cap, but the event reports a failure that must
+    /// not be lost: its lines are dropped and counted like any refused
+    /// `ServerOutput`, and the event itself — now carrying only the failure
+    /// and the drop count — is admitted over the cap.
+    EnqueueWithoutLines,
     /// Its value was folded into one already queued. Nothing was lost, so
     /// this is not a drop and is not counted as one.
     Coalesced,
@@ -886,11 +980,19 @@ impl Inner {
             // creates it, and a refused event must not leave one behind.
             return Admission::Enqueue;
         }
-        if let SessionEvent::ServerOutput { lines, .. } = event
+        if let SessionEvent::ServerOutput { lines, failure, .. } = event
             && let Some(state) = self.sessions.get_mut(&session)
         {
             let lost = u32::try_from(lines.len()).unwrap_or(u32::MAX);
             state.dropped_lines = state.dropped_lines.saturating_add(lost);
+            if failure.is_some() {
+                // A failed read is news the UI must show ("output incomplete,
+                // because …"), and a drop would hide it. At most one such
+                // event exists per execute, and it is always followed by that
+                // execute's reply, which holds a request slot until drained —
+                // so the class is bounded by `max_outstanding_requests`.
+                return Admission::EnqueueWithoutLines;
+            }
         }
         Admission::Dropped
     }
@@ -922,6 +1024,7 @@ impl Inner {
                 session,
                 lines,
                 dropped,
+                failure,
             } => {
                 let dropped = dropped.saturating_add(state.dropped_lines);
                 state.dropped_lines = 0;
@@ -929,6 +1032,7 @@ impl Inner {
                     session,
                     lines,
                     dropped,
+                    failure,
                 }
             }
             other => other,
@@ -1271,6 +1375,7 @@ mod tests {
             session,
             lines: (0..lines).map(|i| format!("line {i}").into()).collect(),
             dropped: 0,
+            failure: None,
         }
     }
 
@@ -1360,6 +1465,89 @@ mod tests {
         assert_eq!(queue.waker_panics(), 2);
         assert_eq!(queue.len(), 1, "the event was queued despite the panic");
         queue.set_waker(None);
+    }
+
+    fn failed_output(session: SessionId, lines: usize) -> SessionEvent {
+        SessionEvent::ServerOutput {
+            session,
+            lines: (0..lines).map(|i| format!("line {i}").into()).collect(),
+            dropped: 0,
+            failure: Some(reldex_db_driver_api::DbError::internal("the read failed")),
+        }
+    }
+
+    #[test]
+    fn a_failed_read_is_never_dropped_even_at_the_cap() {
+        // M2.7: "the output is incomplete, and this is why" must reach the UI
+        // whatever the queue's state. At the cap the event loses its lines —
+        // counted, by the existing mechanism — and keeps its failure.
+        let (sink, queue) = event_channel(caps(1));
+        let session = SessionId::allocate();
+        emit(&sink, output(session, 2));
+        emit(&sink, output(session, 5)); // refused: 5 lines owed
+        emit(&sink, failed_output(session, 3)); // admitted without its 3 lines
+        assert_eq!(queue.len(), 2, "the failure was admitted over the cap");
+        assert_eq!(
+            queue.dropped_unsolicited(),
+            1,
+            "only the refused event counts as refused; the stripped one was delivered"
+        );
+
+        match queue.next().expect("the first output") {
+            SessionEvent::ServerOutput {
+                lines,
+                dropped,
+                failure,
+                ..
+            } => {
+                assert_eq!(lines.len(), 2);
+                assert_eq!(dropped, 0);
+                assert!(failure.is_none());
+            }
+            other => panic!("expected ServerOutput, got {other:?}"),
+        }
+        match queue.next().expect("the failure") {
+            SessionEvent::ServerOutput {
+                lines,
+                dropped,
+                failure,
+                ..
+            } => {
+                assert!(lines.is_empty(), "its lines were shed at the cap");
+                assert_eq!(
+                    dropped,
+                    5 + 3,
+                    "the refused event's lines and its own shed lines are both reported"
+                );
+                assert!(failure.is_some(), "the failure survived the cap");
+            }
+            other => panic!("expected ServerOutput, got {other:?}"),
+        }
+        assert_eq!(
+            queue.pending_dropped_lines(session),
+            0,
+            "nothing still owed"
+        );
+    }
+
+    #[test]
+    fn a_failed_read_under_the_cap_keeps_its_lines() {
+        let (sink, queue) = event_channel(caps(4));
+        let session = SessionId::allocate();
+        emit(&sink, failed_output(session, 3));
+        match queue.next().expect("the failure") {
+            SessionEvent::ServerOutput {
+                lines,
+                dropped,
+                failure,
+                ..
+            } => {
+                assert_eq!(lines.len(), 3, "nothing is shed below the cap");
+                assert_eq!(dropped, 0);
+                assert!(failure.is_some());
+            }
+            other => panic!("expected ServerOutput, got {other:?}"),
+        }
     }
 
     #[test]

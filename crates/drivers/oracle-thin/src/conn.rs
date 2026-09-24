@@ -1,5 +1,6 @@
 //! The driver and connection implementations.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -8,8 +9,8 @@ use reldex_db_driver_api::{
     Bind, Binds, CancelHandle, CancelKind, CancelOutcome, Capabilities, ConnectionId, Credentials,
     DatabaseConnection, DatabaseDriver, DbError, DbResult, Endpoint, ErrorKind, ExecutionOutcome,
     ExtensionValue, LobKind, LobLocator, MetadataCatalog, NamedBind, OutBindSpec, OutValues,
-    SavepointName, SessionRole, SqlType, Statement, StatementKind, TlsMode, TransactionState,
-    Value, Warning, WarningKind,
+    SavepointName, ServerOutputChunk, ServerOutputSetting, SessionRole, SqlType, Statement,
+    StatementKind, TlsMode, TransactionState, Value, Warning, WarningKind,
 };
 
 use oracledb::{
@@ -100,6 +101,9 @@ fn capabilities() -> Capabilities {
         // server's SQL error offset, so a position is only available for PL/SQL
         // compilation errors, which is the case `SPEC.md` §24.14 needs.
         .with_error_position(true)
+        // M2.7: `DBMS_OUTPUT`, read through one packed block per round trip;
+        // `server_output.rs` says why not `GET_LINES` and what was measured.
+        .with_server_output(true)
 }
 
 /// The thin Oracle Database driver.
@@ -1484,6 +1488,27 @@ impl DatabaseConnection for OracleConnection {
         self.inner.ping().map_err(|error| crate::error::map(&error))
     }
 
+    /// One round trip. Neither this nor [`take_server_output`] is a statement
+    /// the user wrote, so neither touches the transaction tracking:
+    /// `DBMS_OUTPUT` is session state, not transaction state. Both run under
+    /// whatever call deadline the last statement armed, exactly like
+    /// [`ping`](Self::ping).
+    ///
+    /// [`take_server_output`]: Self::take_server_output
+    fn set_server_output(&mut self, setting: ServerOutputSetting) -> DbResult<ServerOutputSetting> {
+        self.guard()?;
+        crate::server_output::set(&self.inner, setting)
+    }
+
+    fn take_server_output(
+        &mut self,
+        max_lines: NonZeroUsize,
+        max_bytes: NonZeroUsize,
+    ) -> DbResult<ServerOutputChunk> {
+        self.guard()?;
+        crate::server_output::take(&self.inner, max_lines, max_bytes)
+    }
+
     fn close(mut self: Box<Self>) -> DbResult<()> {
         if self.closed.is_closed() {
             return Ok(());
@@ -1577,6 +1602,10 @@ mod tests {
         assert!(
             !capabilities.exact_transaction_state(),
             "the upstream transaction flag is not exposed"
+        );
+        assert!(
+            capabilities.server_output(),
+            "DBMS_OUTPUT is read through the packed block in `server_output.rs`"
         );
         assert_eq!(OracleThinDriver::new().name(), "oracle-thin");
     }

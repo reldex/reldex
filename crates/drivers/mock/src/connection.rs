@@ -17,6 +17,7 @@ use crate::generated::GeneratedCursor;
 use crate::scenario::{
     Action, BlockSpec, ParkOutcome, QueryPlan, QuerySource, Scenario, ScriptValue, TransactionEpoch,
 };
+use crate::server_output::{self, ConnectionOutput};
 
 /// The uncommitted table-store overlay for one connection.
 ///
@@ -197,6 +198,8 @@ pub struct MockConnection {
     /// [`DatabaseConnection::take_connect_warnings`]; see
     /// [`Scenario::set_connect_warnings`].
     connect_warnings: Vec<Warning>,
+    /// This connection's server-side output buffer; see [`crate::server_output`].
+    output: ConnectionOutput,
 }
 
 impl MockConnection {
@@ -237,6 +240,7 @@ impl MockConnection {
             latched_cancel,
             cancel_handle,
             connect_warnings,
+            output: ConnectionOutput::default(),
         }
     }
 
@@ -493,6 +497,10 @@ impl DatabaseConnection for MockConnection {
         if self.closed.load(Ordering::SeqCst) {
             return Err(DbError::connection_closed("connection"));
         }
+        // Printed as the statement starts, so a statement scripted to fail
+        // still leaves its lines behind.
+        self.output
+            .statement_started(&self.scenario, statement.sql());
         let Some(action) = self.scenario.find_action(statement.sql()) else {
             return Err(DbError::new(
                 ErrorKind::Other,
@@ -554,6 +562,35 @@ impl DatabaseConnection for MockConnection {
     fn ping(&mut self) -> DbResult<()> {
         self.record();
         self.scenario.ping_behavior()
+    }
+
+    fn set_server_output(
+        &mut self,
+        setting: reldex_db_driver_api::ServerOutputSetting,
+    ) -> DbResult<reldex_db_driver_api::ServerOutputSetting> {
+        self.record();
+        if !self.capabilities.server_output() {
+            return Err(server_output::unsupported());
+        }
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(DbError::connection_closed("connection"));
+        }
+        self.output.set(&self.scenario, setting)
+    }
+
+    fn take_server_output(
+        &mut self,
+        max_lines: std::num::NonZeroUsize,
+        max_bytes: std::num::NonZeroUsize,
+    ) -> DbResult<reldex_db_driver_api::ServerOutputChunk> {
+        self.record();
+        if !self.capabilities.server_output() {
+            return Err(server_output::unsupported());
+        }
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(DbError::connection_closed("connection"));
+        }
+        self.output.take(&self.scenario, max_lines, max_bytes)
     }
 
     fn close(self: Box<Self>) -> DbResult<()> {

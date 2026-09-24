@@ -133,6 +133,14 @@
 //!   still commits server-side, which is reported through
 //!   [`committed_implicitly`](reldex_db_driver_api::ExecutionOutcome::committed_implicitly)
 //!   rather than hidden.
+//! - **Server output is `DBMS_OUTPUT`, read in packed chunks.** `oracledb`
+//!   has no PL/SQL collection binds, so `GET_LINES` is out of reach; each
+//!   [`take_server_output`](reldex_db_driver_api::DatabaseConnection::take_server_output)
+//!   is one anonymous block that loops `GET_LINE` on the server and returns
+//!   up to ~32 KiB of length-prefixed lines in one round trip (10,000 lines:
+//!   5 round trips, measured). A requested buffer size is clamped to
+//!   2,000..=1,000,000 bytes, as the server does, and reported. ADR-0002
+//!   amendment T.
 //! - **`CREATE … TRIGGER` is rewritten so it can run at all.** `oracledb`
 //!   reads `:NEW`, `:OLD` — any `:name` — in a trigger body as a bind
 //!   placeholder and then demands a value for it, so the statement every other
@@ -325,6 +333,7 @@ mod error;
 mod lob;
 mod metadata;
 mod rewrite;
+mod server_output;
 mod sql_dialect;
 mod value;
 

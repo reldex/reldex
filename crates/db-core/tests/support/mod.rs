@@ -34,8 +34,8 @@ use std::thread;
 use reldex_db_core::{
     CloseDisposition, CloseError, CompletedOperation, ConnectionParams, DatabaseDriver,
     DatabaseSession, DbError, DbResult, EventCaps, EventQueue, ExecuteOutcome, FetchedBatch,
-    LobHandle, RequestId, ResultId, SavepointName, SessionEvent, SessionId, SessionLimits,
-    SessionManager, SessionRegistry, Statement, event_channel,
+    LobHandle, RequestId, ResultId, SavepointName, ServerOutputSetting, SessionEvent, SessionId,
+    SessionLimits, SessionManager, SessionRegistry, Statement, event_channel,
 };
 use reldex_db_driver_api::{Credentials, Endpoint};
 use reldex_driver_mock::{MockDriver, Scenario};
@@ -661,6 +661,75 @@ impl Session {
         }
     }
 
+    /// Turns server output on or off.
+    pub(crate) fn set_server_output(
+        &self,
+        setting: ServerOutputSetting,
+    ) -> Answered<ServerOutputSetting> {
+        match self.path {
+            ReplyPath::Completion => Answered(self.inner.set_server_output(setting).wait()),
+            ReplyPath::Events => self.submitted(
+                |request| self.inner.submit_set_server_output(request, setting),
+                |event| match event {
+                    SessionEvent::ServerOutputConfigured { result, .. } => result,
+                    other => panic!("expected ServerOutputConfigured, got {other:?}"),
+                },
+            ),
+        }
+    }
+
+    /// Everything the session delivered as server output since the last call,
+    /// read the way each path delivers it: `ServerOutput` events taken off the
+    /// queue while waiting for replies, or the completion-path log.
+    ///
+    /// On the event path it only sees what has been drained so far, which —
+    /// because output precedes its statement's reply — is everything a
+    /// statement printed once that statement's `wait()` has returned.
+    pub(crate) fn take_output(&self) -> Output {
+        match self.path {
+            ReplyPath::Completion => {
+                let log = self.inner.take_server_output();
+                Output {
+                    lines: log.lines.iter().map(|line| line.to_string()).collect(),
+                    dropped: u64::from(log.dropped),
+                    failures: log.failures,
+                    first_failure: log.failure,
+                    events: 0,
+                }
+            }
+            ReplyPath::Events => {
+                let mut output = Output::default();
+                let mut stashed = self.stashed.borrow_mut();
+                let mut kept = Vec::with_capacity(stashed.len());
+                for event in stashed.drain(..) {
+                    match event {
+                        SessionEvent::ServerOutput {
+                            lines,
+                            dropped,
+                            failure,
+                            ..
+                        } => {
+                            output.events += 1;
+                            output
+                                .lines
+                                .extend(lines.iter().map(|line| line.to_string()));
+                            output.dropped += u64::from(dropped);
+                            if let Some(failure) = failure {
+                                output.failures += 1;
+                                if output.first_failure.is_none() {
+                                    output.first_failure = Some(failure);
+                                }
+                            }
+                        }
+                        other => kept.push(other),
+                    }
+                }
+                *stashed = kept;
+                output
+            }
+        }
+    }
+
     /// Closes the session.
     ///
     /// On the event path this also waits for the session's `Terminal` when
@@ -689,6 +758,28 @@ impl Session {
                 result
             }
         }
+    }
+}
+
+/// Server output as a test sees it, whichever path delivered it.
+#[derive(Debug, Default)]
+pub(crate) struct Output {
+    /// Every line, in order.
+    pub(crate) lines: Vec<String>,
+    /// Lines reported as dropped.
+    pub(crate) dropped: u64,
+    /// How many reads failed.
+    pub(crate) failures: u32,
+    /// The first failed read.
+    pub(crate) first_failure: Option<DbError>,
+    /// How many `ServerOutput` events carried this (event path only).
+    pub(crate) events: usize,
+}
+
+impl Output {
+    /// Whether nothing at all was delivered.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.lines.is_empty() && self.dropped == 0 && self.failures == 0 && self.events == 0
     }
 }
 

@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-24T22:12:00+07:00",
+  "updatedAt": "2026-09-24T22:36:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1184,8 +1184,8 @@
               "status": "done"
             },
             {
-              "title": "M2.7 ★ Server output capability (DBMS_OUTPUT) in contract + driver + core polling when enabled (opus, review mandatory)",
-              "status": "todo"
+              "title": "M2.7 ★ Server output capability (DBMS_OUTPUT) in contract + driver + core polling when enabled (opus, review mandatory) — done 2026-09-24: server output capability — set_server_output/take_server_output in the contract, Oracle drain via one anonymous block per round trip (10,000 lines in 5 round trips, 32,767-byte lines byte-exact), core drains after every execute before the reply and makes no driver call while off; independently reviewed (no must-fix; should-fixes landed); ADR-0002 amendment T; follow-ups M2.12/M2.13",
+              "status": "done"
             },
             {
               "title": "M2.8 Metadata catalog descriptor (MetadataCatalog) + Oracle dictionary SQL for the 9 object groups (sonnet) — done 2026-09-24: MetadataCatalog descriptor (db-driver-api::metadata) — one prepare(MetadataRequest) returning a Statement + declared column contract + error classifier; Oracle ALL_* SQL only in the driver; filter is a bind (case-insensitive contains, wildcards literal), limit+1 truncation, invisible columns excluded, composed type_name; ORA-00942/01039 on catalog queries → Permission; independently reviewed twice (2 must-fix fixed); real-DB 9/9",
@@ -1202,6 +1202,16 @@
             {
               "title": "M2.11 FFI surface for M2.5–M2.10 + regenerate and verify header (sonnet)",
               "status": "todo"
+            },
+            {
+              "title": "M2.12 Server output framing over RAW/LENGTHB with per-line UTF-8 decoding, so one invalid line loses only itself (sonnet; M2.7 review follow-up)",
+              "status": "todo",
+              "note": "Today a line that is not valid UTF-8 loses every line of its read (up to 4,096 good lines)."
+            },
+            {
+              "title": "M2.13 Per-statement server-output drain bound (total cap reported, or a cancel flag checked between reads) (opus; M2.7 review follow-up)",
+              "status": "todo",
+              "note": "Today the drain has no length bound, cannot be cancelled on Oracle, and holds Executed back until it finishes."
             }
           ]
         },
@@ -1662,6 +1672,14 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-24",
+      "text": "M2.7 done: DBMS_OUTPUT reaches the core. The driver drains the server buffer in bounded chunks (10,000 lines in 5 round trips; Thai, emoji and 32,767-byte lines byte-exact), the core reads after every statement — success or failure — and delivers the lines before the statement's reply, and a session with the pane off costs no extra round trip (proven with call counters and on the real database). Independent review found no must-fix; it corrected the completion log to keep a strict prefix, documented a second attribution exception (output of a timed-out statement arrives with the next one), and fixed a wrong rationale. Two follow-ups recorded: RAW-based framing so one invalid line cannot lose a read (M2.12) and a per-statement drain bound (M2.13)."
+    },
+    {
+      "date": "2026-09-24",
+      "text": "M2.7 (server output) in review on draft PR #28, status still todo: independent review ACCEPT-WITH-FOLLOW-UPS, no must-fix. Should-fixes landed. The completion-path log is now a strict prefix of the output. A failed statement that leaves the session needing validation delivers its output with the next statement, now documented as a second exception. The reason for draining to the end is corrected: the next PUT purges leftovers, measured on 19c. A lost drain over-reports transaction loss on exact-state drivers, documented as deliberate. Two follow-ups recorded. M2.12: per-line UTF-8 framing, because today one invalid line loses its whole read. M2.13: a per-statement drain bound, because today the drain is unbounded and uncancellable on Oracle and holds Executed back."
+    },
     {
       "date": "2026-09-24",
       "text": "M2.8 done: the metadata catalog descriptor behind the object browser. The driver hands the core a prepared dictionary query plus a declared column contract (same columns for every driver), so the browser's tree is vendor-neutral and no new result plumbing exists. Independent review found two real defects on the unfiltered happy path — a schema listing failed outright if any object name contained a backslash, and invisible columns broke the declared 'position' contract — both fixed and proven on the live 19c database; type names now carry precision/length (NUMBER(10,2), VARCHAR2(4000 CHAR)). Known limits recorded: the live permission-denied path cannot be provoked with the single test user; materialized-view container tables may list as tables; REF/owner-qualified types render bare."

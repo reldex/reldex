@@ -109,7 +109,8 @@ pub use ids::{LobHandle, ResultId, SessionId};
 pub use registry::{Abandoned, RegisteredSession, RegistryCounts, SessionRegistry};
 pub use session::{
     CloseDisposition, CloseError, Completion, DROP_SHUTDOWN_TIMEOUT, DatabaseSession,
-    ExecuteOutcome, FetchedBatch, OutValue, OutValues, SessionLimits, SessionManager,
+    ExecuteOutcome, FetchedBatch, OutValue, OutValues, ServerOutputLog, SessionLimits,
+    SessionManager,
 };
 pub use shared::SessionLifecycle;
 
@@ -122,6 +123,7 @@ pub use shared::SessionLifecycle;
 // one. [`LobHandle`] is what callers get instead.
 pub use reldex_db_driver_api::{
     CancelKind, CancelOutcome, Column, ColumnMetadata, ConnectionId, ConnectionParams,
-    DatabaseDriver, DbError, DbResult, ErrorKind, RowBatch, SavepointName, SessionState, Statement,
-    StatementKind, TransactionState, ValueRef, Warning,
+    DatabaseDriver, DbError, DbResult, ErrorKind, RowBatch, SavepointName, ServerOutputBuffer,
+    ServerOutputSetting, SessionState, Statement, StatementKind, TransactionState, ValueRef,
+    Warning,
 };

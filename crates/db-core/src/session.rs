@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use reldex_db_driver_api::{
     CancelKind, CancelOutcome, Column, ConnectionId, ConnectionParams, DatabaseDriver, DbError,
-    DbResult, RowBatch, SavepointName, Statement, StatementKind, ValueRef, Warning,
+    DbResult, RowBatch, SavepointName, ServerOutputSetting, Statement, StatementKind, ValueRef,
+    Warning,
 };
 
 use crate::events::{CompletedOperation, EventSink, RequestId};
@@ -159,6 +160,54 @@ pub struct ExecuteOutcome {
     /// `REF CURSOR` or large object among them is already registered on this
     /// session; see [`OutValue`].
     pub out_values: OutValues,
+}
+
+/// Server output collected for requests answered through a [`Completion`].
+///
+/// The event path delivers server output as
+/// [`crate::SessionEvent::ServerOutput`]; a request answered through a
+/// `Completion` has no stream to put it on, so the worker appends it here
+/// instead, **before** it answers that request — once
+/// [`Completion::wait`] returns, the statement's output is already in place,
+/// including the output of a statement that failed after printing. Read it
+/// with [`DatabaseSession::take_server_output`].
+///
+/// Bounded, and honest about it: at most
+/// [`ServerOutputLog::MAX_RETAINED_LINES`] lines and
+/// [`ServerOutputLog::MAX_RETAINED_BYTES`] bytes are kept between two takes.
+/// The kept lines are always a **prefix** of the output: from the first line
+/// that does not fit, every later line is counted in
+/// [`ServerOutputLog::dropped`] instead, even one small enough to fit, until
+/// the next take. The log is per session, not per statement; see
+/// [`DatabaseSession::take_server_output`]. This path is for tools and tests.
+/// A UI uses the event path, whose bound is the consumer's own drain.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct ServerOutputLog {
+    /// The lines, oldest first. An empty line is an empty string.
+    pub lines: Vec<Box<str>>,
+    /// How many lines were discarded because the log was full.
+    pub dropped: u32,
+    /// The first read that failed since the last take: the output after it
+    /// may be incomplete. `None` when every read succeeded.
+    pub failure: Option<DbError>,
+    /// How many reads failed since the last take, including the one in
+    /// [`ServerOutputLog::failure`].
+    pub failures: u32,
+}
+
+impl ServerOutputLog {
+    /// The most lines kept between two takes.
+    pub const MAX_RETAINED_LINES: usize = 10_000;
+
+    /// The most bytes of text kept between two takes.
+    pub const MAX_RETAINED_BYTES: usize = 1024 * 1024;
+
+    /// Whether nothing was collected: no lines, no drops, no failure.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty() && self.dropped == 0 && self.failures == 0
+    }
 }
 
 /// One fetched batch: plain data, plus a handle for every large object the
@@ -428,6 +477,8 @@ pub struct SessionLimits {
     max_open_results: NonZeroUsize,
     max_lob_chunk_bytes: NonZeroUsize,
     max_outstanding_requests: NonZeroUsize,
+    server_output_chunk_lines: NonZeroUsize,
+    server_output_chunk_bytes: NonZeroUsize,
 }
 
 impl SessionLimits {
@@ -466,14 +517,41 @@ impl SessionLimits {
     /// limit and cannot be refused;
     /// [`crate::SessionRegistry::abandon`] reserves none at all, which is what
     /// makes it impossible to refuse. The published bound
-    /// (`2R + U + 3` events per session, see [`crate::EventQueue`]) is
-    /// therefore unchanged by either.
+    /// (`3R + U + 3` events per session since M2.7, `2R + U + 3` for a session
+    /// whose server output is off; see [`crate::EventQueue`]) is therefore
+    /// unchanged by either.
     ///
     /// It does **not** apply to [`Completion`]-path calls: those hold their
     /// reply in the caller's own `Completion`, so they are bounded by the
     /// caller, and the command queue itself stays unbounded on purpose
     /// (ADR-0002 K9).
     pub const DEFAULT_MAX_OUTSTANDING_REQUESTS: NonZeroUsize = match NonZeroUsize::new(1024) {
+        Some(value) => value,
+        None => unreachable!(),
+    };
+
+    /// The most server-output lines one read may return, and therefore the
+    /// most one [`crate::SessionEvent::ServerOutput`] carries.
+    ///
+    /// A read is one round trip whatever it returns, so this and
+    /// [`SessionLimits::DEFAULT_SERVER_OUTPUT_CHUNK_BYTES`] are what bound the
+    /// memory one read can take on the worker. 4,096 lines is more than the
+    /// byte bound lets through for any line longer than three characters, so
+    /// in practice bytes decide and this only stops a flood of empty lines.
+    pub const DEFAULT_SERVER_OUTPUT_CHUNK_LINES: NonZeroUsize = match NonZeroUsize::new(4096) {
+        Some(value) => value,
+        None => unreachable!(),
+    };
+
+    /// The text one server-output read aims to return, in bytes.
+    ///
+    /// A target the driver fills up to, not a splitter: lines are returned
+    /// whole, and a read may carry one more line beyond the target — the one
+    /// that did not fit — so one read holds at most this plus one
+    /// maximum-length line (ADR-0002 amendment T1). 32 KiB matches the primary
+    /// driver's largest single transfer, so the default costs it no extra
+    /// round trips.
+    pub const DEFAULT_SERVER_OUTPUT_CHUNK_BYTES: NonZeroUsize = match NonZeroUsize::new(32 * 1024) {
         Some(value) => value,
         None => unreachable!(),
     };
@@ -485,7 +563,35 @@ impl SessionLimits {
             max_open_results: Self::DEFAULT_MAX_OPEN_RESULTS,
             max_lob_chunk_bytes: Self::DEFAULT_MAX_LOB_CHUNK_BYTES,
             max_outstanding_requests: Self::DEFAULT_MAX_OUTSTANDING_REQUESTS,
+            server_output_chunk_lines: Self::DEFAULT_SERVER_OUTPUT_CHUNK_LINES,
+            server_output_chunk_bytes: Self::DEFAULT_SERVER_OUTPUT_CHUNK_BYTES,
         }
+    }
+
+    /// Sets the most server-output lines one read may return.
+    #[must_use]
+    pub const fn with_server_output_chunk_lines(mut self, lines: NonZeroUsize) -> Self {
+        self.server_output_chunk_lines = lines;
+        self
+    }
+
+    /// Sets the text one server-output read aims to return.
+    #[must_use]
+    pub const fn with_server_output_chunk_bytes(mut self, bytes: NonZeroUsize) -> Self {
+        self.server_output_chunk_bytes = bytes;
+        self
+    }
+
+    /// The most server-output lines one read may return.
+    #[must_use]
+    pub const fn server_output_chunk_lines(self) -> NonZeroUsize {
+        self.server_output_chunk_lines
+    }
+
+    /// The text one server-output read aims to return, in bytes.
+    #[must_use]
+    pub const fn server_output_chunk_bytes(self) -> NonZeroUsize {
+        self.server_output_chunk_bytes
     }
 
     /// Sets how many results one session may hold open at once.
@@ -819,6 +925,13 @@ impl DatabaseSession {
     /// `None` means the command could not be delivered, so there is nothing to
     /// wait for: the worker has already gone.
     pub(crate) fn begin_abandon(&self) -> Option<AbandonReply> {
+        // First, and before the cancel: a worker inside a server-output drain
+        // checks this between round trips, so the drain stops at the next
+        // boundary instead of reading a buffer nobody will see (ADR-0002
+        // amendment T). It cannot interrupt the read already in progress —
+        // nothing can on a driver without a native cancel — which is why
+        // `abandon` never waits for the worker.
+        self.shared.request_abandon();
         // Best effort, and honest about it: on a driver that cannot interrupt
         // a running call this does nothing at all, exactly as in `Drop`.
         //
@@ -1090,6 +1203,37 @@ impl DatabaseSession {
         })
     }
 
+    /// Turns server output (`DBMS_OUTPUT` and its kind) on or off for this
+    /// session; its reply is one [`crate::SessionEvent::ServerOutputConfigured`]
+    /// carrying the setting actually in force (ADR-0002 amendment T).
+    ///
+    /// **One round trip, and the only thing that makes the session read
+    /// output.** Output is off when a session opens. While it is off the
+    /// worker makes no server-output call of any kind; once it is on, the
+    /// worker reads the server's buffer after every statement and delivers
+    /// the lines as [`crate::SessionEvent::ServerOutput`] events, before that
+    /// statement's `Executed`. A read is a round trip per statement — which
+    /// is exactly why this is a switch the user controls.
+    ///
+    /// Turning output off lets the server discard whatever it still holds.
+    ///
+    /// # Errors
+    ///
+    /// As [`DatabaseSession::submit_execute`]. A driver without
+    /// [`reldex_db_driver_api::Capabilities::server_output`] answers with
+    /// [`reldex_db_driver_api::ErrorKind::Unsupported`] in the reply, and no
+    /// driver call is made.
+    pub fn submit_set_server_output(
+        &self,
+        request: RequestId,
+        setting: ServerOutputSetting,
+    ) -> DbResult<()> {
+        self.submit_event(request, (), |reply| Command::SetServerOutput {
+            setting,
+            reply,
+        })
+    }
+
     /// Submits a session close; its reply is one
     /// [`crate::SessionEvent::SessionClosed`], followed — only if the session
     /// actually ended — by this session's single
@@ -1145,9 +1289,44 @@ impl DatabaseSession {
 
     /// Executes one statement. Binds, deadlines and the fetch-size hint live
     /// on [`Statement`] itself.
+    ///
+    /// With server output on, what the statement printed is in
+    /// [`DatabaseSession::take_server_output`] by the time this completes —
+    /// whether it succeeded or failed.
     #[must_use]
     pub fn execute(&self, statement: Statement) -> Completion<ExecuteOutcome> {
         self.submit((), |reply| Command::Execute { statement, reply })
+    }
+
+    /// Turns server output on or off; the completion-path twin of
+    /// [`DatabaseSession::submit_set_server_output`], with the same cost and
+    /// the same answer — the setting actually in force.
+    #[must_use]
+    pub fn set_server_output(
+        &self,
+        setting: ServerOutputSetting,
+    ) -> Completion<ServerOutputSetting> {
+        self.submit((), |reply| Command::SetServerOutput { setting, reply })
+    }
+
+    /// Takes the server output collected for requests answered through a
+    /// [`Completion`], leaving the log empty. See [`ServerOutputLog`].
+    ///
+    /// **Never a round trip**: the worker has already read the output, after
+    /// each statement, before answering it. This only hands over what it
+    /// collected. Output of event-path requests is not here — it went out as
+    /// [`crate::SessionEvent::ServerOutput`] instead.
+    ///
+    /// **One log per session, not per statement.** Taken after a single
+    /// `wait()`, it holds exactly that statement's output. A caller that
+    /// pipelines several completions and takes once afterwards gets their
+    /// output mixed in execution order, with nothing marking where one
+    /// statement's lines end. [`ServerOutputLog::failure`] is then the first
+    /// failed read among them, and it is not attributed to any statement. To
+    /// attribute output, take after each `wait()`, or use the event path.
+    #[must_use]
+    pub fn take_server_output(&self) -> ServerOutputLog {
+        self.shared.take_collected_server_output()
     }
 
     /// Fetches the next batch of an open result. An empty batch means the
