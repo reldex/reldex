@@ -61,6 +61,23 @@
 //! successfully before a later, expensive row's round trip is the one that
 //! exceeds the deadline.
 //!
+//! ## Canaries for U-6/U-7
+//!
+//! `docs/exec-plans/active/oracledb-upgrade-checklist.md` §2 points at two
+//! tests here as the deterministic replacement for its former "manual check"
+//! entries: `scenario_1_control_a_sleep_10_dies_as_the_issue_describes`
+//! (U-6: a fired deadline on suspended server work costs the session —
+//! `NetworkLost`, and the session is independently confirmed unusable, not
+//! just self-reported) and `scenario_3_cpu_bound_plsql_loop` (the contrasting
+//! case this file exists to add: a fired deadline on CPU-bound server work
+//! does not — `Timeout`, session independently confirmed usable). Both assert
+//! on the real invariant (a follow-up `SELECT 1 FROM dual`), not only on the
+//! error's own self-reported kind, and neither asserts a timing upper bound.
+//! These stayed in this file rather than moving into `canary_upstream_live.rs`
+//! because that file's own header commits it to driving **raw `oracledb`**,
+//! never `OracleThinDriver` — the opposite of every test in this file, which
+//! exists to measure the wrapper's `Statement::with_deadline` contract.
+//!
 //! ## Method for "did the server-side statement keep running"
 //!
 //! A privileged control connection (`system_params()`, the same `SYSTEM`
@@ -282,6 +299,15 @@ fn scenario_1_control_a_sleep_10_dies_as_the_issue_describes() {
             probe.elapsed >= SHORT_DEADLINE,
             "run {run}: a fired deadline should take at least the deadline itself"
         );
+        // Canary for U-6/U-7 (`oracledb-upgrade-checklist.md` §2): a
+        // suspended server must leave the session genuinely unusable, not
+        // merely self-reported as `Lost` — this is the independent
+        // `SELECT 1 FROM dual` check, not the error's own claim.
+        assert!(
+            probe.still_usable_after.is_err(),
+            "run {run}: NetworkLost must leave the session genuinely unusable, not just \
+             self-reported — but `SELECT 1 FROM dual` still succeeded"
+        );
     }
 }
 
@@ -328,6 +354,16 @@ fn scenario_3_cpu_bound_plsql_loop() {
             probe.elapsed >= SHORT_DEADLINE,
             "run {run}: a fired deadline should take at least the deadline itself"
         );
+        // Canary for U-6/U-7: CPU-bound work must leave the session
+        // genuinely usable, not just self-reported — the independent
+        // `SELECT 1 FROM dual` check, not the error's own claim.
+        probe.still_usable_after.as_ref().unwrap_or_else(|error| {
+            panic!(
+                "run {run}: Timeout must leave the session genuinely usable, not just \
+                 self-reported: {}",
+                describe(error)
+            )
+        });
     }
 }
 

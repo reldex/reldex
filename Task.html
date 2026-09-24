@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-23T22:15:00+07:00",
+  "updatedAt": "2026-09-24T10:30:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1655,6 +1655,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-24",
+      "text": "CPU-bound re-test of upstream oracledb issue #23 (docs/exec-plans/active/phase-0-spike-results.md, \"S4 addendum (2026-09-24)\"), on branch probe/call-timeout-cpu-bound: confirmed the maintainer's explanation holds for a plain session-level sleep — a fired call-timeout kills the connection, 3/3 runs — but found it does NOT hold for CPU-bound work. A busy PL/SQL loop, a CPU-heavy SQL join, and a query fetching slow rows all recovered cleanly instead (a plain timeout, session intact, 3/3 runs each): the server does notice the client's interrupt while it is busy on CPU, just not while it is suspended in a sleep. Two of the new tests (crates/drivers/oracle-thin/tests/probe_call_timeout_cpu_bound.rs) are now deterministic canaries for U-6/U-7 in oracledb-upgrade-checklist.md, replacing the old load-dependent 'manual check' entries. This does not reopen ADR-0001 — there is still no on-demand cancel API and the owner's 2026-09-19 decision stands — but it changes what M4.6's honest-no-Cancel UI wording should say for the common case: a fired time limit usually means the statement stopped and the session is fine, not that the connection was lost. A factual reply draft for #23 is ready in phase-0-spike-results.md §6; not yet posted."
+    },
     {
       "date": "2026-09-23",
       "text": "Upstream oracledb issue reconciliation (docs-only, no repo pin change, no code change): re-read all five filed issues (#21-#25) with their comments and diffed upstream `main` against our pinned =26.0.0-beta.3. #21 (NUMBER x10) and the #22 poisoned-lock panic are fixed on `main` (commits `efcda45`, `6785e95`); #22's other two panics (NUMBER index-out-of-bounds, region TIMESTAMP WITH TIME ZONE todo!()) are confirmed still present, and two new issues plus an acknowledgement reply are drafted per the maintainer's explicit invitation. #23 was explained as expected DBMS_SESSION.SLEEP/no-OOB behaviour (pool recommended); a skeleton reply awaits a pending CPU-bound re-test. #24 is a known limitation pending a future async API. #25's items 1 and 3 are accepted by the maintainer; item 2 (mutual TLS + a private CA in one ewallet.pem) got a clarification request back, answered with a precise repro drafted from the S8 evidence and a source read of transport.rs (unchanged on main). Also found: U-8 (server error code/position discarded) is already fixed on main (commit 04b96be), not yet in beta.3. Issues F and G were refreshed against main and every cited fact still holds; both stay unsubmitted per the 2026-09-19 owner decision. New issue drafts also prepared for U-5, U-9, U-11 (bundled) and the transaction-in-progress-flag request; U-8 needs no filing since it is already fixed. Nothing was posted upstream (read-only access); full reconciliation table and all drafts are in phase-0-spike-results.md §6."
