@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-24T21:16:00+07:00",
+  "updatedAt": "2026-09-24T21:52:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -609,7 +609,7 @@
   ],
   "nextSteps": [
     "Owner: rule on S15's three open questions (K1 p99 wording, K2 warm-vs-cold, K3 baseline/metric) and accept or re-open ADR-0003 (TASKS.md Owner decisions group)",
-    "Owner: decide the remaining open items in phase-1.md §C.3 (#10, #11, #15) — fetch-batch default sign-off, no-Cancel/no-limit wording, Community/Pro licensing",
+    "Owner: decide the remaining open items in phase-1.md §C.3 (#10, #11) — fetch-batch default sign-off, no-Cancel/no-limit wording (§C.3 #15, Community/Pro licensing, decided 2026-09-24: GPL-3.0-or-later — see decisions)",
     "Start M2 core work (events/async-open/settings/SQL text/driver leftovers) — proceeds regardless of the ADR-0003 ruling, per the owner's standing instruction",
     "Track M5.8 (frame drops while scrolling a streaming result) and M6.9 (cold first paint vs SPEC.md §19) as new performance tasks surfaced by S15",
     "Phase 0 leftovers: iOS physical-device evidence (needs a Mac, an Apple Developer account and a device) and the Android packaged-app path (APK, sandbox, real network); the driver carry-over (C-5, U-18, C-6) and the Android native-binary device run (7/7 checks) are merged"
@@ -670,6 +670,13 @@
       "status": "Read-only reconciliation, 2026-09-23 (docs-only, no code change). All five filed issues (#21-#25) have maintainer replies: #21 (NUMBER x10) and the #22 poisoned-lock panic are fixed on upstream `main` (commits `efcda45`, `6785e95`) but not yet in our pinned beta.3; #22's other two panics (NUMBER index-out-of-bounds, region-encoded TIMESTAMP WITH TIME ZONE) are confirmed still present on `main` and two new issues are drafted per the maintainer's invitation; #23 (call-timeout recovery) was explained as expected DBMS_SESSION.SLEEP/no-OOB behaviour, a pool is recommended, a CPU-bound re-test is pending; #24 (break API) is a known limitation pending a future async API; #25 (TCPS) items 1 and 3 are accepted by the maintainer, item 2 (mutual TLS + private CA) awaits our clarification, drafted. Also found by reading `main`: U-8 (server error code/position discarded) is already fixed there (commit `04b96be`). Issues F and G stay unsubmitted per the 2026-09-19 owner decision; both refreshed against `main` and every fact confirmed unchanged. Full table and drafts: `docs/exec-plans/active/phase-0-spike-results.md` §6.",
       "date": "2026-09-23",
       "link": "docs/exec-plans/active/phase-0-spike-results.md"
+    },
+    {
+      "id": "ADR-0005",
+      "title": "Repository public to keep hosted CI, plus the Community/Pro licence decision",
+      "status": "Accepted — owner decision 2026-09-24. The reldex GitHub account's Free-plan Actions minutes (2,000/month, private-repo only) were exhausted 2026-09-21 after >=100 workflow runs; every job since has failed in ~2s on a billing error. Of five options (reduce matrix, self-hosted runner, stop using Actions, wait, go public), the owner's first choice was 'stop using Actions' but switched the same day to making the repository public once the per-run cost (~40 billable min/PR, macOS x10 multiplier) showed a public repo gets Actions minutes free with no cap. ci.yml/ui.yml/mobile-cross-compile.yml are unchanged; hosted CI stays the merge gate; tools/gates.sh is added as a local pre-push/pre-PR check, not a CI replacement. The visibility flip itself is not yet executed — gated on a history exposure scan, run 2026-09-24: no credentials/keys/certificates ever committed; no files over 5 MB; one Android device serial in phase-0-android-device.md redacted at HEAD but present in history (accepted as low risk). Same decision also settles Community/Pro licensing (open since P0): Community edition is GPL-3.0-or-later, copyright (C) 2026 Supawit Nu-iat (LICENSE, COPYRIGHT); Reldex Pro is licensed separately by the copyright holder; external contributions will require a CLA to keep dual licensing possible. PRs #22, #24 and #25 merged 2026-09-21 to 09-24 on local verification only, while CI was down — stated here honestly, not glossed over.",
+      "date": "2026-09-24",
+      "link": "docs/decisions/0005-public-repository-for-hosted-ci.md"
     }
   ],
   "spikes": [
@@ -838,8 +845,8 @@
               "status": "todo"
             },
             {
-              "title": "Decide Community/Pro licensing before public release",
-              "status": "todo"
+              "title": "Decide Community/Pro licensing before public release — decided 2026-09-24: GPL-3.0-or-later for Community, Pro separate (ADR-0005)",
+              "status": "done"
             },
             {
               "title": "Run trademark/domain clearance before commercial launch",
@@ -1414,8 +1421,8 @@
               "status": "done"
             },
             {
-              "title": "Owner: Community/Pro licensing decision before M6.6 so the notices file and About dialog are right the first time (decision C.3 #15)",
-              "status": "todo"
+              "title": "Owner: Community/Pro licensing decision before M6.6 so the notices file and About dialog are right the first time (decision C.3 #15) — decided 2026-09-24: GPL-3.0-or-later for Community, Pro separate (ADR-0005)",
+              "status": "done"
             },
             {
               "title": "Owner: Rule on S15 (K1 p99 wording, K2 warm vs cold, K3 baseline/metric) and accept or re-open ADR-0003",
@@ -1656,12 +1663,12 @@
   ],
   "activity": [
     {
-      "date": "2026-09-21",
-      "text": "M2.6 done: SessionRegistry with non-blocking open and abandon. Independent review found no leaked connection in 960 randomized sessions and clean lock discipline, and 3 must-fix, all about not hiding transaction loss or blocking shutdown: abandon() reported 'no transaction lost' from a caller-thread snapshot while a queued INSERT was still to run and be rolled back; registry teardown waited N x 500 ms serially although the ADR claimed the waits overlapped (now one deadline: ~0.51 s for 8 stuck sessions); and a DML that dies with its connection re-read the dead connection's cached 'inactive' state. The authoritative answer is now Terminal.transaction_possibly_lost, computed on the worker when the session really ends. The C ABI is unchanged; M2.11 switches the FFI to this path and must carry the new field to the user. CI then exposed a latent M2.5 race (3 in 1,000 runs on main): after a lost session, a second close could answer 'closed cleanly'. Fixed at the root — how a session ended (cleanly / unresolved) is recorded once on the worker and every idempotent close answers from that record; a repeated close on a lost session now reports the loss again (ADR-0002 E7). 3,000-iteration loops, 0 failures."
+      "date": "2026-09-24",
+      "text": "ADR-0005 (Repository public to keep hosted CI): the reldex account's Free-plan Actions minutes were exhausted 2026-09-21 (>=100 workflow runs since 09-19, billing error on every job since). Stated honestly: CI was dead from 2026-09-21 until this decision, and PRs #22, #24 and #25 were merged in that window on local verification only (cargo fmt/clippy/test and the relevant oracle-it suite run by hand), not on a green CI run. Rather than reduce the OS matrix, add a self-hosted runner, or stop using Actions (the owner's first choice earlier the same day), the owner chose to make the repository public once shown that a public repo gets Actions minutes free with no monthly cap — ci.yml/ui.yml/mobile-cross-compile.yml are unchanged and CI stays the merge gate. tools/gates.sh added as a local pre-push/pre-PR script (fmt, clippy, test, header, doc-lint, and, when discoverable, the Qt UI build and the real-database suite) with a Markdown summary for the PR body. The visibility flip is not yet executed, gated on a history exposure scan (run 2026-09-24: clean of credentials/keys/certs; one Android device serial in phase-0-android-device.md redacted at HEAD, present in history, accepted as low risk). Same day, the owner also decided the long-open Community/Pro licensing question: Community edition is GPL-3.0-or-later (LICENSE, COPYRIGHT, copyright (C) 2026 Supawit Nu-iat), Pro licensed separately by the copyright holder, external contributions will need a CLA. Every crate's Cargo.toml now carries license/repository; cargo build --workspace stays clean."
     },
     {
-      "date": "2026-09-24",
-      "text": "CPU-bound re-test of upstream oracledb issue #23 (docs/exec-plans/active/phase-0-spike-results.md, \"S4 addendum (2026-09-24)\"), on branch probe/call-timeout-cpu-bound: confirmed the maintainer's explanation holds for a plain session-level sleep — a fired call-timeout kills the connection, 3/3 runs — but found it does NOT hold for CPU-bound work. A busy PL/SQL loop, a CPU-heavy SQL join, and a query fetching slow rows all recovered cleanly instead (a plain timeout, session intact, 3/3 runs each): the server does notice the client's interrupt while it is busy on CPU, just not while it is suspended in a sleep. Two of the new tests (crates/drivers/oracle-thin/tests/probe_call_timeout_cpu_bound.rs) are now deterministic canaries for U-6/U-7 in oracledb-upgrade-checklist.md, replacing the old load-dependent 'manual check' entries. This does not reopen ADR-0001 — there is still no on-demand cancel API and the owner's 2026-09-19 decision stands — but it changes what M4.6's honest-no-Cancel UI wording should say for the common case: a fired time limit usually means the statement stopped and the session is fine, not that the connection was lost. A factual reply draft for #23 is ready in phase-0-spike-results.md §6; not yet posted."
+      "date": "2026-09-21",
+      "text": "M2.6 done: SessionRegistry with non-blocking open and abandon. Independent review found no leaked connection in 960 randomized sessions and clean lock discipline, and 3 must-fix, all about not hiding transaction loss or blocking shutdown: abandon() reported 'no transaction lost' from a caller-thread snapshot while a queued INSERT was still to run and be rolled back; registry teardown waited N x 500 ms serially although the ADR claimed the waits overlapped (now one deadline: ~0.51 s for 8 stuck sessions); and a DML that dies with its connection re-read the dead connection's cached 'inactive' state. The authoritative answer is now Terminal.transaction_possibly_lost, computed on the worker when the session really ends. The C ABI is unchanged; M2.11 switches the FFI to this path and must carry the new field to the user. CI then exposed a latent M2.5 race (3 in 1,000 runs on main): after a lost session, a second close could answer 'closed cleanly'. Fixed at the root — how a session ended (cleanly / unresolved) is recorded once on the worker and every idempotent close answers from that record; a repeated close on a lost session now reports the loss again (ADR-0002 E7). 3,000-iteration loops, 0 failures."
     },
     {
       "date": "2026-09-23",
