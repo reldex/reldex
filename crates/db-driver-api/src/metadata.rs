@@ -88,12 +88,19 @@
 //! itself always names a dictionary object the driver chose, which always
 //! exists, so a failure carrying one of the same "object not found" codes back
 //! from *this* statement can only mean "not visible to this session" — a
-//! permission fact, not a syntax one. [`MetadataCatalog::classify_error`] is
-//! that narrow, typed correction: the caller passes it an error a metadata
-//! statement produced, and gets back the same error with
-//! [`crate::ErrorKind::Permission`] where the ambiguity applies. The default
-//! implementation is the identity function, for a driver whose dictionary
-//! errors are already unambiguous.
+//! permission fact, not a syntax one.
+//!
+//! That correction travels with the [`PreparedMetadataQuery`] itself rather
+//! than living on a separate method a caller has to remember to invoke on the
+//! `&dyn MetadataCatalog`: every value [`MetadataCatalog::prepare`] returns
+//! embeds a [`MetadataErrorClassifier`] function pointer, applied through
+//! [`PreparedMetadataQuery::reclassify_error`] to an error the statement's
+//! execution produced. Because the classifier rides along on the value the
+//! caller already holds (the thing it must have to execute the statement in
+//! the first place), there is no separate step to forget. A driver whose
+//! dictionary errors are already unambiguous passes
+//! [`no_error_reclassification`], the identity classifier — no allocation, no
+//! vendor-specific type, just a plain function pointer.
 
 use std::num::NonZeroU32;
 
@@ -242,8 +249,15 @@ impl MetadataRequest {
     }
 
     /// Attaches a server-side name filter to a `Schemas` or `ObjectsOfKind`
-    /// request. A no-op on [`MetadataRequest::ColumnsOf`], which has no name
-    /// filter to set.
+    /// request.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` is [`MetadataRequest::ColumnsOf`]. `ColumnsOf` has no
+    /// name filter to set and never will (`SPEC.md` §16: a table's columns
+    /// are always shown in full) — silently ignoring the call would let a
+    /// caller believe a filter is in effect when it is not, so this is a loud
+    /// programmer error rather than a quiet no-op.
     #[must_use]
     pub fn with_name_filter(self, filter: impl Into<String>) -> Self {
         match self {
@@ -262,24 +276,61 @@ impl MetadataRequest {
                 name_filter: Some(filter.into()),
                 limit,
             },
-            other @ Self::ColumnsOf { .. } => other,
+            Self::ColumnsOf { .. } => panic!(
+                "MetadataRequest::with_name_filter called on ColumnsOf, which has no name \
+                 filter to set"
+            ),
         }
     }
 }
 
+/// A permission-ambiguity correction a [`PreparedMetadataQuery`] carries;
+/// see the module documentation, "Permission failures".
+///
+/// Given a reference to an error produced while executing that query's
+/// [`Statement`], returns the corrected error (typically the same error with
+/// its `kind` changed to [`crate::ErrorKind::Permission`]) if the ambiguity
+/// applies, or `None` if the error is unrelated and should pass through
+/// unchanged. A plain function pointer: no allocation, no vendor-specific
+/// type, and trivially satisfied by a driver with nothing to correct — see
+/// [`no_error_reclassification`].
+pub type MetadataErrorClassifier = fn(&DbError) -> Option<DbError>;
+
+/// The identity [`MetadataErrorClassifier`]: never reclassifies anything.
+///
+/// The right classifier for a driver whose dictionary errors are already
+/// unambiguous.
+#[must_use]
+pub fn no_error_reclassification(_error: &DbError) -> Option<DbError> {
+    None
+}
+
 /// A statement a [`MetadataCatalog`] prepared, plus the column contract its
-/// result is promised to match. See the module documentation.
+/// result is promised to match and the classifier that corrects a
+/// permission-ambiguous error it can produce. See the module documentation.
 #[derive(Debug, Clone)]
 pub struct PreparedMetadataQuery {
     statement: Statement,
     columns: Vec<ColumnMetadata>,
+    classifier: MetadataErrorClassifier,
 }
 
 impl PreparedMetadataQuery {
-    /// Pairs a statement with the column contract it promises to satisfy.
+    /// Pairs a statement with the column contract it promises to satisfy and
+    /// the classifier that corrects one of its own permission-ambiguous
+    /// errors. A driver with nothing to correct passes
+    /// [`no_error_reclassification`].
     #[must_use]
-    pub const fn new(statement: Statement, columns: Vec<ColumnMetadata>) -> Self {
-        Self { statement, columns }
+    pub const fn new(
+        statement: Statement,
+        columns: Vec<ColumnMetadata>,
+        classifier: MetadataErrorClassifier,
+    ) -> Self {
+        Self {
+            statement,
+            columns,
+            classifier,
+        }
     }
 
     /// The statement to execute through the ordinary
@@ -297,7 +348,26 @@ impl PreparedMetadataQuery {
         &self.columns
     }
 
-    /// Splits this value into its statement and its declared column contract.
+    /// This query's [`MetadataErrorClassifier`], for a caller that wants the
+    /// function pointer itself rather than [`PreparedMetadataQuery::reclassify_error`]'s
+    /// convenience wrapper.
+    #[must_use]
+    pub const fn classifier(&self) -> MetadataErrorClassifier {
+        self.classifier
+    }
+
+    /// Applies this query's classifier to `error`, correcting it if the
+    /// permission ambiguity described in the module documentation applies,
+    /// and returning it unchanged otherwise.
+    #[must_use]
+    pub fn reclassify_error(&self, error: DbError) -> DbError {
+        (self.classifier)(&error).unwrap_or(error)
+    }
+
+    /// Splits this value into its statement and its declared column contract,
+    /// discarding the classifier. Prefer
+    /// [`PreparedMetadataQuery::reclassify_error`] over this when the caller
+    /// still needs to correct an execution error.
     #[must_use]
     pub fn into_parts(self) -> (Statement, Vec<ColumnMetadata>) {
         (self.statement, self.columns)
@@ -321,9 +391,14 @@ pub fn schemas_columns() -> Vec<ColumnMetadata> {
 /// The declared column contract for [`MetadataRequest::ObjectsOfKind`].
 ///
 /// `status` is declared nullable: not every object kind, and not every
-/// vendor, has a compiled/valid notion to report (`SPEC.md` §16). `created`
-/// and `last_modified` are not hedged the same way because every kind Oracle
-/// reports here carries both.
+/// vendor, has a compiled/valid notion to report (`SPEC.md` §16) — a
+/// sequence has no compiled state, so Oracle always reports `'VALID'` for
+/// one, while a view, a PL/SQL unit or a synonym can genuinely be
+/// `'INVALID'`. `created` and `last_modified` are not hedged the same way
+/// because every kind Oracle reports here carries both; on Oracle,
+/// `last_modified` is `LAST_DDL_TIME`, which moves not only when the
+/// object's own definition changes but also on a `GRANT`/`REVOKE` against it
+/// or a dependent's recompile — "last touched", not "last redefined".
 #[must_use]
 pub fn objects_of_kind_columns() -> Vec<ColumnMetadata> {
     vec![
@@ -340,7 +415,11 @@ pub fn objects_of_kind_columns() -> Vec<ColumnMetadata> {
 /// documentation. `nullable` here is the target column's own nullability,
 /// reported as the text `"YES"`/`"NO"` (the ANSI `information_schema`
 /// convention), not whether this *result* column can hold NULL — it never
-/// does.
+/// does. `position` is declared non-nullable on the understanding that a
+/// driver hides an invisible column rather than reporting a NULL ordinal for
+/// one: on Oracle, `ALL_TAB_COLUMNS` carries a NULL `COLUMN_ID` for an
+/// `INVISIBLE` column, and the query filters those rows out — the same
+/// default behaviour tools like SQL Developer use.
 #[must_use]
 pub fn columns_of_columns() -> Vec<ColumnMetadata> {
     vec![
@@ -355,7 +434,9 @@ pub fn columns_of_columns() -> Vec<ColumnMetadata> {
 /// §16; `phase-1.md` §B4.3). See the module documentation for the whole
 /// design.
 pub trait MetadataCatalog: Send + Sync {
-    /// Prepares `request` as a statement plus its declared column contract.
+    /// Prepares `request` as a statement plus its declared column contract
+    /// and permission-ambiguity classifier (see
+    /// [`PreparedMetadataQuery::reclassify_error`]).
     ///
     /// # Errors
     ///
@@ -364,13 +445,6 @@ pub trait MetadataCatalog: Send + Sync {
     /// [`MetadataObjectKind`] this driver predates); any other [`DbError`] the
     /// driver hits while building the statement.
     fn prepare(&self, request: MetadataRequest) -> crate::error::DbResult<PreparedMetadataQuery>;
-
-    /// Corrects an error produced while executing a statement this catalog
-    /// prepared, for the ambiguity described in the module documentation
-    /// ("Permission failures"). The default is the identity function.
-    fn classify_error(&self, error: DbError) -> DbError {
-        error
-    }
 }
 
 #[cfg(test)]
@@ -429,15 +503,9 @@ mod tests {
     }
 
     #[test]
-    fn columns_of_request_ignores_a_name_filter() {
-        let request = MetadataRequest::columns_of("HR", "EMPLOYEES").with_name_filter("ignored");
-        assert_eq!(
-            request,
-            MetadataRequest::ColumnsOf {
-                schema: "HR".to_owned(),
-                table: "EMPLOYEES".to_owned(),
-            }
-        );
+    #[should_panic(expected = "ColumnsOf")]
+    fn with_name_filter_on_columns_of_panics_instead_of_silently_ignoring() {
+        let _ = MetadataRequest::columns_of("HR", "EMPLOYEES").with_name_filter("ignored");
     }
 
     #[test]
@@ -460,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn a_driver_that_does_not_override_classify_error_returns_it_unchanged() {
+    fn a_driver_that_cannot_prepare_a_request_says_so_with_a_typed_error() {
         struct Noop;
         impl MetadataCatalog for Noop {
             fn prepare(
@@ -470,11 +538,6 @@ mod tests {
                 Err(DbError::unsupported("test stub"))
             }
         }
-        let expected = DbError::new(ErrorKind::Other, "boom");
-        let rebuilt = Noop.classify_error(DbError::new(ErrorKind::Other, "boom"));
-        assert_eq!(rebuilt.kind(), expected.kind());
-        assert_eq!(rebuilt.message(), expected.message());
-
         // A driver that genuinely cannot prepare a request says so with a
         // typed error rather than a panic or an empty statement.
         let error = Noop
@@ -483,5 +546,35 @@ mod tests {
             ))
             .expect_err("the stub never supports anything");
         assert_eq!(error.kind(), ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn no_error_reclassification_is_the_identity_classifier() {
+        let error = DbError::new(ErrorKind::Other, "boom");
+        assert!(no_error_reclassification(&error).is_none());
+    }
+
+    fn stub_query(classifier: MetadataErrorClassifier) -> PreparedMetadataQuery {
+        PreparedMetadataQuery::new(Statement::new("SELECT 1 FROM DUAL"), Vec::new(), classifier)
+    }
+
+    #[test]
+    fn reclassify_error_applies_the_carried_classifier_when_it_matches() {
+        fn always_permission(_error: &DbError) -> Option<DbError> {
+            Some(DbError::new(ErrorKind::Permission, "reclassified"))
+        }
+        let prepared = stub_query(always_permission);
+        let corrected = prepared.reclassify_error(DbError::new(ErrorKind::Syntax, "original"));
+        assert_eq!(corrected.kind(), ErrorKind::Permission);
+        assert_eq!(corrected.message(), "reclassified");
+    }
+
+    #[test]
+    fn reclassify_error_leaves_the_error_alone_when_the_classifier_declines() {
+        let prepared = stub_query(no_error_reclassification);
+        let original = DbError::new(ErrorKind::Syntax, "untouched");
+        let after = prepared.reclassify_error(DbError::new(ErrorKind::Syntax, "untouched"));
+        assert_eq!(after.kind(), original.kind());
+        assert_eq!(after.message(), original.message());
     }
 }

@@ -13,17 +13,25 @@
 //!
 //! # What this file does not verify
 //!
-//! `OracleMetadataCatalog::classify_error` reclassifies `ORA-00942` (and two
-//! related codes) as [`ErrorKind::Permission`] when it comes back from a
+//! The Oracle driver's `reclassify_ambiguous_permission_error` — the
+//! [`reldex_db_driver_api::MetadataErrorClassifier`] every
+//! [`PreparedMetadataQuery`] here carries — reclassifies `ORA-00942` and
+//! `ORA-01039` as [`ErrorKind::Permission`] when either comes back from a
 //! statement this catalog built itself. Every statement this catalog builds
 //! queries an `ALL_*` dictionary view, and `SELECT` on those views is granted
 //! to `PUBLIC` by Oracle out of the box, so an ordinary test user cannot be
 //! made to hit that failure without a second, deliberately under-privileged
 //! account this test suite does not have. That path is instead covered by
-//! unit tests on the ORA code in `src/metadata.rs`
+//! unit tests on the ORA codes in `src/metadata.rs`
 //! (`ambiguous_not_visible_codes_are_reclassified_as_permission` and
 //! neighbours) — the fallback the M2.8 brief allows when the permission path
 //! cannot be provoked safely.
+//!
+//! Also not verified: whether a materialized view's container table lists
+//! under `Tables`. The test account has no `CREATE MATERIALIZED VIEW`
+//! privilege, so this could not be confirmed in either direction and is left
+//! as a known open item rather than guessed at (see `phase-1.md`'s M2.8 "as
+//! implemented" note).
 
 #![cfg(feature = "oracle-it")]
 #![allow(
@@ -33,6 +41,7 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::num::{NonZeroU32, NonZeroUsize};
 
 use common::{connect, exec, exec_quietly, observation, scalar, unique};
@@ -53,11 +62,45 @@ fn current_owner(connection: &mut dyn DatabaseConnection) -> String {
     scalar(connection, "SELECT USER FROM dual")
 }
 
-/// Asserts the executed result's columns match the declared contract's names
-/// and logical types, in order — exactly what the M2.8 brief's integration
-/// tests ask for. Nullability is not compared: the declared contract is a
-/// cross-vendor promise (see `reldex_db_driver_api::metadata`), not a claim
-/// about this specific describe.
+/// `ColumnsOf` columns that are necessarily *computed* SQL expressions in
+/// `OracleMetadataCatalog`'s statement (`position` hides invisible columns,
+/// `type_name` composes a display type, `nullable` renders `Y`/`N` as text)
+/// rather than a bare column reference. A review-round diagnostic against
+/// this Oracle database found that the pinned `oracledb` crate's describe
+/// reports `nullable=true` for **any** computed expression, however
+/// trivially non-null — even `SELECT 1 FROM DUAL` and `NVL(COLUMN_ID, -1)`
+/// describe as nullable — while a genuinely `NOT NULL` *bare* column
+/// reference (`ALL_USERS.USERNAME`, `ALL_TAB_COLUMNS.COLUMN_NAME`, …)
+/// correctly describes as non-nullable. There is no SQL wording that makes
+/// a computed expression describe as non-nullable through this crate, so
+/// these three columns' declared non-nullability — a real promise about the
+/// *data* those expressions produce, not about this driver's describe of
+/// them — cannot be checked this way and is exempted here rather than
+/// papered over with a SQL trick that cannot work.
+const NULLABLE_UNVERIFIABLE_VIA_DESCRIBE: [&str; 3] = ["position", "type_name", "nullable"];
+
+/// Asserts the executed result's columns match the declared contract's
+/// names and logical types, in order, and that nullability's one
+/// *checkable* direction holds where a describe can actually answer it —
+/// the M2.8 brief's integration-test ask, extended by the review round's
+/// must-fix 2.
+///
+/// `nullable() == Some(false)` is the only firm promise the declared
+/// contract makes (`reldex_db_driver_api::metadata`: "when the driver
+/// knows"); `Some(true)` is either a real "can be null" fact or, for a field
+/// the module documentation calls out as hedged for cross-vendor
+/// portability (`schemas_columns`'s `created`), a conservative "no promise
+/// either way" that a concrete driver is free to over-deliver on. A live run
+/// against this Oracle database found both directions: `ColumnsOf`'s
+/// `position` was declared non-nullable while the live describe reported it
+/// nullable — but, per [`NULLABLE_UNVERIFIABLE_VIA_DESCRIBE`], that turned
+/// out to be a describe-layer limitation for *any* computed expression, not
+/// a data-level broken promise. Separately, `Schemas`' hedged `created`
+/// (declared nullable, for a vendor that might not track it) described as
+/// non-nullable on this concrete database — the safe, over-delivering
+/// direction, not a broken promise. Only the
+/// non-nullable-declared-but-nullable-in-practice direction is asserted,
+/// and only for columns a bare-column describe can actually corroborate.
 fn assert_contract_matches(actual: &[ColumnMetadata], declared: &[ColumnMetadata]) {
     assert_eq!(
         actual.len(),
@@ -72,6 +115,15 @@ fn assert_contract_matches(actual: &[ColumnMetadata], declared: &[ColumnMetadata
             "column `{}`'s logical type",
             declared.name()
         );
+        if !NULLABLE_UNVERIFIABLE_VIA_DESCRIBE.contains(&declared.name()) {
+            assert!(
+                declared.nullable() != Some(false) || actual.nullable() == Some(false),
+                "column `{}` is declared non-nullable but the server's own describe of this \
+                 statement reports nullable={:?}",
+                declared.name(),
+                actual.nullable()
+            );
+        }
     }
 }
 
@@ -130,6 +182,35 @@ fn schemas_reports_the_current_user_when_filtered_to_it() {
         "schemas filtered to {owner}: {} row(s)",
         batch.row_count()
     ));
+    connection.close().expect("close");
+}
+
+/// M2.8 review round, must-fix 1(a): every other `Schemas` test in this file
+/// passes a name filter, so the unfiltered path's `LIKE` pattern fallback had
+/// never actually executed against the server. This runs it directly.
+#[test]
+fn schemas_unfiltered_reports_the_current_user_among_every_visible_schema() {
+    let mut connection = connect();
+    let driver = OracleThinDriver::new();
+    let owner = current_owner(connection.as_mut());
+
+    let prepared = driver
+        .metadata_catalog()
+        .prepare(MetadataRequest::schemas(generous_limit()))
+        .expect("schemas is supported");
+    let batch = run(connection.as_mut(), &prepared);
+
+    let found = names_column(&batch);
+    assert!(
+        found.contains(&owner),
+        "the current user should appear in an unfiltered listing: {found:?}"
+    );
+    assert!(
+        batch.row_count() > 1,
+        "an unfiltered schema listing should see more than just the current user \
+         (ALL_USERS lists every account, e.g. SYS/SYSTEM): got {found:?}"
+    );
+    observation(format!("unfiltered schemas: {} row(s)", batch.row_count()));
     connection.close().expect("close");
 }
 
@@ -268,12 +349,21 @@ fn name_filter_treats_wildcard_and_escape_characters_literally() {
     let sequence = unique("m28lit");
     exec(connection.as_mut(), &format!("CREATE SEQUENCE {sequence}"));
 
-    // No Oracle identifier can contain `%`, `_`'s special meaning is a LIKE
-    // wildcard rather than a character Oracle forbids, and `\` cannot appear
-    // in an unquoted identifier either. If any of these were treated as a
-    // wildcard instead of a literal character, at least one of them would
-    // match every object of the kind instead of none.
+    // No unquoted Oracle identifier can contain `%` or `\`. The filter
+    // combines each character with this test's own unique fixture name
+    // rather than searching the whole schema for it bare: cargo runs test
+    // functions in parallel by default, and another test in this same file
+    // (`quoted_identifiers_with_special_characters_survive_unfiltered_and_
+    // filtered_listings`) deliberately creates *quoted* sequences containing
+    // these exact characters, so a bare, schema-wide "should match nothing"
+    // search would be flaky against that concurrently-running fixture. A
+    // search for "this fixture's own name" + the character still catches a
+    // real wildcard-treated-as-wildcard bug: if the character were left
+    // unescaped, the resulting pattern would accidentally match this very
+    // fixture (whose name is a literal prefix of the search text), not just
+    // fail to find some unrelated object.
     for literal in ["%", "\\"] {
+        let filter = format!("{sequence}{literal}");
         let prepared = driver
             .metadata_catalog()
             .prepare(
@@ -282,14 +372,15 @@ fn name_filter_treats_wildcard_and_escape_characters_literally() {
                     MetadataObjectKind::Sequences,
                     generous_limit(),
                 )
-                .with_name_filter(literal),
+                .with_name_filter(&filter),
             )
             .expect("objects_of_kind is supported");
         let batch = run(connection.as_mut(), &prepared);
         assert_eq!(
             batch.row_count(),
             0,
-            "a literal {literal:?} should match no Oracle identifier, got {:?}",
+            "this fixture's own name has no {literal:?} in it, so appending one should match \
+             nothing, got {:?}",
             names_column(&batch)
         );
     }
@@ -316,6 +407,94 @@ fn name_filter_treats_wildcard_and_escape_characters_literally() {
     );
 
     exec_quietly(connection.as_mut(), &format!("DROP SEQUENCE {sequence}"));
+    connection.close().expect("close");
+}
+
+/// M2.8 review round, must-fix 1(b): a **quoted** identifier can legally
+/// contain `\`, `%` or `_` — unlike the unquoted names
+/// `name_filter_treats_wildcard_and_escape_characters_literally` above uses,
+/// which can never contain any of them. This is the exact shape that exposed
+/// the bug: the earlier `NVL(UPPER(:filter_pattern), UPPER(col))` fallback
+/// put a stored name containing `\` straight into the `LIKE` pattern, and
+/// `ESCAPE '\'` then raised `ORA-01424` and failed the *entire* unfiltered
+/// listing, not just the one row.
+#[test]
+fn quoted_identifiers_with_special_characters_survive_unfiltered_and_filtered_listings() {
+    let mut connection = connect();
+    let driver = OracleThinDriver::new();
+    let owner = current_owner(connection.as_mut());
+
+    // `unique()`'s own output embeds `_` between its prefix/pid/counter
+    // parts, which would make every fixture "contain an underscore" and
+    // defeat the exclusivity checks below — strip them and rely on the
+    // remaining hex/counter digits for uniqueness instead.
+    let base: String = unique("m28q").chars().filter(|c| *c != '_').collect();
+    let backslash_name = format!("{base}A\\Z");
+    let percent_name = format!("{base}B%Z");
+    let underscore_name = format!("{base}C_Z");
+    for name in [&backslash_name, &percent_name, &underscore_name] {
+        exec(connection.as_mut(), &format!("CREATE SEQUENCE \"{name}\""));
+    }
+
+    // Unfiltered: must not raise ORA-01424 just because a stored name
+    // contains `\`, and every fixture must be visible.
+    let prepared = driver
+        .metadata_catalog()
+        .prepare(MetadataRequest::objects_of_kind(
+            owner.clone(),
+            MetadataObjectKind::Sequences,
+            generous_limit(),
+        ))
+        .expect("objects_of_kind is supported");
+    let batch = run(connection.as_mut(), &prepared);
+    let found = names_column(&batch);
+    for name in [&backslash_name, &percent_name, &underscore_name] {
+        assert!(
+            found.contains(name),
+            "an unfiltered listing must not fail, and must still include {name:?}, among {} \
+             row(s)",
+            batch.row_count()
+        );
+    }
+
+    // Filtered: a filter naming one special character matches only the
+    // fixture that actually contains it — the character is a literal, not a
+    // wildcard, even when it comes from a stored name rather than the filter
+    // text itself.
+    let cases: [(&str, &str, [&str; 2]); 3] = [
+        ("\\", &backslash_name, [&percent_name, &underscore_name]),
+        ("%", &percent_name, [&backslash_name, &underscore_name]),
+        ("_", &underscore_name, [&backslash_name, &percent_name]),
+    ];
+    for (filter, expected, others) in cases {
+        let prepared = driver
+            .metadata_catalog()
+            .prepare(
+                MetadataRequest::objects_of_kind(
+                    owner.clone(),
+                    MetadataObjectKind::Sequences,
+                    generous_limit(),
+                )
+                .with_name_filter(filter),
+            )
+            .expect("objects_of_kind is supported");
+        let batch = run(connection.as_mut(), &prepared);
+        let found = names_column(&batch);
+        assert!(
+            found.contains(&expected.to_owned()),
+            "filtering on {filter:?} should match {expected:?}: found {found:?}"
+        );
+        for other in others {
+            assert!(
+                !found.contains(&other.to_owned()),
+                "filtering on {filter:?} should not match {other:?}: found {found:?}"
+            );
+        }
+    }
+
+    for name in [&backslash_name, &percent_name, &underscore_name] {
+        exec_quietly(connection.as_mut(), &format!("DROP SEQUENCE \"{name}\""));
+    }
     connection.close().expect("close");
 }
 
@@ -388,5 +567,75 @@ fn a_schema_with_no_matching_objects_reports_zero_rows_not_an_error() {
         .expect("objects_of_kind is supported");
     let batch = run(connection.as_mut(), &prepared);
     assert_eq!(batch.row_count(), 0);
+    connection.close().expect("close");
+}
+
+/// M2.8 review round, should-fix 3: `type_name` composes Oracle's own
+/// precision/scale/length qualifiers onto bare `DATA_TYPE` for the families
+/// where `DATA_TYPE` alone loses information. Every documented family gets
+/// its own column here, and the assertion is the exact string, not just a
+/// non-empty check.
+#[test]
+fn columns_of_type_name_matches_oracles_own_precision_scale_and_length_rules() {
+    let mut connection = connect();
+    let driver = OracleThinDriver::new();
+    let owner = current_owner(connection.as_mut());
+    let table = unique("m28ty");
+
+    exec(
+        connection.as_mut(),
+        &format!(
+            "CREATE TABLE {table} ( \
+             num_ps NUMBER(10,2), \
+             num_star_s NUMBER(*,2), \
+             num_bare NUMBER, \
+             flt FLOAT(24), \
+             vc2_char VARCHAR2(10 CHAR), \
+             vc2_byte VARCHAR2(10 BYTE), \
+             ch CHAR(5), \
+             nch NCHAR(5), \
+             nvc2 NVARCHAR2(5), \
+             rw RAW(8), \
+             dt DATE \
+             )"
+        ),
+    );
+
+    let prepared = driver
+        .metadata_catalog()
+        .prepare(MetadataRequest::columns_of(owner, stored(&table)))
+        .expect("columns_of is supported");
+    let batch = run(connection.as_mut(), &prepared);
+
+    let mut type_names: HashMap<String, String> = HashMap::new();
+    for row in 0..batch.row_count() {
+        let name = text_cell(&batch, row, 1).expect("column name");
+        let type_name = text_cell(&batch, row, 2).expect("type_name");
+        type_names.insert(name, type_name);
+    }
+
+    let expected: &[(&str, &str)] = &[
+        ("NUM_PS", "NUMBER(10,2)"),
+        ("NUM_STAR_S", "NUMBER(*,2)"),
+        ("NUM_BARE", "NUMBER"),
+        ("FLT", "FLOAT(24)"),
+        ("VC2_CHAR", "VARCHAR2(10 CHAR)"),
+        ("VC2_BYTE", "VARCHAR2(10 BYTE)"),
+        ("CH", "CHAR(5)"),
+        ("NCH", "NCHAR(5)"),
+        ("NVC2", "NVARCHAR2(5)"),
+        ("RW", "RAW(8)"),
+        ("DT", "DATE"),
+    ];
+    for (column, expected_type) in expected {
+        assert_eq!(
+            type_names.get(*column).map(String::as_str),
+            Some(*expected_type),
+            "column {column}: got {:?}",
+            type_names.get(*column)
+        );
+    }
+
+    exec_quietly(connection.as_mut(), &format!("DROP TABLE {table} PURGE"));
     connection.close().expect("close");
 }

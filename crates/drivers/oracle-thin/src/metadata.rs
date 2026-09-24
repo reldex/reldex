@@ -8,7 +8,7 @@
 //! `ALL_TAB_COLUMNS` for a table's columns. `ALL_*` views already scope
 //! themselves to what the current session can see, which is why a permission
 //! failure against one of them is unusual rather than routine — see
-//! [`OracleMetadataCatalog::classify_error`].
+//! [`reclassify_ambiguous_permission_error`].
 //!
 //! # Why the SQL text never changes per call
 //!
@@ -27,12 +27,25 @@
 //! *this driver's* declared named binds (see `crate::conn::prepare_binds`),
 //! and nothing in this codebase had yet exercised a name used more than once
 //! in one statement's text. Rather than depend on unverified behaviour, the
-//! filter uses `UPPER(col) LIKE NVL(UPPER(:filter_pattern), UPPER(col))
-//! ESCAPE '\'`: `:filter_pattern` appears exactly once, and when it is NULL —
-//! no filter — the pattern degenerates to `UPPER(col) LIKE UPPER(col)`, which
-//! is always true for any non-NULL `col`, exactly the "no filter" behaviour
-//! wanted. Every column filtered this way (`OBJECT_NAME`, `USERNAME`) is
-//! `NOT NULL` in the dictionary.
+//! filter uses `UPPER(col) LIKE NVL(UPPER(:filter_pattern), '%') ESCAPE '\'`:
+//! `:filter_pattern` appears exactly once, and when it is NULL — no filter —
+//! the pattern degenerates to the constant wildcard `'%'`, which matches
+//! every non-NULL `col` without depending on what `col` itself contains.
+//!
+//! An earlier draft used `UPPER(col)` as this fallback instead of `'%'`: when
+//! there was no filter, the pattern became `UPPER(col) LIKE UPPER(col)`,
+//! which is true for any non-NULL `col` — correct as a truth table, but wrong
+//! as a `LIKE` pattern. `ESCAPE '\'` makes every `\` in *the pattern*
+//! significant, and the pattern was `col`'s own value: a name legally
+//! containing a literal `\` (a quoted identifier such as
+//! `"OPS$DOMAIN\user"`, which Oracle happily creates) turned into a pattern
+//! ending in an unpartnered escape character, raising `ORA-01424` and failing
+//! the *entire* unfiltered listing rather than just mishandling that one row.
+//! `'%'` never contains a `\`, so it carries no such risk regardless of what
+//! any stored name contains. Every column filtered this way (`OBJECT_NAME`,
+//! `USERNAME`) is `NOT NULL` in the dictionary, so the `NVL` only ever
+//! substitutes when `:filter_pattern` itself is NULL — i.e. no filter — never
+//! because of the column.
 
 use reldex_db_driver_api::{
     Bind, DbError, DbResult, ErrorKind, MetadataCatalog, MetadataObjectKind, MetadataRequest,
@@ -42,7 +55,7 @@ use reldex_db_driver_api::{
 
 /// `ALL_USERS` scoped and shaped for [`MetadataRequest::Schemas`].
 const SCHEMAS_SQL: &str = "SELECT USERNAME AS \"name\", CREATED AS \"created\" FROM ALL_USERS \
-WHERE UPPER(USERNAME) LIKE NVL(UPPER(:filter_pattern), UPPER(USERNAME)) ESCAPE '\\' \
+WHERE UPPER(USERNAME) LIKE NVL(UPPER(:filter_pattern), '%') ESCAPE '\\' \
 ORDER BY USERNAME FETCH FIRST :limit_plus_one ROWS ONLY";
 
 /// `ALL_OBJECTS` joined to `ALL_TABLES` for the `Tables` group: the join is
@@ -56,7 +69,7 @@ JOIN ALL_TABLES t ON t.OWNER = o.OWNER AND t.TABLE_NAME = o.OBJECT_NAME \
 WHERE o.OWNER = :schema AND o.OBJECT_TYPE = 'TABLE' AND t.NESTED = 'NO' \
 AND t.SECONDARY = 'N' AND (t.IOT_TYPE IS NULL OR t.IOT_TYPE != 'IOT_OVERFLOW') \
 AND o.OBJECT_NAME NOT LIKE 'BIN$%' \
-AND UPPER(o.OBJECT_NAME) LIKE NVL(UPPER(:filter_pattern), UPPER(o.OBJECT_NAME)) ESCAPE '\\' \
+AND UPPER(o.OBJECT_NAME) LIKE NVL(UPPER(:filter_pattern), '%') ESCAPE '\\' \
 ORDER BY o.OBJECT_NAME FETCH FIRST :limit_plus_one ROWS ONLY";
 
 /// `ALL_TAB_COLUMNS` scoped and shaped for [`MetadataRequest::ColumnsOf`].
@@ -66,9 +79,62 @@ ORDER BY o.OBJECT_NAME FETCH FIRST :limit_plus_one ROWS ONLY";
 /// rendered as the ANSI `information_schema` convention `"YES"`/`"NO"` rather
 /// than Oracle's own `Y`/`N`, so the value is meaningful without knowing which
 /// vendor answered.
+///
+/// `AND COLUMN_ID IS NOT NULL` excludes `INVISIBLE` columns: Oracle gives
+/// them no ordinal position (`COLUMN_ID` is NULL), which would otherwise
+/// falsify the declared contract's `position` column (always non-nullable)
+/// in the *data*. This is the same default SQL Developer's column list uses;
+/// a later phase can add an explicit "show invisible columns" request shape
+/// if that turns out to matter.
+///
+/// This is a promise about the *data*, not about what this driver's own
+/// describe of the statement reports. A live run against this Oracle
+/// database (`m2_8_metadata_catalog.rs`'s review-round diagnostics) found
+/// that the pinned `oracledb` crate's describe reports `nullable=true` for
+/// **any** computed SQL expression — even a bare `SELECT 1 FROM DUAL`, and
+/// even `NVL(COLUMN_ID, -1)`, which is structurally non-null — while
+/// correctly reporting `false` for a genuinely `NOT NULL` *bare* column
+/// reference such as `ALL_USERS.USERNAME`. Since `position`, `type_name` and
+/// `nullable` all have to be computed here (to hide invisible columns, to
+/// compose a display type, and to render `Y`/`N` as text, respectively),
+/// none of the three can ever describe as non-nullable through this crate
+/// regardless of SQL wording; `m2_8_metadata_catalog.rs`'s
+/// `assert_contract_matches` documents and works around this specific,
+/// confirmed limitation rather than chasing a SQL trick that cannot succeed
+/// against it.
+///
+/// `type_name` composes Oracle's own precision/scale/length qualifiers onto
+/// `DATA_TYPE` for the families where `DATA_TYPE` alone loses information —
+/// `NUMBER`, `FLOAT`, `VARCHAR2`, `CHAR`, `NCHAR`, `NVARCHAR2`, `RAW` — using
+/// the same rules Oracle's own DDL-generation tools use (`NUMBER(*,s)` is
+/// Oracle's own notation for "any precision, scale `s`"; `VARCHAR2` is the
+/// one family where `CHAR_USED` controls whether the length is char or byte
+/// semantics, so it is the only one that shows the unit). Every other family
+/// (`DATE`, `CLOB`, `RAW` handled above, and notably `TIMESTAMP(6) WITH TIME
+/// ZONE`/`INTERVAL DAY(2) TO SECOND(6)`-shaped types) already carries its
+/// precision inside Oracle's own `DATA_TYPE` text, so the `ELSE` branch
+/// passes it through unchanged.
 const COLUMNS_OF_SQL: &str = "SELECT COLUMN_ID AS \"position\", COLUMN_NAME AS \"name\", \
-DATA_TYPE AS \"type_name\", DECODE(NULLABLE, 'Y', 'YES', 'NO') AS \"nullable\" \
+CASE DATA_TYPE \
+WHEN 'NUMBER' THEN CASE \
+  WHEN DATA_PRECISION IS NOT NULL AND DATA_SCALE IS NOT NULL \
+    THEN 'NUMBER(' || DATA_PRECISION || ',' || DATA_SCALE || ')' \
+  WHEN DATA_PRECISION IS NULL AND DATA_SCALE IS NOT NULL \
+    THEN 'NUMBER(*,' || DATA_SCALE || ')' \
+  ELSE 'NUMBER' \
+END \
+WHEN 'FLOAT' THEN 'FLOAT(' || DATA_PRECISION || ')' \
+WHEN 'VARCHAR2' THEN 'VARCHAR2(' || CHAR_LENGTH || ' ' \
+  || DECODE(CHAR_USED, 'C', 'CHAR', 'B', 'BYTE', 'BYTE') || ')' \
+WHEN 'CHAR' THEN 'CHAR(' || CHAR_LENGTH || ')' \
+WHEN 'NCHAR' THEN 'NCHAR(' || CHAR_LENGTH || ')' \
+WHEN 'NVARCHAR2' THEN 'NVARCHAR2(' || CHAR_LENGTH || ')' \
+WHEN 'RAW' THEN 'RAW(' || DATA_LENGTH || ')' \
+ELSE DATA_TYPE \
+END AS \"type_name\", \
+DECODE(NULLABLE, 'Y', 'YES', 'NO') AS \"nullable\" \
 FROM ALL_TAB_COLUMNS WHERE OWNER = :schema AND TABLE_NAME = :table_name \
+AND COLUMN_ID IS NOT NULL \
 ORDER BY COLUMN_ID";
 
 /// Every other object group: `ALL_OBJECTS` filtered by `OBJECT_TYPE`, which
@@ -80,7 +146,7 @@ fn simple_objects_of_kind_sql(object_type: &str) -> String {
         "SELECT OBJECT_NAME AS \"name\", STATUS AS \"status\", CREATED AS \"created\", \
          LAST_DDL_TIME AS \"last_modified\" FROM ALL_OBJECTS WHERE OWNER = :schema \
          AND OBJECT_TYPE = '{object_type}' \
-         AND UPPER(OBJECT_NAME) LIKE NVL(UPPER(:filter_pattern), UPPER(OBJECT_NAME)) ESCAPE '\\' \
+         AND UPPER(OBJECT_NAME) LIKE NVL(UPPER(:filter_pattern), '%') ESCAPE '\\' \
          ORDER BY OBJECT_NAME FETCH FIRST :limit_plus_one ROWS ONLY"
     )
 }
@@ -134,21 +200,35 @@ fn filter_and_limit_binds(
 ///   statement this catalog builds names a dictionary view chosen by this
 ///   driver, which always exists, so here the ambiguity resolves the other
 ///   way.
-/// - `1039` and `4043` are the same "does not exist / not visible" shape for
-///   a describe-style lookup and a stored-object reference respectively.
-const AMBIGUOUS_NOT_VISIBLE_CODES: [i32; 3] = [942, 1039, 4043];
+/// - `1039` ("insufficient privileges on underlying objects of the view") is
+///   the same "not visible" shape one level down: it names the view's own
+///   underlying objects rather than the view.
+///
+/// Two codes the M2.8 review round considered and rejected: `1031`
+/// ("insufficient privileges") is not here because `classify_code` already
+/// reports it as [`ErrorKind::Permission`] unconditionally — there is no
+/// ambiguity for this list to resolve. `4043` ("object does not exist") was
+/// in an earlier draft of this list; it is a match by name against a
+/// bare `4043`, but every statement this catalog builds is a plain `SELECT`,
+/// and `ORA-04043` is Oracle's answer for a *DDL or PL/SQL* reference to a
+/// missing object (`ALTER`/`DROP`/a PL/SQL call naming an object that is not
+/// there), not something a `SELECT` on an existing, `PUBLIC`-granted `ALL_*`
+/// view can raise — there is no statement here that could ever produce it,
+/// so keeping it would be an untested, unreachable branch.
+const AMBIGUOUS_NOT_VISIBLE_CODES: [i32; 2] = [942, 1039];
 
-/// Reclassifies one of [`AMBIGUOUS_NOT_VISIBLE_CODES`] as
-/// [`ErrorKind::Permission`], preserving everything else about the error.
-fn reclassify_ambiguous_permission_error(error: DbError) -> DbError {
+/// The [`reldex_db_driver_api::MetadataErrorClassifier`]
+/// [`OracleMetadataCatalog::prepare`] embeds in every [`PreparedMetadataQuery`]
+/// it returns: reclassifies one of [`AMBIGUOUS_NOT_VISIBLE_CODES`] as
+/// [`ErrorKind::Permission`], preserving everything else about the error, or
+/// declines (`None`) for anything else.
+fn reclassify_ambiguous_permission_error(error: &DbError) -> Option<DbError> {
     if error.kind() == ErrorKind::Permission {
-        return error;
+        return None;
     }
-    let Some(code) = error.native().map(NativeError::code) else {
-        return error;
-    };
+    let code = error.native().map(NativeError::code)?;
     if !AMBIGUOUS_NOT_VISIBLE_CODES.contains(&code) {
-        return error;
+        return None;
     }
     // `DbError` has no setter for its own kind and no way to take `source`
     // back out once lent through `Error::source`; this driver never attaches
@@ -156,7 +236,7 @@ fn reclassify_ambiguous_permission_error(error: DbError) -> DbError {
     // documentation), so nothing is lost by rebuilding — but say so out loud
     // rather than leave it to be rediscovered if that ever changes.
     debug_assert!(
-        std::error::Error::source(&error).is_none(),
+        std::error::Error::source(error).is_none(),
         "this rebuild would drop a source that this driver does not currently attach"
     );
     let mut rebuilt = DbError::new(ErrorKind::Permission, error.message().to_owned())
@@ -168,7 +248,7 @@ fn reclassify_ambiguous_permission_error(error: DbError) -> DbError {
     if let Some(position) = error.position() {
         rebuilt = rebuilt.with_position(*position);
     }
-    rebuilt
+    Some(rebuilt)
 }
 
 /// The Oracle Database implementation of `MetadataCatalog` (`SPEC.md` §16).
@@ -186,7 +266,11 @@ impl MetadataCatalog for OracleMetadataCatalog {
             MetadataRequest::Schemas { name_filter, limit } => {
                 let statement = Statement::new(SCHEMAS_SQL)
                     .with_named_binds(filter_and_limit_binds(name_filter, limit));
-                Ok(PreparedMetadataQuery::new(statement, schemas_columns()))
+                Ok(PreparedMetadataQuery::new(
+                    statement,
+                    schemas_columns(),
+                    reclassify_ambiguous_permission_error,
+                ))
             }
             MetadataRequest::ObjectsOfKind {
                 schema,
@@ -201,6 +285,7 @@ impl MetadataCatalog for OracleMetadataCatalog {
                 Ok(PreparedMetadataQuery::new(
                     statement,
                     objects_of_kind_columns(),
+                    reclassify_ambiguous_permission_error,
                 ))
             }
             MetadataRequest::ColumnsOf { schema, table } => {
@@ -209,16 +294,16 @@ impl MetadataCatalog for OracleMetadataCatalog {
                     NamedBind::new("table_name", Bind::input(table)),
                 ];
                 let statement = Statement::new(COLUMNS_OF_SQL).with_named_binds(binds);
-                Ok(PreparedMetadataQuery::new(statement, columns_of_columns()))
+                Ok(PreparedMetadataQuery::new(
+                    statement,
+                    columns_of_columns(),
+                    reclassify_ambiguous_permission_error,
+                ))
             }
             _ => Err(DbError::unsupported(
                 "this metadata request shape (a future shape this driver predates)",
             )),
         }
-    }
-
-    fn classify_error(&self, error: DbError) -> DbError {
-        reclassify_ambiguous_permission_error(error)
     }
 }
 
@@ -262,6 +347,66 @@ mod tests {
             named_bind_value(prepared.statement(), "filter_pattern"),
             Some(&reldex_db_driver_api::BindValue::Null)
         );
+    }
+
+    /// M2.8 review round, must-fix 1: an unfiltered listing's `LIKE` pattern
+    /// must fall back to the constant `'%'`, never to the column's own
+    /// value — a fallback of `UPPER(col)` put whatever a stored name
+    /// happened to contain into the pattern, and a `\` in that name (legal
+    /// in a quoted identifier) raised `ORA-01424` under `ESCAPE '\'` and
+    /// failed the entire listing. This checks the SQL text directly, at the
+    /// level a unit test can; the live behaviour is covered by
+    /// `m2_8_metadata_catalog.rs`'s unfiltered-`Schemas` and
+    /// quoted-identifier tests.
+    #[test]
+    fn the_unfiltered_like_pattern_falls_back_to_a_constant_wildcard() {
+        for sql in [
+            SCHEMAS_SQL,
+            TABLES_SQL,
+            &simple_objects_of_kind_sql("VIEW"),
+            &simple_objects_of_kind_sql("SEQUENCE"),
+        ] {
+            assert!(
+                sql.contains("NVL(UPPER(:filter_pattern), '%')"),
+                "expected the constant '%' fallback in: {sql}"
+            );
+            assert!(
+                !sql.contains("NVL(UPPER(:filter_pattern), UPPER("),
+                "must not fall back to the filtered column's own value: {sql}"
+            );
+        }
+    }
+
+    /// M2.8 review round, must-fix 2: `INVISIBLE` columns (`COLUMN_ID IS
+    /// NULL` in `ALL_TAB_COLUMNS`) must be excluded, so the declared
+    /// `position` contract (always non-nullable) is never falsified.
+    #[test]
+    fn columns_of_sql_excludes_invisible_columns() {
+        assert!(COLUMNS_OF_SQL.contains("AND COLUMN_ID IS NOT NULL"));
+    }
+
+    /// M2.8 review round, should-fix 3: `type_name` composes Oracle's own
+    /// precision/scale/length qualifiers for the families where bare
+    /// `DATA_TYPE` loses information. Exact-string behaviour against a real
+    /// table is `m2_8_metadata_catalog.rs`'s job; this only checks the SQL
+    /// text builds a case for each documented family.
+    #[test]
+    fn columns_of_sql_composes_type_name_for_every_documented_family() {
+        for fragment in [
+            "WHEN 'NUMBER'",
+            "WHEN 'FLOAT'",
+            "WHEN 'VARCHAR2'",
+            "WHEN 'CHAR'",
+            "WHEN 'NCHAR'",
+            "WHEN 'NVARCHAR2'",
+            "WHEN 'RAW'",
+            "ELSE DATA_TYPE",
+        ] {
+            assert!(
+                COLUMNS_OF_SQL.contains(fragment),
+                "expected {fragment} in COLUMNS_OF_SQL"
+            );
+        }
     }
 
     #[test]
@@ -407,7 +552,8 @@ mod tests {
             let native = NativeError::new(code, format!("ORA-{code:05}: does not exist"));
             let error =
                 DbError::new(ErrorKind::Syntax, "table or view does not exist").with_native(native);
-            let reclassified = OracleMetadataCatalog.classify_error(error);
+            let reclassified = reclassify_ambiguous_permission_error(&error)
+                .unwrap_or_else(|| panic!("ORA-{code:05} should be reclassified"));
             assert_eq!(reclassified.kind(), ErrorKind::Permission, "ORA-{code:05}");
             assert_eq!(
                 reclassified.native().map(NativeError::code),
@@ -415,6 +561,19 @@ mod tests {
                 "the native code must survive the reclassification"
             );
         }
+    }
+
+    #[test]
+    fn dropped_code_4043_is_no_longer_reclassified() {
+        // The M2.8 review round dropped ORA-04043 from the ambiguous list:
+        // every statement this catalog builds is a plain `SELECT` against a
+        // `PUBLIC`-granted `ALL_*` view, and `ORA-04043` is Oracle's answer
+        // for a DDL/PL-SQL reference to a missing object, not something a
+        // `SELECT` here can raise. Kept as a regression guard, not a claim
+        // that 4043 is reachable through this catalog.
+        let error = DbError::new(ErrorKind::Syntax, "object does not exist")
+            .with_native(NativeError::new(4043, "ORA-04043: object does not exist"));
+        assert!(reclassify_ambiguous_permission_error(&error).is_none());
     }
 
     #[test]
@@ -427,7 +586,8 @@ mod tests {
             .with_position(SqlPosition::at_char_offset(7))
             .with_session_state(SessionState::Usable)
             .with_retryable(false);
-        let reclassified = OracleMetadataCatalog.classify_error(error);
+        let reclassified =
+            reclassify_ambiguous_permission_error(&error).expect("942 should be reclassified");
         assert_eq!(reclassified.kind(), ErrorKind::Permission);
         assert_eq!(reclassified.session_state(), SessionState::Usable);
         assert_eq!(
@@ -443,22 +603,51 @@ mod tests {
     fn classify_error_leaves_unrelated_errors_alone() {
         let error = DbError::new(ErrorKind::Syntax, "ORA-00904: invalid identifier")
             .with_native(NativeError::new(904, "ORA-00904: invalid identifier"));
-        let reclassified = OracleMetadataCatalog.classify_error(error);
-        assert_eq!(reclassified.kind(), ErrorKind::Syntax);
+        assert!(reclassify_ambiguous_permission_error(&error).is_none());
 
         // Already-`Permission` errors (e.g. ORA-01031, which the general
-        // classifier already gets right) pass through unchanged.
+        // classifier already gets right) decline too: there is nothing left
+        // for this catalog-specific correction to do.
         let permission = DbError::new(ErrorKind::Permission, "insufficient privileges")
             .with_native(NativeError::new(1031, "ORA-01031: insufficient privileges"));
-        let unchanged = OracleMetadataCatalog.classify_error(permission);
-        assert_eq!(unchanged.kind(), ErrorKind::Permission);
-        assert_eq!(unchanged.native().map(NativeError::code), Some(1031));
+        assert!(reclassify_ambiguous_permission_error(&permission).is_none());
     }
 
     #[test]
     fn an_error_with_no_native_code_is_left_alone() {
         let error = DbError::new(ErrorKind::Other, "no native code here");
-        let reclassified = OracleMetadataCatalog.classify_error(error);
-        assert_eq!(reclassified.kind(), ErrorKind::Other);
+        assert!(reclassify_ambiguous_permission_error(&error).is_none());
+    }
+
+    #[test]
+    fn every_prepared_query_carries_the_reclassifying_classifier() {
+        // The correction travels with the returned value (M2.8 review
+        // round): a caller holding only the `PreparedMetadataQuery`, not a
+        // separate `&dyn MetadataCatalog`, can still get it corrected.
+        let prepared_queries = [
+            OracleMetadataCatalog
+                .prepare(MetadataRequest::schemas(limit(1)))
+                .expect("schemas is supported"),
+            OracleMetadataCatalog
+                .prepare(MetadataRequest::objects_of_kind(
+                    "HR",
+                    MetadataObjectKind::Tables,
+                    limit(1),
+                ))
+                .expect("objects_of_kind is supported"),
+            OracleMetadataCatalog
+                .prepare(MetadataRequest::columns_of("HR", "EMPLOYEES"))
+                .expect("columns_of is supported"),
+        ];
+        for prepared in prepared_queries {
+            let error =
+                DbError::new(ErrorKind::Syntax, "table or view does not exist").with_native(
+                    NativeError::new(942, "ORA-00942: table or view does not exist"),
+                );
+            assert_eq!(
+                prepared.reclassify_error(error).kind(),
+                ErrorKind::Permission
+            );
+        }
     }
 }

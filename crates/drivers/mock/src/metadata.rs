@@ -25,7 +25,7 @@
 use reldex_db_driver_api::{
     Bind, DbError, DbResult, ErrorKind, MetadataCatalog, MetadataObjectKind, MetadataRequest,
     NamedBind, PreparedMetadataQuery, Statement, Timestamp, columns_of_columns,
-    objects_of_kind_columns, schemas_columns,
+    no_error_reclassification, objects_of_kind_columns, schemas_columns,
 };
 
 use crate::{Action, ColumnSpec, QueryPlan, QuerySource, Scenario, ScriptValue, ScriptedError};
@@ -69,7 +69,11 @@ impl MetadataCatalog for MockMetadataCatalog {
                     NamedBind::new("filter_pattern", Bind::input(name_filter)),
                     NamedBind::new("limit", Bind::input(i64::from(limit.get()))),
                 ]);
-                Ok(PreparedMetadataQuery::new(statement, schemas_columns()))
+                Ok(PreparedMetadataQuery::new(
+                    statement,
+                    schemas_columns(),
+                    no_error_reclassification,
+                ))
             }
             MetadataRequest::ObjectsOfKind {
                 schema,
@@ -86,6 +90,7 @@ impl MetadataCatalog for MockMetadataCatalog {
                 Ok(PreparedMetadataQuery::new(
                     statement,
                     objects_of_kind_columns(),
+                    no_error_reclassification,
                 ))
             }
             MetadataRequest::ColumnsOf { schema, table } => {
@@ -94,7 +99,11 @@ impl MetadataCatalog for MockMetadataCatalog {
                         NamedBind::new("schema", Bind::input(schema)),
                         NamedBind::new("table_name", Bind::input(table)),
                     ]);
-                Ok(PreparedMetadataQuery::new(statement, columns_of_columns()))
+                Ok(PreparedMetadataQuery::new(
+                    statement,
+                    columns_of_columns(),
+                    no_error_reclassification,
+                ))
             }
             _ => Err(DbError::unsupported(
                 "this metadata request shape (a future shape this driver predates)",
@@ -102,9 +111,9 @@ impl MetadataCatalog for MockMetadataCatalog {
         }
     }
 
-    // `classify_error` keeps the default identity implementation: nothing the
-    // mock scripts is ambiguous the way a real dictionary's ORA-00942 is —
-    // `MetadataFixture::fail_objects_with_permission` and
+    // Every `PreparedMetadataQuery` above carries `no_error_reclassification`:
+    // nothing the mock scripts is ambiguous the way a real dictionary's
+    // ORA-00942 is — `MetadataFixture::fail_objects_with_permission` and
     // `MetadataFixture::fail_columns_with_permission` already script
     // `ErrorKind::Permission` directly.
 }
@@ -188,8 +197,12 @@ impl<'a> MetadataFixture<'a> {
 
     /// Scripts an `ObjectsOfKind` permission failure for one `(schema, kind)`
     /// pair, carrying the native `ORA-00942` shape a real dictionary
-    /// permission failure through `OracleMetadataCatalog::classify_error`
-    /// would also carry.
+    /// permission failure would also carry once reclassified by the Oracle
+    /// driver's classifier (`reldex_driver_oracle_thin`'s
+    /// `reclassify_ambiguous_permission_error`, carried on its
+    /// `PreparedMetadataQuery`). Scripted here directly as
+    /// [`ErrorKind::Permission`], since this driver has no classifier of its
+    /// own to exercise.
     pub fn fail_objects_with_permission(&self, schema: &str, kind: MetadataObjectKind) {
         self.scenario.on_sql(
             objects_marker(schema, kind),

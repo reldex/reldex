@@ -221,14 +221,21 @@ Database Cursor -> Batch Fetch -> Result Store -> Virtual Table Model -> Visible
   built from shared functions in `db-driver-api` so drivers cannot drift from it. An optional name
   filter is always a bound parameter — case-insensitive "contains", with `%`/`_`/escape-char
   wildcard characters in the filter text escaped so they match literally, never string-concatenated
-  into SQL. The mandatory row-cap `limit` is enforced server-side by requesting `limit + 1` rows;
-  getting back exactly `limit + 1` is the caller's signal that the result was truncated. A
-  dictionary query that fails for lack of privilege is reclassified via
-  `MetadataCatalog::classify_error` into `ErrorKind::Permission` (Oracle: the catalog's own queries
-  against `ALL_*` views hitting ORA-00942/01031/00990-family codes); the hook only reclassifies the
-  catalog's own queries and does not change how the same ambiguous codes are classified for
-  ordinary user SQL. This descriptor is the narrow driver-level contract; the lazy/cached
-  `MetadataProvider` described above remains a separate, not-yet-built `db-core`-level consumer.
+  into SQL, and an unfiltered request's `LIKE` pattern falls back to a constant `'%'`, never to the
+  column's own value (a stored name containing `\` would otherwise raise `ORA-01424` and fail the
+  whole listing). The mandatory row-cap `limit` is enforced server-side by requesting `limit + 1`
+  rows; getting back exactly `limit + 1` is the caller's signal that the result was truncated. A
+  dictionary query that fails for lack of privilege is reclassified into `ErrorKind::Permission` by
+  a `MetadataErrorClassifier` function pointer carried on the returned `PreparedMetadataQuery`
+  itself (`PreparedMetadataQuery::reclassify_error`) rather than a separate method a caller could
+  forget to call. On Oracle this reclassifies `ORA-00942` and `ORA-01039` — both "not visible" from
+  a statement that always names a dictionary object the driver chose, which always exists — and only
+  for the catalog's own queries; it does not change how the same ambiguous codes are classified for
+  ordinary user SQL. `ORA-01031` needs no reclassification (already `Permission` unconditionally,
+  for any SQL); `ORA-00990` ("missing or invalid privilege" in a `GRANT` statement's own syntax) is
+  a parse-time error unrelated to this catalog's read-only `SELECT`s and correctly stays `Syntax`.
+  This descriptor is the narrow driver-level contract; the lazy/cached `MetadataProvider` described
+  above remains a separate, not-yet-built `db-core`-level consumer.
 - SQLite local persistence covers profiles (without plaintext secrets), workspace, query history,
   metadata cache, favorites, snippets, settings, UI layout, feature state (`SPEC.md` §20).
 - Credentials use platform secure storage (Windows Credential Manager, Apple Keychain, Android

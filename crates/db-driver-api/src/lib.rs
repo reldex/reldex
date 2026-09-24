@@ -60,9 +60,9 @@ pub use crate::ids::{
     ConnectionId, MAX_SAVEPOINT_NAME_LEN, ResultSetId, SavepointName, SavepointNameError,
 };
 pub use crate::metadata::{
-    MetadataCatalog, MetadataObjectKind, MetadataRequest, NAME_FILTER_ESCAPE_CHAR,
-    PreparedMetadataQuery, columns_of_columns, name_filter_pattern, objects_of_kind_columns,
-    schemas_columns,
+    MetadataCatalog, MetadataErrorClassifier, MetadataObjectKind, MetadataRequest,
+    NAME_FILTER_ESCAPE_CHAR, PreparedMetadataQuery, columns_of_columns, name_filter_pattern,
+    no_error_reclassification, objects_of_kind_columns, schemas_columns,
 };
 pub use crate::params::{
     ConnectionParams, Credentials, Endpoint, ExtensionValue, Extensions, Secret, SessionRole,
