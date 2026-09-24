@@ -63,7 +63,7 @@ See `docs/exec-plans/active/phase-0.md` and, for the spike evidence behind the s
 - [ ] iOS/iPadOS ARM64 physical device (cross-compile + link proven in CI — spike S6, PR #3; physical-device evidence still needed, needs a Mac + Apple Developer account + device)
 
 - [x] Owner: decide cancellation path (ADR-0001 re-opened) [decision 2026-09-19: stay on `oracledb`; ship the pre-armed per-statement deadline with an honest UI; pursue upstream fixes via the four drafted issues — see ADR-0001 "Owner decision (2026-09-19)"]
-- [x] Owner: submit the drafted upstream issues — five submitted 2026-09-19 (#21–#25) (`docs/exec-plans/active/phase-0-spike-results.md` §6)
+- [x] Owner: submit the drafted upstream issues — five submitted 2026-09-19 (#21–#25) (`docs/exec-plans/active/phase-0-spike-results.md` §6). Maintainer replies reconciled 2026-09-23: #21 fixed on `main`; #22's poisoned-lock panic fixed on `main`, two follow-up issues (NUMBER OOB, region TSZ) drafted per the maintainer's invitation, not yet posted; #23 explained as expected behaviour, CPU-bound re-test pending; #24 acknowledged as a known limitation; #25 items 1 and 3 accepted, item 2 clarification drafted, not yet posted
 - [x] Owner decision 2026-09-19: issues F and G are NOT submitted for now; drafts kept for tracking (results file §6)
 - [x] Owner: Phase 0 go/no-go — GO for Phase 1 (2026-09-19)
 - [ ] Track upstream `oracle/rust-oracledb` releases; re-run the integration suite and the ignored abort-repro tests on each new beta
@@ -172,7 +172,7 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 - [ ] Owner: fetch-batch default sign-off once the M5.6 benchmark produces a number (decision C.3 #10)
 - [ ] Owner: wording sign-off for the no-Cancel UX and "no limit" strings, M4.6 (decision C.3 #11)
 - [x] Owner: Phase-0 leftovers (C-5, U-18, C-6) carried into Phase 1 M2 — confirmed 2026-09-19; done 2026-09-20 (decision C.3 #12)
-- [x] Owner: upstream issues F and G — decided 2026-09-19 not to submit for now; drafts kept for tracking only, results file §6 (decision C.3 #13)
+- [x] Owner: upstream issues F and G — decided 2026-09-19 not to submit for now; drafts kept for tracking only, results file §6 (decision C.3 #13). Refreshed against `main` 2026-09-23: both confirmed still fully present, no facts changed; still awaiting owner go-ahead to submit
 - [x] Owner: mobile test hardware — resolved 2026-09-19: Android arm64 phone (OPPO CPH2399) provided, NDK 28.2 installed; physical-device validation itself is separate Phase-0 tail work in progress on `phase-0/android-device`; iOS still needs a Mac + Apple Developer account + device, not provided (decision C.3 #14)
 - [ ] Owner: Community/Pro licensing decision before M6.6 so the notices file and About dialog are right the first time (decision C.3 #15)
 - [ ] Owner: Rule on S15 (K1 p99 wording, K2 warm vs cold, K3 baseline/metric) and accept or re-open ADR-0003

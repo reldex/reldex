@@ -1914,9 +1914,45 @@ is one more independent check that the off switch changes nothing else.
 
 ---
 
-## 6. Drafted upstream issues — **five submitted 2026-09-19; F and G await the owner's go-ahead**
+## 6. Drafted upstream issues — **five submitted 2026-09-19; maintainer responses recorded 2026-09-20 and 2026-09-23; F and G refreshed against `main` 2026-09-23**
 
 > **Submitted 2026-09-19 by the owner's account (SupawitNu):** B → [oracle/rust-oracledb#21](https://github.com/oracle/rust-oracledb/issues/21) (NUMBER bind ×10), C → [#22](https://github.com/oracle/rust-oracledb/issues/22) (process aborts: NUMBER index OOB, region TSTZ `todo!()`, poisoned-mutex double panic), D → [#23](https://github.com/oracle/rust-oracledb/issues/23) (call-timeout recovery closes the connection; server-side cancel not observed), A → [#24](https://github.com/oracle/rust-oracledb/issues/24) (public break/interrupt API), E → [#25](https://github.com/oracle/rust-oracledb/issues/25) (TCPS trust / `SSL_SERVER_DN_MATCH`). Issues **F** and **G** below are drafted but **not yet submitted**, pending the owner's go-ahead.
+
+### Reconciliation against upstream, 2026-09-23
+
+All five filed issues are still **OPEN** but every one has a maintainer reply (anthony-tuininga). This
+table folds those replies, plus a read of `main` (tip `6785e95`, 2026-09-22, version bumped to
+`26.0.0-beta.4`-dev) against our pinned `=26.0.0-beta.3`, into one verdict per tracked item. "Fixed on
+main" means confirmed by reading the diff, not by re-running the canary — the pin does not move as
+part of this change.
+
+| Item | Existing coverage | What was already said | Verdict |
+| --- | --- | --- | --- |
+| A (U-10, break/interrupt API) | [#24](https://github.com/oracle/rust-oracledb/issues/24) | 2026-09-20: "known limitation... I am hoping to add support for an async API where this will be relatively straightforward... this will take some work." | Tracked as-is. No new text needed. |
+| B (U-1, NUMBER ×10) | [#21](https://github.com/oracle/rust-oracledb/issues/21) | 2026-09-20: "I have pushed a patch that corrects this issue and added the necessary tests... Rust's % operator is not the same as Python's." | **Already fixed on `main`**, commit [`efcda45`](https://github.com/oracle/rust-oracledb/commit/efcda4544459e8eed1e12feeda4e1a073446232a) (2026-09-19): `decimal_point_index % 2 == 1` → `!= 0` (plus a clippy-driven `is_multiple_of` rewrite of the sibling check). `-1 % 2 == -1` in Rust, so the old test silently missed every negative-odd case; the new one does not. Not yet in our pinned beta.3. |
+| C / U-2 (NUMBER index-out-of-bounds) | [#22](https://github.com/oracle/rust-oracledb/issues/22) | 2026-09-20: "I'll make sure both of these do not result in a panic." 2026-09-23: "The other two issues will be resolved later. If you wish to create a new issues for them, please go ahead!" | **Confirmed still present** — read `git diff v26.0.0-beta.3..main -- src/ora_type/number.rs`: the only change is the B/U-1 fix above. `FromStr`'s `!decimal_point_detected` branch still does `num_digits += num_zeros` with no check against `digits.len()` (`ORA_NUM_MAX_DIGITS = 40`), and `to_buf` (now `number.rs:295`) still indexes `self.digits[digits_pos + 1]` unchecked. **New issue** (explicitly invited). |
+| C / U-3 (region TSTZ `todo!()`) | [#22](https://github.com/oracle/rust-oracledb/issues/22) | same as U-2 above | **Confirmed still present** — `todo!()` is still at `src/ora_type/timestamp.rs:236` (was `:238` in beta.3; only unrelated lines moved) inside `FromBuf for OracleTimestamp`, same `buf[11] & 0x80 != 0` region-flag branch. **New issue** (explicitly invited). |
+| C / U-4 (poisoned mutex double-panics in `Drop`, aborting the process) | [#22](https://github.com/oracle/rust-oracledb/issues/22) | 2026-09-23: "I have ensured that a poisoned lock does not result in a panic." | **Fixed on `main`**, commit [`6785e95`](https://github.com/oracle/rust-oracledb/commit/6785e95b7a39ebef44ac0470720c6e22fc6da5ce) (2026-09-22): a new `ErrorKind::LockPoisoned` plus `impl<T> From<std::sync::PoisonError<T>> for Error` replace essentially every `.lock().unwrap()` with `.lock()?`; `Statement`'s `Drop` (the old `StatementHolder::drop` was folded into it by the unrelated `#19` statement-refactor commit) is now `if let Ok(mut client) = self.client_ref.lock() { ... }` — it skips cleanup on a poisoned lock instead of panicking again. One unrelated `.lock().unwrap()` remains, on the connection pool's own contents mutex (`src/pool/manager.rs:59`), not on the per-connection client mutex U-4 is about. Acknowledge in a reply to #22; no new issue needed. |
+| D (U-6/U-7, call-timeout recovery / cancel not observed) | [#23](https://github.com/oracle/rust-oracledb/issues/23) | 2026-09-20: expected behaviour — `DBMS_SESSION.SLEEP` suspends the server so it never sees the interrupt; the socket is deemed unusable once the call timeout fires without a reply; recommends a pool; OOB break unsupported on Rust/Windows and "generally frowned upon anyway." | Tracked as-is; **skeleton reply drafted** (below) with a placeholder for the CPU-bound re-test another worker is running now. Not a defect by the maintainer's account — no fix to check on `main`. |
+| E item 1 (U-12, wallet file / trust undocumented) | [#25](https://github.com/oracle/rust-oracledb/issues/25) | 2026-09-20: "management has declared that `cwallet.sso` may not be used by open source drivers, so the use of `ewallet.pem` is mandatory. The documentation will be updated." | **By-design won't-fix on the `cwallet.sso`/`ewallet.p12` question**; documentation update pending upstream. Confirmed unchanged on `main`: `process_security_nodes` (`config/connect_options.rs`) still only has an arm for `wallet_location`/`WALLET_LOCATION`, not `MY_WALLET_DIRECTORY`. No further filing. |
+| E item 2 (U-13, one `ewallet.pem` cannot both trust a CA and present a client cert) | [#25](https://github.com/oracle/rust-oracledb/issues/25) | 2026-09-20: "I'm not sure exactly what you are referring to... Can you clarify a bit more?" | **Confirmed still present on `main`** — `CustomClientCertResolver::populate` (`transport.rs:506-575`) is unchanged: a private key in the PEM makes the certs a `CertifiedKey` (client auth) and *none* are added to `root_store`; no private key adds all of them to `root_store`. Mutually exclusive either way. **Clarification comment drafted** (below). |
+| E item 3 (U-14, `SSL_SERVER_DN_MATCH`/`SSL_SERVER_CERT_DN` parsed, never applied) | [#25](https://github.com/oracle/rust-oracledb/issues/25) | 2026-09-20: "that should indeed be addressed. I'll take care of it." | **Confirmed still present on `main`** — both fields are still parsed and written into the `SECURITY` segment (`config/connect_options.rs`) and neither name appears in `transport.rs`. Tracked as a promised fix, not yet landed; no new text needed. |
+| F (U-15/U-16/U-17, connect cannot be bounded / socket timeout misreported / no keepalive) | none filed | drafted, not submitted (owner decision 2026-09-19, `TASKS.md` line 175) | **Refreshed against `main`, 2026-09-23 — all three confirmed still present**, see the Issue F section below for the updated line numbers. Owner go-ahead to submit still pending; the 2026-09-19 decision is not overridden here. |
+| G (U-18, `:NEW`/`:OLD` parsed as bind placeholders inside DDL) | none filed | drafted, not submitted (owner decision 2026-09-19, `TASKS.md` line 175) | **Refreshed against `main`, 2026-09-23 — confirmed still present**, and unaffected by #1's fix (that closed `todo!()`s in comment/q-string parsing, a different code path from the bind-placeholder scanner). See the Issue G section below. Owner go-ahead to submit still pending. |
+| U-5 (`TIMESTAMP WITH TIME ZONE` returned without applying its own offset) | none filed | — | Not a duplicate of open issue [#8](https://github.com/oracle/rust-oracledb/issues/8) (that one is the *bind* direction — an explicit offset passed to `new_timestamp_tz()` is overridden by the session `TIME_ZONE` at bind time) or [#9](https://github.com/oracle/rust-oracledb/issues/9) (fixed on `main` 2026-09-16, commit `4775233` — session default time zone on connect; unrelated). Confirmed unchanged on `main`: `OracleTimestamp::from_buf`/`Display` are byte-identical to beta.3. **New issue recommended** (drafted below). |
+| U-8 (server error code/position discarded, recovered only by parsing `ORA-nnnnn` out of the message) | none filed | — | **Already fixed on `main`**, commit [`04b96be`](https://github.com/oracle/rust-oracledb/commit/04b96be0667b9d45344ef6e863243f2553b78eb1) (2026-09-14): `ErrorKind::DbError(String)` became `ErrorKind::DbError(DbError)`, and the new `DbError` struct (`src/response/error_info.rs`) exposes `.code()`, `.message()`, `.offset()` populated straight from the wire's `error_num`/`error_pos` fields instead of `String`-parsing. Not yet in our pinned beta.3. **Drop** — nothing to file, it is already done. |
+| U-9 (`oracledb::Error` does not implement `std::error::Error`) | none filed | — | Confirmed unchanged on `main` — no `impl std::error::Error for Error` anywhere in `error.rs`. **New issue recommended** (drafted below). |
+| U-11 (minor API gaps: `OracleNumber` digit/exponent accessors, `Config: Debug`, `DB_TYPE_*` as `static`, doc typo) | none filed | — | All four confirmed unchanged on `main` (`git diff` on `number.rs`, `config/base.rs`, `db_type.rs` shows no relevant change; the `db_type.rs` diff that does exist is a doc-link refactor, and `Repreents` at `db_type.rs:34` is still misspelled). Same verdict for all four, so **one bundled new issue recommended** (drafted below) rather than four separate ones. |
+| Transaction-in-progress flag (ADR-0002 driver-notes request) | none filed | — | Confirmed unchanged on `main` — `transaction_in_progress: bool` (`client/mod.rs:93`) is still a private field with no accessor; `Capabilities::exact_transaction_state` still has to be `false`. **New issue recommended** (drafted below). |
+
+**Overlap checks asked for explicitly:**
+
+- **Did `efcda45` (B/U-1's fix) also fix U-2's out-of-bounds read?** No — read above; the commit touches only the two modulus/parity checks in `to_buf`, not `FromStr`'s unbounded `num_digits += num_zeros`.
+- **Does #1's parser fix, or anything else on `main`, change how `:NEW` inside `CREATE TRIGGER` is parsed (U-18)?** No — `src/statement/sql_parser.rs` has zero commits against it since beta.3 (`git log v26.0.0-beta.3..main -- src/statement/sql_parser.rs` is empty). #1 closed two different `todo!()`s (multi-line comments, q-strings); the bind-placeholder scanner `add_bind` (now `sql_parser.rs:96`) and `determine_statement_type` (now `statement/mod.rs:89-103`, moved by the unrelated `#19` refactor) are untouched and still scan regardless of `is_ddl`.
+- **Does #16 (client hangs on socket read when DML `RETURNING INTO` fails in a `BEFORE INSERT` trigger) overlap with anything of ours?** No — none of U-1…U-18 describe this path. It is fixed on `main` in two steps: commit `191ba69` (2026-09-09, the original repro) and commit `fafb5a9` ("flush out binds", 2026-09-22, after a second reporter found more hangs on plain constraint failures with `RETURNING`). Still open upstream because that second thread also spun off [#29](https://github.com/oracle/rust-oracledb/issues/29) (pool `ping_timeout` never applied) — a pool-liveness issue, unrelated to any U-item. No Reldex action.
+- **Does PR [#30](https://github.com/oracle/rust-oracledb/pull/30) / [#29](https://github.com/oracle/rust-oracledb/issues/29) touch keepalive or socket timeouts (U-16/U-17)?** No — both are about `PoolConfig::ping_timeout` on the connection-pool's internal ping, not the raw per-connection socket read timeout or `SO_KEEPALIVE`. `git grep -n "keepalive\|KEEPALIVE"` on `main` returns nothing anywhere in `src/`.
+- **Does anything on `main` add a connect timeout (U-15)?** No — `client/mod.rs` still calls `TcpStream::connect(sock_addr)` with no timeout at what is now line 620 (was 616) and again at line 639 (was 635) after a redirect; `ConnectOptions::tcp_connect_timeout` is declared, defaulted to `None`, and has no reader anywhere outside its own declaration.
+- Also checked and not otherwise noted above: [#27](https://github.com/oracle/rust-oracledb/issues/27) (`prefetch_rows(n>=3)` duplicate-value parse failure, fixed on `main` 2026-09-21) and [#28](https://github.com/oracle/rust-oracledb/issues/28) (`Row::get` building an `Error`/backtrace on every call, fixed on `main` 2026-09-22) — neither maps to any U-item; no Reldex action beyond awareness.
 
 ### Issue A — the one ADR-0001 asks for
 
@@ -1985,6 +2021,14 @@ is one more independent check that the off switch changes nothing else.
 > Environment: `oracledb` 26.0.0-beta.3, Rust 1.98.1 MSVC, Windows 11, Oracle
 > Database 19.3 EE.
 
+**Upstream response (2026-09-20):** "I've already responded to #23 as that is
+expected behaviour. This is a known limitation and one that I intend to
+resolve. I am hoping to add support for an async API where this will be
+relatively straightforward. In any case, this will take some work to
+resolve!" No change on `main` to check — the maintainer has accepted the
+request in principle and named a direction (async), with no committed
+timeline. Tracked as-is; no further text needed from us.
+
 ### Issue B — the data-corruption one (submit first)
 
 **Title:** `Binding a NUMBER with an odd number of leading zeros stores a value ten times too large`
@@ -2023,6 +2067,17 @@ is one more independent check that the off switch changes nothing else.
 > `decimal_point_index & 1 != 0`) would match the intent.
 >
 > Environment: `oracledb` 26.0.0-beta.3, Rust 1.98.1, Oracle Database 19.3 EE.
+
+**Upstream response (2026-09-20):** "I have pushed a patch that corrects this
+issue and added the necessary tests as well. Thanks for pointing this out! I
+discovered that Rust's % operator is not the same as Python's. :-)" **Fixed on
+`main`**, commit [`efcda45`](https://github.com/oracle/rust-oracledb/commit/efcda4544459e8eed1e12feeda4e1a073446232a)
+(2026-09-19): the guard is now `decimal_point_index % 2 != 0`, which — unlike
+the original `== 1` — is true for `-1 % 2 == -1` and every other negative-odd
+case. Confirmed against `main`'s tip (`6785e95`, 2026-09-22): no later commit
+touches `number.rs` beyond a clippy rewrite of the sibling check. Not yet in
+our pinned beta.3; `canary_upstream_live::u1_...` should still pass (fail =
+FIXED) until the pin moves.
 
 ### Issue C — the two aborts
 
@@ -2075,6 +2130,30 @@ is one more independent check that the off switch changes nothing else.
 > Environment: `oracledb` 26.0.0-beta.3, Rust 1.98.1 MSVC, Windows 11, Oracle
 > Database 19.3 EE.
 
+**Upstream response (2026-09-20, 2026-09-23):** 2026-09-20: "I'll make sure
+both of these do not result in a panic." 2026-09-23: "For now I have ensured
+that a poisoned lock does not result in a panic. The other two issues will be
+resolved later. If you wish to create a new issues for them, please go
+ahead!"
+
+**Part 3 (poisoned-mutex double panic) is fixed on `main`**, commit
+[`6785e95`](https://github.com/oracle/rust-oracledb/commit/6785e95b7a39ebef44ac0470720c6e22fc6da5ce)
+(2026-09-22): a new `ErrorKind::LockPoisoned` and
+`impl<T> From<std::sync::PoisonError<T>> for Error` replace `.lock().unwrap()`
+with `.lock()?` at every call site we found in `statement/`, `connection/` and
+`client/`. The `Drop` that used to be quoted above (`StatementHolder::drop`)
+was folded into `Statement` by the unrelated `#19` statement-refactor commit;
+its current form is `if let Ok(mut client) = self.client_ref.lock() { ... }`
+(`statement/public.rs:279`) — a poisoned lock is now skipped, not unwrapped.
+One `.lock().unwrap()` remains, on the connection pool's own contents mutex
+(`pool/manager.rs:59`), unrelated to this report's client mutex.
+
+**Parts 1 and 2 (the panics themselves) are confirmed still present** — see
+the reconciliation table above and the two new-issue drafts later in this
+section. Only the *double*-panic-into-abort is what #22 closes; a single
+panic on these inputs still happens, it just no longer poisons a second
+`Drop` into a second panic during unwinding.
+
 ### Issue D — the recovery and cancel-observation defects
 
 **Title:** `A fired call timeout closes the connection when the server cannot answer immediately; a server-side cancel is never observed`
@@ -2108,6 +2187,33 @@ is one more independent check that the off switch changes nothing else.
 >
 > Environment: `oracledb` 26.0.0-beta.3, Rust 1.98.1 MSVC, Windows 11, Oracle
 > Database 19.3 EE.
+
+**Upstream response (2026-09-20):** "This is expected behaviour. With
+`dbms_session.sleep()` the server doesn't observe the interrupt sent to it (as
+it is suspended). After the call timeout expires, an interrupt is indeed sent
+to the server, but the server ignores that. Since it doesn't respond within
+the call timeout period, the socket is considered unusable. If you adjusted
+the sleep period to only 3 seconds you would get the call timeout exceeded
+error since the server is able to respond within the 2 seconds allotted. If
+you adjust the call timeout to > 10 seconds you would also get the call
+timeout exceeded. This can be verified with python-oracledb as well when
+setting `disable_oob` to `True`. Rust doesn't support OOB (without getting
+into C API calls) as far as I am aware and it definitely isn't supported on
+Windows -- and it is generally frowned upon anyway. If you want to ensure that
+you always have a connection, the best solution is to use a pool. When the
+connection is returned to the pool the unusable connection will be discarded
+and a new one established without any additional effort on your part."
+
+This reframes part 1 as expected behaviour of `DBMS_SESSION.SLEEP` specifically
+(a suspended server cannot see the interrupt), not a general defect in the
+recovery path — our repro used exactly that statement. No code changed on
+`main` to check, because the maintainer does not consider this a bug. A
+worker is separately re-running the S4/D repro with **CPU-bound** statements
+(which do not suspend the server session) rather than `DBMS_SESSION.SLEEP`, to
+see whether the same "socket deemed unusable" outcome still occurs when the
+server could in principle answer the interrupt; see the skeleton reply drafted
+later in this section, with a placeholder for that result. Part 2
+(server-side cancel not observed) was not addressed by name in the reply.
 
 ### Issue E — the TLS trust story (U-12, U-13, U-14)
 
@@ -2182,6 +2288,22 @@ smell.
 > 1.98.1 MSVC, Windows 11, Oracle Database 19.3 EE, listener TLS 1.2 /
 > `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`.
 
+**Upstream response (2026-09-20):** "For your first item, management has
+declared that `cwallet.sso` may not be used by open source drivers, so the use
+of `ewallet.pem` is mandatory. The documentation will be updated. For your
+second item, I'm not sure exactly what you are referring to -- my expertise
+does not extend to this sort of thing! Can you clarify a bit more? For your
+third item, that should indeed be addressed. I'll take care of it."
+
+- **Item 1** is a by-design won't-fix on `cwallet.sso`/`ewallet.p12`/Oracle
+  wallet formats generally (an Oracle policy decision, not a driver bug); the
+  documentation update is pending. Confirmed unchanged on `main`.
+- **Item 2** needs a clarification from us before it can be actioned — drafted
+  below, grounded in the S8 evidence and a read of `main`'s (unchanged)
+  `CustomClientCertResolver::populate`.
+- **Item 3** is accepted and promised; confirmed not yet landed on `main` (the
+  reconciliation table above has the exact grep).
+
 ### Issue F — timeouts and dead links (U-15, U-16, U-17)
 
 **Title:** `No way to bound a connect, no dead-connection detection, and every socket timeout is reported as a call timeout`
@@ -2247,6 +2369,29 @@ smell.
 > Environment: `oracledb` 26.0.0-beta.3, Rust 1.98.1 MSVC, Windows 11, Oracle
 > Database 19.3 EE.
 
+**Refreshed against `main`, 2026-09-23** (tip `6785e95`, 2026-09-22). Not
+submitted; the owner decision of 2026-09-19 (`TASKS.md` line 175) stands. All
+three parts checked line-by-line and **confirmed still present**, with only
+line numbers shifted by an unrelated transport refactor (`Transport` grew a
+`LowLevelTransport` enum to prepare for future transport types — no behaviour
+change to connect, timeout classification, or keepalive):
+
+1. **Connect still unbounded.** `client/mod.rs:620` (was `:616`) and `:639`
+   (was `:635`) are unchanged calls to `TcpStream::connect`.
+   `ConnectOptions::tcp_connect_timeout` is still declared and still has no
+   reader anywhere (`grep -rn "tcp_connect_timeout\b" src/` outside its own
+   declaration returns nothing).
+2. **Every socket timeout still reported as a call timeout.** The
+   `WouldBlock`/`TimedOut` → `CallTimeoutExceeded` mapping, `None` cause and
+   all, is unchanged, now at `error.rs:135-138` (was `:131`).
+3. **Still no keepalive.** `transport.rs:337-338` (was `:245-246`) is the
+   same `set_nodelay(true)` / `set_read_timeout(None)` with no
+   `SO_KEEPALIVE`. `EXPIRE_TIME` is still parsed and written back into the
+   descriptor and never read for anything but that (`grep -rn "expire_time\b"
+   src/` outside `connect_options.rs` returns nothing). `grep -rn
+   "keepalive|KEEPALIVE" src/ Cargo.toml` returns nothing anywhere in the
+   crate.
+
 ### Issue G — `CREATE TRIGGER` cannot be executed (U-18)
 
 **Title:** `Bind placeholders are parsed inside DDL, so CREATE TRIGGER with :NEW/:OLD cannot be executed`
@@ -2295,6 +2440,336 @@ smell.
 >
 > Environment: `oracledb` 26.0.0-beta.3, Rust 1.98.1 MSVC, Windows 11, Oracle
 > Database 19.3 EE.
+
+**Refreshed against `main`, 2026-09-23** (tip `6785e95`, 2026-09-22). Not
+submitted; the owner decision of 2026-09-19 (`TASKS.md` line 175) stands.
+`git log v26.0.0-beta.3..main -- src/statement/sql_parser.rs` is **empty** —
+no commit has touched the file, including #1's fix (which closed different
+`todo!()`s, in multi-line-comment and q-string parsing, not in bind-placeholder
+scanning). The two cited call sites moved, by the unrelated `#19`
+statement-introspection refactor, but are otherwise unchanged: `add_bind` is
+called unconditionally at `sql_parser.rs:96` (was `:233`), and
+`determine_statement_type`'s `is_ddl = true` arm is at `statement/mod.rs:102`
+(was `:88`, function starts `:89`) with no check of `is_ddl` anywhere in the
+bind-scanning path. The reproduction and workaround above are unchanged.
+
+### New draft — reply to #25 item 2: clarifying U-13 (one `ewallet.pem` cannot both trust a CA and present a client certificate)
+
+The maintainer asked us to clarify what we meant. This is a precise repro
+grounded in source and in our own S8 evidence (`phase-0-spike-results.md` §3
+S8, `crates/drivers/oracle-thin/tests/s8_tcps.rs`), not a live mTLS test —
+S8's listener runs `SSL_CLIENT_AUTHENTICATION = FALSE`, so this has not been
+observed failing end-to-end against a live server, only read from source and
+confirmed unchanged on `main`.
+
+> Thanks for the follow-up — here is a more precise version.
+>
+> `CustomClientCertResolver::populate` (`src/transport.rs`, currently lines
+> 506-575 on `main`, same shape on 26.0.0-beta.3) reads exactly one file,
+> `<wallet_location>/ewallet.pem`, and parses every certificate in it into
+> `certs: Vec<CertificateDer>`. It then looks for a private key in the same
+> file (encrypted PKCS#8 header, or an unencrypted key header) and **branches
+> on whether one was found**:
+>
+> ```rust
+> if let Some(key) = private_key {
+>     // certs become a client certificate for mutual TLS;
+>     // NONE of them is added to the root store
+>     self.key = Some(Arc::new(CertifiedKey::new(certs, signing_key)));
+> } else {
+>     // no private key: ALL certs are added to the root store instead
+>     let root_store = self.root_store.as_mut().unwrap();
+>     for cert in &certs {
+>         root_store.add(cert.clone())?;
+>     }
+> }
+> ```
+>
+> So a wallet directory's single `ewallet.pem` is read as **either** a client
+> identity **or** a set of trusted roots, never both, because whichever
+> certificates are in the file take exactly one of the two paths based only on
+> whether a private key is present alongside them.
+>
+> **What we did:** built `ewallet.pem` containing only our private CA's
+> certificate (no private key) and pointed `oracle.wallet_dir` (our extension
+> over `Config::set_wallet_location`) at its directory. This is the case we
+> have tested end-to-end (S8): the session opens, the CA is trusted, and
+> `s8_tcps.rs::a_private_ca_is_not_trusted_without_the_wallet` confirms the
+> *absence* of the wallet is refused. We have **not** built a combined file
+> (CA certificate **and** a client private key in the same `ewallet.pem`)
+> against a listener with `SSL_CLIENT_AUTHENTICATION = TRUE`, because our test
+> listener does not enable client authentication.
+>
+> **What we expect, reading the code above:** a combined `ewallet.pem`
+> (private-CA certificate plus a client certificate/key pair) would take the
+> `if let Some(key)` branch — the client certificate would be presented, but
+> none of the file's certificates would be added to `root_store`, so the
+> server's certificate (signed by that same private CA) would then fail
+> verification with `UnknownIssuer`, because trust and identity came from one
+> file and only one purpose survived.
+>
+> **What we'd ask for:** either don't treat "contains a private key" as
+> mutually exclusive with "contains trusted roots" — add every certificate
+> that is *not* the client's own leaf certificate to `root_store` regardless
+> of which branch is taken — or accept a second, separate location for the
+> trust anchors (a `wallet_location` for the client identity and something
+> like `ca_location` for the roots) so the two concerns don't have to share one
+> file.
+>
+> Environment: `oracledb` 26.0.0-beta.3, `rustls` 0.23.45 / `aws-lc-rs`, Rust
+> 1.98.1 MSVC, Windows 11.
+
+### New draft — Issue H (U-2): `OracleNumber::to_buf` still indexes past its digit buffer for large-exponent values
+
+Per the #22 invitation ("If you wish to create a new issues for them, please
+go ahead!"). Confirmed present on `main` (tip `6785e95`) by reading
+`git diff v26.0.0-beta.3..main -- src/ora_type/number.rs`: the only change in
+that file since beta.3 is #21's fix (see the reconciliation table above),
+which does not touch `FromStr` or the bounds of the digit-pair loop in
+`to_buf`.
+
+> **Title:** `OracleNumber::to_buf indexes past its 40-entry digit buffer for values whose decimal-point index is large and positive`
+>
+> A legal `NUMBER` value panics on bind, with no error returned first:
+>
+> ```rust
+> let n: OracleNumber = "9.9999999999999999999999999999999999999E125".parse()?;
+> conn.execute("INSERT INTO t VALUES (:1)", &[&n])?;
+> // panicked at src/ora_type/number.rs:347 (line number as of 26.0.0-beta.3):
+> // index out of bounds: the len is 40 but the index is 40
+> ```
+>
+> **Cause.** `FromStr`'s `!decimal_point_detected` branch (the "no `.` was
+> seen, so the value is an integer times a power of ten" case) does
+> `num_digits += num_zeros; decimal_point_index = num_digits.try_into()...`
+> with no check that the result stays within `digits.len()`
+> (`ORA_NUM_MAX_DIGITS = 40`, `src/constants.rs`). `to_buf` (currently
+> `number.rs:295` on `main`) later computes `num_pairs = num_digits / 2` from
+> that inflated count and indexes `self.digits[digits_pos]` /
+> `self.digits[digits_pos + 1]` in a loop over `num_pairs`, which runs past
+> the fixed-size array once `num_digits` exceeds 40.
+>
+> **Expected:** either `FromStr` rejects a value whose effective digit count
+> would exceed `ORA_NUM_MAX_DIGITS` (as the *other* overflow check already does
+> a few lines above it, for the case where a decimal point *was* seen), or
+> `to_buf` never indexes past what it actually stored.
+>
+> **Actual:** a panic while the client mutex is held.
+>
+> **Note on #22:** the poisoned-lock panic-during-`Drop` that used to turn
+> this into a process abort is fixed on `main` as of commit `6785e95`
+> (`ErrorKind::LockPoisoned`, `.lock()?` instead of `.lock().unwrap()`
+> throughout). This panic itself is unaffected by that fix and still happens;
+> what changes is that it should no longer cascade into a second panic during
+> unwinding, so a caller built with `panic = "unwind"` may now be able to
+> contain it with `catch_unwind` — not verified against a live database as
+> part of this report.
+>
+> Environment: `oracledb` 26.0.0-beta.3 (confirmed still present on `main`,
+> commit `6785e95`, 2026-09-22), Rust 1.98.1 MSVC, Windows 11, Oracle Database
+> 19.3 EE.
+
+### New draft — Issue I (U-3): region-encoded `TIMESTAMP WITH TIME ZONE` still hits `todo!()`
+
+Per the same #22 invitation. Confirmed present on `main` (tip `6785e95`): the
+`todo!()` is still there, now at `src/ora_type/timestamp.rs:236` (was `:238`
+on beta.3 — only an unrelated import removal shifted the line), inside the
+same branch.
+
+> **Title:** `FromBuf for OracleTimestamp still hits todo!() for a region-encoded TIMESTAMP WITH TIME ZONE`
+>
+> ```rust
+> conn.query("SELECT TO_TIMESTAMP_TZ('2026-09-19 13:45:30 Asia/Bangkok',
+>                                    'YYYY-MM-DD HH24:MI:SS TZR') FROM dual", &[])?;
+> // panicked at src/ora_type/timestamp.rs:236: not yet implemented
+> ```
+>
+> **Cause.** `FromBuf for OracleTimestamp` reads the time-zone bytes as either
+> a fixed hour/minute offset or, when the high bit of `buf[11]` is set, a named
+> region (an index into Oracle's time-zone-region table). Only the fixed-offset
+> path is implemented:
+>
+> ```rust
+> if buf[11] & 0x80 != 0 {
+>     todo!();
+> }
+> ```
+>
+> A named-region `TIMESTAMP WITH TIME ZONE` is not an exotic value — it is
+> what `TZR`-style formatting and any client that lets a user pick an IANA-style
+> zone name produce, and it is legal to store today; only reading it back
+> through this driver panics.
+>
+> **Expected:** either the region index is decoded into a fixed offset (Oracle
+> ships the region table; `python-oracledb` and OCI clients resolve it) or the
+> value is reported as an unsupported-but-recoverable `Error`, not a panic.
+>
+> **Actual:** a panic while the client mutex is held.
+>
+> **Note on #22:** as with the NUMBER report above, the poisoned-lock
+> panic-during-`Drop` this used to trigger is fixed on `main` (commit
+> `6785e95`); the `todo!()` itself is untouched.
+>
+> Environment: `oracledb` 26.0.0-beta.3 (confirmed still present on `main`,
+> commit `6785e95`, 2026-09-22), Rust 1.98.1 MSVC, Windows 11, Oracle Database
+> 19.3 EE.
+
+### New draft — acknowledgement reply to #22
+
+> Thanks for fixing the poisoned-lock case so quickly. I've filed the other
+> two separately as invited: #<H-number> for the NUMBER index-out-of-bounds
+> and #<I-number> for the region-encoded TIMESTAMP WITH TIME ZONE `todo!()`.
+> Both still panic on `main` as of `6785e95`; the process-abort part is gone
+> now that a poisoned lock returns an error instead of panicking again in
+> `Drop`, so these should at least be containable by a caller using
+> `catch_unwind`, even before they're fixed properly. No further action needed
+> here — closing this out on our side in favour of the two new reports.
+
+### New draft — U-5 (`TIMESTAMP WITH TIME ZONE` returned without applying its own offset)
+
+Recommend: **file.** Not a duplicate of #8 (bind-direction: an explicit offset
+is overridden by the session `TIME_ZONE`) or #9 (fixed on `main`; default
+session time zone on connect). Confirmed unchanged on `main`:
+`OracleTimestamp::from_buf`/`Display` are byte-identical to beta.3.
+
+> **Title:** `OracleTimestamp's Display does not apply its own time-zone offset to the hour/minute/second it decoded`
+>
+> `FromBuf for OracleTimestamp` reads the wire's date/time fields together
+> with a separate zone offset, and `Display` prints them side by side without
+> combining them — so a value the server holds as `2026-09-19 13:45:30 +07:00`
+> renders as `2026-09-19T06:45:30.000000000+07:00`: the clock fields as they
+> arrived on the wire (UTC-relative), labelled with the offset as if they were
+> already local. The two together describe a different instant than what the
+> server holds and would print through `TO_CHAR`.
+>
+> **Note:** an `oracledb`-only round trip (write with this driver, read back
+> with this driver) is self-consistent, because the write path
+> (`OracleTimestamp::to_buf`) has the matching omission — the discrepancy only
+> shows up against the server's own rendering, or when comparing against a
+> value produced by SQL\*Plus, another client, or `SYS_EXTRACT_UTC`.
+>
+> **Expected:** `Display` (and any accessor that claims to give the local
+> wall-clock time) applies the decoded offset to the decoded hour/minute/second
+> before presenting them, matching what `TO_CHAR(ts)` would print in SQL.
+>
+> **Actual:** the offset is carried as a separate, unapplied annotation.
+>
+> Environment: `oracledb` 26.0.0-beta.3, Rust 1.98.1 MSVC, Windows 11, Oracle
+> Database 19.3 EE.
+
+### New draft — U-9 (`oracledb::Error` does not implement `std::error::Error`)
+
+Recommend: **file.** Confirmed unchanged on `main` — no
+`impl std::error::Error for Error` anywhere in `error.rs`, and `Error` cannot
+be attached as a `source()` to another error type without being wrapped in an
+opaque string first.
+
+> **Title:** `oracledb::Error does not implement std::error::Error`
+>
+> `oracledb::Error` implements `fmt::Display` and `fmt::Debug` but not
+> `std::error::Error`, so it cannot be used with `?` in a function returning
+> `Box<dyn std::error::Error>`, cannot be attached as a `source()` on another
+> error type, and doesn't compose with `anyhow`/`thiserror`-based error chains
+> without an explicit `.to_string()` (which loses the type). Since beta.4-dev
+> the crate already builds structured errors internally (`DbError` with
+> `code()`/`message()`/`offset()`, see the `ErrorKind::DbError` change), so the
+> pieces needed to expose a meaningful `source()` chain already exist.
+>
+> **Requested:** `impl std::error::Error for Error`, at minimum a no-op impl
+> (all default methods), so callers can use `oracledb::Error` in an ordinary
+> Rust error chain.
+>
+> Environment: `oracledb` 26.0.0-beta.3, confirmed unchanged on `main` (commit
+> `6785e95`, 2026-09-22).
+
+### New draft — U-11 (bundled: `OracleNumber` digit accessors, `Config: Debug`, `DB_TYPE_*` as `static`, doc typo)
+
+Recommend: **file, as one issue** — all four sub-items are still open on
+`main` and are all small, independent API-completeness gaps with the same
+"nice to have" weight, so one issue is more useful to the maintainer than four
+near-empty ones.
+
+> **Title:** `A few small API completeness gaps: OracleNumber digit access, Config: Debug, DB_TYPE_* as static, and a doc typo`
+>
+> Four independent, minor items found while integrating the crate:
+>
+> 1. **`OracleNumber` has no lossless constructor/accessor for its digits.**
+>    `digits`/`decimal_point_index`/`num_digits` are private, so the only
+>    lossless way in or out is `Display`/`FromStr` — one string allocation per
+>    numeric cell, in both directions. A `from_digits(is_positive, digits:
+>    &[u8], decimal_point_index: i16)` constructor and matching accessors
+>    would let a caller avoid that allocation.
+> 2. **`Config` does not implement `Debug`** (`#[derive(Clone, PartialEq,
+>    Eq)]` only, `src/config/base.rs:42`), so `Result<Config, _>::expect_err`
+>    and similar test helpers can't be used with it.
+> 3. **`DB_TYPE_*` are `const`, not `static`** (`src/db_type.rs`, e.g.
+>    `pub const DB_TYPE_BFILE: DbType = ...`), so `&DB_TYPE_NUMBER` may be a
+>    distinct promoted temporary on each use; anything that needs pointer
+>    identity has to be documented as comparing by value only. Recent commits
+>    have already re-pointed a few internal call sites at `crate::DB_TYPE_*`
+>    re-exports, but the items themselves are still `const`.
+> 4. **Doc typo:** `db_type.rs:34`, "Repreents a database type supported by
+>    the library."
+>
+> None of these affect correctness; all four are still present as of `main`
+> commit `6785e95` (2026-09-22).
+>
+> Environment: `oracledb` 26.0.0-beta.3 / `main` @ `6785e95`.
+
+### New draft — transaction-in-progress flag
+
+Recommend: **file.** Confirmed unchanged on `main` — `transaction_in_progress:
+bool` (`src/client/mod.rs:93`, set from `call_status & 0x00000002 != 0` at
+`:134`, read internally at `:710`) is a private field on `Client` with no
+public accessor.
+
+> **Title:** `Expose whether a transaction is currently in progress on Connection`
+>
+> The driver already tracks this internally — `Client` has a private
+> `transaction_in_progress: bool`, derived from a bit in the server's call
+> status on every round trip — but there is no way for a caller to read it.
+>
+> **Why it matters:** we're building a desktop SQL client with an explicit,
+> user-visible transaction/commit model (auto-commit off by default). Right
+> now we can only infer "is there an open transaction" indirectly, by tracking
+> which statements we've sent, which cannot see a transaction opened by a
+> trigger, an autonomous block, or anything else the server does on our
+> connection's behalf that we didn't initiate ourselves. A direct
+> `Connection::transaction_in_progress() -> bool` (or equivalent) would let a
+> UI honestly answer "would closing this session lose uncommitted work?"
+> without guessing.
+>
+> **Requested:** a public accessor exposing the existing internal flag; no
+> protocol or behaviour change needed, since the value is already computed on
+> every round trip.
+>
+> Environment: `oracledb` 26.0.0-beta.3 / `main` @ `6785e95`.
+
+### New draft — skeleton reply to #23 (CPU-bound re-test)
+
+Placeholder — do not post until the CPU-bound re-test another worker is
+running now has a result to report. Fill in the bracketed section, then this
+becomes the actual reply.
+
+> Thanks for the detailed explanation — that matches what we're seeing with
+> `DBMS_SESSION.SLEEP`: the server is suspended and never observes the
+> interrupt, so the socket is correctly deemed unusable once the call timeout
+> fires without a reply. That part is clear now.
+>
+> We re-ran the same shape of test with a **CPU-bound** PL/SQL block instead of
+> a sleep, on the theory that a server that is actively running (not
+> suspended) might observe the interrupt and let the call and the connection
+> recover cleanly within the call timeout, rather than needing the socket
+> discarded.
+>
+> [PLACEHOLDER — fill in once the CPU-bound re-test completes:
+> statement used, call timeout armed, elapsed time, whether the connection
+> came back as `Usable`/`UnableToRecover`/other, and whether this changes our
+> read of the recommendation to always use a pool.]
+>
+> Either way, using a pool as you suggest is a reasonable mitigation for us
+> and we'll design around that. Filing this as a data point in case it's
+> useful, not as a re-opened bug report.
 
 ---
 
