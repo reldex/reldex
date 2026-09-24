@@ -1,6 +1,6 @@
 # 0001 — Database Driver Strategy
 
-**Status:** Accepted — owner decision 2026-09-19: stay on oracledb; pre-armed deadline + honest UI; upstream issues pending — upstream issues #21–#25 filed 2026-09-19
+**Status:** Accepted — owner decision 2026-09-19: stay on oracledb; pre-armed deadline + honest UI; upstream issues pending — upstream issues #21–#25 filed 2026-09-19; upstream responses 2026-09-20/23: #21 (NUMBER ×10) fixed on `main` (commit `efcda45`); #22 (process aborts) poisoned-lock panic fixed on `main` (commit `6785e95`), the NUMBER index-out-of-bounds and region-TZ `todo!()` remain and two new issues are being filed per the maintainer's invitation; #23 (call-timeout recovery / cancel not observed) explained as expected `DBMS_SESSION.SLEEP`/no-OOB behaviour with a pool recommended, a CPU-bound re-test pending; #24 (break/interrupt API) acknowledged as a known limitation pending a future async API; #25 (TCPS trust) item 1 (`ewallet.pem` mandatory, docs to follow) and item 3 (`SSL_SERVER_DN_MATCH`) accepted and promised, item 2 (mutual TLS + private CA) awaiting our clarification (drafted, see `phase-0-spike-results.md` §6)
 **Date:** 2026-09-19
 **Amended:** 2026-09-19 — **C1 revised and spike S4 widened.** The ADR-0002 API review re-read
 `oracledb`'s source and established that `set_call_timeout` locks the same `Arc<Mutex<Client>>` that

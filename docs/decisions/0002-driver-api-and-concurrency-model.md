@@ -1601,7 +1601,9 @@ rediscover them, not as contract requirements.
 - **`transaction_in_progress` is tracked internally but not exposed.** *Confirmed* — a private field
   on `Client` with no accessor. The wrapper must therefore report
   `Capabilities::exact_transaction_state == false`. An upstream request to expose it is worthwhile;
-  it would materially improve `SPEC.md` §10 prompting.
+  it would materially improve `SPEC.md` §10 prompting. **[2026-09-23: still unchanged on `main`
+  (commit `6785e95`) — `transaction_in_progress: bool` remains private with no accessor; a new issue
+  is drafted, see `phase-0-spike-results.md` §6.]**
 - **Fetch is row-at-a-time**, `DbRow { column_values: Vec<Option<DbValue>> }`, with a per-cell
   `String` for character data (`DbValue::String`). *Confirmed.* Building D6's column batches
   therefore costs one extra copy on top. Measure before optimising: the copy may be cheaper than the
@@ -1639,6 +1641,12 @@ rediscover them, not as contract requirements.
   recover the ORA code by parsing `ORA-nnnnn` out of the message, and a character offset for a plain
   SQL error is **unavailable at any price** — only the `line n, column m` that ORA-06550 puts in its
   own text can be recovered, which happens to be the PL/SQL case `SPEC.md` §24.14 needs.
+  **[2026-09-23: this gap is now closed on `main` (commit `04b96be`, 2026-09-14, unreleased
+  beta.4-dev) — `ErrorKind::DbError(String)` became `ErrorKind::DbError(DbError)`, and the new
+  `DbError` struct exposes `.code()`, `.message()` and `.offset()` populated directly from the wire's
+  `error_num`/`error_pos` fields. Not yet in our pinned `=26.0.0-beta.3`; this note's description of
+  beta.3 itself is unchanged and the wrapper's parse-from-message workaround stays until the pin
+  moves.]**
   `SqlPosition::at_char_offset` therefore has no upstream source on this version, and `SPEC.md`
   §24.14's "highlight the offending token" is achievable for PL/SQL only. `Capabilities::error_position`
   has no finer grain than one boolean; see spike contract note C-3.
@@ -1646,7 +1654,14 @@ rediscover them, not as contract requirements.
   `impl Drop for StatementHolder` does `self.client_ref.lock().unwrap()`, so a panic that poisoned
   the client mutex panics again during unwinding. **No wrapper can contain an upstream panic**, and
   `catch_unwind` does not help. Everything a driver knows to be a panicking input must therefore be
-  refused *before* it reaches the crate.
+  refused *before* it reaches the crate. **[2026-09-23: the poisoned-lock half of this is fixed on
+  `main` (commit `6785e95`, 2026-09-22) — `StatementHolder` no longer exists as such (folded into
+  `Statement` by an unrelated refactor) and its `Drop` is now
+  `if let Ok(mut client) = self.client_ref.lock() { ... }`, so a poisoned lock is skipped rather than
+  unwrapped. A panic on a still-panicking input (U-2, U-3) therefore no longer *cascades* into a
+  second panic during unwinding; whether `catch_unwind` now actually contains it is unverified against
+  a live database. This wrapper's refuse-before-it-reaches-the-crate posture is unchanged either way,
+  since the underlying panics themselves are not fixed.]**
 - **Warnings are a plain `String`** — `last_warning() -> Result<Option<String>, Error>`, with no code
   and no structure. *Confirmed.* See S11.
 
