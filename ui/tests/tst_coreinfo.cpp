@@ -1,14 +1,21 @@
 #include "AdapterTestSupport.h"
 
+#include <QAccessible>
+#include <QAccessibleInterface>
+#include <QDir>
 #include <QGuiApplication>
+#include <QImage>
 #include <QQmlApplicationEngine>
 #include <QQmlComponent>
 #include <QQmlEngine>
 #include <QQmlError>
+#include <QQuickStyle>
 #include <QSignalSpy>
 #include <QTest>
 #include <QtQuick/QQuickItem>
+#include <QtQuick/QQuickWindow>
 
+#include <AppSettings.h>
 #include <reldex.h>
 
 // M1.5 acceptance criteria (docs/exec-plans/active/phase-1.md, row M1.5):
@@ -16,17 +23,50 @@
 //   (b) the QML module / Main.qml loads via QQmlApplicationEngine under
 //       QT_QPA_PLATFORM=offscreen, with the root object created and no QML
 //       warnings.
-// M1.6 adds (c): the QML surface really is bound to the real model -- a query
-// runs through the loaded tree and its column headers come back through QML.
+// M1.6 added (c): the QML surface really is bound to the real model -- a
+// query runs through the loaded tree and its column headers come back
+// through QML. M1.6's surface moved to Harness.qml at M3.1 (see
+// ui/app/main.cpp and ui/README.md "Running the shell vs the harness"), so
+// (c) now loads "Harness" explicitly rather than "Main".
+//
+// M3.1 adds the app-shell checks (row M3.1's acceptance: "Renders at
+// 100/150/200% DPI; theme switch has no restart"): "Main" is now the real
+// shell, and the tests below instantiate it offscreen, toggle the theme
+// override, collapse/expand the sidebar and output pane, check the fixed
+// Thai sample strings are not zero-width, and check the shell renders
+// sanely at whichever QT_SCALE_FACTOR the process was started with (see
+// ui/tests/CMakeLists.txt for the three DPI ctest registrations that vary
+// it across processes).
 class TstCoreInfo : public QObject
 {
     Q_OBJECT
 
 private slots:
+    void initTestCase();
+
     void abiVersionMatchesHeader();
     void qmlModuleLoadsCleanly();
-    void theQmlSurfaceIsBoundToTheRealModel();
+    void harnessSurfaceIsBoundToTheRealModel();
+
+    void appShellLoadsCleanly();
+    void appShellThemeOverrideChangesTokensWithoutRecreatingTheWindow();
+    void appShellSidebarAndOutputPaneCollapseAndExpand();
+    void appShellThaiSampleTextIsNotZeroWidth();
+    void appShellMainRegionsHaveAccessibleNames();
+    void appShellRendersAtCurrentScaleFactor();
 };
+
+void TstCoreInfo::initTestCase()
+{
+    // Must run before the first QML file importing QtQuick.Controls loads
+    // (ui/app/main.cpp does the same thing, for the same reason -- see its
+    // comment). Without it, Qt Quick Controls falls back to a
+    // platform-default style (e.g. native "Windows" on this machine), which
+    // is not what Reldex.exe actually runs and which spends every test
+    // querying real OS theme handles that an offscreen platform cannot open
+    // (harmless "OpenThemeData() failed" qWarnings, but pure noise here).
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+}
 
 void TstCoreInfo::abiVersionMatchesHeader()
 {
@@ -58,7 +98,7 @@ void TstCoreInfo::qmlModuleLoadsCleanly()
     QVERIFY2(warnings.isEmpty(), qPrintable(warningText));
 }
 
-void TstCoreInfo::theQmlSurfaceIsBoundToTheRealModel()
+void TstCoreInfo::harnessSurfaceIsBoundToTheRealModel()
 {
     QQmlApplicationEngine engine;
 
@@ -66,7 +106,7 @@ void TstCoreInfo::theQmlSurfaceIsBoundToTheRealModel()
     connect(&engine, &QQmlEngine::warnings, &engine,
             [&warnings](const QList<QQmlError> &reported) { warnings += reported; });
 
-    engine.loadFromModule("Reldex.App", "Main");
+    engine.loadFromModule("Reldex.App", "Harness");
     const QList<QObject *> roots = engine.rootObjects();
     QCOMPARE(roots.size(), 1);
 
@@ -109,6 +149,225 @@ void TstCoreInfo::theQmlSurfaceIsBoundToTheRealModel()
         warningText += warning.toString() + QLatin1Char('\n');
     }
     QVERIFY2(warnings.isEmpty(), qPrintable(warningText));
+}
+
+void TstCoreInfo::appShellLoadsCleanly()
+{
+    QQmlApplicationEngine engine;
+
+    QList<QQmlError> warnings;
+    connect(&engine, &QQmlEngine::warnings, &engine,
+            [&warnings](const QList<QQmlError> &reported) { warnings += reported; });
+
+    QSignalSpy creationFailedSpy(&engine, &QQmlApplicationEngine::objectCreationFailed);
+
+    engine.loadFromModule("Reldex.App", "Main");
+
+    QCOMPARE(creationFailedSpy.count(), 0);
+    const QList<QObject *> roots = engine.rootObjects();
+    QCOMPARE(roots.size(), 1);
+    QVERIFY(qobject_cast<QQuickWindow *>(roots.constFirst()) != nullptr);
+
+    QString warningText;
+    for (const QQmlError &warning : std::as_const(warnings)) {
+        warningText += warning.toString() + QLatin1Char('\n');
+    }
+    QVERIFY2(warnings.isEmpty(), qPrintable(warningText));
+}
+
+void TstCoreInfo::appShellThemeOverrideChangesTokensWithoutRecreatingTheWindow()
+{
+    QQmlApplicationEngine engine;
+    engine.loadFromModule("Reldex.App", "Main");
+    const QList<QObject *> roots = engine.rootObjects();
+    QCOMPARE(roots.size(), 1);
+
+    auto *window = qobject_cast<QQuickWindow *>(roots.constFirst());
+    QVERIFY(window != nullptr);
+
+    auto *settings = engine.singletonInstance<AppSettings *>("Reldex.Adapter", "AppSettings");
+    QVERIFY(settings != nullptr);
+
+    // Three ways, per the task brief: System, Light, Dark. Light and Dark
+    // resolve unconditionally (Theme.qml); System additionally depends on
+    // Application.styleHints.colorScheme, which this test does not control,
+    // so only Light vs Dark is asserted to actually differ.
+    settings->setThemeOverride(AppSettings::Light);
+    QCoreApplication::processEvents();
+    const QVariant lightBackground = window->property("color");
+    QVERIFY(lightBackground.isValid());
+
+    settings->setThemeOverride(AppSettings::Dark);
+    QCoreApplication::processEvents();
+    const QVariant darkBackground = window->property("color");
+    QVERIFY(darkBackground.isValid());
+
+    QVERIFY2(lightBackground != darkBackground,
+             "Theme.tokens.background did not change when AppSettings.themeOverride changed "
+             "between Light and Dark");
+
+    settings->setThemeOverride(AppSettings::System);
+    QCoreApplication::processEvents();
+
+    // Same window throughout: "theme switch has no restart"
+    // (docs/exec-plans/active/phase-1.md row M3.1).
+    QCOMPARE(qobject_cast<QQuickWindow *>(engine.rootObjects().constFirst()), window);
+
+    // Leave global state as found for any test that runs after this one in
+    // the same process.
+    settings->setThemeOverride(AppSettings::System);
+}
+
+void TstCoreInfo::appShellSidebarAndOutputPaneCollapseAndExpand()
+{
+    QQmlApplicationEngine engine;
+    engine.loadFromModule("Reldex.App", "Main");
+    QObject *root = engine.rootObjects().constFirst();
+    QVERIFY(root != nullptr);
+
+    auto *sidebar = root->findChild<QQuickItem *>(QStringLiteral("sidebar"));
+    auto *outputPanes = root->findChild<QQuickItem *>(QStringLiteral("outputPanes"));
+    QVERIFY(sidebar != nullptr);
+    QVERIFY(outputPanes != nullptr);
+    QVERIFY(sidebar->isVisible());
+    QVERIFY(outputPanes->isVisible());
+
+    // Exercises the same QML functions Main.qml's Ctrl+B/Ctrl+J Shortcut
+    // items call -- see that file for why a real synthetic key event is not
+    // used here (offscreen window activation is not reliable enough across
+    // three CI platforms to make that the automated check; it was exercised
+    // interactively instead, see the M3.1 task report).
+    QVERIFY(QMetaObject::invokeMethod(root, "toggleSidebar"));
+    QCoreApplication::processEvents();
+    QVERIFY(!sidebar->isVisible());
+
+    QVERIFY(QMetaObject::invokeMethod(root, "toggleSidebar"));
+    QCoreApplication::processEvents();
+    QVERIFY(sidebar->isVisible());
+
+    QVERIFY(QMetaObject::invokeMethod(root, "toggleOutputPane"));
+    QCoreApplication::processEvents();
+    QVERIFY(!outputPanes->isVisible());
+
+    QVERIFY(QMetaObject::invokeMethod(root, "toggleOutputPane"));
+    QCoreApplication::processEvents();
+    QVERIFY(outputPanes->isVisible());
+}
+
+void TstCoreInfo::appShellThaiSampleTextIsNotZeroWidth()
+{
+    QQmlApplicationEngine engine;
+    engine.loadFromModule("Reldex.App", "Main");
+    QObject *root = engine.rootObjects().constFirst();
+    QVERIFY(root != nullptr);
+
+    // The sidebar's ListView defers delegate instantiation to its own
+    // polish/refill pass, which -- unlike a plain property binding -- only
+    // runs on an actual scene-graph frame tick; a bare processEvents() can
+    // return before one fires, so this needs a real wait, not just a queue
+    // drain.
+    QTest::qWait(50);
+
+    // The root object is the ApplicationWindow itself (a QQuickWindow, not a
+    // QQuickItem) -- its contentItem() is where the visual item tree starts.
+    auto *window = qobject_cast<QQuickWindow *>(root);
+    QVERIFY(window != nullptr);
+    QQuickItem *rootItem = window->contentItem();
+    QVERIFY(rootItem != nullptr);
+
+    const QStringList names = { QStringLiteral("thaiSampleSidebar"),
+                                 QStringLiteral("thaiSampleStatusBar") };
+    for (const QString &name : names) {
+        // findVisualChild(), not findChild(): thaiSampleSidebar is a
+        // ListView delegate (see that helper's comment for why
+        // QObject::findChild() cannot see it).
+        auto *item = adapter_test::findVisualChild(rootItem, name);
+        QVERIFY2(item != nullptr, qPrintable(name));
+        const QVariant contentWidth = item->property("contentWidth");
+        QVERIFY2(contentWidth.isValid(), qPrintable(name));
+        QVERIFY2(contentWidth.toReal() > 0.0,
+                 qPrintable(name + QStringLiteral(": contentWidth is zero (clipped or tofu "
+                                                   "glyphs would still report nonzero; zero "
+                                                   "means the text did not shape at all)")));
+    }
+}
+
+void TstCoreInfo::appShellMainRegionsHaveAccessibleNames()
+{
+    // Public API (QAccessible::queryAccessibleInterface), not the
+    // QQuickAccessibleAttached private header: this is the same technique
+    // Qt's own Quick autotests use to read a QML `Accessible.name` from C++
+    // without an actual platform AT client attached.
+    const bool wasActive = QAccessible::isActive();
+    QAccessible::setActive(true);
+
+    QQmlApplicationEngine engine;
+    engine.loadFromModule("Reldex.App", "Main");
+    QObject *root = engine.rootObjects().constFirst();
+    QVERIFY(root != nullptr);
+
+    const QStringList names = { QStringLiteral("sidebar"), QStringLiteral("worksheetArea"),
+                                 QStringLiteral("outputPanes"), QStringLiteral("statusBar") };
+    for (const QString &name : names) {
+        auto *item = root->findChild<QQuickItem *>(name);
+        QVERIFY2(item != nullptr, qPrintable(name));
+        QAccessibleInterface *iface = QAccessible::queryAccessibleInterface(item);
+        QVERIFY2(iface != nullptr, qPrintable(name));
+        QVERIFY2(!iface->text(QAccessible::Name).isEmpty(), qPrintable(name));
+    }
+
+    QAccessible::setActive(wasActive);
+}
+
+void TstCoreInfo::appShellRendersAtCurrentScaleFactor()
+{
+    QQmlApplicationEngine engine;
+    engine.loadFromModule("Reldex.App", "Main");
+    QObject *root = engine.rootObjects().constFirst();
+    auto *window = qobject_cast<QQuickWindow *>(root);
+    QVERIFY(window != nullptr);
+
+    // SplitView defers its own layout pass (pane sizing) to the next
+    // event-loop turn, same as the ListView note above.
+    QCoreApplication::processEvents();
+    QCoreApplication::processEvents();
+
+    // QT_SCALE_FACTOR is read once at QPA platform start-up, so it cannot be
+    // varied within one already-running process; this function is
+    // registered three times in CMakeLists.txt, once per scale factor, each
+    // its own ctest process (see the comment there).
+    const qreal dpr = window->devicePixelRatio();
+    QVERIFY2(dpr > 0.0, "devicePixelRatio must be positive");
+
+    if (const QByteArray requested = qgetenv("QT_SCALE_FACTOR"); !requested.isEmpty()) {
+        const qreal expected = requested.toDouble();
+        QVERIFY2(qAbs(dpr - expected) < 0.01,
+                 qPrintable(QStringLiteral("expected QT_SCALE_FACTOR=%1, devicePixelRatio was %2")
+                                    .arg(expected)
+                                    .arg(dpr)));
+    }
+
+    const QStringList regions = { QStringLiteral("sidebar"), QStringLiteral("worksheetArea"),
+                                   QStringLiteral("outputPanes"), QStringLiteral("statusBar") };
+    for (const QString &name : regions) {
+        auto *item = root->findChild<QQuickItem *>(name);
+        QVERIFY2(item != nullptr, qPrintable(name));
+        QVERIFY2(item->width() > 0.0, qPrintable(name + QStringLiteral(": width is zero")));
+        QVERIFY2(item->height() > 0.0, qPrintable(name + QStringLiteral(": height is zero")));
+    }
+
+    // Not part of the pass/fail check: manual DPI verification support only
+    // (task brief -- "grab the window to PNG under the scratchpad ... report
+    // sizes/pixel dimensions; do not commit images"). Inert unless a
+    // developer sets this env var by hand; ctest never does.
+    if (const QByteArray grabDir = qgetenv("RELDEX_UI_DPI_GRAB_DIR"); !grabDir.isEmpty()) {
+        QDir().mkpath(QString::fromLocal8Bit(grabDir));
+        const QImage grab = window->grabWindow();
+        const QString path = QDir(QString::fromLocal8Bit(grabDir))
+                                      .filePath(QStringLiteral("shell-scale-%1.png").arg(dpr));
+        qInfo() << "DPI grab" << path << grab.size() << "devicePixelRatio" << dpr;
+        QVERIFY2(grab.save(path), qPrintable(path));
+    }
 }
 
 QTEST_MAIN(TstCoreInfo)

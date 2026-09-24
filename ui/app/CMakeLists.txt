@@ -17,11 +17,22 @@ qt_add_executable(Reldex
     main.cpp
 )
 
+# `pragma Singleton` inside Theme.qml is documentation, not registration:
+# qt_add_qml_module()'s qmldir generator only emits the `singleton` keyword
+# when the QT_QML_SINGLETON_TYPE source property is set (checked directly in
+# Qt6QmlMacros.cmake), so it has to be set explicitly here. Without it,
+# `Theme` is registered as an ordinary (non-singleton) QML type, and every
+# `Theme.tokens...` reference elsewhere silently resolves to `undefined`
+# instead of failing to build (M3.1 build-time finding).
+set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/Theme.qml" PROPERTIES
+    QT_QML_SINGLETON_TYPE TRUE
+)
+
 qt_add_qml_module(Reldex
     URI Reldex.App
     VERSION 1.0
     QML_FILES
-        Main.qml
+        ${RELDEX_APP_QML_FILES}
 )
 
 target_link_libraries(Reldex
@@ -30,6 +41,12 @@ target_link_libraries(Reldex
         Qt6::Gui
         Qt6::Qml
         Qt6::Quick
+        # QQuickStyle (main.cpp, M3.1): selects the Basic style before the
+        # first QML load. The style's own QML plugin (Basic) is resolved at
+        # runtime like any other Qt Quick import, from the Qt install's own
+        # qml/ directory -- see ui/README.md "App shell" for why no further
+        # CMake component is needed for that half.
+        Qt6::QuickControls2
         reldex_adapter
 )
 

@@ -223,6 +223,23 @@ QML  ->  QObject / QAbstractItemModel  ->  Thin C++ Adapter  ->  Stable Rust FFI
   large JS/QML arrays.
 - Platform-specific behavior stays behind the adapter/platform layer.
 
+**App shell (M3.1).** `ui/app/Main.qml` is the fixed, docking-free desktop layout — sidebar,
+worksheet tab bar/content, output panes, status bar, each a real `SplitView` pane so the split
+positions are draggable and session-scoped (no persistence yet; that is M6.2) — with every
+backend-shaped region left as a named placeholder for the milestone that fills it in (M3.2
+connections, M3.3 session state, M3.4 production indicator, M4.x editor/result, M4.7
+DBMS_OUTPUT). Presentation-only per the invariants above: no session, no `SessionController`, no
+FFI call originates in this file. Theming is a QML singleton (`Theme.qml`) exposing semantic
+tokens for a light and a dark palette, resolved from the live system colour scheme with a user
+override (`AppSettings`, a small adapter-owned `QObject`, `ui/adapter/AppSettings.h` — in-memory
+only until M2.9's settings model exists); every consumer binds to `Theme.tokens.*`, so a token or
+override change re-evaluates the whole tree with no window or `QQmlEngine` recreation. M1.6's own
+QML surface (`Bridge`/`SessionController`/`ResultTableModel` over a `TableView`, built for spike
+S15) moved unchanged to `ui/app/Harness.qml`, still reachable from `ui/app/main.cpp` behind its
+existing S15 environment gate or `--harness`, so the measurement work this ADR's evidence depends
+on keeps working. See `ui/README.md` "App shell (M3.1)" for the full layout diagram, the
+theme-token list, and the high-DPI verification method and results.
+
 ## 8. Result pipeline
 
 ```text

@@ -59,7 +59,7 @@ set(RELDEX_UI_CMAKE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 # ---------------------------------------------------------------------------
 # Qt 6.8 -- LGPL modules only. No Qt Creator, no GPL-only module.
 # ---------------------------------------------------------------------------
-find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Qml Quick Test)
+find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Test)
 
 qt_standard_project_setup(REQUIRES 6.8)
 
@@ -142,6 +142,28 @@ function(reldex_deploy_ffi_dll target)
         VERBATIM
     )
 endfunction()
+
+# ---------------------------------------------------------------------------
+# M3.1: the app shell's QML files, listed once (by filename, relative to
+# ui/app/) and shared between ui/app (the real executable, where they are
+# used as plain relative QML_FILES) and ui/tests (which re-attaches the same
+# "Reldex.App" module into its own test binaries -- see
+# ui/tests/CMakeLists.txt for why a statically linked QML entry-point module
+# only self-registers when compiled directly into the binary that loads it,
+# the same reason ui/app/CMakeLists.txt attaches these files to `Reldex`
+# directly rather than to a shared library, and for why ui/tests builds each
+# one back into an absolute path plus a QT_RESOURCE_ALIAS instead of reusing
+# this list's relative form directly).
+# ---------------------------------------------------------------------------
+set(RELDEX_APP_QML_FILES
+    Main.qml
+    Harness.qml
+    Theme.qml
+    Sidebar.qml
+    WorksheetArea.qml
+    OutputPanes.qml
+    StatusBar.qml
+)
 
 enable_testing()
 
