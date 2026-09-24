@@ -1569,6 +1569,274 @@ loaded machine came out proportionally higher across *every* benchmark, includin
 touched, so treat all of these as shape rather than as figures to compare across machines.
 Allocations per event are unchanged at 0.033. Still information only, still not a claim.
 
+### E7 — an idempotent close reports *how* the session ended, not merely that it has
+
+Closing an already-closed session succeeds (K2's spirit, applied to the session rather than to a
+cursor). That rule was implemented as "a close has run, therefore report success", stored as one
+boolean on `SessionShared` and read by `DatabaseSession::submit_close` — and "a close has run" is
+not "a close succeeded". The worker sets that flag on **both** of its ends: the clean one, and the
+one where the connection was already gone and the close truthfully reported the loss. So a close
+submitted after a *lost* session had already been closed once could answer `Ok(())`, telling the
+caller their `Commit` had happened when nothing had been committed. Intermittent — it needed the
+worker to reach the flag between two submits on the caller's thread — and found by CI on
+`event_terminal.rs::a_close_after_a_lost_session_still_reports_the_loss` (3/1000 on the M2.5
+baseline). It is a latent M2.5 defect, not an M2.6 regression, and it is the loss `SPEC.md` §10
+exists to prevent, told backwards.
+
+**Decided: there is one record of how a session ended, and every "this session is already over"
+answer is derived from it.** `SessionShared` stores `EndedAs`, written once on the worker thread at
+the point the session ends, first writer wins:
+
+- `Cleanly` — an explicit `close` reached the end of the close path on a live connection. Getting
+  there means the caller's transaction was resolved as asked or there was none to resolve: the only
+  other ways out of the disposition step are `DecisionRequired`, `CommitFailed` and
+  `RollbackFailed`, and all three leave the session **open**. A failure from
+  `DatabaseConnection::close` itself does not change the classification — it is a report about
+  releasing the connection, not about the user's data, and it was already delivered to the close
+  that caused it.
+- `Unresolved` — everything else: the session was already lost when the close ran, it was abandoned
+  (which resolves nothing, by design, K5), or its worker ended without any close at all.
+
+`SessionShared::settled_close()` turns that into the answer, and all three call sites use it —
+`submit_close`'s short-circuit, `DatabaseSession::close`'s "there is no worker left to ask" paths,
+and `CloseReplyTo`'s `Drop`. **Idempotency answers "this session is already over", never "your
+commit happened."**
+
+This changes one documented behaviour: closing a **lost** session a second time now reports the
+loss again — with the original error's kind and native code — instead of returning `Ok(())`. The
+first close already said so; saying it once and then claiming success is worse than either
+consistent answer. Nothing runs on the second call either way, so the close is still idempotent in
+the sense that matters: it changes nothing, and it never reaches the driver. Closing a session that
+a close really did end cleanly still succeeds, however many times it is asked.
+
+*Evidence:* `event_terminal.rs::a_close_after_a_lost_session_still_reports_the_loss` and its
+deterministic twin `…::a_second_close_after_a_lost_session_reports_the_loss_deterministically`
+(which forces the interleaving by waiting for the first close's reply rather than hoping for it),
+against `…::concurrent_closes_all_report_success_on_a_cleanly_closed_session` for the other
+direction; both looped 3,000 times with no failures. `close_disposition.rs::close_is_idempotent` and
+`…::a_failing_connection_close_is_reported_but_the_session_is_gone` pin the clean side on both reply
+paths; `session_loss.rs` pins the lost side.
+
+## Amendment: the session registry, a non-blocking open, and `abandon` (2026-09-21, task M2.6)
+
+Built to `docs/exec-plans/active/phase-1.md` §B3, on top of the event path (E1–E6). **Nothing about
+the driver contract changes** — no new method, no new bound, no new rule for a driver implementer.
+What changes is who waits for a `connect`, and what "give up on one" means. Numbering: `R` =
+registry.
+
+### R1 — `spawn` stops waiting, and the connect's outcome becomes a `ReplyTo`
+
+`worker::spawn` used to create the thread and then block the caller on a ready channel; it now
+returns the instant the thread exists, carrying only the two things that exist before a connection
+does (the command channel, the thread handle). The connect's outcome is delivered through a
+`ReportOpen` callback the caller supplies, which runs **on the worker thread** the moment `connect`
+returns and answers one question: is this session adopted, or was it given up on?
+
+- `SessionManager::open_session` passes a callback that sends down a channel it is parked on. Its
+  behaviour, its errors and its tests are unchanged, including "the caller gave up, so close the
+  connection cleanly" — that case is now spelled `Adoption::Abandoned` instead of a failed send.
+- `SessionRegistry` passes one that hands the outcome to the registry.
+
+`SessionShared` is now built **by the caller** and passed in, already bound to its `EventSink`
+(`phase-1-m2-5-event-queue.md` §6 asked for exactly this). That is what lets the registry emit a
+session's `Opened`/`OpenFailed`/`Terminal` through the same per-session emit lock as everything
+else, before any worker exists, so ordering rule 1 holds for a session's very first events.
+
+The connect reply is an ordinary `ReplyPayload` (`OpenedSession`), so the open is a request like any
+other: it reserves a slot, `answer` consumes its channel, and a channel dropped unanswered emits
+`OpenFailed` from the same `Drop` that gives every other request its "never zero replies" (E2).
+`abandon` needs no bespoke path — it drops the reply.
+
+### R2 — `SessionRegistry` is the one place open, abandon, close and a finishing connect are ordered
+
+Four states, one mutex: `Opening` (the worker is inside `connect`; no handle exists, so `get`
+answers `None` and nothing can be submitted), `Open` (`get` hands out the `Arc<DatabaseSession>`),
+`Ending` (abandoned; the handle is kept so that nothing is *dropped*, and therefore nothing waited
+on, inside `abandon`) and `Ended` (announced, no handle — the tombstone a late connect finds).
+
+Two properties make it reviewable rather than merely tested:
+
+- **No event is emitted and no driver call is made while the lock is held.** Every entry point
+  decides under the lock, releases it, and only then emits or calls the driver — the discipline
+  M2.5 established for `SessionShared` (E3/E4). Lock order is registry → per-session emit → queue,
+  and never the other way.
+- **The lock *is* held across `thread::Builder::spawn`**, deliberately. A connect can finish before
+  `spawn` has returned, and the entry that owns its reply must already be recorded when it looks.
+  The alternative — a placeholder entry filled in afterwards — reintroduces the race it was meant
+  to remove. It is not free: `spawn` is a syscall, so `open` serialises on it and a concurrent
+  `state()` waits behind it. Measured (2026-09-21 review, Windows debug build): at a burst of 400
+  opens the worst `open` took **48.9 ms** and a concurrent `state()` waited **61 ms**; at the rate
+  an application actually opens sessions — one per worksheet — both are microseconds. Accepted at
+  that price, and worth revisiting only if a workload ever opens sessions in bursts.
+
+`open` therefore **never blocks and never fails synchronously**: it returns a `SessionId`, and even
+"the thread could not be spawned" is reported as that session's `OpenFailed` plus its `Terminal`. A
+caller holding an id needs one answer, not two shapes of answer.
+
+### R3 — every session the registry names produces exactly one `Terminal`
+
+Including one that never opened. A connect that failed — or a worker thread that would not spawn —
+announces `Lost` with that error as the cause (kind, native code and cause chain intact, K8); an
+open that was abandoned announces `Closed`, because the abandon won and nothing failed. Only a
+deliberate end reports `Closed`. Both follow that session's single `OpenFailed`, which is ordering
+rule 3 applied to the one request such a session ever had.
+
+That ordering is why the worker emits **nothing** when its report comes back `Abandoned`: whoever
+refused the session has already produced the `OpenFailed`/`Terminal` pair, and a "backstop"
+announcement on the worker thread would race it and could deliver `Terminal` first.
+
+That completes the rule an adapter needs: **retire per-session state on `Terminal`, and on nothing
+else**, for every session, not merely for the ones that got far enough to open.
+
+### R4 — `abandon` answers now and closes late; it never waits and it is never refused
+
+A `connect` cannot be interrupted — that is what forced the driver's own helper thread (H1/H2,
+spike U-15) — so abandoning one cannot mean waiting for it:
+
+1. The open's one reply is produced **immediately**, as `OpenFailed { ErrorKind::Cancelled }`.
+   `Cancelled` and not `Connection`: nothing failed and nothing was ever connected, and a UI that
+   cannot tell "I gave up" from "the listener is down" will say the wrong thing.
+2. The session's `Terminal { Closed }` follows it.
+3. The worker thread is **detached, never joined** (ADR-0003 A17 applied to the connect). When the
+   connect finally returns it finds the tombstone, and — this is the part that must not be skipped
+   — **closes the connection on its own thread**, the only thread allowed to touch it (D1/D2, H2).
+   A late success therefore never produces an `Opened` after an `OpenFailed`, and never leaves a
+   live database session on the server.
+
+On a session that is already **open**, `abandon` is `Drop`'s abandon without `Drop`'s wait: request
+the cancel, queue `CloseIntent::Abandon`, return. It **never commits and never rolls back
+explicitly**; the server's own rollback-on-disconnect resolves whatever transaction the session
+held, which is what makes "abandoning cannot commit" structural rather than a promise (K5). That
+*is* a transaction loss, and `SPEC.md` §10 forbids hiding it — which R6 is about. `abandon` returns
+`Abandoned::Open { transaction_possibly_lost }` so a caller can warn **immediately**, but that value
+is a documented **lower bound**, not the verdict: it is `has_possibly_active_transaction() ||
+outstanding_requests() > 0 || a driver call is in flight`, widened to those three because any of
+them can open a transaction after the snapshot is taken. The verdict is on `Terminal` (R6). §B3
+sketches `abandon` as returning unit; it returns this instead, because a caller that cannot see
+which case it hit cannot report the one that costs the user something.
+
+**`abandon` reserves no request slot, so it can never be refused for lack of one.** Neither event it
+produces is a new request's reply: the `OpenFailed` answers the open, whose slot `open` reserved,
+and `Terminal` is not a reply. The alternative the M2.5 note allowed — reserving above the limit,
+like `submit_close` — was not needed and would have grown the published bound for nothing. The
+bound is unchanged at **`2R + U + 3` events per session** (`R + 1` replies counting the close
+exemption, `R` `Executing`s, `U + 1` unsolicited, one `Terminal`), with the open sitting *inside*
+`R`: it reserves an ordinary slot on a session that has nothing outstanding, so it always fits.
+Stated in `events.rs`, `session.rs`, §B2 and here, and probed by
+`registry_abandon.rs::abandon_is_never_refused_at_the_request_cap` (a limit of one, consumed by the
+open itself, on a session that has not even connected) and
+`…::abandon_is_never_refused_when_an_open_sessions_replies_are_undrained`.
+
+Dropping the registry does all of the above for every session it still holds: connecting ones are
+answered, announced and detached; open ones are told to abandon *first*, all of them, and then
+waited for against **one deadline shared by the whole teardown**.
+
+That bound is `DROP_SHUTDOWN_TIMEOUT` **in total**, not per session, however many sessions are
+stuck. Issuing every abandon before waiting for any of them is only half of it: the wait itself has
+to happen in the teardown, against the shared deadline, and take each session's worker handle with
+it, so the `DatabaseSession::drop` that follows has nothing left to wait for. (The first
+implementation issued the abandons and then dropped the sessions, which parked `Drop` on its own
+fresh timeout each time — measured by the 2026-09-21 review at 509 ms for one stuck session,
+1.016 s for two and 2.015 s for four, exactly the serial cost this claim denied.) The honest
+residual, because A17 says to state it: a worker inside an uninterruptible driver call is
+**detached** at the deadline, and keeps its connection until that call returns.
+
+### R5 — the initial transaction state is seeded silently
+
+`db-core` seeds the driver's real `transaction_state()` right after `connect`, so closing an
+untouched session does not demand a disposition it cannot need. On the event path that seeding used
+to emit a `TransactionStateChanged` — **before** the session's own `Opened`, because the registry
+binds the sink before the worker exists. `TransactionStateChanged` reports a *flip* of
+`has_possibly_active_transaction()` (§B2), and a session that did not exist a moment ago has not
+flipped anything, so the seed is now silent.
+
+A consumer takes the initial value from `has_possibly_active_transaction()` when it sees `Opened` —
+which is authoritative anyway — and the stream reports every change from there. Assuming the
+conservative default until it asks costs at most an extra close prompt, which K7 already accepts;
+the opposite mistake is a silent commit, which it does not. The `Completion` path is unaffected: it
+has no sink bound at that moment, so nothing was ever emitted there.
+
+### R6 — `Terminal` carries `transaction_possibly_lost`, decided on the worker thread
+
+`SessionEvent::Terminal` gains a fourth field: whether the session ended while it may still have
+held an unresolved transaction. **It is the authoritative answer and a consumer must surface it**
+(`SPEC.md` §10: never silently commit or hide transaction loss).
+
+It has to live here, and nowhere else, because it is the only place that can be right. K4 already
+established that `close` decides on the worker thread *after* every command queued ahead of it has
+run; the same reasoning applies to every other way a session can end, and there are five of them —
+`abandon`, `retire` of an open session, the registry's teardown, `DatabaseSession::drop`, and a
+connection that died — of which four said nothing at all before this. Any answer a control thread
+reads is a snapshot that a statement already in the queue can invalidate. The review's repro:
+a statement parked in the driver, an `INSERT` queued behind it, `abandon` on the caller's thread
+reads "no transaction", the worker then runs the `INSERT`, reaches the abandon, and the server
+rolls it back. The loss was real and nobody was told.
+
+The value, at the point the session ends:
+
+| How it ended | `transaction_possibly_lost` |
+| --- | --- |
+| `close(Commit)` that succeeded | `false` — the user decided and it happened |
+| `close(Rollback)` that succeeded | `false` — a rollback the user *chose* is a decision, not a loss |
+| `close` with no transaction to resolve | `false` |
+| `close` whose disposition failed (`CommitFailed`/`RollbackFailed`) | no `Terminal` — the session stays open (K4) |
+| `close(None)` with a transaction open | no `Terminal` — `DecisionRequired`, the session stays open |
+| `abandon` of an open session | `true` if a transaction may be open when the worker reaches it |
+| `retire` of an open session, and `DatabaseSession::drop` | same — they are the same lossy drop (K5) |
+| the registry's teardown | same |
+| connection lost while idle (found by the revalidating ping) | `false` when nothing was open — the common dropped connection must not invent a loss |
+| connection lost **by** a driver call (execute, rollback-to-savepoint, commit, rollback) | `true`: the statement may have reached the server, so the driver's cached state is not trusted and `Unknown` is recorded instead |
+| any of the above on a driver with `exact_transaction_state == false` | `true`, because `Unknown` reads as "may be open" (K7) |
+| a session that never opened (connect failed, spawn failed, open abandoned) | `false` — nothing was connected |
+
+Two asymmetries hold this together, and both are deliberate.
+
+"The disposition succeeded" is recorded as a fact on the worker when it happens, not re-derived from
+the driver afterwards: a driver that reports `Unknown` would otherwise say "may be open" forever,
+and turn a clean `close(Commit)` into a reported loss.
+
+And `DatabaseConnection::transaction_state` is a cache the driver last refreshed on a call that
+*returned*, so the three arms that re-read it after a failure must not trust it when the failure
+carries `SessionState::Lost`: an `INSERT` that reached the server and then lost its connection
+leaves an exact driver still reporting `Inactive`, which would report "no loss" for work the server
+rolled back (found by the 2026-09-21 delta review). Those arms record `TransactionState::Unknown`
+instead. This is **not** "lost implies a lost transaction": the revalidating-ping path never touches
+the driver's transaction state, so a session lost while idle with nothing open still reports
+`false`. Nor is it classified by statement kind — the kind lives on an `ExecuteOutcome` a failed
+call never produced, so `Unknown` is the honest answer the core actually has. The conservative
+default stands everywhere else: an extra warning costs a sentence, a missed one costs the user's
+work.
+
+### R7 — `request_cancel` after `close` must be a harmless no-op
+
+A doc-only addition to the `CancelHandle` contract, and the one that made it necessary: the
+registry's teardown asks a session to abandon, and a session may already have ended — its
+`DatabaseConnection::close` already called — by the time it does. `db-core` now skips the cancel
+when it can see the session has ended, but that check is a race narrowed, not closed, in exactly the
+way K3 describes for cancels generally. So the contract says it outright: **`request_cancel` on a
+handle whose connection has been closed must return without panicking and without touching the
+closed connection.** Returning an error is allowed; `Ok(CancelOutcome::Requested)` is allowed; doing
+nothing is expected. A driver that cannot make that safe must keep whatever state the handle needs
+alive independently of the connection (the handle is already `Arc`-shared and outlives it).
+
+*Evidence:* `crates/db-core/tests/registry_open.rs` (10 tests: success with connection id, cancel
+kind and connect warnings; a driver failure with its native code preserved; a `connect_timeout`
+expiry classified `Connection`; a panicking `connect` contained as `DriverInternal`; the open's
+slot; no handle while connecting; `open` returning with the connect still parked; 32 concurrent
+opens with per-session order; retirement; and the adversarial probe that submits the instant `get()`
+answers, which still cannot get a reply ahead of `Opened`), `crates/db-core/tests/registry_abandon.rs`
+(18 tests, every interleaving forced with the mock's connect gate rather than hoped for: abandon
+before a late success and before a late failure, both orders of the race looped 60 times under real
+contention with alternating spawn order and a floor that fails a run which only ever saw one order,
+abandon after open, abandon twice, abandon at the request cap, abandon of a busy worker, the
+registry dropped mid-connect and with open sessions, the one-deadline teardown with eight stuck
+sessions, 200 abandoned opens that nobody retires leaving an empty map, the queue dropped
+mid-connect, and retirement of a connecting session) and
+`crates/db-core/tests/registry_transaction_loss.rs` (12 tests: the whole R6 table, including the
+review's parked-statement repro). The whole `db-core` event and registry set: 30 solo runs and
+2 concurrent loops, no failures. `reldex.h` is byte-identical (`gen-header.sh --check`), because the
+C ABI is M2.11's.
+
 ## Notes for driver implementers
 
 Findings from reading `oracle/rust-oracledb` **`=26.0.0-beta.3`** — the version this repository pins

@@ -157,13 +157,18 @@ impl DatabaseDriver for MockDriver {
         &self,
         _params: &reldex_db_driver_api::ConnectionParams,
     ) -> DbResult<Box<dyn DatabaseConnection>> {
-        self.scenario.connect_behavior()?;
+        if let Err(error) = self.scenario.connect_behavior() {
+            self.scenario.record_connect_failed();
+            return Err(error);
+        }
         let id = ConnectionId::allocate();
+        let connection = Box::new(MockConnection::new(id, Arc::clone(&self.scenario)));
         self.scenario.record_thread(id);
-        Ok(Box::new(MockConnection::new(
-            id,
-            Arc::clone(&self.scenario),
-        )))
+        // Last, and after the connection exists: a test waiting on
+        // `Counts::connects_finished` must never see the connect counted
+        // before the connection it produced.
+        self.scenario.record_connection_opened();
+        Ok(connection)
     }
 }
 
@@ -519,6 +524,7 @@ impl DatabaseConnection for MockConnection {
         if !self.capabilities.savepoints() {
             return Err(DbError::unsupported("savepoints"));
         }
+        self.scenario.savepoint_behavior()?;
         self.overlay.savepoint(name.as_str());
         Ok(())
     }
@@ -528,6 +534,7 @@ impl DatabaseConnection for MockConnection {
         if !self.capabilities.savepoints() {
             return Err(DbError::unsupported("savepoints"));
         }
+        self.scenario.savepoint_behavior()?;
         self.overlay.rollback_to_savepoint(name.as_str())?;
         // The transaction stays open, but handles opened before the savepoint
         // can still be invalidated; that is what a real rollback does.

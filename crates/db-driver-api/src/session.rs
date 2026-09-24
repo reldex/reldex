@@ -413,6 +413,17 @@ impl TransactionState {
 /// 8. **No transaction is implicitly resolved.** A cancelled statement neither
 ///    commits nor rolls back; [`DatabaseConnection::transaction_state`] is
 ///    authoritative afterwards.
+/// 9. **Safe after the connection is closed.** A handle outlives its connection
+///    — it is `Arc`-shared precisely so a control path can hold one while the
+///    worker owns the connection — so `request_cancel` can arrive after
+///    [`DatabaseConnection::close`] has run. It must return without panicking
+///    and without touching the closed connection. Returning an error is fine
+///    and so is [`CancelOutcome::Requested`]; doing nothing is expected. A
+///    driver that cannot make this safe keeps whatever state the handle needs
+///    alive independently of the connection. The core narrows this window but
+///    cannot close it, for the same reason rule 6 exists
+///    (`docs/decisions/0002-driver-api-and-concurrency-model.md`, amendment
+///    R7).
 pub trait CancelHandle: Send + Sync {
     /// Requests that the connection stop its current operation.
     ///

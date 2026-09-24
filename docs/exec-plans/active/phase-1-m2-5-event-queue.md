@@ -8,7 +8,8 @@
 
 This file holds the two things that would have swamped the milestone table: the performance
 numbers either side of the refactor (§2), and the exact `SessionEvent` → `ReldexEvent` mapping
-M2.11 has to write (§3).
+M2.11 has to write (§3). §7 adds the part M2.6 produced — the open events, `abandon`, and what the
+FFI switch does with them.
 
 ---
 
@@ -282,6 +283,35 @@ on push, one `Arc` drop and one `fetch_update` on pop.
 
 ---
 
+## 5b. Review round 2 (2026-09-21, found by CI during M2.6): the idempotent close
+
+One latent defect survived round 1 and was found by `test (ubuntu-latest)` on PR #22, failing
+`event_terminal.rs::a_close_after_a_lost_session_still_reports_the_loss` intermittently — 3/1000 on
+the M2.5 baseline (2b4426d), so **not an M2.6 regression**, and a real semantic bug rather than a
+flaky test.
+
+**What it was.** "Closing an already-closed session succeeds" was implemented as one boolean —
+`SessionShared::ended`, meaning *a close has run* — set by the worker on **both** of its ends: the
+clean one, and the one where the connection was already gone and the close had just reported the
+loss. `DatabaseSession::submit_close` short-circuited on that boolean and answered `Ok(())`. So the
+second, third or fourth close of a lost session could report that the caller's `Commit` had
+happened when nothing had been committed. Whether it did depended on the worker reaching the flag
+between two submits on the caller's thread, which is why it was intermittent; waiting for the first
+close's reply makes it happen every time.
+
+**The fix.** `SessionShared` now records *how* the session ended (`EndedAs::Cleanly` /
+`EndedAs::Unresolved`), written once on the worker thread at the point it ends, and
+`settled_close()` is the single place that turns that record into a close's answer. All three
+idempotent-close sites read it: `submit_close`, `DatabaseSession::close`'s "no worker left to ask"
+paths (which each returned a bare `Ok(())` before, including after a registry teardown detached the
+worker at its deadline), and `CloseReplyTo`'s `Drop`. Idempotency now answers "this session is
+already over", never "your commit happened". ADR-0002 amendment **E7** has the classification rule
+and the one behaviour it changes: a second close on a *lost* session reports the loss again, with
+the original kind and native code, instead of succeeding.
+
+**Proof.** The lost and clean directions looped 3,000 runs each, 0 failures, plus a deterministic
+regression test that forces the interleaving instead of hoping for it.
+
 ## 6. Locked in for M2.6 and M2.11
 
 Decided here, while the reasons are in front of us, so neither task re-litigates them.
@@ -326,3 +356,107 @@ Decided here, while the reasons are in front of us, so neither task re-litigates
   reuses a live one.
 * Route strictly by `RequestId`; retire a session's state on `Terminal` only. Delivery is production
   order, not acceptance order, so "every earlier request looks answered" is not a fact.
+
+---
+
+## 7. `Opened` / `OpenFailed` / `abandon`, for M2.11 (added by M2.6)
+
+M2.6 landed `SessionRegistry` (`phase-1.md` §B3, ADR-0002 R1–R7) and is the producer of the two
+rows §3 left to it. The C ABI is **still unchanged** — `reldex.h` is byte-identical — because
+M2.11 owns it. What M2.11 has to know:
+
+**The short version, as rules.** Route on `Opened`; never poll `get()`. Hold exactly one
+`Arc<DatabaseSession>` per adapter session slot, and drop it before calling `retire`. Tear a session
+down with `abandon` and then `retire`, and call `retire` **only on `Terminal`** — but call it for
+every session, always, or the registry's map grows (`SessionRegistry::counts()` is there to make
+that visible). `SessionId` is safe as an FFI key: it is monotonic and never reused. `get() == None`
+means `INVALID_STATE` — accept nothing and emit nothing (ADR-0003 A18) — and that includes the whole
+`Opening` window. `transaction_possibly_lost` on `Terminal` is the authoritative transaction-loss
+answer and **must** reach the user; the value `abandon` returns is a lower bound for warning early.
+The whole shutdown budget is one `DROP_SHUTDOWN_TIMEOUT`, not one per session.
+
+### 7.1 The two open events
+
+| `SessionEvent` | `ReldexEventKind` | fields to fill |
+| --- | --- | --- |
+| `Opened { session, request, connection, cancel_kind, warnings }` | `OPENED` (1) | `session`, `request`, `connection_id`, `cancel_kind`, `warning_count = warnings.len()`. The warnings themselves stay behind `reldex_session_connect_warnings`, which reads `DatabaseSession::connect_warnings()` — the handle keeps its own copy, so a UI that asks late still gets them |
+| `OpenFailed { session, request, error }` | `OPENED` (1) with `error` | `session`, `request`, `error`, `session_state = LOST` |
+
+`Opened` is a session's **first** event. Nothing else for that session precedes it — M2.6 had to
+silence the connect-time transaction-state seed to keep that true (R5) — so the adapter creates its
+per-session state there and retires it on `TERMINAL`.
+
+### 7.2 Replacing the interim pump's open
+
+`reldex_hub_open_session` currently spawns a pump thread that performs the blocking
+`SessionManager::open_session` and reports through it. It becomes:
+
+* `SessionRegistry::open(driver, params, request)` → return the `SessionId` **immediately**, with
+  `RELDEX_STATUS_OK` and no pump thread. The hub keeps its `RequestId` allocator (`RequestId` is
+  caller-chosen and unchecked by the core).
+* Every "the pump is still inside `open_session`, nothing may be submitted yet" state disappears:
+  `SessionRegistry::get` answers `None` until the session is open, which is the same refusal
+  ADR-0003 A18 already permits (`INVALID_STATE`, nothing accepted, no event follows).
+* `reldex_session_close`/destroy paths that today tear a pump down map onto
+  `SessionRegistry::abandon` + `SessionRegistry::retire`.
+
+### 7.3 `abandon`, and what the adapter must surface
+
+`abandon(id) -> Abandoned` is the teardown path, and the only way to stop a session that is still
+connecting. It never blocks and is never refused.
+
+* `Abandoned::Connecting` — the open gets one `OpenFailed` with `ErrorKind::Cancelled`, then
+  `Terminal { Closed }`. A connection that arrives afterwards is closed on the worker thread; the
+  adapter sees nothing further.
+* `Abandoned::Open { transaction_possibly_lost }` — abandoning an open session never commits, so
+  the server rolls back whatever transaction it held. The flag here is a **lower bound**, meant for
+  warning the user immediately: `true` means "say so now", `false` means only "nothing visible from
+  this thread says otherwise yet". `Terminal` follows when the worker reaches the abandon, which on
+  a blocked statement is when that statement returns, and it carries the real answer.
+* `Abandoned::Ending` / `Abandoned::Unknown` — idempotent no-ops; nothing is produced.
+
+Exposing the `Abandoned` hint across the ABI is M2.11's call: an out-parameter on the abandon entry
+point is the obvious shape, and it is additive.
+
+### 7.3a `Terminal` needs a new field, and this is the cheap moment
+
+`SessionEvent::Terminal` is now `{ session, lifecycle, cause, transaction_possibly_lost }`. The last
+field is the authoritative answer to "did this session take the user's work with it?", computed on
+the worker thread at the point the session ends (ADR-0002 R6 has the full table). **It must reach
+the user** — `SPEC.md` §10 forbids hiding a transaction loss — so the C `TERMINAL` event needs a
+field for it, e.g. a `uint8_t transaction_possibly_lost` beside the existing lifecycle and error.
+The ABI has not switched to the core event path yet, so adding it costs nothing now and would be a
+breaking change later.
+
+Five paths produce `true`, and four of them had no way to report anything before M2.6: `abandon` of
+an open session, `retire` of an open session, the registry's teardown, `DatabaseSession::drop`, and
+a connection that was lost. A `close` whose disposition succeeded — commit *or* a rollback the user
+chose — is `false`, and so is a session that never opened.
+
+For a lost connection the answer is finer than "lost, therefore warn": a session lost **by** a
+driver call reports `true`, because the statement that died may have reached the server (the core
+records `TransactionState::Unknown` rather than trusting the driver's pre-call cache); a session
+lost while **idle**, with nothing open, reports `false`. So the adapter can show the warning
+whenever the flag is set without training the user to ignore it on every dropped connection.
+
+### 7.4 Retirement
+
+`SessionRegistry::retire(id)` is what lets the registry drop its handle, and `Terminal` is the only
+event that says it may. The adapter's own per-session state and the registry's entry retire
+together, on the same event. A `SessionId` that has been retired answers `Unknown` to a later
+abandon and `None` to `get`, so a double-retire is harmless.
+
+Two things to get right:
+
+* **Retire only on `Terminal`.** Retiring a session that is still **open** is a blocking, lossy
+  path: it drops the handle, which runs `DatabaseSession::drop` — up to `DROP_SHUTDOWN_TIMEOUT` on
+  the calling thread, and it resolves nothing, so the server rolls back whatever the session held
+  (reported afterwards on that session's `Terminal`). Neither belongs on the UI thread. `abandon`
+  is the immediate, non-blocking half; `retire` on `Terminal` is the clean-up, where there is
+  nothing left to wait for.
+* **Retire every session, always**, and drop the adapter's own `Arc<DatabaseSession>` first — the
+  registry can only release *its* hold. An open session's entry is released by nothing else. (Two
+  cases release themselves, because the registry owns nothing for them: an open that failed, and an
+  abandoned open once its late connect has arrived. Those answer `false` to `retire`, which means
+  only "there was nothing left to release".) `SessionRegistry::len()` / `counts()` are the
+  diagnostic that makes a leaking adapter visible.
