@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use reldex_db_driver_api::{
     Bind, Binds, CancelHandle, CancelKind, CancelOutcome, Capabilities, ConnectionId, Credentials,
     DatabaseConnection, DatabaseDriver, DbError, DbResult, Endpoint, ErrorKind, ExecutionOutcome,
-    ExtensionValue, LobKind, LobLocator, NamedBind, OutBindSpec, OutValues, SavepointName,
-    SessionRole, SqlType, Statement, StatementKind, TlsMode, TransactionState, Value, Warning,
-    WarningKind,
+    ExtensionValue, LobKind, LobLocator, MetadataCatalog, NamedBind, OutBindSpec, OutValues,
+    SavepointName, SessionRole, SqlType, Statement, StatementKind, TlsMode, TransactionState,
+    Value, Warning, WarningKind,
 };
 
 use oracledb::{
@@ -123,6 +123,10 @@ impl DatabaseDriver for OracleThinDriver {
 
     fn capabilities(&self) -> Capabilities {
         capabilities()
+    }
+
+    fn metadata_catalog(&self) -> &dyn MetadataCatalog {
+        &crate::metadata::OracleMetadataCatalog
     }
 
     fn connect(

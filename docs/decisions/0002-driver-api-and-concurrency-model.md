@@ -1932,6 +1932,14 @@ rediscover them, not as contract requirements.
   since the underlying panics themselves are not fixed.]**
 - **Warnings are a plain `String`** — `last_warning() -> Result<Option<String>, Error>`, with no code
   and no structure. *Confirmed.* See S11.
+- **Describe nullability is the server's `nulls_allowed` flag, copied verbatim.** *New; found by
+  M2.8's metadata catalog work, confirmed against a live database.* `nullable: (nulls_allowed != 0)`
+  reads the wire's own byte with no client-side computation
+  (`oracledb-26.0.0-beta.3/src/metadata.rs:120,157`) — this is Oracle's own describe/TTC protocol
+  behaviour, not a crate-level heuristic or limitation. Only a bare reference to a `NOT NULL`
+  column describes as non-null. Every expression, and every bare column that is nullable at its
+  source, describes as nullable. `WHERE` predicates never narrow it. A computed column cannot be
+  proven non-null by describe; verify declared non-null contracts against the data.
 
 ## Consequences
 
