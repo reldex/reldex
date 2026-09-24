@@ -45,6 +45,7 @@ pub mod error;
 pub mod ids;
 pub mod params;
 pub mod result;
+pub mod server_output;
 pub mod session;
 pub mod statement;
 pub mod types;
@@ -62,6 +63,7 @@ pub use crate::result::{
     BytesColumn, Column, ColumnData, ColumnKind, Cursor, DEFAULT_FETCH_ROWS, ExecutionOutcome,
     NullMask, OutValues, RowBatch, StatementKind, TextColumn, Warning, WarningKind,
 };
+pub use crate::server_output::{ServerOutputBuffer, ServerOutputChunk, ServerOutputSetting};
 pub use crate::session::{
     CancelHandle, CancelKind, CancelOutcome, Capabilities, DatabaseConnection, DatabaseDriver,
     TransactionState,

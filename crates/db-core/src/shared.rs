@@ -16,6 +16,7 @@ use reldex_db_driver_api::{
 
 use crate::events::{EventSink, RequestSlots, SessionEvent};
 use crate::ids::SessionId;
+use crate::session::ServerOutputLog;
 
 /// Where a session is in its lifecycle.
 ///
@@ -243,6 +244,15 @@ pub(crate) struct SessionShared {
     /// [`crate::SessionRegistry::abandon`] never resolve anything, which is
     /// exactly why they are lossy (ADR-0002 K5).
     transaction_resolved_at_end: AtomicBool,
+    /// Set the moment anything asks this session to go away without a close —
+    /// [`crate::SessionRegistry::abandon`], the registry's teardown, or the
+    /// handle's `Drop` — so the worker stops reading server output between
+    /// round trips instead of finishing a long drain nobody will see
+    /// (ADR-0002 amendment T). Never cleared.
+    abandon_requested: AtomicBool,
+    /// Server output collected for requests answered through a
+    /// [`crate::Completion`]; see [`ServerOutputLog`].
+    collected_output: Mutex<ServerOutputLog>,
     /// The slots event-path requests hold: taken when a request is accepted,
     /// given back when the consumer takes its reply **out of** the queue. That
     /// is what makes [`crate::SessionLimits::max_outstanding_requests`] bound
@@ -270,6 +280,8 @@ impl SessionShared {
             ended: AtomicU8::new(EndedAs::NOT_ENDED),
             open_cancelled: AtomicBool::new(false),
             transaction_resolved_at_end: AtomicBool::new(false),
+            abandon_requested: AtomicBool::new(false),
+            collected_output: Mutex::new(ServerOutputLog::default()),
             requests: Arc::new(RequestSlots::default()),
         }
     }
@@ -718,6 +730,60 @@ impl SessionShared {
     /// `DatabaseSession::cancel`.
     pub(crate) fn driver_call_in_flight(&self) -> bool {
         self.in_flight.load(Ordering::SeqCst) > 0
+    }
+
+    /// Records that something asked this session to go away without a close.
+    ///
+    /// Read by the worker between server-output reads, so a drain stops at
+    /// the next round-trip boundary rather than running to the end of a large
+    /// buffer for a session nobody is listening to any more.
+    pub(crate) fn request_abandon(&self) {
+        self.abandon_requested.store(true, Ordering::Release);
+    }
+
+    /// Whether [`SessionShared::request_abandon`] has run.
+    pub(crate) fn abandon_requested(&self) -> bool {
+        self.abandon_requested.load(Ordering::Acquire)
+    }
+
+    /// Appends one read's worth of server output to the completion-path log,
+    /// within its bounds; see [`ServerOutputLog`].
+    ///
+    /// Lines past the bound are refused, newest first, and counted — the same
+    /// "keep what is already promised, count the rest" rule the event queue
+    /// applies, because the start of a run is where an error usually is.
+    pub(crate) fn collect_server_output(&self, lines: Vec<Box<str>>, failure: Option<DbError>) {
+        let mut log = self
+            .collected_output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut bytes: usize = log.lines.iter().map(|line| line.len()).sum();
+        for line in lines {
+            let fits = log.lines.len() < ServerOutputLog::MAX_RETAINED_LINES
+                && bytes.saturating_add(line.len()) <= ServerOutputLog::MAX_RETAINED_BYTES;
+            if fits {
+                bytes += line.len();
+                log.lines.push(line);
+            } else {
+                log.dropped = log.dropped.saturating_add(1);
+            }
+        }
+        if let Some(failure) = failure {
+            log.failures = log.failures.saturating_add(1);
+            if log.failure.is_none() {
+                log.failure = Some(failure);
+            }
+        }
+    }
+
+    /// Takes everything the completion-path log holds, leaving it empty.
+    pub(crate) fn take_collected_server_output(&self) -> ServerOutputLog {
+        std::mem::take(
+            &mut *self
+                .collected_output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// The error every command gets once the session is lost or closed.

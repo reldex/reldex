@@ -55,16 +55,17 @@ use std::thread;
 use reldex_db_driver_api::{
     CancelHandle, CancelKind, ColumnKind, ConnectionId, ConnectionParams, Cursor,
     DatabaseConnection, DatabaseDriver, DbError, DbResult, ErrorKind, LobLocator, ResultSetId,
-    RowBatch, SavepointName, SessionState, Statement, TransactionState, Warning,
+    RowBatch, SavepointName, ServerOutputSetting, SessionState, Statement, TransactionState,
+    Warning,
 };
 
-use crate::events::SessionEvent;
+use crate::events::{RequestId, SessionEvent};
 use crate::ids::{LobHandle, ResultId, SessionId};
 use crate::reply::{CloseReplyTo, ReplyTo};
 use crate::session::{
     CloseDisposition, CloseError, ExecuteOutcome, FetchedBatch, OutValue, OutValues, SessionLimits,
 };
-use crate::shared::{EndedAs, SessionShared};
+use crate::shared::{EndedAs, SessionLifecycle, SessionShared};
 
 /// Why the worker is being asked to shut down.
 pub(crate) enum CloseIntent {
@@ -124,6 +125,11 @@ pub(crate) enum Command {
     },
     /// Release a parked large object.
     CloseLob { lob: LobHandle, reply: ReplyTo<()> },
+    /// Turn server output on or off for this session (ADR-0002 amendment T).
+    SetServerOutput {
+        setting: ServerOutputSetting,
+        reply: ReplyTo<ServerOutputSetting>,
+    },
     /// Resolve the transaction (if a disposition is given) and close the
     /// connection.
     Close {
@@ -157,6 +163,9 @@ impl Command {
                 reply.answer(Err(error));
             }
             Self::ReadLobChunk { reply, .. } => {
+                reply.answer(Err(error));
+            }
+            Self::SetServerOutput { reply, .. } => {
                 reply.answer(Err(error));
             }
             Self::Close { reply, .. } => {
@@ -364,12 +373,18 @@ fn worker_main(
         return;
     }
 
+    let capabilities = connection.capabilities();
     let mut worker = Worker {
         session,
         shared,
         limits,
         connection_id: connection.id(),
-        exact_transaction_state: connection.capabilities().exact_transaction_state(),
+        exact_transaction_state: capabilities.exact_transaction_state(),
+        server_output_supported: capabilities.server_output(),
+        // Off until the caller turns it on. A new session never inherits a
+        // setting — not from the session it may be replacing, which never
+        // happens silently anyway, and not from anything the driver assumes.
+        server_output: ServerOutputSetting::Disabled,
         connection: Some(connection),
         cursors: HashMap::new(),
         lobs: HashMap::new(),
@@ -427,6 +442,18 @@ struct Worker {
     limits: SessionLimits,
     connection_id: ConnectionId,
     exact_transaction_state: bool,
+    /// [`reldex_db_driver_api::Capabilities::server_output`], read once.
+    server_output_supported: bool,
+    /// Whether this session reads server output after each statement — the
+    /// output pane's switch, and nothing else. It lives here, on the worker,
+    /// and dies with it: it is a property of this session only.
+    ///
+    /// It is what the caller asked for and the driver confirmed, not a
+    /// mirror of the server: SQL the user runs themselves can enable or
+    /// disable the server's buffer behind it. When this is `Disabled` the
+    /// worker makes **no** server-output call at all, which is the "no round
+    /// trip when the pane is off" guarantee.
+    server_output: ServerOutputSetting,
     connection: Option<Box<dyn DatabaseConnection>>,
     cursors: HashMap<ResultSetId, Box<dyn Cursor>>,
     lobs: HashMap<LobHandle, ParkedLob>,
@@ -647,6 +674,7 @@ impl Worker {
                 reply.answer(outcome);
                 Flow::Continue
             }
+            Command::SetServerOutput { setting, reply } => self.set_server_output(setting, reply),
             Command::Close { intent, reply } => self.close(intent, reply),
         }
     }
@@ -674,13 +702,49 @@ impl Worker {
             return Flow::Continue;
         };
 
+        let answer = self.finish_execute(outcome);
+
+        // Whatever the statement printed goes out **before** its reply — and
+        // that includes a statement that failed after printing, which is the
+        // case output matters most for. Before, not after, for two reasons:
+        // a consumer can attribute every `ServerOutput` to the execute whose
+        // `Executing` it follows and whose `Executed` it precedes, with no
+        // request id on the event; and a read that fails can be reported
+        // without a second reply, because the one reply has not gone yet
+        // (ADR-0002 amendment T).
+        self.drain_server_output(reply.request());
+
+        match answer {
+            Ok((value, registered)) => {
+                if !reply.answer(Ok(value)) {
+                    // The caller dropped its `Completion` before the reply
+                    // landed. Whatever this command registered is unreachable
+                    // now, so it must be released here rather than living
+                    // until the session closes.
+                    self.release_registered(registered);
+                }
+            }
+            Err(err) => {
+                reply.answer(Err(err));
+            }
+        }
+        Flow::Continue
+    }
+
+    /// Everything `execute` does with the driver's outcome before answering:
+    /// adopts the cursor and output values, and updates the transaction
+    /// tracking. Returns the value to answer with and the results it
+    /// registered, so they can be released if nobody takes the answer.
+    fn finish_execute(
+        &mut self,
+        outcome: DbResult<reldex_db_driver_api::ExecutionOutcome>,
+    ) -> DbResult<(ExecuteOutcome, Vec<ResultSetId>)> {
         let mut outcome = match outcome {
             Ok(outcome) => outcome,
             Err(err) => {
                 self.shared.note_error(&err);
                 self.note_transaction_state_after(Some(&err));
-                reply.answer(Err(err));
-                return Flow::Continue;
+                return Err(err);
             }
         };
 
@@ -720,8 +784,7 @@ impl Worker {
                 }
                 Err(err) => {
                     self.shared.note_error(&err);
-                    reply.answer(Err(err));
-                    return Flow::Continue;
+                    return Err(err);
                 }
             },
         };
@@ -731,8 +794,7 @@ impl Worker {
             Err(err) => {
                 self.release_registered(registered);
                 self.shared.note_error(&err);
-                reply.answer(Err(err));
-                return Flow::Continue;
+                return Err(err);
             }
         };
 
@@ -753,13 +815,134 @@ impl Worker {
             warnings: outcome.warnings().to_vec(),
             out_values,
         };
-        if !reply.answer(Ok(value)) {
-            // The caller dropped its `Completion` before the reply landed.
-            // Whatever this command registered is unreachable now, so it must be
-            // released here rather than living until the session closes.
-            self.release_registered(registered);
+        Ok((value, registered))
+    }
+
+    // ---------------------------------------------------------- server output
+
+    /// Turns server output on or off: one round trip, answered as a normal
+    /// reply carrying the setting the driver put in force.
+    ///
+    /// A driver without the capability is answered here, with
+    /// [`ErrorKind::Unsupported`] and **no driver call**. On any failure the
+    /// setting is unchanged — the reply says it could not be changed, so the
+    /// session must keep behaving as it did.
+    fn set_server_output(
+        &mut self,
+        setting: ServerOutputSetting,
+        reply: ReplyTo<ServerOutputSetting>,
+    ) -> Flow {
+        if !self.server_output_supported {
+            reply.answer(Err(DbError::unsupported("server output")));
+            return Flow::Continue;
         }
+        let Some(outcome) =
+            self.with_connection(|connection| connection.set_server_output(setting))
+        else {
+            reply.answer(Err(self.shared.terminal_error()));
+            return Flow::Continue;
+        };
+        match &outcome {
+            Ok(effective) => self.server_output = *effective,
+            Err(err) => {
+                self.shared.note_error(err);
+                // The same loss path as every other driver call: a call that
+                // lost the connection is not trusted to have left the
+                // driver's cached transaction state true.
+                self.note_transaction_state_after(Some(err));
+            }
+        }
+        reply.answer(outcome);
         Flow::Continue
+    }
+
+    /// Reads back what the server buffered, after a statement, when — and
+    /// only when — this session's output is on.
+    ///
+    /// Reads in bounded chunks until the driver says the buffer is empty, one
+    /// round trip each, and delivers each chunk as it arrives so the worker
+    /// never holds more than one chunk. It reads to the end even when the
+    /// consumer is not keeping up: the server's buffer has to be emptied, or a
+    /// sized buffer overflows on the user's *next* statement with old output,
+    /// and what the consumer cannot take is dropped and counted by the event
+    /// queue's existing policy ([`crate::EventCaps`]).
+    ///
+    /// Not attempted at all when:
+    ///
+    /// * output is off — no round trip, ever (ADR-0002 amendment T);
+    /// * the session is not [`SessionLifecycle::Usable`] — a lost session has
+    ///   no connection, and one that needs validation must be pinged before
+    ///   it is used again, which the next command does; the output stays on
+    ///   the server and is read after that command;
+    /// * the session is being abandoned — checked before every read, so an
+    ///   abandon arriving during a long drain stops it at the next round
+    ///   trip.
+    ///
+    /// A failed read ends the drain and is delivered as a
+    /// [`SessionEvent::ServerOutput`] carrying `failure` (or in the
+    /// completion-path log). It never replaces the statement's own result,
+    /// and it goes through the same loss path as any other driver call, so a
+    /// read that finds the connection gone ends the session exactly as a
+    /// failed statement would.
+    fn drain_server_output(&mut self, request: Option<RequestId>) {
+        if !self.server_output.is_enabled() {
+            return;
+        }
+        let max_lines = self.limits.server_output_chunk_lines();
+        let max_bytes = self.limits.server_output_chunk_bytes();
+        loop {
+            if self.shared.lifecycle() != SessionLifecycle::Usable
+                || self.shared.abandon_requested()
+            {
+                return;
+            }
+            let Some(outcome) = self
+                .with_connection(|connection| connection.take_server_output(max_lines, max_bytes))
+            else {
+                return;
+            };
+            match outcome {
+                Ok(chunk) => {
+                    // An empty chunk ends the drain whatever it claims: the
+                    // contract says an empty chunk is drained, and a driver
+                    // that says otherwise must not make this loop spin.
+                    let done = chunk.is_drained() || chunk.is_empty();
+                    if !chunk.is_empty() {
+                        self.deliver_server_output(request, chunk.into_lines(), None);
+                    }
+                    if done {
+                        return;
+                    }
+                }
+                Err(err) => {
+                    self.shared.note_error(&err);
+                    self.note_transaction_state_after(Some(&err));
+                    self.deliver_server_output(request, Vec::new(), Some(err));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Sends one read's output where the statement's reply is going: the
+    /// event stream for an event-path request, the completion-path log
+    /// otherwise.
+    fn deliver_server_output(
+        &self,
+        request: Option<RequestId>,
+        lines: Vec<Box<str>>,
+        failure: Option<DbError>,
+    ) {
+        if request.is_some() {
+            self.shared.emit(SessionEvent::ServerOutput {
+                session: self.session,
+                lines,
+                dropped: 0,
+                failure,
+            });
+        } else {
+            self.shared.collect_server_output(lines, failure);
+        }
     }
 
     /// Moves the driver's output values onto the core side, replacing every

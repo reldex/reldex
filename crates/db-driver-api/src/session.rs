@@ -40,13 +40,15 @@
 //! Nothing in this crate starts a thread or an async runtime. The traits block,
 //! and `db-core` decides how blocking work is scheduled.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::error::DbResult;
+use crate::error::{DbError, DbResult};
 use crate::ids::{ConnectionId, SavepointName};
 use crate::params::ConnectionParams;
 use crate::result::{ExecutionOutcome, Warning};
+use crate::server_output::{ServerOutputChunk, ServerOutputSetting};
 use crate::statement::Statement;
 
 /// How a driver implements statement cancellation.
@@ -196,6 +198,7 @@ pub struct Capabilities {
     tls: bool,
     exact_transaction_state: bool,
     error_position: bool,
+    server_output: bool,
 }
 
 impl Capabilities {
@@ -212,6 +215,7 @@ impl Capabilities {
             tls: false,
             exact_transaction_state: false,
             error_position: false,
+            server_output: false,
         }
     }
 
@@ -278,6 +282,15 @@ impl Capabilities {
         self
     }
 
+    /// Declares that the connection can collect server output
+    /// ([`DatabaseConnection::set_server_output`],
+    /// [`DatabaseConnection::take_server_output`]).
+    #[must_use]
+    pub const fn with_server_output(mut self, supported: bool) -> Self {
+        self.server_output = supported;
+        self
+    }
+
     /// How statement cancellation is implemented.
     #[must_use]
     pub const fn cancel(self) -> CancelKind {
@@ -331,6 +344,17 @@ impl Capabilities {
     #[must_use]
     pub const fn error_position(self) -> bool {
         self.error_position
+    }
+
+    /// Whether the connection can collect server output — text a session
+    /// writes out of band, such as `DBMS_OUTPUT` (ADR-0002 amendment T).
+    ///
+    /// When this is false, `db-core` answers a request to enable it with
+    /// [`crate::ErrorKind::Unsupported`] without calling the driver, and the UI
+    /// does not offer the output pane.
+    #[must_use]
+    pub const fn server_output(self) -> bool {
+        self.server_output
     }
 
     /// Whether a statement that is **already running** can be stopped.
@@ -641,6 +665,84 @@ pub trait DatabaseConnection: Send {
     /// [`crate::SessionState::Lost`].
     fn ping(&mut self) -> DbResult<()>;
 
+    /// Turns server output on or off for this connection (ADR-0002
+    /// amendment T), and reports the setting actually in force.
+    ///
+    /// One round trip. It changes what the **server** buffers for this
+    /// session; it reads nothing. Turning output off may discard whatever the
+    /// server was still holding — that is the server's behaviour (Oracle's
+    /// `DBMS_OUTPUT.DISABLE` purges its buffer), and the caller must drain
+    /// first if it wants those lines.
+    ///
+    /// The returned value is what the caller shows: a driver whose server
+    /// accepts only a range of buffer sizes clamps
+    /// [`crate::ServerOutputBuffer::Bytes`] into that range and returns the
+    /// size it used, rather than refusing or pretending. It never answers a
+    /// different enabled/disabled state than it was asked for.
+    ///
+    /// Must not touch the transaction: enabling or disabling output is not a
+    /// statement the user ran, and it neither opens nor resolves anything.
+    ///
+    /// The default answers [`crate::ErrorKind::Unsupported`] and issues
+    /// nothing, so a driver without the capability needs no code at all.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::ErrorKind::Unsupported`] when
+    /// [`Capabilities::server_output`] is false; otherwise any
+    /// [`crate::DbError`] the round trip produced, classified like any other
+    /// call's (a lost connection reports [`crate::SessionState::Lost`]).
+    fn set_server_output(&mut self, setting: ServerOutputSetting) -> DbResult<ServerOutputSetting> {
+        let _ = setting;
+        Err(DbError::unsupported("server output"))
+    }
+
+    /// Takes up to `max_lines` buffered lines of server output, oldest first.
+    ///
+    /// **One round trip per call, whatever it returns** — a driver must never
+    /// read one line per round trip, and must not loop internally until the
+    /// buffer is empty: the caller decides how many chunks to ask for, which
+    /// is what keeps one call's memory bounded. The lines leave the server's
+    /// buffer as they are taken.
+    ///
+    /// `max_bytes` bounds the text in one chunk. It is a target, not a
+    /// splitter: a line is the unit the server produced, and cutting one
+    /// would be inventing a line break, so a line is always returned whole.
+    /// A chunk holds at most `max_lines` lines, and lines totalling at most
+    /// `max_bytes` bytes **plus at most one more line** — the one that did
+    /// not fit. That last line exists because a driver may learn a line's
+    /// size only by taking it from the server, and a line taken cannot be put
+    /// back; returning it is the only alternative to losing it. A caller
+    /// bounding memory therefore allows `max_bytes` plus one maximum-length
+    /// line (32,767 bytes for `DBMS_OUTPUT`).
+    ///
+    /// What the server has not finished — for `DBMS_OUTPUT`, a `PUT` with no
+    /// line end yet — is not a line and is not returned. Empty lines are
+    /// lines, and are returned as empty strings.
+    ///
+    /// Must not touch the transaction, for the same reason as
+    /// [`DatabaseConnection::set_server_output`].
+    ///
+    /// The default answers [`crate::ErrorKind::Unsupported`] and issues
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::ErrorKind::Unsupported`] when
+    /// [`Capabilities::server_output`] is false; otherwise any
+    /// [`crate::DbError`] the round trip produced. A failure may lose the
+    /// lines that round trip had already taken from the server's buffer —
+    /// the caller reports the failure rather than assuming the output is
+    /// complete.
+    fn take_server_output(
+        &mut self,
+        max_lines: NonZeroUsize,
+        max_bytes: NonZeroUsize,
+    ) -> DbResult<ServerOutputChunk> {
+        let _ = (max_lines, max_bytes);
+        Err(DbError::unsupported("server output"))
+    }
+
     /// Closes the connection.
     ///
     /// The driver must not commit as part of closing (`SPEC.md` §10): an open
@@ -777,6 +879,26 @@ mod tests {
     }
 
     #[test]
+    fn a_driver_without_server_output_needs_no_code_and_says_unsupported() {
+        // Additive contract (ADR-0002 amendment T): the defaults must compile
+        // for every existing driver and answer in a typed way, not with an
+        // `Ok` that reads as "enabled" or an empty chunk that reads as
+        // "nothing was printed".
+        let mut connection: Box<dyn DatabaseConnection> = Box::new(StubConnection);
+        let set = connection
+            .set_server_output(ServerOutputSetting::Enabled(
+                crate::ServerOutputBuffer::Unlimited,
+            ))
+            .expect_err("a driver without the capability refuses");
+        assert_eq!(set.kind(), ErrorKind::Unsupported);
+        let n = NonZeroUsize::new(16).expect("non-zero");
+        let take = connection
+            .take_server_output(n, n)
+            .expect_err("a driver without the capability refuses");
+        assert_eq!(take.kind(), ErrorKind::Unsupported);
+    }
+
+    #[test]
     fn default_capabilities_support_nothing() {
         let capabilities = Capabilities::default();
         assert_eq!(capabilities, Capabilities::none());
@@ -790,6 +912,7 @@ mod tests {
         assert!(!capabilities.tls());
         assert!(!capabilities.exact_transaction_state());
         assert!(!capabilities.error_position());
+        assert!(!capabilities.server_output());
     }
 
     #[test]
@@ -805,9 +928,11 @@ mod tests {
             .with_lob_streaming(true)
             .with_tls(true)
             .with_exact_transaction_state(true)
-            .with_error_position(true);
+            .with_error_position(true)
+            .with_server_output(true);
 
         assert_eq!(capabilities.cancel(), CancelKind::Native);
+        assert!(capabilities.server_output());
         assert!(capabilities.savepoints());
         assert!(capabilities.exact_transaction_state());
         assert!(capabilities.error_position());

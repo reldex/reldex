@@ -116,7 +116,8 @@ predates", ADR-0003 D7) and therefore a **minor** ABI bump, not a major one.
 | `LobChunk { lob, bytes }` | **new** `LOB_CHUNK` | `request`, the handle, the bytes (needs a `ReldexBytes`-shaped carrier or an arena append; the ABI has no LOB reader yet) |
 | `SessionClosed { session, request, result }` | `SESSION_CLOSED` (5) | `close_outcome` and `session_still_open` from `CloseError` exactly as `QueuedEvent::with_close_outcome` does today; `error` from `close_error_to_reldex` |
 | `Executing { session, request, deadline }` | **new** `EXECUTING` | `request`, `deadline_ms` + `has_deadline`; this is the honest "running, with this limit" state `SPEC.md` §24.8 needs on a driver that cannot cancel |
-| `ServerOutput { session, lines, dropped }` | **new** `SERVER_OUTPUT` | `dropped`, plus an accessor for the lines (M2.7) |
+| `ServerOutput { session, lines, dropped, failure }` | **new** `SERVER_OUTPUT` | `dropped`, `error` from `failure`, plus an accessor for the lines; M2.7 landed it, see §7.5 |
+| `ServerOutputConfigured { session, request, result }` | **new** `SERVER_OUTPUT_CONFIGURED` (or `COMPLETED` with an operation value) | a reply; see §7.5 (M2.7) |
 | `TransactionStateChanged { session, possibly_active }` | **new** `TRANSACTION_STATE` | `possibly_active` |
 | `Terminal { session, lifecycle, cause }` | **new** `TERMINAL` | `session_state` from `lifecycle`, `error` from `cause`; this is what lets the adapter retire a worksheet's session once, rather than inferring it |
 
@@ -330,7 +331,8 @@ Decided here, while the reasons are in front of us, so neither task re-litigates
   `submit_close`'s exemption — reserve above the limit, or do not reserve at all and account for the
   one `OpenFailed` it produces. Whichever M2.6 picks, say so where the bound is published
   (`events.rs` module docs, `session.rs`, §B2, ADR-0002 E2/E5) and keep the arithmetic exact; the
-  bound is currently `2R + U + 3` per session and a reviewer checks it against an adversarial probe.
+  bound is currently `2R + U + 3` per session (`3R + U + 3` with server output on, since M2.7: §7.5)
+  and a reviewer checks it against an adversarial probe.
 * Give the connect reply the `ReplyTo` treatment. `abandon` then yields exactly one
   `OpenFailed { Cancelled }` from the same `Drop` mechanism as every other request, instead of a
   second bespoke path — and reserve the open request through `reserve_request` so it is bounded
@@ -460,3 +462,45 @@ Two things to get right:
   abandoned open once its late connect has arrived. Those answer `false` to `retire`, which means
   only "there was nothing left to release".) `SessionRegistry::len()` / `counts()` are the
   diagnostic that makes a leaking adapter visible.
+
+### 7.5 Server output, for M2.11 (added by M2.7)
+
+**M2.11 guidance.** M2.7 (`phase-1.md` §B4.2 as implemented, ADR-0002 T1–T9) produces the
+`ServerOutput` row of §3 and adds one reply. The C ABI is **still unchanged**: `reldex.h` is
+byte-identical and `gen-header.sh --check` is clean. Until M2.11 maps them, both events arrive at
+the interim pump as `RELDEX_EVENT_UNKNOWN`. What M2.11 has to add:
+
+| `SessionEvent` | `ReldexEventKind` | fields to fill |
+| --- | --- | --- |
+| `ServerOutput { session, lines, dropped, failure }` | **new** `SERVER_OUTPUT` | `line_count`; the lines behind an accessor or an arena as `(pointer, length)` UTF-8, **never** NUL-terminated, because a line may contain `\n` or NUL and an empty line is a real line; `dropped` (lines refused before this event, so "output truncated"); `error` from `failure` (a failed read, so "output incomplete, because …"). There is no `request`: every `ServerOutput` between an execute's `EXECUTING` and its `EXECUTED` belongs to that execute. |
+| `ServerOutputConfigured { session, request, result }` | a reply: **new** `SERVER_OUTPUT_CONFIGURED`, or `COMPLETED` with a new `completed_operation` value | `request`, `error` when `Err`, and the setting **in force** — enabled, unlimited, and buffer bytes. Oracle clamps a requested size into 2,000..=1,000,000, and the pane must show the real one. |
+
+Entry point: one `reldex_session_set_server_output(session, request, mode, buffer_bytes)` onto
+`DatabaseSession::submit_set_server_output`. Keep it typed across the C line too: a mode enum
+(`OFF`, `UNLIMITED`, `BYTES`) plus a size that is read only for `BYTES`. A `(bool, size)` pair is
+exactly what the Rust side replaced (§B4.2 item 1).
+
+Rules the adapter must keep:
+
+* **Off by default, and only the user turns it on.** While on, every statement pays at least one
+  extra round trip. A reconnect is a new session, and a new session starts with output **off**:
+  the core never carries the setting over. If the pane stays open across a reconnect, re-enabling
+  is a visible request the adapter issues, never an implicit one.
+* **Ordering.** For one execute: `EXECUTING`, then `TRANSACTION_STATE` if it changed, then zero or
+  more `SERVER_OUTPUT`, then `EXECUTED`. A read that loses the connection gives `SERVER_OUTPUT`
+  with an error, then the statement's `EXECUTED` (its own result, untouched), then `TERMINAL`
+  (`Lost`, `transaction_possibly_lost`). Output a function wrote during a *fetch* arrives inside
+  the **next** execute's window, ahead of that execute's own lines. The pane should not
+  attribute it more precisely than that.
+* **Budget.** One event carries at most `SessionLimits::server_output_chunk_lines` (4,096) lines
+  and `server_output_chunk_bytes` (32 KiB) of text plus at most one more line (up to 32,767 bytes).
+  With output on, the per-session queue bound is `3R + U + 3` (§B2), and a chatty PL/SQL run fills
+  `U` with `SERVER_OUTPUT`. The adapter's drain budget should count lines or bytes, not only
+  events.
+* **Drops are reported, never hidden.** A non-zero `dropped` and an error both mean the pane must
+  say so. Lines still owed when the session ends are read with
+  `EventQueue::pending_dropped_lines(session)` on `TERMINAL`.
+* **The completion path has no stream.** Anything that still runs a statement through a
+  `Completion` (the interim pump) must call `DatabaseSession::take_server_output()` after it. That
+  is a bounded log (10,000 lines / 1 MiB, with `dropped` and `failure`/`failures`) and costs no
+  round trip.

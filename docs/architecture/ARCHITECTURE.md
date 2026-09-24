@@ -209,6 +209,27 @@ exit: it issues every abandon first and then waits for all of them against **one
 so shutting down N stuck sessions costs one `DROP_SHUTDOWN_TIMEOUT` in total rather than N of them,
 after which each remaining worker is detached and releases its connection when its call returns.
 
+### Server output
+
+Server output (`DBMS_OUTPUT` on Oracle Database; `SPEC.md` §9, §24 item 10) is a **per-session**
+switch, off by default, and its cost is paid only by a session that turned it on (ADR-0002
+amendment T). The contract is vendor-neutral — `Capabilities::server_output`,
+`DatabaseConnection::set_server_output(ServerOutputSetting)` and
+`take_server_output(max_lines, max_bytes)`, both defaulting to `Unsupported` — and every vendor
+statement lives in the driver (`crates/drivers/oracle-thin/src/server_output.rs`). Turning it on or
+off is an ordinary request with one reply and one round trip. While it is on, the session's worker
+reads the server's buffer after **every `execute`, whether it succeeded or failed, and before that
+statement's reply**, in bounded chunks until the buffer is empty. On the event path the chunks are
+`ServerOutput` events between the statement's `Executing` and its `Executed`, so a consumer
+attributes them by position. On the completion path they go into a bounded per-session log that
+`DatabaseSession::take_server_output` hands over without a round trip. A read that fails never
+replaces the statement's reply: it travels on the output stream as a `failure`, and a read that
+loses the connection ends the session through the same loss path as any other call. Output the
+consumer cannot keep up with is dropped and counted by the existing `ServerOutput` drop policy
+(ADR-0002 E5), never silently. While output is off the worker makes no call at all, and the driver
+adds nothing to `execute`. Nothing is read after a fetch, commit, rollback, savepoint, ping or
+close, so output written while rows are fetched arrives with the next statement's read.
+
 ## 7. FFI and Qt adapter boundary
 
 ```text
