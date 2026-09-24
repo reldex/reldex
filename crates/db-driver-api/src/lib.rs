@@ -37,12 +37,17 @@
 //!
 //! `DatabaseSession` (`SPEC.md` §6) is a `db-core` type, not a trait here:
 //! session ownership, worker threads, conservative transaction tracking and
-//! reconnect policy are core concerns. Connection pooling, metadata providers,
-//! script splitting and the FFI surface are deliberately out of scope
-//! (ADR-0002 D8; `AGENTS.md`, "keep public APIs small").
+//! reconnect policy are core concerns. Connection pooling, script splitting
+//! and the FFI surface are deliberately out of scope (ADR-0002 D8;
+//! `AGENTS.md`, "keep public APIs small"). The one addition in that direction
+//! is narrow and deliberate: [`mod@metadata`]'s [`MetadataCatalog`] returns a
+//! prepared [`Statement`] for a vendor-neutral metadata request, not a new
+//! provider abstraction with its own result shape (M2.8; see that module's
+//! documentation).
 
 pub mod error;
 pub mod ids;
+pub mod metadata;
 pub mod params;
 pub mod result;
 pub mod server_output;
@@ -54,6 +59,11 @@ pub mod value;
 pub use crate::error::{DbError, DbResult, ErrorKind, NativeError, SessionState, SqlPosition};
 pub use crate::ids::{
     ConnectionId, MAX_SAVEPOINT_NAME_LEN, ResultSetId, SavepointName, SavepointNameError,
+};
+pub use crate::metadata::{
+    MetadataCatalog, MetadataErrorClassifier, MetadataObjectKind, MetadataRequest,
+    NAME_FILTER_ESCAPE_CHAR, PreparedMetadataQuery, columns_of_columns, name_filter_pattern,
+    no_error_reclassification, objects_of_kind_columns, schemas_columns,
 };
 pub use crate::params::{
     ConnectionParams, Credentials, Endpoint, ExtensionValue, Extensions, Secret, SessionRole,

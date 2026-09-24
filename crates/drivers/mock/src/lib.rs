@@ -50,6 +50,7 @@
 mod connection;
 mod cursor;
 mod generated;
+mod metadata;
 mod scenario;
 mod server_output;
 
@@ -58,6 +59,7 @@ pub use cursor::MockCursor;
 pub use generated::{
     GeneratedColumn, GeneratedCursor, GeneratedQuerySpec, GeneratedQuerySpecError,
 };
+pub use metadata::{MetadataFixture, MockMetadataCatalog};
 pub use scenario::{
     Action, BlockGate, BlockSpec, ColumnSpec, Counts, Matcher, QueryPlan, QuerySource, Scenario,
     ScriptValue, ScriptedError,

@@ -7,8 +7,9 @@ use std::time::Instant;
 
 use reldex_db_driver_api::{
     CancelHandle, CancelKind, CancelOutcome, Capabilities, ConnectionId, DatabaseConnection,
-    DatabaseDriver, DbError, DbResult, ErrorKind, ExecutionOutcome, LobLocator, OutValues,
-    SavepointName, SessionState, Statement, StatementKind, TransactionState, Value, Warning,
+    DatabaseDriver, DbError, DbResult, ErrorKind, ExecutionOutcome, LobLocator, MetadataCatalog,
+    OutValues, SavepointName, SessionState, Statement, StatementKind, TransactionState, Value,
+    Warning,
 };
 
 use crate::cursor::{MockCursor, MockLobStream};
@@ -152,6 +153,10 @@ impl DatabaseDriver for MockDriver {
 
     fn capabilities(&self) -> Capabilities {
         self.scenario.capabilities()
+    }
+
+    fn metadata_catalog(&self) -> &dyn MetadataCatalog {
+        &crate::metadata::MockMetadataCatalog
     }
 
     fn connect(

@@ -331,6 +331,7 @@ mod cursor;
 mod descriptor;
 mod error;
 mod lob;
+mod metadata;
 mod rewrite;
 mod server_output;
 mod sql_dialect;

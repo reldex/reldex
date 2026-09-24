@@ -544,6 +544,9 @@ Expected baseline:
 - explain plan
 - basic export
 
+Licence: GPL-3.0-or-later (owner decision 2026-09-24); Pro is licensed separately by the copyright
+holder; external contributions require a CLA so dual licensing stays possible.
+
 ### Pro
 Candidates:
 - schema compare

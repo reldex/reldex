@@ -17,7 +17,7 @@ This file is the human-readable current task board. Detailed active execution pl
 - [x] Add `.gitignore` and `.editorconfig`
 - [x] Add repository-local skill under `.agents/skills/reldex-development/`
 - [ ] Enable branch protection when repository becomes collaborative/public
-- [ ] Decide Community/Pro licensing before public release
+- [x] Decide Community/Pro licensing before public release — decided 2026-09-24: GPL-3.0-or-later for Community, Pro separate (ADR-0005)
 - [ ] Run trademark/domain clearance before commercial launch
 
 ## P0 — Architecture validation
@@ -107,7 +107,7 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 - [x] M2.5 ★ `EventQueue`/`EventSink`/`SessionEvent`/`Waker` + `ReplyTo` refactor of the worker (opus, review mandatory) — done 2026-09-21: `EventQueue`/`EventSink`/`SessionEvent`/`Waker` + `ReplyTo` in `db-core` (no thread per session); ordering rules 1–5 and exactly-once `Terminal` tested; back-pressure bound `2R + U + 3` made true (slot released when the consumer pops); 42 session tests run on both reply paths; independently reviewed twice (3 must-fix fixed); FFI pump switch is M2.11 (`phase-1-m2-5-event-queue.md`)
 - [x] M2.6 ★ `SessionRegistry` + non-blocking `open`, `abandon` semantics (opus, review mandatory) — done 2026-09-21: `SessionRegistry` — `open` never blocks (one `Opened`/`OpenFailed`, one `Terminal`, last); `abandon` never blocks and is never refused, a late connect is closed by the worker (0 leaks in 960 randomized sessions); `Terminal.transaction_possibly_lost` computed on the worker covers abandon/retire/drop/lost; one-deadline teardown; independently reviewed twice (3 must-fix fixed); ADR-0002 amendment R
 - [ ] M2.7 ★ Server output capability (DBMS_OUTPUT) in contract + driver + core polling when enabled (opus, review mandatory)
-- [ ] M2.8 Metadata catalog descriptor (`MetadataCatalog`) + Oracle dictionary SQL for the 9 object groups (sonnet)
+- [x] M2.8 Metadata catalog descriptor (`MetadataCatalog`) + Oracle dictionary SQL for the 9 object groups (sonnet) — done 2026-09-24: `MetadataCatalog` descriptor (`db-driver-api::metadata`) — one `prepare(MetadataRequest)` returning a `Statement` + declared column contract + error classifier; Oracle `ALL_*` SQL only in the driver; filter is a bind (case-insensitive contains, wildcards literal), `limit+1` truncation, invisible columns excluded, composed `type_name`; ORA-00942/01039 on catalog queries → `Permission`; independently reviewed twice (2 must-fix fixed); real-DB 9/9
 - [ ] M2.9 ★ Settings model: three-level resolution with provenance; profile model; SQLite store (opus, review mandatory)
 - [ ] M2.10 ★ Credential store: `CredentialStore` trait + Windows Credential Manager implementation (opus, review mandatory)
 - [ ] M2.11 FFI surface for M2.5–M2.10 + regenerate and verify header (sonnet)
@@ -176,7 +176,7 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 - [x] Owner: Phase-0 leftovers (C-5, U-18, C-6) carried into Phase 1 M2 — confirmed 2026-09-19; done 2026-09-20 (decision C.3 #12)
 - [x] Owner: upstream issues F and G — decided 2026-09-19 not to submit for now; drafts kept for tracking only, results file §6 (decision C.3 #13). Refreshed against `main` 2026-09-23: both confirmed still fully present, no facts changed; still awaiting owner go-ahead to submit
 - [x] Owner: mobile test hardware — resolved 2026-09-19: Android arm64 phone (OPPO CPH2399) provided, NDK 28.2 installed; physical-device validation itself is separate Phase-0 tail work in progress on `phase-0/android-device`; iOS still needs a Mac + Apple Developer account + device, not provided (decision C.3 #14)
-- [ ] Owner: Community/Pro licensing decision before M6.6 so the notices file and About dialog are right the first time (decision C.3 #15)
+- [x] Owner: Community/Pro licensing decision before M6.6 so the notices file and About dialog are right the first time (decision C.3 #15) — decided 2026-09-24: GPL-3.0-or-later for Community, Pro separate (ADR-0005)
 - [ ] Owner: Rule on S15 (K1 p99 wording, K2 warm vs cold, K3 baseline/metric) and accept or re-open ADR-0003
 
 ## P2 — IDE capabilities

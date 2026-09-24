@@ -46,6 +46,7 @@ use std::time::Duration;
 
 use crate::error::{DbError, DbResult};
 use crate::ids::{ConnectionId, SavepointName};
+use crate::metadata::MetadataCatalog;
 use crate::params::ConnectionParams;
 use crate::result::{ExecutionOutcome, Warning};
 use crate::server_output::{ServerOutputChunk, ServerOutputSetting};
@@ -485,6 +486,12 @@ pub trait DatabaseDriver: Send + Sync {
 
     /// What this driver can do. Constant for the lifetime of the driver.
     fn capabilities(&self) -> Capabilities;
+
+    /// This driver's vendor-neutral metadata catalog descriptor (`SPEC.md`
+    /// §16; M2.8). See [`mod@crate::metadata`] for the whole design. Cheap and
+    /// non-blocking: it returns a statement builder, never a connection or a
+    /// round trip.
+    fn metadata_catalog(&self) -> &dyn MetadataCatalog;
 
     /// Opens one connection.
     ///
