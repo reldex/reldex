@@ -513,3 +513,16 @@ Rules the adapter must keep:
   `failure` not attributed to any of them.
 * **`SessionEvent::ServerOutput` is `#[non_exhaustive]`.** Match it with `..`, because its fields
   are expected to grow (follow-up M2.13 may add a per-statement truncation report).
+* **`ServerOutputChunk` already grew one field (M2.12) that this mapping does not carry yet.**
+  `crates/db-driver-api/src/server_output.rs::ServerOutputChunk::invalid_utf8_lines()` — how many
+  of a chunk's lines were not valid UTF-8 on the wire and were delivered with U+FFFD in place of
+  the bad bytes rather than dropped (ADR-0002 amendment T, M2.12 update). Today
+  `db-core::worker::drain_server_output` reads it and calls `chunk.into_lines()`, which silently
+  discards the count along with `drained` — there is nowhere in `SessionEvent::ServerOutput` or
+  `ServerOutputLog` for it to go yet. When this table's `ServerOutput` row is implemented, add
+  `invalid_utf8_lines: u32` next to `dropped` (`SessionEvent` is already `#[non_exhaustive]` for
+  exactly this) and a matching field on `ServerOutputLog` for the completion path, and thread both
+  through `drain_server_output`/`deliver_server_output`/`collect_server_output` rather than
+  dropping the count at the `db-core` boundary the way it is dropped today. The pane's reason to
+  care: a line reported this way is not corrupt data lost to a bug, it is exactly what the server
+  held, and the UI should be able to mark it rather than show mojibake with no explanation.
