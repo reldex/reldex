@@ -546,12 +546,40 @@ fn a_privileged_cancel_reaches_the_server_but_not_the_client() {
 
     // Half of this works. `ALTER SYSTEM CANCEL SQL` is accepted in a couple of
     // milliseconds and the server really does end the call: `V$SESSION` leaves
-    // ACTIVE almost immediately.
+    // ACTIVE quickly, but *how* quickly is load-dependent, not just "server or
+    // client" as the file-level comment above once implied.
+    //
+    // **This bound was tightened by a false assumption and is load-dependent
+    // like its siblings above.** Investigated 2026-09-24 after two back-to-back
+    // failures of this exact assertion under `tools/gates.sh --only db` (see
+    // `docs/exec-plans/active/phase-0-spike-results.md`, "S4 addendum
+    // (2026-09-24)", for the related-but-distinct candidate-1 finding this is
+    // NOT the same mechanism as). Measured on this machine: run alone
+    // (`--test-threads=1`, this test only), `stopped` is a steady ~1.5s across
+    // 5 runs; run as part of this file at cargo's default parallelism — which
+    // is exactly what `tools/oracle-test-db/run-it.sh` and therefore
+    // `tools/gates.sh --only db` do — several of this file's *other* tests
+    // (`a_deadline_stops_a_long_sql_statement_and_reports_the_session_honestly`,
+    // `killing_a_session_is_a_different_thing_with_different_consequences`)
+    // also drive the same CPU-bound `LONG_SQL` cartesian join concurrently
+    // against the same single-instance container, and the server takes longer
+    // to notice and act on this test's own `ALTER SYSTEM CANCEL SQL` while it
+    // is busy servicing the others: 6.1-6.6s across 4 such runs (3 file-only +
+    // 1 full `gates.sh --only db`), consistently failing a `< 5s` bound with no
+    // margin for that contention. The client-observed half of this test (below
+    // — `NetworkLost`, ~24-29s, never `ORA-01013`) was unaffected and identical
+    // across every one of those runs, isolated or not: this bound is the only
+    // load-sensitive part of this test, not the finding itself. 10s keeps the
+    // assertion meaningful (single-digit seconds, nowhere near the client's own
+    // `SAFETY_DEADLINE`) while sitting comfortably under the 12s the polling
+    // loop above can observe at all (`for _ in 0..24 { sleep(500ms) }`) and
+    // above the worst measured contention. If this still flakes, the polling
+    // loop's own cap is the next thing to widen, not this number again.
     let stopped = result
         .server_stopped_after
         .unwrap_or_else(|| panic!("the server never stopped the statement"));
     assert!(
-        stopped < Duration::from_secs(5),
+        stopped < Duration::from_secs(10),
         "the server took {stopped:.1?} to stop the statement"
     );
 
