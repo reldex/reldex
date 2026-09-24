@@ -17,7 +17,7 @@ This file is the human-readable current task board. Detailed active execution pl
 - [x] Add `.gitignore` and `.editorconfig`
 - [x] Add repository-local skill under `.agents/skills/reldex-development/`
 - [ ] Enable branch protection when repository becomes collaborative/public
-- [ ] Decide Community/Pro licensing before public release
+- [x] Decide Community/Pro licensing before public release — decided 2026-09-24: GPL-3.0-or-later for Community, Pro separate (ADR-0005)
 - [ ] Run trademark/domain clearance before commercial launch
 
 ## P0 — Architecture validation
@@ -174,7 +174,7 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 - [x] Owner: Phase-0 leftovers (C-5, U-18, C-6) carried into Phase 1 M2 — confirmed 2026-09-19; done 2026-09-20 (decision C.3 #12)
 - [x] Owner: upstream issues F and G — decided 2026-09-19 not to submit for now; drafts kept for tracking only, results file §6 (decision C.3 #13). Refreshed against `main` 2026-09-23: both confirmed still fully present, no facts changed; still awaiting owner go-ahead to submit
 - [x] Owner: mobile test hardware — resolved 2026-09-19: Android arm64 phone (OPPO CPH2399) provided, NDK 28.2 installed; physical-device validation itself is separate Phase-0 tail work in progress on `phase-0/android-device`; iOS still needs a Mac + Apple Developer account + device, not provided (decision C.3 #14)
-- [ ] Owner: Community/Pro licensing decision before M6.6 so the notices file and About dialog are right the first time (decision C.3 #15)
+- [x] Owner: Community/Pro licensing decision before M6.6 so the notices file and About dialog are right the first time (decision C.3 #15) — decided 2026-09-24: GPL-3.0-or-later for Community, Pro separate (ADR-0005)
 - [ ] Owner: Rule on S15 (K1 p99 wording, K2 warm vs cold, K3 baseline/metric) and accept or re-open ADR-0003
 
 ## P2 — IDE capabilities

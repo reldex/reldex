@@ -169,6 +169,17 @@ local NDK/Xcode) — this is spike S6; see
 [`phase-0-s6-mobile-cross-compile.md`](docs/exec-plans/active/phase-0-s6-mobile-cross-compile.md) for
 what it does and does not prove.
 
+Before opening or updating a PR, run the local gate script — it runs a superset of the CI checks
+(plus the header check, doc-lint on the crates that are clean, and, when discoverable/healthy, the Qt
+UI build and the real-database integration suite) and prints a Markdown summary line meant to be
+pasted into the PR body. **CI remains the merge gate**; `tools/gates.sh` is a fast local pre-check,
+not a replacement for it (ADR-0005):
+
+```sh
+bash tools/gates.sh            # every stage
+bash tools/gates.sh --quick    # fmt, clippy, test, header only
+```
+
 Run the Phase 0 validation harness:
 
 ```sh
@@ -199,4 +210,10 @@ Initial development targets compatibility with **Oracle Database 19c+**. This is
 
 ## License
 
-No project license has been selected yet. The repository should remain private until the Community/Pro licensing model is finalized.
+Reldex Community is licensed under the **GNU General Public License v3.0 or later**
+(`GPL-3.0-or-later`) — owner decision 2026-09-24, see
+[`docs/decisions/0005-public-repository-for-hosted-ci.md`](docs/decisions/0005-public-repository-for-hosted-ci.md)
+"Licence". Copyright (C) 2026 Supawit Nu-iat. See [`LICENSE`](LICENSE) for the full text and
+[`COPYRIGHT`](COPYRIGHT) for the copyright/attribution statement, including Qt's LGPLv3 dynamic-linking
+position. **Reldex Pro is licensed separately by the copyright holder** and is not covered by the
+GPL grant above.

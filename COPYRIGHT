@@ -1,0 +1,13 @@
+Copyright (C) 2026 Supawit Nu-iat.
+
+Reldex is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See LICENSE.
+
+Reldex's Qt Quick UI uses Qt under the GNU Lesser General Public License
+version 3 (LGPLv3), dynamically linked (see
+docs/exec-plans/active/phase-1.md, "C.0 -- Toolchain to install", licence
+position). Third-party notices for the full dependency graph are generated
+at packaging time (TASKS.md M6.5) and shipped alongside the built
+application.
