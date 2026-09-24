@@ -294,6 +294,18 @@ impl MetadataRequest {
 /// unchanged. A plain function pointer: no allocation, no vendor-specific
 /// type, and trivially satisfied by a driver with nothing to correct — see
 /// [`no_error_reclassification`].
+///
+/// A classifier receives only `&DbError`, not owned `DbError`, so it cannot
+/// take a `source` out of the original error (`DbError` lends its `source`
+/// through [`std::error::Error::source`], which borrows from `&self`, and
+/// has no owned-transfer form). A classifier that corrects by rebuilding a
+/// new `DbError` therefore cannot carry an existing `source` chain forward
+/// onto the corrected value; a driver whose errors do attach one needs to
+/// either accept that a reclassified error drops it, or classify without
+/// rebuilding (not possible today, since `DbError` has no in-place `kind`
+/// setter). `reldex_driver_oracle_thin`'s classifier does not currently
+/// attach a `source` to server-message errors, so this does not lose
+/// anything there today; it would if that ever changed.
 pub type MetadataErrorClassifier = fn(&DbError) -> Option<DbError>;
 
 /// The identity [`MetadataErrorClassifier`]: never reclassifies anything.
@@ -364,13 +376,14 @@ impl PreparedMetadataQuery {
         (self.classifier)(&error).unwrap_or(error)
     }
 
-    /// Splits this value into its statement and its declared column contract,
-    /// discarding the classifier. Prefer
-    /// [`PreparedMetadataQuery::reclassify_error`] over this when the caller
-    /// still needs to correct an execution error.
+    /// Splits this value into its statement, its declared column contract
+    /// and its classifier — nothing is silently dropped. A caller that only
+    /// needs to correct an execution error, without also taking the
+    /// statement and columns apart, can use
+    /// [`PreparedMetadataQuery::reclassify_error`] instead.
     #[must_use]
-    pub fn into_parts(self) -> (Statement, Vec<ColumnMetadata>) {
-        (self.statement, self.columns)
+    pub fn into_parts(self) -> (Statement, Vec<ColumnMetadata>, MetadataErrorClassifier) {
+        (self.statement, self.columns, self.classifier)
     }
 }
 

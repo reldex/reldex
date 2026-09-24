@@ -24,8 +24,8 @@
 
 use reldex_db_driver_api::{
     Bind, DbError, DbResult, ErrorKind, MetadataCatalog, MetadataObjectKind, MetadataRequest,
-    NamedBind, PreparedMetadataQuery, Statement, Timestamp, columns_of_columns,
-    no_error_reclassification, objects_of_kind_columns, schemas_columns,
+    NamedBind, NativeError, PreparedMetadataQuery, Statement, Timestamp, columns_of_columns,
+    objects_of_kind_columns, schemas_columns,
 };
 
 use crate::{Action, ColumnSpec, QueryPlan, QuerySource, Scenario, ScriptValue, ScriptedError};
@@ -54,6 +54,41 @@ fn as_column_specs(contract: Vec<reldex_db_driver_api::ColumnMetadata>) -> Vec<C
         .collect()
 }
 
+/// Native codes this mimics as "not visible to this session" — the same
+/// codes `reldex_driver_oracle_thin`'s `AMBIGUOUS_NOT_VISIBLE_CODES`
+/// reclassifies, duplicated here (not imported: a driver crate does not
+/// depend on another driver crate) so this mock's classifier exercises the
+/// same shape a real Oracle connection's does.
+const MOCK_AMBIGUOUS_NOT_VISIBLE_CODES: [i32; 2] = [942, 1039];
+
+/// A [`reldex_db_driver_api::MetadataErrorClassifier`] that mimics
+/// `reldex_driver_oracle_thin`'s reclassification shape for testing
+/// purposes: reclassifies one of [`MOCK_AMBIGUOUS_NOT_VISIBLE_CODES`] from
+/// whatever it arrived as into [`ErrorKind::Permission`].
+///
+/// This exists so a `db-core`/M6.1 test written against this mock exercises
+/// the same "raw failure, then the caller must call
+/// [`PreparedMetadataQuery::reclassify_error`]" path a real Oracle
+/// connection produces. [`MetadataFixture::fail_objects_with_permission`]
+/// and [`MetadataFixture::fail_columns_with_permission`] script the *raw*,
+/// unclassified failure by default precisely so a caller that forgets to
+/// call `reclassify_error` sees the wrong [`ErrorKind`] against this mock
+/// too — not a false-positive `Permission` that would hide the omission.
+fn mimic_oracle_permission_classifier(error: &DbError) -> Option<DbError> {
+    if error.kind() == ErrorKind::Permission {
+        return None;
+    }
+    let code = error.native().map(NativeError::code)?;
+    if !MOCK_AMBIGUOUS_NOT_VISIBLE_CODES.contains(&code) {
+        return None;
+    }
+    let mut rebuilt = DbError::new(ErrorKind::Permission, error.message().to_owned());
+    if let Some(native) = error.native() {
+        rebuilt = rebuilt.with_native(NativeError::new(native.code(), native.message()));
+    }
+    Some(rebuilt)
+}
+
 /// The mock driver's `MetadataCatalog` implementation.
 ///
 /// Stateless, like the Oracle driver's: it only builds statements, and a test
@@ -72,7 +107,7 @@ impl MetadataCatalog for MockMetadataCatalog {
                 Ok(PreparedMetadataQuery::new(
                     statement,
                     schemas_columns(),
-                    no_error_reclassification,
+                    mimic_oracle_permission_classifier,
                 ))
             }
             MetadataRequest::ObjectsOfKind {
@@ -90,7 +125,7 @@ impl MetadataCatalog for MockMetadataCatalog {
                 Ok(PreparedMetadataQuery::new(
                     statement,
                     objects_of_kind_columns(),
-                    no_error_reclassification,
+                    mimic_oracle_permission_classifier,
                 ))
             }
             MetadataRequest::ColumnsOf { schema, table } => {
@@ -102,7 +137,7 @@ impl MetadataCatalog for MockMetadataCatalog {
                 Ok(PreparedMetadataQuery::new(
                     statement,
                     columns_of_columns(),
-                    no_error_reclassification,
+                    mimic_oracle_permission_classifier,
                 ))
             }
             _ => Err(DbError::unsupported(
@@ -111,11 +146,10 @@ impl MetadataCatalog for MockMetadataCatalog {
         }
     }
 
-    // Every `PreparedMetadataQuery` above carries `no_error_reclassification`:
-    // nothing the mock scripts is ambiguous the way a real dictionary's
-    // ORA-00942 is — `MetadataFixture::fail_objects_with_permission` and
-    // `MetadataFixture::fail_columns_with_permission` already script
-    // `ErrorKind::Permission` directly.
+    // Every `PreparedMetadataQuery` above carries
+    // `mimic_oracle_permission_classifier`, so a test against this mock
+    // exercises the same "raw failure, then reclassify_error" shape a real
+    // Oracle connection produces — see that function's documentation.
 }
 
 /// Scripts a [`Scenario`] with deterministic answers for
@@ -196,17 +230,23 @@ impl<'a> MetadataFixture<'a> {
     }
 
     /// Scripts an `ObjectsOfKind` permission failure for one `(schema, kind)`
-    /// pair, carrying the native `ORA-00942` shape a real dictionary
-    /// permission failure would also carry once reclassified by the Oracle
-    /// driver's classifier (`reldex_driver_oracle_thin`'s
-    /// `reclassify_ambiguous_permission_error`, carried on its
-    /// `PreparedMetadataQuery`). Scripted here directly as
-    /// [`ErrorKind::Permission`], since this driver has no classifier of its
-    /// own to exercise.
+    /// pair, carrying the *raw*, unclassified shape a real Oracle dictionary
+    /// permission failure actually arrives as — `ErrorKind::Syntax` with
+    /// native `ORA-00942` — exactly as it would come back from
+    /// [`DatabaseConnection::execute`](reldex_db_driver_api::DatabaseConnection::execute)
+    /// before a caller applies
+    /// [`PreparedMetadataQuery::reclassify_error`]. Deliberately *not*
+    /// scripted as [`ErrorKind::Permission`] directly: this mock's
+    /// [`mimic_oracle_permission_classifier`] reclassifies it the same way
+    /// the Oracle driver's does, so a `db-core`/M6.1 test that forgets to
+    /// call `reclassify_error` sees the wrong `ErrorKind` here too, instead
+    /// of a false-positive `Permission` that would hide the omission. Use
+    /// [`MetadataFixture::fail_objects_with_permission_preclassified`] to
+    /// script the already-`Permission` case directly instead.
     pub fn fail_objects_with_permission(&self, schema: &str, kind: MetadataObjectKind) {
         self.scenario.on_sql(
             objects_marker(schema, kind),
-            Action::Fail(permission_denied()),
+            Action::Fail(permission_denied_raw()),
         );
     }
 
@@ -214,12 +254,45 @@ impl<'a> MetadataFixture<'a> {
     pub fn fail_columns_with_permission(&self, schema: &str, table: &str) {
         self.scenario.on_sql(
             columns_marker(schema, table),
-            Action::Fail(permission_denied()),
+            Action::Fail(permission_denied_raw()),
+        );
+    }
+
+    /// Scripts an `ObjectsOfKind` failure that is *already*
+    /// [`ErrorKind::Permission`] — the shape after reclassification, for a
+    /// test that wants to exercise a caller's handling of an
+    /// already-corrected error without also exercising the classifier
+    /// itself.
+    pub fn fail_objects_with_permission_preclassified(
+        &self,
+        schema: &str,
+        kind: MetadataObjectKind,
+    ) {
+        self.scenario.on_sql(
+            objects_marker(schema, kind),
+            Action::Fail(permission_denied_preclassified()),
+        );
+    }
+
+    /// The same, for [`MetadataRequest::ColumnsOf`].
+    pub fn fail_columns_with_permission_preclassified(&self, schema: &str, table: &str) {
+        self.scenario.on_sql(
+            columns_marker(schema, table),
+            Action::Fail(permission_denied_preclassified()),
         );
     }
 }
 
-fn permission_denied() -> ScriptedError {
+/// The raw, unclassified shape: what a real Oracle connection's execute
+/// actually returns before [`PreparedMetadataQuery::reclassify_error`] runs.
+fn permission_denied_raw() -> ScriptedError {
+    ScriptedError::new(ErrorKind::Syntax, "ORA-00942: table or view does not exist")
+        .with_native(942, "ORA-00942: table or view does not exist")
+}
+
+/// The already-reclassified shape, for a test that wants `Permission`
+/// straight from `execute` without exercising the classifier.
+fn permission_denied_preclassified() -> ScriptedError {
     ScriptedError::new(
         ErrorKind::Permission,
         "reldex-driver-mock: not visible to this session",
@@ -359,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn a_scripted_permission_failure_reaches_the_caller() {
+    fn a_scripted_permission_failure_arrives_raw_and_reclassify_error_corrects_it() {
         let scenario = Scenario::new();
         MetadataFixture::new(&scenario)
             .fail_objects_with_permission("HR", MetadataObjectKind::Tables);
@@ -377,17 +450,76 @@ mod tests {
         let error = connection
             .execute(prepared.statement())
             .expect_err("the scenario scripts a failure");
-        assert_eq!(error.kind(), ErrorKind::Permission);
+        // Raw, as a real Oracle connection would actually return it — a
+        // caller that forgets to call `reclassify_error` would see this
+        // wrong `ErrorKind`, not a false-positive `Permission`.
+        assert_eq!(error.kind(), ErrorKind::Syntax);
         assert_eq!(
             error.native().map(reldex_db_driver_api::NativeError::code),
+            Some(942)
+        );
+
+        let corrected = prepared.reclassify_error(error);
+        assert_eq!(corrected.kind(), ErrorKind::Permission);
+        assert_eq!(
+            corrected
+                .native()
+                .map(reldex_db_driver_api::NativeError::code),
             Some(942)
         );
     }
 
     #[test]
-    fn columns_of_permission_failure_reaches_the_caller() {
+    fn a_preclassified_permission_failure_reaches_the_caller_directly() {
+        let scenario = Scenario::new();
+        MetadataFixture::new(&scenario)
+            .fail_objects_with_permission_preclassified("HR", MetadataObjectKind::Tables);
+        let mut connection = connect(&scenario);
+        let catalog = MockDriver::new(Arc::clone(&scenario));
+        let prepared = catalog
+            .metadata_catalog()
+            .prepare(MetadataRequest::objects_of_kind(
+                "HR",
+                MetadataObjectKind::Tables,
+                limit(10),
+            ))
+            .expect("objects_of_kind is supported");
+
+        let error = connection
+            .execute(prepared.statement())
+            .expect_err("the scenario scripts a failure");
+        assert_eq!(error.kind(), ErrorKind::Permission);
+        // `reclassify_error` is a no-op on an already-`Permission` error, the
+        // same as the Oracle driver's own classifier.
+        let unchanged = prepared.reclassify_error(error);
+        assert_eq!(unchanged.kind(), ErrorKind::Permission);
+    }
+
+    #[test]
+    fn columns_of_permission_failure_arrives_raw_and_reclassify_error_corrects_it() {
         let scenario = Scenario::new();
         MetadataFixture::new(&scenario).fail_columns_with_permission("HR", "SALARIES");
+        let mut connection = connect(&scenario);
+        let catalog = MockDriver::new(Arc::clone(&scenario));
+        let prepared = catalog
+            .metadata_catalog()
+            .prepare(MetadataRequest::columns_of("HR", "SALARIES"))
+            .expect("columns_of is supported");
+
+        let error = connection
+            .execute(prepared.statement())
+            .expect_err("the scenario scripts a failure");
+        assert_eq!(error.kind(), ErrorKind::Syntax);
+
+        let corrected = prepared.reclassify_error(error);
+        assert_eq!(corrected.kind(), ErrorKind::Permission);
+    }
+
+    #[test]
+    fn columns_of_preclassified_permission_failure_reaches_the_caller_directly() {
+        let scenario = Scenario::new();
+        MetadataFixture::new(&scenario)
+            .fail_columns_with_permission_preclassified("HR", "SALARIES");
         let mut connection = connect(&scenario);
         let catalog = MockDriver::new(Arc::clone(&scenario));
         let prepared = catalog

@@ -87,32 +87,40 @@ ORDER BY o.OBJECT_NAME FETCH FIRST :limit_plus_one ROWS ONLY";
 /// a later phase can add an explicit "show invisible columns" request shape
 /// if that turns out to matter.
 ///
-/// This is a promise about the *data*, not about what this driver's own
-/// describe of the statement reports. A live run against this Oracle
-/// database (`m2_8_metadata_catalog.rs`'s review-round diagnostics) found
-/// that the pinned `oracledb` crate's describe reports `nullable=true` for
-/// **any** computed SQL expression — even a bare `SELECT 1 FROM DUAL`, and
-/// even `NVL(COLUMN_ID, -1)`, which is structurally non-null — while
-/// correctly reporting `false` for a genuinely `NOT NULL` *bare* column
-/// reference such as `ALL_USERS.USERNAME`. Since `position`, `type_name` and
-/// `nullable` all have to be computed here (to hide invisible columns, to
-/// compose a display type, and to render `Y`/`N` as text, respectively),
-/// none of the three can ever describe as non-nullable through this crate
-/// regardless of SQL wording; `m2_8_metadata_catalog.rs`'s
-/// `assert_contract_matches` documents and works around this specific,
-/// confirmed limitation rather than chasing a SQL trick that cannot succeed
-/// against it.
+/// This is a promise about the *data*, not about what a describe of the
+/// statement reports. Oracle's own describe protocol reports the server's
+/// `nulls_allowed` flag for a projected column, and the pinned `oracledb`
+/// crate copies it verbatim with no client-side computation
+/// (`nullable: (nulls_allowed != 0)`,
+/// `oracledb-26.0.0-beta.3/src/metadata.rs:120,157`) — see ADR-0002, "Notes
+/// for driver implementers". That flag narrows to non-null only for a
+/// **bare reference to a `NOT NULL` column** (e.g. `ALL_USERS.USERNAME`);
+/// every computed expression describes as nullable regardless of how
+/// provably non-null it is, and a `WHERE` predicate never narrows a bare
+/// column's own declared nullability either. `type_name` and `nullable`
+/// below are computed (`CASE`/`DECODE`) and so always describe nullable.
+/// `position` is a bare `COLUMN_ID` reference, not computed — but
+/// `COLUMN_ID` is itself declared nullable in `ALL_TAB_COLUMNS`'s own
+/// definition (it holds NULL for an `INVISIBLE` column), and the `AND
+/// COLUMN_ID IS NOT NULL` filter above narrows the *data*, not what Oracle
+/// reports for the source column's own declared nullability, so `position`
+/// also describes nullable. None of the three can ever describe as
+/// non-nullable through this driver regardless of SQL wording;
+/// `m2_8_metadata_catalog.rs`'s `assert_contract_matches` documents this and
+/// checks the promise against the data directly instead.
 ///
 /// `type_name` composes Oracle's own precision/scale/length qualifiers onto
 /// `DATA_TYPE` for the families where `DATA_TYPE` alone loses information —
 /// `NUMBER`, `FLOAT`, `VARCHAR2`, `CHAR`, `NCHAR`, `NVARCHAR2`, `RAW` — using
 /// the same rules Oracle's own DDL-generation tools use (`NUMBER(*,s)` is
-/// Oracle's own notation for "any precision, scale `s`"; `VARCHAR2` is the
-/// one family where `CHAR_USED` controls whether the length is char or byte
-/// semantics, so it is the only one that shows the unit). Every other family
-/// (`DATE`, `CLOB`, `RAW` handled above, and notably `TIMESTAMP(6) WITH TIME
-/// ZONE`/`INTERVAL DAY(2) TO SECOND(6)`-shaped types) already carries its
-/// precision inside Oracle's own `DATA_TYPE` text, so the `ELSE` branch
+/// Oracle's own notation for "any precision, scale `s`"; `VARCHAR2` and
+/// `CHAR` both show a `CHAR|BYTE` unit, since `CHAR_USED` distinguishes char
+/// from byte semantics for either family — `NCHAR`/`NVARCHAR2` never need
+/// the unit, since a national-charset column is always char-length
+/// semantics). Every other family (`DATE`, `CLOB`, `RAW` handled above, and
+/// notably `TIMESTAMP(6) WITH TIME ZONE`/`INTERVAL DAY(2) TO SECOND(6)`-
+/// shaped types) already carries its precision inside Oracle's own
+/// `DATA_TYPE` text, so the `ELSE` branch
 /// passes it through unchanged.
 const COLUMNS_OF_SQL: &str = "SELECT COLUMN_ID AS \"position\", COLUMN_NAME AS \"name\", \
 CASE DATA_TYPE \
@@ -126,7 +134,8 @@ END \
 WHEN 'FLOAT' THEN 'FLOAT(' || DATA_PRECISION || ')' \
 WHEN 'VARCHAR2' THEN 'VARCHAR2(' || CHAR_LENGTH || ' ' \
   || DECODE(CHAR_USED, 'C', 'CHAR', 'B', 'BYTE', 'BYTE') || ')' \
-WHEN 'CHAR' THEN 'CHAR(' || CHAR_LENGTH || ')' \
+WHEN 'CHAR' THEN 'CHAR(' || CHAR_LENGTH || ' ' \
+  || DECODE(CHAR_USED, 'C', 'CHAR', 'B', 'BYTE', 'BYTE') || ')' \
 WHEN 'NCHAR' THEN 'NCHAR(' || CHAR_LENGTH || ')' \
 WHEN 'NVARCHAR2' THEN 'NVARCHAR2(' || CHAR_LENGTH || ')' \
 WHEN 'RAW' THEN 'RAW(' || DATA_LENGTH || ')' \

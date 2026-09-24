@@ -32,6 +32,16 @@
 //! privilege, so this could not be confirmed in either direction and is left
 //! as a known open item rather than guessed at (see `phase-1.md`'s M2.8 "as
 //! implemented" note).
+//!
+//! `type_name`'s composition has three known, deliberately unimplemented
+//! gaps, recorded here and in `phase-1.md` rather than guessed at: a `REF
+//! <type>` column shows as the bare `REF` (`DATA_TYPE_MOD = 'REF'` is
+//! dropped, so the referenced type name is lost); a user-defined-type or
+//! `XMLTYPE` column's owning schema is dropped (only `DATA_TYPE` itself is
+//! shown, not `schema.type`); and `UROWID(100)` shows as the bare `UROWID`
+//! (its declared length is dropped, unlike `RAW(n)`). None of these are
+//! among the M2.8 brief's nine object groups' everyday column types; a later
+//! phase can extend the `CASE` if a real UI need shows up.
 
 #![cfg(feature = "oracle-it")]
 #![allow(
@@ -62,21 +72,22 @@ fn current_owner(connection: &mut dyn DatabaseConnection) -> String {
     scalar(connection, "SELECT USER FROM dual")
 }
 
-/// `ColumnsOf` columns that are necessarily *computed* SQL expressions in
-/// `OracleMetadataCatalog`'s statement (`position` hides invisible columns,
-/// `type_name` composes a display type, `nullable` renders `Y`/`N` as text)
-/// rather than a bare column reference. A review-round diagnostic against
-/// this Oracle database found that the pinned `oracledb` crate's describe
-/// reports `nullable=true` for **any** computed expression, however
-/// trivially non-null — even `SELECT 1 FROM DUAL` and `NVL(COLUMN_ID, -1)`
-/// describe as nullable — while a genuinely `NOT NULL` *bare* column
-/// reference (`ALL_USERS.USERNAME`, `ALL_TAB_COLUMNS.COLUMN_NAME`, …)
-/// correctly describes as non-nullable. There is no SQL wording that makes
-/// a computed expression describe as non-nullable through this crate, so
-/// these three columns' declared non-nullability — a real promise about the
-/// *data* those expressions produce, not about this driver's describe of
-/// them — cannot be checked this way and is exempted here rather than
-/// papered over with a SQL trick that cannot work.
+/// `ColumnsOf` columns whose declared non-nullability cannot be checked
+/// against Oracle's own describe: `type_name` and `nullable` are computed
+/// (`CASE`/`DECODE`), and `position` is a bare `COLUMN_ID` reference that is
+/// itself declared nullable in `ALL_TAB_COLUMNS`'s own definition (it holds
+/// NULL for an `INVISIBLE` column). Oracle's describe reports the server's
+/// own `nulls_allowed` flag for a projected column — the pinned `oracledb`
+/// crate copies it verbatim, with no client-side computation
+/// (`oracledb-26.0.0-beta.3/src/metadata.rs:120,157`; ADR-0002, "Notes for
+/// driver implementers") — and that flag narrows to non-null only for a
+/// **bare reference to a `NOT NULL` column**; it never reflects a `WHERE`
+/// predicate that happens to exclude NULLs from this specific query's data,
+/// and never narrows a computed expression regardless of how provably
+/// non-null it is. So these three columns' declared non-nullability — a real
+/// promise about the *data* `COLUMNS_OF_SQL` produces, not about what this
+/// describe reports — is checked against the data directly instead, by
+/// [`assert_declared_non_nullable_columns_hold_no_null_data`].
 const NULLABLE_UNVERIFIABLE_VIA_DESCRIBE: [&str; 3] = ["position", "type_name", "nullable"];
 
 /// Asserts the executed result's columns match the declared contract's
@@ -93,14 +104,15 @@ const NULLABLE_UNVERIFIABLE_VIA_DESCRIBE: [&str; 3] = ["position", "type_name", 
 /// either way" that a concrete driver is free to over-deliver on. A live run
 /// against this Oracle database found both directions: `ColumnsOf`'s
 /// `position` was declared non-nullable while the live describe reported it
-/// nullable — but, per [`NULLABLE_UNVERIFIABLE_VIA_DESCRIBE`], that turned
-/// out to be a describe-layer limitation for *any* computed expression, not
-/// a data-level broken promise. Separately, `Schemas`' hedged `created`
-/// (declared nullable, for a vendor that might not track it) described as
-/// non-nullable on this concrete database — the safe, over-delivering
-/// direction, not a broken promise. Only the
+/// nullable — see [`NULLABLE_UNVERIFIABLE_VIA_DESCRIBE`] for why, and
+/// [`assert_declared_non_nullable_columns_hold_no_null_data`] for how that
+/// column's promise is actually checked instead. Separately, `Schemas`'
+/// hedged `created` (declared nullable, for a vendor that might not track
+/// it) described as non-nullable on this concrete database — the safe,
+/// over-delivering direction, not a broken promise. Only the
 /// non-nullable-declared-but-nullable-in-practice direction is asserted,
-/// and only for columns a bare-column describe can actually corroborate.
+/// and only for columns a bare-`NOT NULL`-column describe can actually
+/// corroborate.
 fn assert_contract_matches(actual: &[ColumnMetadata], declared: &[ColumnMetadata]) {
     assert_eq!(
         actual.len(),
@@ -127,6 +139,32 @@ fn assert_contract_matches(actual: &[ColumnMetadata], declared: &[ColumnMetadata
     }
 }
 
+/// Checks the *data* directly for the columns
+/// [`NULLABLE_UNVERIFIABLE_VIA_DESCRIBE`] exempts from the describe-based
+/// check in [`assert_contract_matches`]: no row may hold NULL in a column
+/// declared non-nullable, regardless of what the describe could or could not
+/// corroborate.
+fn assert_declared_non_nullable_columns_hold_no_null_data(
+    batch: &RowBatch,
+    declared: &[ColumnMetadata],
+) {
+    for (index, column) in declared.iter().enumerate() {
+        if column.nullable() != Some(false)
+            || !NULLABLE_UNVERIFIABLE_VIA_DESCRIBE.contains(&column.name())
+        {
+            continue;
+        }
+        for row in 0..batch.row_count() {
+            let is_null = batch.value(row, index).is_none_or(|value| value.is_null());
+            assert!(
+                !is_null,
+                "column `{}` is declared non-nullable but row {row} holds NULL",
+                column.name()
+            );
+        }
+    }
+}
+
 /// Executes a prepared metadata statement through the ordinary path, checks
 /// its result against the declared contract, and returns every row.
 fn run(connection: &mut dyn DatabaseConnection, prepared: &PreparedMetadataQuery) -> RowBatch {
@@ -141,6 +179,7 @@ fn run(connection: &mut dyn DatabaseConnection, prepared: &PreparedMetadataQuery
         .fetch_batch(NonZeroUsize::new(10_000).expect("non-zero"))
         .expect("fetch");
     cursor.close().expect("closing a cursor cannot fail");
+    assert_declared_non_nullable_columns_hold_no_null_data(&batch, prepared.columns());
     batch
 }
 
@@ -349,41 +388,52 @@ fn name_filter_treats_wildcard_and_escape_characters_literally() {
     let sequence = unique("m28lit");
     exec(connection.as_mut(), &format!("CREATE SEQUENCE {sequence}"));
 
-    // No unquoted Oracle identifier can contain `%` or `\`. The filter
-    // combines each character with this test's own unique fixture name
-    // rather than searching the whole schema for it bare: cargo runs test
-    // functions in parallel by default, and another test in this same file
+    // No unquoted Oracle identifier can contain `%`. The filter combines it
+    // with this test's own unique fixture name rather than searching the
+    // whole schema for it bare: cargo runs test functions in parallel by
+    // default, and another test in this same file
     // (`quoted_identifiers_with_special_characters_survive_unfiltered_and_
     // filtered_listings`) deliberately creates *quoted* sequences containing
-    // these exact characters, so a bare, schema-wide "should match nothing"
-    // search would be flaky against that concurrently-running fixture. A
-    // search for "this fixture's own name" + the character still catches a
-    // real wildcard-treated-as-wildcard bug: if the character were left
-    // unescaped, the resulting pattern would accidentally match this very
-    // fixture (whose name is a literal prefix of the search text), not just
-    // fail to find some unrelated object.
-    for literal in ["%", "\\"] {
-        let filter = format!("{sequence}{literal}");
-        let prepared = driver
-            .metadata_catalog()
-            .prepare(
-                MetadataRequest::objects_of_kind(
-                    owner.clone(),
-                    MetadataObjectKind::Sequences,
-                    generous_limit(),
-                )
-                .with_name_filter(&filter),
+    // `%`, so a bare, schema-wide "should match nothing" search would be
+    // flaky against that concurrently-running fixture. A search for "this
+    // fixture's own name" + `%` still catches a real
+    // wildcard-treated-as-wildcard bug: if `%` were left unescaped, the
+    // resulting pattern would accidentally match this very fixture (whose
+    // name is a literal prefix of the search text), not just fail to find
+    // some unrelated object.
+    //
+    // `\` is deliberately not tested here the same way: appending a bare `\`
+    // to a filter and escaping it correctly still produces a pattern ending
+    // `...\\%` (an escaped backslash followed by the wrapping wildcard), but
+    // a *broken* escape (leaving the trailing `\` bare) produces `...\%`,
+    // which `ESCAPE '\'` reads as "a literal `%`, then end of pattern" — also
+    // zero rows. Both the correct and the buggy behaviour give the same
+    // result here, so this shape cannot distinguish them.
+    // `quoted_identifiers_with_special_characters_survive_unfiltered_and_
+    // filtered_listings` covers `\` properly instead, by asserting a `\`
+    // filter matches *exactly* the fixture whose stored name contains one,
+    // and not the fixtures containing `%`/`_` instead — a shape a broken
+    // escape would fail.
+    let filter = format!("{sequence}%");
+    let prepared = driver
+        .metadata_catalog()
+        .prepare(
+            MetadataRequest::objects_of_kind(
+                owner.clone(),
+                MetadataObjectKind::Sequences,
+                generous_limit(),
             )
-            .expect("objects_of_kind is supported");
-        let batch = run(connection.as_mut(), &prepared);
-        assert_eq!(
-            batch.row_count(),
-            0,
-            "this fixture's own name has no {literal:?} in it, so appending one should match \
-             nothing, got {:?}",
-            names_column(&batch)
-        );
-    }
+            .with_name_filter(&filter),
+        )
+        .expect("objects_of_kind is supported");
+    let batch = run(connection.as_mut(), &prepared);
+    assert_eq!(
+        batch.row_count(),
+        0,
+        "this fixture's own name has no '%' in it, so appending one should match nothing, got \
+         {:?}",
+        names_column(&batch)
+    );
 
     // A real substring of the fixture's own name still matches normally.
     let stored_name = stored(&sequence);
@@ -592,7 +642,8 @@ fn columns_of_type_name_matches_oracles_own_precision_scale_and_length_rules() {
              flt FLOAT(24), \
              vc2_char VARCHAR2(10 CHAR), \
              vc2_byte VARCHAR2(10 BYTE), \
-             ch CHAR(5), \
+             ch_char CHAR(5 CHAR), \
+             ch_byte CHAR(5 BYTE), \
              nch NCHAR(5), \
              nvc2 NVARCHAR2(5), \
              rw RAW(8), \
@@ -621,7 +672,8 @@ fn columns_of_type_name_matches_oracles_own_precision_scale_and_length_rules() {
         ("FLT", "FLOAT(24)"),
         ("VC2_CHAR", "VARCHAR2(10 CHAR)"),
         ("VC2_BYTE", "VARCHAR2(10 BYTE)"),
-        ("CH", "CHAR(5)"),
+        ("CH_CHAR", "CHAR(5 CHAR)"),
+        ("CH_BYTE", "CHAR(5 BYTE)"),
         ("NCH", "NCHAR(5)"),
         ("NVC2", "NVARCHAR2(5)"),
         ("RW", "RAW(8)"),
@@ -635,6 +687,49 @@ fn columns_of_type_name_matches_oracles_own_precision_scale_and_length_rules() {
             type_names.get(*column)
         );
     }
+
+    exec_quietly(connection.as_mut(), &format!("DROP TABLE {table} PURGE"));
+    connection.close().expect("close");
+}
+
+/// M2.8 delta review: `COLUMNS_OF_SQL`'s `AND COLUMN_ID IS NOT NULL` was
+/// previously covered only by a SQL-text unit test
+/// (`columns_of_sql_excludes_invisible_columns`); this proves the exclusion
+/// against a real `INVISIBLE` column, live.
+#[test]
+fn columns_of_excludes_an_invisible_column() {
+    let mut connection = connect();
+    let driver = OracleThinDriver::new();
+    let owner = current_owner(connection.as_mut());
+    let table = unique("m28inv");
+
+    exec(
+        connection.as_mut(),
+        &format!("CREATE TABLE {table} (visible_col NUMBER, hidden_col NUMBER INVISIBLE)"),
+    );
+
+    let prepared = driver
+        .metadata_catalog()
+        .prepare(MetadataRequest::columns_of(owner, stored(&table)))
+        .expect("columns_of is supported");
+    let batch = run(connection.as_mut(), &prepared);
+
+    let names: Vec<String> = (0..batch.row_count())
+        .map(|row| text_cell(&batch, row, 1).unwrap_or_default())
+        .collect();
+    assert!(
+        names.contains(&"VISIBLE_COL".to_owned()),
+        "the visible column should still be listed: {names:?}"
+    );
+    assert!(
+        !names.contains(&"HIDDEN_COL".to_owned()),
+        "an INVISIBLE column must not appear in a ColumnsOf listing: {names:?}"
+    );
+    assert_eq!(
+        batch.row_count(),
+        1,
+        "only the visible column should be listed: {names:?}"
+    );
 
     exec_quietly(connection.as_mut(), &format!("DROP TABLE {table} PURGE"));
     connection.close().expect("close");
