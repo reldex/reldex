@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-21T04:20:00+07:00",
+  "updatedAt": "2026-09-24T21:16:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -518,12 +518,6 @@
     "M2 core work (events/async-open/settings/SQL text/driver leftovers) is next and proceeds regardless, per the owner's standing instruction — nothing there depends on how the ADR-0003 ruling comes out"
   ],
   "blockers": [
-    {
-      "title": "CI cannot run: GitHub Actions jobs are not started (account billing / spending limit) — merges frozen since 2026-09-21",
-      "detail": "From 2026-09-21 every GitHub Actions job on the repository ends in about 2 seconds with the annotation 'The job was not started because recent account payments have failed or your spending limit needs to be increased'. The last run that executed was PR #23 (M2.4). Green CI is the gate for every merge, and a run that never started is not green, so PR #22 (M2.6) and everything after it stays unmerged. Work continues on branches stacked on the unmerged ones, with the full local gates on Windows; Linux and macOS are unverified until CI returns. Probable cause: the private repository's included minutes are used up (13 jobs per pull request, several on macOS at the 10x multiplier). Owner action: check 'Billing & plans' for the reldex organization (failed payment or spending limit). Options to cut minutes afterwards: path filters so the Qt and mobile jobs run only when ui/, crates/ffi or the workflows change; macOS jobs only on main and nightly.",
-      "severity": "medium",
-      "since": "2026-09-21"
-    },
     {
       "title": "ADR-0003 not yet accepted: K2 fails as written (cold first paint 903.55 ms vs 150 ms; warm 15.85 ms; cause outside the boundary)",
       "detail": "Spike S15 (M1.8, 2026-09-20) measured all seven kill criteria against the real boundary. No criterion's failure is located in the boundary itself, and both the measurement author and an independent reviewer recommend acceptance — but K2 has no warm/cold qualifier as written, and its cold-process reading fails by ~6x (903.55 ms vs a 150 ms threshold), while the warm path (15.85 ms) passes by ~9x. K1's p99 clause and K3's baseline/metric also need a ruling. The lead does not accept ADR-0003 unilaterally and does not re-open the design; three rulings are requested from the owner instead.",
@@ -669,6 +663,13 @@
       "status": "Proposed — S15 complete, owner ruling requested. Spike S15 (2026-09-20) measured all seven kill criteria; no failure is located in the boundary, but K2 fails as written and K1/K3 need a wording/baseline ruling. Not accepted by the owner.",
       "date": "2026-09-20",
       "link": "docs/decisions/0003-qt-rust-integration.md"
+    },
+    {
+      "id": "OWNER-2026-09-23-UPSTREAM-SYNC",
+      "title": "Upstream oracledb issue reconciliation — maintainer replies and main-branch fixes recorded, no repo pin change",
+      "status": "Read-only reconciliation, 2026-09-23 (docs-only, no code change). All five filed issues (#21-#25) have maintainer replies: #21 (NUMBER x10) and the #22 poisoned-lock panic are fixed on upstream `main` (commits `efcda45`, `6785e95`) but not yet in our pinned beta.3; #22's other two panics (NUMBER index-out-of-bounds, region-encoded TIMESTAMP WITH TIME ZONE) are confirmed still present on `main` and two new issues are drafted per the maintainer's invitation; #23 (call-timeout recovery) was explained as expected DBMS_SESSION.SLEEP/no-OOB behaviour, a pool is recommended, a CPU-bound re-test is pending; #24 (break API) is a known limitation pending a future async API; #25 (TCPS) items 1 and 3 are accepted by the maintainer, item 2 (mutual TLS + private CA) awaits our clarification, drafted. Also found by reading `main`: U-8 (server error code/position discarded) is already fixed there (commit `04b96be`). Issues F and G stay unsubmitted per the 2026-09-19 owner decision; both refreshed against `main` and every fact confirmed unchanged. Full table and drafts: `docs/exec-plans/active/phase-0-spike-results.md` §6.",
+      "date": "2026-09-23",
+      "link": "docs/exec-plans/active/phase-0-spike-results.md"
     }
   ],
   "spikes": [
@@ -1656,11 +1657,15 @@
   "activity": [
     {
       "date": "2026-09-21",
-      "text": "Blocker: GitHub Actions stopped starting jobs (account billing / spending limit). PR #22 (M2.6) passed every local gate but cannot be merged — green CI is the merge gate and the checks never ran. Work continues on stacked branches (M2.7 on top of M2.6, M2.8 alongside); nothing merges until the owner restores CI."
+      "text": "M2.6 done: SessionRegistry with non-blocking open and abandon. Independent review found no leaked connection in 960 randomized sessions and clean lock discipline, and 3 must-fix, all about not hiding transaction loss or blocking shutdown: abandon() reported 'no transaction lost' from a caller-thread snapshot while a queued INSERT was still to run and be rolled back; registry teardown waited N x 500 ms serially although the ADR claimed the waits overlapped (now one deadline: ~0.51 s for 8 stuck sessions); and a DML that dies with its connection re-read the dead connection's cached 'inactive' state. The authoritative answer is now Terminal.transaction_possibly_lost, computed on the worker when the session really ends. The C ABI is unchanged; M2.11 switches the FFI to this path and must carry the new field to the user. CI then exposed a latent M2.5 race (3 in 1,000 runs on main): after a lost session, a second close could answer 'closed cleanly'. Fixed at the root — how a session ended (cleanly / unresolved) is recorded once on the worker and every idempotent close answers from that record; a repeated close on a lost session now reports the loss again (ADR-0002 E7). 3,000-iteration loops, 0 failures."
     },
     {
-      "date": "2026-09-21",
-      "text": "M2.6 done: SessionRegistry with non-blocking open and abandon. Independent review found no leaked connection in 960 randomized sessions and clean lock discipline, and 3 must-fix, all about not hiding transaction loss or blocking shutdown: abandon() reported 'no transaction lost' from a caller-thread snapshot while a queued INSERT was still to run and be rolled back; registry teardown waited N x 500 ms serially although the ADR claimed the waits overlapped (now one deadline: ~0.51 s for 8 stuck sessions); and a DML that dies with its connection re-read the dead connection's cached 'inactive' state. The authoritative answer is now Terminal.transaction_possibly_lost, computed on the worker when the session really ends. The C ABI is unchanged; M2.11 switches the FFI to this path and must carry the new field to the user. CI then exposed a latent M2.5 race (3 in 1,000 runs on main): after a lost session, a second close could answer 'closed cleanly'. Fixed at the root — how a session ended (cleanly / unresolved) is recorded once on the worker and every idempotent close answers from that record; a repeated close on a lost session now reports the loss again (ADR-0002 E7). 3,000-iteration loops, 0 failures."
+      "date": "2026-09-24",
+      "text": "CPU-bound re-test of upstream oracledb issue #23 (docs/exec-plans/active/phase-0-spike-results.md, \"S4 addendum (2026-09-24)\"), on branch probe/call-timeout-cpu-bound: confirmed the maintainer's explanation holds for a plain session-level sleep — a fired call-timeout kills the connection, 3/3 runs — but found it does NOT hold for CPU-bound work. A busy PL/SQL loop, a CPU-heavy SQL join, and a query fetching slow rows all recovered cleanly instead (a plain timeout, session intact, 3/3 runs each): the server does notice the client's interrupt while it is busy on CPU, just not while it is suspended in a sleep. Two of the new tests (crates/drivers/oracle-thin/tests/probe_call_timeout_cpu_bound.rs) are now deterministic canaries for U-6/U-7 in oracledb-upgrade-checklist.md, replacing the old load-dependent 'manual check' entries. This does not reopen ADR-0001 — there is still no on-demand cancel API and the owner's 2026-09-19 decision stands — but it changes what M4.6's honest-no-Cancel UI wording should say for the common case: a fired time limit usually means the statement stopped and the session is fine, not that the connection was lost. A factual reply draft for #23 is ready in phase-0-spike-results.md §6; not yet posted."
+    },
+    {
+      "date": "2026-09-23",
+      "text": "Upstream oracledb issue reconciliation (docs-only, no repo pin change, no code change): re-read all five filed issues (#21-#25) with their comments and diffed upstream `main` against our pinned =26.0.0-beta.3. #21 (NUMBER x10) and the #22 poisoned-lock panic are fixed on `main` (commits `efcda45`, `6785e95`); #22's other two panics (NUMBER index-out-of-bounds, region TIMESTAMP WITH TIME ZONE todo!()) are confirmed still present, and two new issues plus an acknowledgement reply are drafted per the maintainer's explicit invitation. #23 was explained as expected DBMS_SESSION.SLEEP/no-OOB behaviour (pool recommended); a skeleton reply awaits a pending CPU-bound re-test. #24 is a known limitation pending a future async API. #25's items 1 and 3 are accepted by the maintainer; item 2 (mutual TLS + a private CA in one ewallet.pem) got a clarification request back, answered with a precise repro drafted from the S8 evidence and a source read of transport.rs (unchanged on main). Also found: U-8 (server error code/position discarded) is already fixed on main (commit 04b96be), not yet in beta.3. Issues F and G were refreshed against main and every cited fact still holds; both stay unsubmitted per the 2026-09-19 owner decision. New issue drafts also prepared for U-5, U-9, U-11 (bundled) and the transaction-in-progress-flag request; U-8 needs no filing since it is already fixed. Nothing was posted upstream (read-only access); full reconciliation table and all drafts are in phase-0-spike-results.md §6."
     },
     {
       "date": "2026-09-21",
