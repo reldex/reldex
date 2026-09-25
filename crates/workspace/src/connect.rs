@@ -64,6 +64,10 @@ pub trait DriverBinding {
 
     /// The endpoint for a host, port and SID.
     ///
+    /// A binding calls the builder its driver exports for this (the first
+    /// driver's is `sid_endpoint` in `reldex-driver-oracle-thin`, wired in
+    /// M2.11) rather than spelling vendor syntax itself.
+    ///
     /// # Errors
     ///
     /// A `Configuration` [`DbError`] when the driver cannot address a SID, or
@@ -341,7 +345,7 @@ mod tests {
             transport: Transport,
         ) -> Result<Endpoint, DbError> {
             Ok(Endpoint::ConnectString(format!(
-                "sid:{host}:{port}:{sid}:{transport:?}"
+                "fake://{host}:{port}/sid/{sid}?transport={transport:?}"
             )))
         }
 
@@ -375,6 +379,7 @@ mod tests {
             name: "p".to_owned(),
             database: DatabaseType::Oracle,
             environment: Environment::Test,
+            treat_as_production: false,
             endpoint,
             authentication: Authentication::Password {
                 username: "scott".to_owned(),
@@ -438,7 +443,10 @@ mod tests {
         let params = params_for(details, &defaults());
         match params.endpoint() {
             Endpoint::ConnectString(text) => {
-                assert_eq!(text, "sid:db.example.internal:1522:ORCL:Tls");
+                assert_eq!(
+                    text,
+                    "fake://db.example.internal:1522/sid/ORCL?transport=Tls"
+                );
             }
             other => panic!("expected the binding's endpoint, got {other:?}"),
         }

@@ -16,6 +16,7 @@
 //! | 0 | 0 | none | a new, empty file: migrate from version 0 |
 //! | `RLDX` | 1..=[`SCHEMA_VERSION`] | ours | a Reldex store: migrate forward if older |
 //! | `RLDX` | > [`SCHEMA_VERSION`] | — | written by a newer Reldex: **refused** |
+//! | `RLDX` | 0 | some | a header Reldex never writes: **refused** |
 //! | anything else | — | — | not a Reldex store: **refused** |
 //!
 //! A refusal happens before anything is written, including the switch to
@@ -63,13 +64,19 @@ pub(crate) const MIGRATIONS: &[Migration] = &[Migration { to: 1, apply: v1 }];
 /// There is no column for a password, a key or a token, and none may be
 /// added: `the_schema_has_no_column_that_could_hold_a_secret` checks every
 /// column name of every table.
+///
+/// Ids compare `COLLATE NOCASE`: this build writes them in lowercase, but a
+/// row edited by hand in uppercase still names the same profile, so an update
+/// or a delete finds it rather than silently doing nothing.
 const V1: &str = "
 CREATE TABLE profile (
-    id                           TEXT    NOT NULL PRIMARY KEY CHECK (length(id) = 36),
+    id                           TEXT    NOT NULL COLLATE NOCASE PRIMARY KEY
+        CHECK (length(id) = 36),
     name                         TEXT    NOT NULL CHECK (length(name) > 0),
     database_type                TEXT    NOT NULL,
     environment                  TEXT    NOT NULL,
     environment_label            TEXT,
+    treat_as_production          INTEGER NOT NULL CHECK (treat_as_production IN (0, 1)),
     endpoint_kind                TEXT    NOT NULL,
     host                         TEXT,
     port                         INTEGER CHECK (port BETWEEN 1 AND 65535),
@@ -90,7 +97,7 @@ CREATE TABLE profile (
 
 CREATE TABLE setting (
     scope       TEXT    NOT NULL CHECK (scope IN ('application', 'profile', 'worksheet')),
-    scope_id    TEXT    NOT NULL,
+    scope_id    TEXT    NOT NULL COLLATE NOCASE,
     setting_key TEXT    NOT NULL,
     kind        TEXT    NOT NULL,
     int_value   INTEGER,
@@ -124,7 +131,9 @@ pub(crate) enum Header {
 /// `two_opens_racing_on_a_new_file_both_succeed_and_migrate_once` in a loop).
 pub(crate) fn inspect(connection: &Connection) -> Result<Header, StoreError> {
     let (application_id, user_version, objects): (i64, i64, i64) = connection.query_row(
-        "SELECT (SELECT application_id FROM pragma_application_id),                 (SELECT user_version FROM pragma_user_version),                 (SELECT count(*) FROM sqlite_schema)",
+        "SELECT (SELECT application_id FROM pragma_application_id), \
+                (SELECT user_version FROM pragma_user_version), \
+                (SELECT count(*) FROM sqlite_schema)",
         [],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
@@ -135,6 +144,13 @@ pub(crate) fn inspect(connection: &Connection) -> Result<Header, StoreError> {
                 found: version,
                 supported: SCHEMA_VERSION,
             });
+        }
+        // The identity and the version are set in the transaction that
+        // creates the tables, so "ours, version 0, with tables" is a header
+        // this build never writes. Migrating from 0 would fail half-way on
+        // the existing tables at best; refuse before anything is written.
+        if version == 0 && objects > 0 {
+            return Err(StoreError::IncompleteHeader);
         }
         return Ok(Header::Reldex { version });
     }

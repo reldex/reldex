@@ -6,7 +6,8 @@ the connect-timeout, time-limit, trigger-rewrite and fetch-size defaults) and 20
 (`docs/exec-plans/active/phase-1.md` §C.3 items 5 app id `com.reldex.reldex`, 7 secrets only in the
 OS credential store with no plaintext fallback, 8 one SQLite file via `rusqlite` with bundled
 SQLite, 9 no telemetry). Nothing here needed a new owner decision.
-**Date:** 2026-09-24
+**Date:** 2026-09-24; revised 2026-09-25 with the independent review's follow-ups (credential
+guard in endpoints, production flag, SID builder moved into the driver, store hardening).
 **Task:** M2.9 ★ (`phase-1.md` §C.2)
 
 ## Context
@@ -51,12 +52,14 @@ depending on `reldex-db-driver-api` only — not on `reldex-db-core`, and on no 
   `Store` and a `SessionRegistry` side by side; neither needs the other's crate.
 
 `ARCHITECTURE.md` §2 draws "workspace" inside the Core box; it still is — vendor-neutral,
-UI-independent Rust — just not inside the `db-core` crate.
+UI-independent Rust — as a crate of its own beside `db-core`, not inside it.
+`tests/dependency_rules.rs` checks the rule both ways.
 
 ### P2 — Settings: a typed registry, three levels, provenance
 
 **Registry.** Every setting is a `SettingId` variant with a static `SettingDescriptor`: stable
-storage key (SQLite only; never crosses a layer), group, value kind, built-in default, the set of
+storage key (SQLite only and crate-private; it never crosses a layer — the FFI, M2.11, names a
+setting by a numeric id of its own), group, value kind, built-in default, the set of
 levels it may be set at, numeric bounds, whether "no limit" is accepted and — if so — *which*
 consequence a UI must state (`NoLimitConsequence`), and when a change takes effect
 (`NextConnection` / `NextStatement`). Code that knows which setting it means uses typed handles —
@@ -74,7 +77,7 @@ value inherits.
 | `results.fetch_rows` | 1,000 | application, profile, worksheet | 1–100,000 | — | next statement |
 | `results.fetches_in_flight` | 2 | application | 1–8 | — | next result |
 | `server_output.enabled` | off | application, profile, worksheet | — | — | next statement |
-| `server_output.buffer` | 1,000,000 bytes | application, profile, worksheet | 1 B–1 GiB | yes — server buffers without limit | next statement |
+| `server_output.buffer` | 1,000,000 bytes | application, profile, worksheet | 2,000 B–1 GiB | yes — server buffers without limit | next statement |
 
 Where each number comes from: 15 s and "can be off", 600 s and "no limit", the trigger rewrite on
 with a per-connection off switch — owner decisions 2026-09-19. The connect-timeout bound is the
@@ -84,9 +87,14 @@ Oracle thin driver's own `MAX_CONNECT_TIMEOUT` (a larger setting would be silent
 sign-off on the number is still open (§C.3 item 10, M5.6), and it is a setting either way. Server
 output off — M2.7 (a round trip per statement when on). The 1,000,000-byte buffer is the lead's
 default: bounded, so one runaway loop cannot make a statement's drain unbounded while the drain
-itself has no bound (M2.13); "unlimited", which is SQL\*Plus's choice, is one setting away.
+itself has no bound (M2.13); "unlimited", which is SQL\*Plus's choice, is one setting away. Its
+lower bound, 2,000 bytes, is the smallest buffer the first driver's server honours — a smaller
+request is silently raised to it (measured in M2.7) — so the setting never promises a limit that
+does not hold; the upper bound is the setting's own, a driver clamps to what its server accepts and
+reports the size in force (ADR-0002 T1).
 `fetches_in_flight` is application-only because it tunes the one result pipeline a process has,
-not a connection; widening a setting's levels later is a compatible change.
+not a connection — **accepted** as such by the review; widening a setting's levels later is a
+compatible change.
 
 **Resolution.** `ResolveContext::new().with_application(&a).with_profile(&p).with_worksheet(&w)`
 then `resolve(SETTING) -> Resolved<T> { value, source: Level }`, where
@@ -113,9 +121,14 @@ being everything the user edits:
 - `database: DatabaseType` — `#[non_exhaustive]`, `Oracle` only today. Naming the vendor here is the
   technical-compatibility use `AGENTS.md` allows; nothing vendor-specific *happens* in the crate.
 - `environment` — `SPEC.md` §17's six: Development, Test, UAT, Staging, Production, Custom(label).
-  Only `Production` gets the indicator; a custom label is never guessed at.
+- `treat_as_production: bool` — whether the production indicator shows, the one thing M3.4 reads
+  (never the enum). Validation ties it to the environment: always `true` for `Production`, always
+  `false` for the other named environments, the user's explicit choice for `Custom` — a custom
+  label is never guessed at. `ProfileDetails::new` starts it at `Environment::production_by_default`.
 - `endpoint` — `HostPort { host, port, target: ServiceName | Sid }` or `ConnectString(text)`, typed
-  variants rather than one string.
+  variants rather than one string. `Debug` of a connect string prints only its length
+  (`ConnectString(<redacted, N bytes>)`): it is the one field whose content the crate cannot vouch
+  for.
 - `authentication` — `Password { username, storage: CredentialStore | PromptEachTime }` or
   `External`. **There is no password field anywhere.**
 - `role` — `SessionRole` (normal, SYSDBA, SYSOPER).
@@ -124,8 +137,13 @@ being everything the user edits:
   opt-out, off by default.
 
 Validation is shallow on purpose — non-empty, bounded length, no control characters (line breaks
-allowed only in a connect string), port ≠ 0, CA path valid Unicode — because whether a host
-resolves or a descriptor parses is the driver's to say, at connect time.
+allowed only in a connect string), port ≠ 0, CA path valid Unicode, the production flag's rule —
+because whether a host resolves or a descriptor parses is the driver's to say, at connect time.
+The one deeper check is the credential guard in the endpoint's free text (P7).
+
+Every enum a UI matches on — `Level`, `Environment`, `ServiceTarget`, `PasswordStorage`,
+`Transport`, `Scope`, `CredentialPattern`, and the error enums — is `#[non_exhaustive]`, so adding
+a variant is not a breaking change for M3.
 
 ### P4 — Mapping to `db-core`: pure functions and a driver binding
 
@@ -155,14 +173,22 @@ pub trait DriverBinding {
 ```
 
 implemented once per database type by the **composition root** — the only place `ARCHITECTURE.md`
-§2 lets name a concrete driver. For Oracle that is `crates/ffi` (M2.11). Until then the reference
-implementation lives in `crates/workspace/tests/support/oracle_binding.rs`, written against
-`reldex_driver_oracle_thin`'s own `EXT_*` constants (a dev-dependency), so a renamed key breaks a
-test, and M2.11 can lift it unchanged. It builds a SID descriptor whose `PROTOCOL` follows the
-transport (the driver refuses a TLS profile whose descriptor says TCP) and refuses a host or SID
-that is not a plain name, since those are interpolated into a descriptor. `connection_params`
-refuses a binding for another database type, a missing password (the caller prompts), and a
-password offered to an externally authenticated profile.
+§2 lets name a concrete driver. For Oracle that is `crates/ffi` (M2.11). The binding holds **no
+vendor syntax of its own**: it maps options onto the driver's `EXT_*` constants and, for a SID,
+calls the driver's own builder, `reldex_driver_oracle_thin::sid_endpoint(host, port, sid, tls)`.
+That function lives next to the driver's Easy Connect builder (`crates/drivers/oracle-thin/src/
+endpoint.rs`) and shares its plain-name rule — a host or SID that could close a parenthesis or start
+a keyword is refused, not escaped — and its `PROTOCOL` follows TLS (the driver refuses a TLS
+profile whose descriptor says TCP). The Easy Connect path now calls the same module, byte-identical
+to before (tested). A live test, `m2_9_sid_endpoint.rs`, proves the descriptor reaches the
+listener: a wrong password through it gets `ORA-01017` (the SID resolved to an instance), an
+unknown SID is a `Connection` error. Until M2.11 the reference binding lives in
+`crates/workspace/tests/support/oracle_binding.rs` (the driver is a dev-dependency), so a renamed
+key breaks a test and M2.11 can lift it unchanged; the crate's own unit tests use a neutral
+`fake://` binding, so no Oracle syntax lives in `crates/workspace`. `connection_params` validates
+the profile again (so the credential guard applies to the pure mapping too) and refuses a binding
+for another database type, a missing password (the caller prompts), and a password offered to an
+externally authenticated profile.
 
 ### P5 — The SQLite store
 
@@ -171,17 +197,30 @@ password offered to an externally authenticated profile.
 refers to are per machine), `~/Library/Application Support` on macOS, `$XDG_DATA_HOME` (absolute
 only) or `~/.local/share` elsewhere on Unix. Android and iOS derive nothing: their platform layer
 passes a path. Written here (~40 lines of environment lookups) because neither `dirs` nor
-`directories` is in the dependency graph.
+`directories` is in the dependency graph. Only `LOCALAPPDATA`, `HOME` and `XDG_DATA_HOME` are read,
+so they are also how a user or a test points Reldex elsewhere (crate docs). A data directory, not a
+config one, by choice: the file is application data, not a config file a user edits by hand; its
+`-wal`/`-shm` companions must never roam or sync mid-write; and a later history file may move to
+`XDG_STATE_HOME` if it is split out.
+
+**Permissions.** `Store::open_default` creates the directory `0700` and a new store file `0600` on
+Unix, before SQLite touches it (SQLite gives `-wal`/`-shm` the file's mode); existing ones are left
+as they are. Windows is unchanged — `%LOCALAPPDATA%` is already per user.
 
 **Schema 1** — two `STRICT` tables:
 
-- `profile` — one column per `ProfileDetails` field plus `created_at`/`modified_at` (Unix ms).
-  `password_in_credential_store` (0/1) is the only password-related column.
+- `profile` — one column per `ProfileDetails` field (including `treat_as_production`, 0/1) plus
+  `created_at`/`modified_at` (Unix ms). `password_in_credential_store` (0/1) is the only
+  password-related column. Schema 1 has never shipped, so the column was added to it rather than
+  as a step 2.
 - `setting(scope, scope_id, setting_key, kind, int_value, text_value, updated_at)`,
   `PRIMARY KEY (scope, scope_id, setting_key)`, `WITHOUT ROWID`. `scope` is
   `application`/`profile`/`worksheet`, `scope_id` the profile or worksheet UUID (empty for
   application). `kind` names the value kind; `int_value` holds it, `NULL` meaning "no limit" /
   "unlimited"; `text_value` is reserved for enumerated kinds and unused by schema 1.
+- Ids (`profile.id`, `setting.scope_id`) compare `COLLATE NOCASE`: the crate writes lowercase, but a
+  row edited by hand in uppercase still names the same profile, so an update, a delete or a
+  profile-scope write finds it rather than silently doing nothing (tested).
 
 Enumerations are stored as fixed lowercase words and validated in code; `CHECK` constraints are
 kept only for invariants that will never change, because SQLite cannot alter a `CHECK` and a new
@@ -193,9 +232,10 @@ written in the same transaction as the DDL they describe, can be read before any
 and cannot disagree with the schema after a crash. An empty file (id 0, version 0, no objects) is
 migrated from 0; a Reldex file newer than this build is refused with
 `StoreError::NewerSchema { found, supported }`; any other file — including an SQLite database
-that is someone else's — is refused with `StoreError::NotAReldexStore`. Refusal happens **before
-anything is written**, including the WAL switch, so an unfamiliar file is left byte-for-byte as it
-was (tested). The header is read in a single statement: read as three statements, identity,
+that is someone else's — is refused with `StoreError::NotAReldexStore`; and a file with Reldex's
+identity, version 0 and tables already in it — a header Reldex never writes — is refused with
+`StoreError::IncompleteHeader`. Refusal happens **before anything is written**, including the WAL
+switch, so an unfamiliar file is left byte-for-byte as it was (tested for each). The header is read in a single statement: read as three statements, identity,
 version and table count could straddle another process's migration commit, and a store being
 created next door was refused as foreign — found by looping the race test, fixed, and re-looped.
 
@@ -211,19 +251,27 @@ never deleted. Query history (M4.10) and workspace (M6.2) arrive as new steps.
 exist?) cannot race. Converting a new file to WAL is the one step of an open for which SQLite does
 not consult the busy handler — two opens converting one new file at once got `SQLITE_BUSY`
 immediately (found by the race test) — so the store retries that step with a short backoff for up
-to the busy timeout.
+to the busy timeout. The timeout bounds each wait, not an open: one open can chain up to **four**
+waits — the header read, the WAL conversion loop, the header re-read before migrating, and the
+migration's `IMMEDIATE` lock — and on Windows each was measured at up to ~1.5× the timeout
+(SQLite's busy handler sleeps in coarse steps there). There is no overall deadline; this is stated
+on `Store::open*` and in the module docs so the service thread does not assume one.
 
-**Errors, never panics.** `StoreError` is typed: `NewerSchema`, `NotAReldexStore`, `Corrupt` (not a
-database, or damaged pages), `Busy` (lock held past the timeout; nothing written), `CannotOpen`,
-`NoDataDirectory`, `CreateDirectory`, `InvalidProfile`, `InvalidSetting`, `ProfileNotFound`,
-`ProfileExists`, `InvalidRow`, and `Sqlite { code, detail }` for the rest. `rusqlite`'s own error
+**Errors, never panics.** `StoreError` is typed: `NewerSchema`, `NotAReldexStore`,
+`IncompleteHeader`, `SchemaMismatch` (a statement SQLite could not prepare against the file's
+tables — a file altered outside Reldex; SQLite's message names the SQL construct, never a value),
+`Corrupt` (not a database, or damaged pages), `ReadOnly` (`SQLITE_READONLY`: a read-only file or
+medium; reads work, the first write is refused and nothing is written), `Busy` (lock held past the
+timeout; nothing written), `CannotOpen`, `NoDataDirectory`, `CreateDirectory`, `InvalidProfile`,
+`InvalidSetting`, `ProfileNotFound`, `ProfileExists`, `InvalidRow`, and `Sqlite { code, detail }`
+for the rest. `rusqlite`'s own error
 type does not leave the crate. A stored row that no longer decodes or no longer passes its
 descriptor is left out and reported in `Loaded::rejected`, and the level below is used — one bad
 row never hides every profile.
 
 ### P6 — Threading contract
 
-`Store` is `Send`, not `Sync` (checked at compile time). It is owned by the workspace service's own
+`Store` is `Send`, not `Sync` (checked at compile time, and by a `compile_fail` doctest). It is owned by the workspace service's own
 thread — the thread that answers the UI's profile and settings requests — and is **never opened or
 used on the UI thread**: every call is disk I/O and a write can wait for the busy timeout. The UI
 asks that thread and is answered asynchronously, as for database work (`ARCHITECTURE.md` §6). It is
@@ -252,17 +300,40 @@ Enforced by construction, then proved:
    and again after close, in UTF-8, UTF-16LE and UTF-16BE. A positive control (a marker in the
    profile's name, which must be stored) proves the search finds text that is there.
 4. **In `Debug`.** No type in the crate bears a secret; the tests assert that `Debug` of the
-   profile, the store and the resulting `ConnectionParams` does not contain the marker.
+   profile, the store and the resulting `ConnectionParams` does not contain the marker. A connect
+   string's `Debug` prints only its length, in `ProfileEndpoint` and in the stored row alike.
+5. **In the endpoint's free text** — the rule below.
 
 **The M2.10 seam** is `CredentialKey` (= the profile's id) and `Profile::credential_key()`; the
 `CredentialStore` trait itself belongs to M2.10's own crate (its row says so), not here.
 `delete_profile` deletes the profile's setting overrides in the same transaction; deleting the
 password from the credential store is the caller's job, named on the method.
 
-**Limit, stated plainly:** free-text fields store what the user typed. A connect string with a
-password pasted into it would be stored; no vendor-neutral rule can tell a credential from a
-legitimate descriptor (an `@` can be part of a certificate DN). The connection manager (M3.2) must
-not invite credentials in those fields.
+**Rule: credential-looking text in an endpoint is refused.** The host, service name, SID and
+connect string are the one place a user could still paste a password (a connect string copied from
+another tool with the logon in front). `ProfileDetails::validate` — which `Profile::create`,
+`Profile::update`, the store's writes, the store's decoding of a row and `connection_params` all
+run — refuses it with `ProfileError::CredentialInEndpoint { field, pattern: CredentialPattern }`,
+which names the field and the pattern class and **never the text**. Matching is case-insensitive
+and ignores all whitespace:
+
+| `CredentialPattern` | Matches |
+| --- | --- |
+| `WalletPassword` | `wallet_password=` |
+| `QueryParameter` | `?password=` or `&password=` |
+| `PasswordKeyword` | any other `password=`, e.g. `(PASSWORD=…)` in a descriptor |
+| `UserPasswordPrefix` | a `user/password@` prefix: `^[^/@()]+/[^@]+@` |
+
+The rule is vendor-neutral — a guard against credential-looking text, not a parser of anyone's
+syntax — and errs towards refusing; an endpoint that trips it can always be written without the
+pattern. Near-misses stay accepted (a service named `PASSWORDS`, a host `pw.example`, an `@` inside
+a parenthesised certificate DN — all tested). A refused save leaves no trace in the file (scanned).
+A driver cannot add patterns yet: validation runs before a binding is chosen; a
+`DriverBinding` hook can be added when a driver needs one. Hand-offs: the connection manager
+(M3.2) must show this error without echoing the field; M3.7 owns two echoes outside this crate —
+`ConnectionParams`' derived `Debug` prints a connect string verbatim (`db-driver-api`
+`params.rs:228`), and the upstream `oracledb` parser echoes one in
+`invalid connect string: {connect_string}: {reason}` (its `error.rs`).
 
 ### P8 — Dependencies added
 
@@ -295,13 +366,22 @@ the product). No `dirs`, `directories` or `tempfile`: the test temp directory is
   honest wording.
 - M2.10 implements the credential store keyed by `CredentialKey`; nothing here changes.
 - **M2.11 must** lift `tests/support/oracle_binding.rs` into `crates/ffi` behind its Oracle driver
-  feature, run the `Store` on the workspace service thread, and carry `ProfileId` as 16 bytes.
+  feature — it maps extension keys only and wires the driver's `sid_endpoint` — run the `Store` on
+  the workspace service thread, carry `ProfileId` as 16 bytes, and name settings by numeric id.
+- **M3.4** shows the production indicator from `Profile::treat_as_production()`, not from the
+  environment enum.
 - M4.10 and M6.2 add tables as migration steps 2 and 3. M6.2 also decides when a closed
-  worksheet's overrides are deleted (`clear_worksheet_settings`); until a worksheet table exists,
-  worksheet overrides are keyed by id alone.
-- A settings screen that applies several changes at once issues one transaction per setting; values
-  are validated before any write, so only an I/O failure could apply part of a batch. A batch write
-  can be added if M3.6 needs it.
+  worksheet's overrides are deleted (`clear_worksheet_settings`).
+- **Accepted limitations** (review of 2026-09-25, one line each):
+  - The WAL-conversion retry sleeps on the calling thread — the workspace service thread, never
+    the UI thread — for at most the busy timeout.
+  - A settings screen that applies several changes issues one transaction per setting; values are
+    validated before any write, so only an I/O failure could apply part of a batch (a batch write
+    can be added if M3.6 needs it).
+  - Worksheet overrides are keyed by worksheet id alone, with no worksheet table to reference,
+    until M6.2 adds one.
+  - `results.fetches_in_flight` is application-only (P2).
+  - An open has no overall deadline, only a per-wait one (P5).
 - `crates/workspace` is not in the mobile cross-compile workflow's package set yet: the bundled
   SQLite build for Android/iOS is unverified (Phase 4/5).
 - Not decided here and deliberately not built: display settings (M5), the metadata cache (P2), the
@@ -331,7 +411,10 @@ the product). No `dirs`, `directories` or `tempfile`: the test temp directory is
 
 ## Evidence
 
-`cargo test -p reldex-workspace`: 88 tests, no database, no network.
+`cargo test -p reldex-workspace`: 100 tests plus 2 doctests on Windows (101 on Unix, where the
+permissions test runs), no database, no network. `reldex-driver-oracle-thin`: 4 unit tests of the
+endpoint builders, a doctest, and the live `m2_9_sid_endpoint.rs` (2 tests, passed against the
+19c test container).
 
 - Resolution: `truth_table_for_a_setting_allowed_at_every_level` and
   `truth_table_for_a_setting_that_skips_the_worksheet_level` — each level in one of four states (no
@@ -345,17 +428,26 @@ the product). No `dirs`, `directories` or `tempfile`: the test temp directory is
   round-trips at every level it allows and is refused at every level it does not; rejected rows are
   reported, kept, and the level below used.
 - Files (`tests/store_file.rs`): new file in WAL mode with the Reldex identity; a v1 file reopens
-  byte-identical; a newer-version file, a foreign SQLite file and a non-database file are refused
-  with typed errors and left byte-identical; damaged pages give `Corrupt`, not a panic; a missing
-  directory gives `CannotOpen`.
+  byte-identical; a newer-version file, a foreign SQLite file, an identified file with tables but
+  no version and a non-database file are refused with typed errors and left byte-identical (no
+  `-wal`/`-shm` created); tables that differ from their version give `SchemaMismatch`; a read-only
+  file reads and refuses the first write with `ReadOnly`, unchanged; damaged pages give `Corrupt`,
+  not a panic; a missing directory gives `CannotOpen`. In-crate: an uppercase id round-trips
+  through read, update, profile-scope write and delete; on Unix the created directory is `0700`
+  and the file and its WAL `0600`.
 - Concurrency (`tests/two_handles.rs`): a reader is not blocked by a held write lock and sees only
   committed data; a writer with no patience gets `Busy` and writes nothing; a patient writer waits
   and succeeds; an exclusively locked file is `Busy` at open; four opens racing on a new file all
   succeed and exactly one migrates. Looped 200 times sequentially and 100 times as two concurrent
   processes, clean — after the two defects the loop found (P5) were fixed.
-- Mapping (`src/connect.rs`, `tests/connect_oracle_binding.rs`): service, SID (TCP and TCPS) and
-  connect-string endpoints; TLS options; "no connect limit" and "rewrite off" through the driver's
-  own keys; a SID or host that could rewrite the descriptor is refused; and, against the real
+- Mapping (`src/connect.rs`, `tests/connect_oracle_binding.rs`): service, SID (the driver's own
+  descriptor, TLS following the transport) and connect-string endpoints; TLS options; "no connect
+  limit" and "rewrite off" through the driver's own keys; a SID or host that could rewrite the
+  descriptor is refused; and, against the real
   `OracleThinDriver::connect` with no socket opened, an unenforceable `SSL_SERVER_CERT_DN` pin is
   refused without the opt-out and a TLS profile with a plaintext descriptor is refused.
-- No secrets: P7.
+- No secrets: P7 — plus each credential pattern refused (in the connect string, host and service
+  name) with a value-free error, the near-misses accepted, and a file scan after refused saves.
+- Dependency rule (`tests/dependency_rules.rs`): the crate's normal dependencies are exactly
+  `reldex-db-driver-api`, `rusqlite` and `uuid`; `db-core`, the driver contract and every driver
+  depend on neither this crate nor `rusqlite`.

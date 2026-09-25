@@ -27,6 +27,22 @@ pub enum StoreError {
     /// The file is an SQLite database, but not a Reldex store. Nothing was
     /// written to it.
     NotAReldexStore,
+    /// The file carries Reldex's identity but schema version 0, and already
+    /// holds tables: a header Reldex never writes, since the identity and the
+    /// version are set in the transaction that creates the tables. Refused
+    /// before anything is written.
+    IncompleteHeader,
+    /// SQLite refused one of this build's statements against the file's
+    /// tables: a table or column differs from what the file's schema version
+    /// promises — a file altered outside Reldex.
+    SchemaMismatch {
+        /// SQLite's message. It names the construct in this build's SQL
+        /// (`no such column: …`), never a row's values.
+        detail: String,
+    },
+    /// The file, its directory or its media is read-only (`SQLITE_READONLY`),
+    /// so nothing can be saved. Nothing was written.
+    ReadOnly,
     /// The file is not a database, or its contents are damaged.
     Corrupt {
         /// SQLite's description.
@@ -36,11 +52,11 @@ pub enum StoreError {
     /// timeout. Nothing was written; the operation can be retried.
     Busy,
     /// The file could not be opened or created: a missing or unwritable
-    /// directory, read-only media, a permission.
+    /// directory, a permission.
     CannotOpen {
         /// The file.
         path: PathBuf,
-        /// SQLite's description.
+        /// SQLite's or the operating system's description.
         detail: String,
     },
     /// No platform data directory could be found. Platforms without one
@@ -85,6 +101,16 @@ impl fmt::Display for StoreError {
                  build understands up to {supported}) and was not opened"
             ),
             Self::NotAReldexStore => f.write_str("this file is not a Reldex settings store"),
+            Self::IncompleteHeader => f.write_str(
+                "this settings file has Reldex's identity but no schema version, and was not \
+                 opened",
+            ),
+            Self::SchemaMismatch { detail } => write!(
+                f,
+                "the settings store's tables differ from what its schema version promises: \
+                 {detail}"
+            ),
+            Self::ReadOnly => f.write_str("the settings store is read-only; nothing was saved"),
             Self::Corrupt { detail } => write!(f, "the settings store is damaged: {detail}"),
             Self::Busy => f.write_str("the settings store is locked by another connection"),
             Self::CannotOpen { path, detail } => {
@@ -137,12 +163,19 @@ impl From<rusqlite::Error> for StoreError {
                     ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt => {
                         Self::Corrupt { detail }
                     }
+                    ErrorCode::ReadOnly => Self::ReadOnly,
                     _ => Self::Sqlite {
                         code: failure.extended_code,
                         detail,
                     },
                 }
             }
+            // A statement SQLite could not prepare. This build's SQL is fixed
+            // and tested, so against a file at a version it understands this
+            // means the file's tables are not what that version promises.
+            rusqlite::Error::SqlInputError { msg, .. } => Self::SchemaMismatch {
+                detail: msg.clone(),
+            },
             _ => Self::Sqlite {
                 code: -1,
                 detail: error.to_string(),
@@ -158,7 +191,7 @@ impl StoreError {
             rusqlite::Error::SqliteFailure(failure, message)
                 if matches!(
                     failure.code,
-                    ErrorCode::CannotOpen | ErrorCode::PermissionDenied | ErrorCode::ReadOnly
+                    ErrorCode::CannotOpen | ErrorCode::PermissionDenied
                 ) =>
             {
                 Self::CannotOpen {

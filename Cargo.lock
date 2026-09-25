@@ -707,6 +707,7 @@ dependencies = [
  "reldex-db-driver-api",
  "reldex-driver-oracle-thin",
  "rusqlite",
+ "serde_json",
  "uuid",
 ]
 

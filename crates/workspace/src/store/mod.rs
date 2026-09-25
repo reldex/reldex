@@ -18,6 +18,21 @@
 //! and a writer that finds the lock held waits for the busy timeout and then
 //! fails with [`StoreError::Busy`], never a panic and never a partial write.
 //!
+//! The busy timeout bounds each wait, not a whole open: one open can wait up
+//! to four times in a row — reading the header, converting the file to WAL,
+//! re-reading the header before migrating, and taking the migration's
+//! `IMMEDIATE` lock — and on Windows each wait was measured at up to about
+//! 1.5× the timeout (SQLite's busy handler sleeps in coarse steps there).
+//! There is no overall deadline; the service thread must not assume one.
+//!
+//! # Permissions
+//!
+//! [`Store::open_default`] creates the data directory owner-only (`0700`) and
+//! a new store file owner-only (`0600`) on Unix, before SQLite touches it;
+//! SQLite gives the `-wal` and `-shm` files the store file's permissions.
+//! Existing directories and files are left as they are. On Windows the
+//! per-user `%LOCALAPPDATA%` already restricts access to the user.
+//!
 //! # Durability
 //!
 //! Every write is one `IMMEDIATE` transaction: it takes the write lock
@@ -51,6 +66,7 @@ use codec::{DecodeValueError, PROFILE_COLUMNS, ProfileRow};
 
 /// Where a setting value is written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Scope {
     /// The application defaults.
     Application,
@@ -161,6 +177,16 @@ impl StoreOptions {
 ///
 /// See the module documentation for the threading contract: `Send`, not
 /// `Sync`, owned by the workspace service thread, never the UI thread.
+///
+/// ```
+/// fn assert_send<T: Send>() {}
+/// assert_send::<reldex_workspace::Store>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<reldex_workspace::Store>();
+/// ```
 #[derive(Debug)]
 pub struct Store {
     connection: Connection,
@@ -179,13 +205,19 @@ const _: fn() = || {
 impl Store {
     /// Opens (creating if needed) the store at `path`, migrating it forward.
     ///
+    /// Does disk I/O and can wait for another connection's lock up to four
+    /// times, each bounded by the busy timeout but with no overall deadline
+    /// (see the module documentation): call it on the service thread.
+    ///
     /// # Errors
     ///
-    /// [`StoreError::NewerSchema`] and [`StoreError::NotAReldexStore`] before
-    /// anything is written to the file; [`StoreError::Corrupt`] for a file
-    /// that is not a database; [`StoreError::CannotOpen`] for a path that
-    /// cannot be opened; [`StoreError::Busy`] when another connection holds
-    /// the lock throughout the busy timeout.
+    /// [`StoreError::NewerSchema`], [`StoreError::NotAReldexStore`] and
+    /// [`StoreError::IncompleteHeader`] before anything is written to the
+    /// file; [`StoreError::Corrupt`] for a file that is not a database;
+    /// [`StoreError::CannotOpen`] for a path that cannot be opened;
+    /// [`StoreError::ReadOnly`] for a file that cannot be written;
+    /// [`StoreError::Busy`] when another connection holds the lock
+    /// throughout a wait.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         Self::open_with(path, StoreOptions::default())
     }
@@ -209,18 +241,36 @@ impl Store {
 
     /// Opens the store at [`default_store_path`], creating its directory.
     ///
+    /// On Unix a directory it creates is owner-only (`0700`), and so is a
+    /// store file it creates (`0600`); see the module documentation.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NoDataDirectory`] where the platform has none Reldex can
     /// derive (pass an explicit path there), [`StoreError::CreateDirectory`],
-    /// or anything [`Store::open`] returns.
+    /// [`StoreError::CannotOpen`] if the file cannot be created, or anything
+    /// [`Store::open`] returns.
     pub fn open_default() -> Result<Self, StoreError> {
         let directory = default_data_dir().ok_or(StoreError::NoDataDirectory)?;
-        std::fs::create_dir_all(&directory).map_err(|source| StoreError::CreateDirectory {
-            path: directory.clone(),
+        Self::open_in_directory(&directory, StoreOptions::default())
+    }
+
+    /// Creates `directory` and the store file in it, owner-only on Unix, then
+    /// opens the file. What [`Store::open_default`] does with its directory.
+    pub(crate) fn open_in_directory(
+        directory: &Path,
+        options: StoreOptions,
+    ) -> Result<Self, StoreError> {
+        private::create_directory(directory).map_err(|source| StoreError::CreateDirectory {
+            path: directory.to_path_buf(),
             source,
         })?;
-        Self::open(directory.join(STORE_FILE_NAME))
+        let path = directory.join(STORE_FILE_NAME);
+        private::create_file(&path).map_err(|error| StoreError::CannotOpen {
+            path: path.clone(),
+            detail: error.to_string(),
+        })?;
+        Self::open_with(path, options)
     }
 
     /// A private, in-memory store, gone when dropped. For tests and for a
@@ -329,7 +379,7 @@ impl Store {
             &format!(
                 "INSERT INTO profile ({PROFILE_COLUMNS}) VALUES \
                  (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-                 ?18, ?19, ?20) ON CONFLICT (id) DO NOTHING"
+                 ?18, ?19, ?20, ?21) ON CONFLICT (id) DO NOTHING"
             ),
             params![
                 row.id,
@@ -337,6 +387,7 @@ impl Store {
                 row.database_type,
                 row.environment,
                 row.environment_label,
+                row.treat_as_production,
                 row.endpoint_kind,
                 row.host,
                 row.port,
@@ -375,10 +426,10 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let updated = transaction.execute(
             "UPDATE profile SET name = ?2, database_type = ?3, environment = ?4, \
-             environment_label = ?5, endpoint_kind = ?6, host = ?7, port = ?8, \
-             service_name = ?9, sid = ?10, connect_string = ?11, auth_kind = ?12, \
-             username = ?13, password_in_credential_store = ?14, role = ?15, transport = ?16, \
-             ca_directory = ?17, allow_unenforced_certificate_pin = ?18, modified_at = ?19 \
+             environment_label = ?5, treat_as_production = ?6, endpoint_kind = ?7, host = ?8, \
+             port = ?9, service_name = ?10, sid = ?11, connect_string = ?12, auth_kind = ?13, \
+             username = ?14, password_in_credential_store = ?15, role = ?16, transport = ?17, \
+             ca_directory = ?18, allow_unenforced_certificate_pin = ?19, modified_at = ?20 \
              WHERE id = ?1",
             params![
                 row.id,
@@ -386,6 +437,7 @@ impl Store {
                 row.database_type,
                 row.environment,
                 row.environment_label,
+                row.treat_as_production,
                 row.endpoint_kind,
                 row.host,
                 row.port,
@@ -711,6 +763,47 @@ fn enable_wal(connection: &Connection, patience: Duration) -> Result<String, Sto
                 }
                 other => return Err(other),
             },
+        }
+    }
+}
+
+/// Owner-only creation on Unix; plain creation elsewhere.
+mod private {
+    use std::io;
+    use std::path::Path;
+
+    /// Creates `directory` and any missing parents; on Unix each one it
+    /// creates is `0700`. An existing directory is left as it is.
+    pub(super) fn create_directory(directory: &Path) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(directory)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(directory)
+        }
+    }
+
+    /// Creates `path` empty if it does not exist — `0600` on Unix — so SQLite
+    /// opens a file that was private from its first byte. An existing file is
+    /// left as it is.
+    pub(super) fn create_file(path: &Path) -> io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(path) {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error),
         }
     }
 }

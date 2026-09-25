@@ -19,6 +19,7 @@ fn details(name: &str) -> ProfileDetails {
         name: name.to_owned(),
         database: DatabaseType::Oracle,
         environment: Environment::Production,
+        treat_as_production: true,
         endpoint: ProfileEndpoint::HostPort {
             host: "db.example.internal".to_owned(),
             port: 1521,
@@ -231,4 +232,90 @@ fn an_empty_file_is_a_new_store() {
     let store = Store::open(dir.store_path()).expect("open");
     assert_eq!(store.migration().from, 0);
     assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
+}
+
+#[test]
+fn an_identified_file_with_tables_but_no_version_is_refused_and_left_untouched() {
+    // Reldex's identity, schema version 0, and a table: a header Reldex never
+    // writes. Refused before the switch to WAL, which would itself write.
+    let dir = TempDir::new("incomplete");
+    {
+        let raw = Connection::open(dir.store_path()).expect("raw open");
+        raw.pragma_update(None, "application_id", APPLICATION_ID)
+            .expect("pragma");
+        raw.execute_batch("CREATE TABLE profile (id TEXT); INSERT INTO profile VALUES ('x');")
+            .expect("create");
+    }
+    let before = bytes_of(&dir.store_path());
+    assert!(matches!(
+        Store::open(dir.store_path()),
+        Err(StoreError::IncompleteHeader)
+    ));
+    assert_eq!(bytes_of(&dir.store_path()), before, "left byte-for-byte");
+    for suffix in ["-wal", "-shm"] {
+        let mut side = dir.store_path().into_os_string();
+        side.push(suffix);
+        assert!(
+            !std::path::Path::new(&side).exists(),
+            "no {suffix} file: WAL was never switched on"
+        );
+    }
+}
+
+#[test]
+fn tables_that_differ_from_their_version_are_a_schema_mismatch() {
+    // Identity and version say "schema 1", the tables say otherwise: a file
+    // altered outside Reldex. Opening only reads the header; the first
+    // statement that touches the missing column fails with a typed error.
+    let dir = TempDir::new("mismatch");
+    {
+        let raw = Connection::open(dir.store_path()).expect("raw open");
+        raw.execute_batch(
+            "CREATE TABLE profile (id TEXT); \
+             CREATE TABLE setting (scope TEXT, scope_id TEXT, setting_key TEXT);",
+        )
+        .expect("create");
+        raw.pragma_update(None, "application_id", APPLICATION_ID)
+            .expect("pragma");
+        raw.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .expect("pragma");
+    }
+    let store = Store::open(dir.store_path()).expect("the header is current");
+    match store.profiles() {
+        Err(StoreError::SchemaMismatch { detail }) => {
+            assert!(detail.contains("no such column"), "{detail}");
+        }
+        other => panic!("expected SchemaMismatch, got {other:?}"),
+    }
+    assert!(matches!(
+        store.application_settings(),
+        Err(StoreError::SchemaMismatch { .. })
+    ));
+}
+
+#[test]
+fn a_read_only_file_is_a_typed_error_and_nothing_is_written() {
+    let dir = TempDir::new("read-only");
+    let profile = populated(&dir);
+    let set_read_only = |read_only: bool| {
+        let mut permissions = std::fs::metadata(dir.store_path())
+            .expect("metadata")
+            .permissions();
+        permissions.set_readonly(read_only);
+        std::fs::set_permissions(dir.store_path(), permissions).expect("permissions");
+    };
+    set_read_only(true);
+    let before = bytes_of(&dir.store_path());
+    let outcome = Store::open(dir.store_path()).and_then(|mut store| {
+        // Reading a read-only store works; the first write is refused.
+        assert_eq!(
+            store.profile(profile.id()).expect("read"),
+            Some(profile.clone())
+        );
+        store.put_setting(Scope::Application, FETCH_ROWS, 99)
+    });
+    let after = bytes_of(&dir.store_path());
+    set_read_only(false);
+    assert!(matches!(outcome, Err(StoreError::ReadOnly)), "{outcome:?}");
+    assert_eq!(after, before, "nothing was written");
 }

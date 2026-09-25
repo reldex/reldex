@@ -17,6 +17,13 @@
 //! [`reldex_db_driver_api::Secret`] without ever passing through this crate's
 //! store. The owner's rule is "no plaintext fallback, ever" (`phase-1.md`
 //! §C.3 item 7): with no credential store, the user is prompted each time.
+//!
+//! The endpoint's free-text fields are the one place a user could still paste
+//! a password — a connect string copied from another tool with the logon in
+//! front of it. Validation refuses credential-looking text there
+//! ([`CredentialPattern`]) before a profile exists, so neither the store nor
+//! the connect mapping ever sees it; and `Debug` of a connect string prints
+//! only its length.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -49,9 +56,14 @@ pub enum DatabaseType {
     Oracle,
 }
 
-/// The environment a database belongs to (`SPEC.md` §17). Production gets a
-/// persistent visual indicator (M3.4).
+/// The environment a database belongs to (`SPEC.md` §17).
+///
+/// Whether the production indicator shows (M3.4) is the profile's own
+/// [`ProfileDetails::treat_as_production`] flag, not this enum: it is always
+/// set for [`Environment::Production`], never for the other named
+/// environments, and the user's choice for [`Environment::Custom`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Environment {
     /// Development.
     Development,
@@ -63,21 +75,31 @@ pub enum Environment {
     Staging,
     /// Production.
     Production,
-    /// A user-named environment. Not treated as production, whatever it is
-    /// called: the indicator must not depend on guessing from a label.
+    /// A user-named environment. Whether it is treated as production is the
+    /// user's explicit choice, never a guess from the label.
     Custom(String),
 }
 
 impl Environment {
-    /// Whether the production indicator applies.
+    /// The [`ProfileDetails::treat_as_production`] value a new profile in this
+    /// environment starts with: `true` for production only.
     #[must_use]
-    pub const fn is_production(&self) -> bool {
+    pub const fn production_by_default(&self) -> bool {
         matches!(self, Self::Production)
+    }
+
+    /// Whether the user may choose [`ProfileDetails::treat_as_production`]
+    /// here: only for a custom environment. Production is always treated as
+    /// production, and the other named environments never are.
+    #[must_use]
+    pub const fn production_flag_is_settable(&self) -> bool {
+        matches!(self, Self::Custom(_))
     }
 }
 
 /// How a host/port endpoint names the database on that listener.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ServiceTarget {
     /// A service name — what the vendor-neutral `Endpoint::HostPort` carries.
     ServiceName(String),
@@ -88,7 +110,10 @@ pub enum ServiceTarget {
 
 /// Where the database is (`SPEC.md` §17: "host/port; service/SID/descriptor
 /// where applicable").
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// `Debug` prints a connect string's length, never its text: it is the one
+/// endpoint field whose content this crate cannot vouch for.
+#[derive(Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ProfileEndpoint {
     /// A host, a port, and the service or SID on that listener.
@@ -106,10 +131,27 @@ pub enum ProfileEndpoint {
     ConnectString(String),
 }
 
+impl fmt::Debug for ProfileEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HostPort { host, port, target } => f
+                .debug_struct("HostPort")
+                .field("host", host)
+                .field("port", port)
+                .field("target", target)
+                .finish(),
+            Self::ConnectString(text) => {
+                write!(f, "ConnectString(<redacted, {} bytes>)", text.len())
+            }
+        }
+    }
+}
+
 /// Whether the operating system's credential store holds the password.
 ///
 /// The only thing a profile knows about its password.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum PasswordStorage {
     /// The credential store holds it, under [`Profile::credential_key`].
     CredentialStore,
@@ -139,6 +181,7 @@ pub enum Authentication {
 
 /// Whether the transport is encrypted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Transport {
     /// Plain TCP.
     Plain,
@@ -185,6 +228,12 @@ pub struct ProfileDetails {
     pub database: DatabaseType,
     /// Which environment it is.
     pub environment: Environment,
+    /// Whether the production indicator shows for this profile (M3.4 reads
+    /// this, not [`ProfileDetails::environment`]). Must be `true` for
+    /// [`Environment::Production`] and `false` for the other named
+    /// environments; the user's choice for [`Environment::Custom`]. See
+    /// [`Environment::production_by_default`].
+    pub treat_as_production: bool,
     /// Where the database is.
     pub endpoint: ProfileEndpoint,
     /// How the session authenticates.
@@ -194,6 +243,96 @@ pub struct ProfileDetails {
     pub role: SessionRole,
     /// Transport security.
     pub tls: TlsOptions,
+}
+
+impl ProfileDetails {
+    /// Details with the defaults a new profile starts with: an ordinary role,
+    /// plain TCP, and the environment's production default.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        database: DatabaseType,
+        environment: Environment,
+        endpoint: ProfileEndpoint,
+        authentication: Authentication,
+    ) -> Self {
+        let treat_as_production = environment.production_by_default();
+        Self {
+            name: name.into(),
+            database,
+            environment,
+            treat_as_production,
+            endpoint,
+            authentication,
+            role: SessionRole::Normal,
+            tls: TlsOptions::default(),
+        }
+    }
+}
+
+/// A class of credential-looking text refused in an endpoint field.
+///
+/// Names the pattern, never the text: the error that carries it is safe to
+/// log and to show, and a UI must show it without echoing the field (M3.2).
+/// Matching is case-insensitive and ignores all whitespace, so `PASSWORD = x`
+/// and `( password=` are caught as well. The rule is deliberately
+/// vendor-neutral — a guard against credential-looking text, not a parser of
+/// any vendor's syntax — and errs towards refusing: an endpoint that trips it
+/// can always be written without the pattern.
+///
+/// | Pattern | Matches |
+/// | --- | --- |
+/// | [`WalletPassword`](Self::WalletPassword) | `wallet_password=` anywhere |
+/// | [`QueryParameter`](Self::QueryParameter) | `?password=` or `&password=` |
+/// | [`PasswordKeyword`](Self::PasswordKeyword) | `password=` anywhere else, e.g. `(PASSWORD=…)` in a descriptor |
+/// | [`UserPasswordPrefix`](Self::UserPasswordPrefix) | a `user/password@` prefix: `^[^/@()]+/[^@]+@` |
+///
+/// Checked in the host, service name, SID and connect string. A driver
+/// binding cannot add patterns yet: validation runs before any binding is
+/// chosen. A hook on [`crate::DriverBinding`] can be added when a driver
+/// needs one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum CredentialPattern {
+    /// `wallet_password=`.
+    WalletPassword,
+    /// `?password=` or `&password=`: a password as a query parameter.
+    QueryParameter,
+    /// `password=` elsewhere, e.g. `(PASSWORD=…)` inside a descriptor.
+    PasswordKeyword,
+    /// A `user/password@` prefix, the logon form some tools accept in front
+    /// of a connect identifier.
+    UserPasswordPrefix,
+}
+
+impl CredentialPattern {
+    /// The first pattern `text` matches, if any. See the type's table.
+    #[must_use]
+    pub fn find(text: &str) -> Option<Self> {
+        let squeezed: String = text
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect();
+        if squeezed.contains("wallet_password=") {
+            return Some(Self::WalletPassword);
+        }
+        if squeezed.contains("?password=") || squeezed.contains("&password=") {
+            return Some(Self::QueryParameter);
+        }
+        if squeezed.contains("password=") {
+            return Some(Self::PasswordKeyword);
+        }
+        // `^[^/@()]+/[^@]+@`: a non-empty prefix free of `/`, `@` and
+        // parentheses, a slash, at least one character that is not `@`, then
+        // an `@`.
+        let (prefix, rest) = squeezed.split_once('/')?;
+        let prefix_ok = !prefix.is_empty() && !prefix.contains(['@', '(', ')']);
+        match rest.find('@') {
+            Some(at) if prefix_ok && at > 0 => Some(Self::UserPasswordPrefix),
+            _ => None,
+        }
+    }
 }
 
 /// Why profile details were refused.
@@ -221,6 +360,19 @@ pub enum ProfileError {
     /// The CA directory path is not valid Unicode, so it cannot be stored
     /// faithfully.
     PathNotUnicode,
+    /// An endpoint field contains credential-looking text. Value-free: it
+    /// names the field and the pattern, never the text, so a UI can show it
+    /// without echoing the field.
+    CredentialInEndpoint {
+        /// Which field.
+        field: ProfileField,
+        /// Which pattern it matched.
+        pattern: CredentialPattern,
+    },
+    /// [`ProfileDetails::treat_as_production`] contradicts the environment:
+    /// production must show the indicator, and the other named environments
+    /// must not.
+    ProductionFlagMismatch,
 }
 
 /// A profile field, for error reporting.
@@ -272,6 +424,16 @@ impl fmt::Display for ProfileError {
             Self::PathNotUnicode => {
                 f.write_str("the profile's CA directory is not a valid Unicode path")
             }
+            Self::CredentialInEndpoint { field, pattern } => write!(
+                f,
+                "the profile's {field} looks like it contains a credential ({pattern:?}); \
+                 passwords belong in the operating system's credential store, never in a \
+                 profile"
+            ),
+            Self::ProductionFlagMismatch => f.write_str(
+                "the production indicator must be on for a production profile and off for \
+                 the other named environments",
+            ),
         }
     }
 }
@@ -297,12 +459,22 @@ fn check_text(field: ProfileField, text: &str) -> Result<(), ProfileError> {
     Ok(())
 }
 
+/// [`check_text`] for an endpoint field, plus the credential guard.
+fn check_endpoint_text(field: ProfileField, text: &str) -> Result<(), ProfileError> {
+    check_text(field, text)?;
+    match CredentialPattern::find(text) {
+        Some(pattern) => Err(ProfileError::CredentialInEndpoint { field, pattern }),
+        None => Ok(()),
+    }
+}
+
 impl ProfileDetails {
     /// Checks every field.
     ///
     /// Deliberately shallow: whether a host resolves or a descriptor parses is
     /// the driver's to say, at connect time, with its own error. This only
-    /// refuses what could never be a profile.
+    /// refuses what could never be a profile — and credential-looking text in
+    /// an endpoint field ([`CredentialPattern`]).
     ///
     /// # Errors
     ///
@@ -317,21 +489,26 @@ impl ProfileDetails {
         if let Environment::Custom(label) = &self.environment {
             check_text(ProfileField::EnvironmentLabel, label)?;
         }
+        if !self.environment.production_flag_is_settable()
+            && self.treat_as_production != self.environment.production_by_default()
+        {
+            return Err(ProfileError::ProductionFlagMismatch);
+        }
         match &self.endpoint {
             ProfileEndpoint::HostPort { host, port, target } => {
-                check_text(ProfileField::Host, host)?;
+                check_endpoint_text(ProfileField::Host, host)?;
                 if *port == 0 {
                     return Err(ProfileError::PortZero);
                 }
                 match target {
                     ServiceTarget::ServiceName(name) => {
-                        check_text(ProfileField::ServiceName, name)?;
+                        check_endpoint_text(ProfileField::ServiceName, name)?;
                     }
-                    ServiceTarget::Sid(sid) => check_text(ProfileField::Sid, sid)?,
+                    ServiceTarget::Sid(sid) => check_endpoint_text(ProfileField::Sid, sid)?,
                 }
             }
             ProfileEndpoint::ConnectString(text) => {
-                check_text(ProfileField::ConnectString, text)?;
+                check_endpoint_text(ProfileField::ConnectString, text)?;
             }
         }
         match &self.authentication {
@@ -425,6 +602,12 @@ impl Profile {
         &self.details
     }
 
+    /// Whether the production indicator shows for this profile (M3.4).
+    #[must_use]
+    pub const fn treat_as_production(&self) -> bool {
+        self.details.treat_as_production
+    }
+
     /// When it was created.
     #[must_use]
     pub const fn created_at(&self) -> UnixTimeMs {
@@ -447,6 +630,7 @@ mod tests {
             name: "Orders (dev)".to_owned(),
             database: DatabaseType::Oracle,
             environment: Environment::Development,
+            treat_as_production: false,
             endpoint: ProfileEndpoint::HostPort {
                 host: "db.example.internal".to_owned(),
                 port: 1521,
@@ -581,16 +765,165 @@ mod tests {
     }
 
     #[test]
-    fn only_production_gets_the_indicator() {
-        assert!(Environment::Production.is_production());
-        for other in [
-            Environment::Development,
-            Environment::Test,
-            Environment::Uat,
-            Environment::Staging,
-            Environment::Custom("Production".to_owned()),
+    fn the_production_flag_follows_the_environment_and_is_free_only_for_custom() {
+        for (environment, default) in [
+            (Environment::Development, false),
+            (Environment::Test, false),
+            (Environment::Uat, false),
+            (Environment::Staging, false),
+            (Environment::Production, true),
+            (Environment::Custom("Production".to_owned()), false),
         ] {
-            assert!(!other.is_production(), "{other:?}");
+            assert_eq!(
+                environment.production_by_default(),
+                default,
+                "{environment:?}"
+            );
+            let details = ProfileDetails::new(
+                "p",
+                DatabaseType::Oracle,
+                environment.clone(),
+                sample().endpoint,
+                Authentication::External,
+            );
+            assert_eq!(details.treat_as_production, default);
+            assert_eq!(details.validate(), Ok(()));
+            let flipped = ProfileDetails {
+                treat_as_production: !default,
+                ..details
+            };
+            let expected = if environment.production_flag_is_settable() {
+                Ok(())
+            } else {
+                Err(ProfileError::ProductionFlagMismatch)
+            };
+            assert_eq!(flipped.validate(), expected, "{environment:?}");
         }
+        let mut custom = sample();
+        custom.environment = Environment::Custom("DR site".to_owned());
+        custom.treat_as_production = true;
+        assert!(
+            Profile::create(custom)
+                .expect("valid")
+                .treat_as_production()
+        );
+    }
+
+    #[test]
+    fn each_credential_pattern_is_refused_without_echoing_the_text() {
+        let secret = "Hunter2Marker";
+        for (text, pattern) in [
+            (
+                format!("(DESCRIPTION=(ADDRESS=(HOST=h)(PORT=1))(PASSWORD={secret}))"),
+                CredentialPattern::PasswordKeyword,
+            ),
+            (
+                format!("( password = {secret} )(CONNECT_DATA=(SERVICE_NAME=s))"),
+                CredentialPattern::PasswordKeyword,
+            ),
+            (
+                format!("(SECURITY=(WALLET_PASSWORD={secret}))"),
+                CredentialPattern::WalletPassword,
+            ),
+            (
+                format!("tcps://h:2484/s?password={secret}"),
+                CredentialPattern::QueryParameter,
+            ),
+            (
+                format!("tcps://h:2484/s?ssl=true&PASSWORD={secret}"),
+                CredentialPattern::QueryParameter,
+            ),
+            (
+                format!("scott/{secret}@db.example.internal:1521/ORDERS"),
+                CredentialPattern::UserPasswordPrefix,
+            ),
+            (
+                format!("scott / {secret} @ //db:1521/ORDERS"),
+                CredentialPattern::UserPasswordPrefix,
+            ),
+        ] {
+            let mut details = sample();
+            details.endpoint = ProfileEndpoint::ConnectString(text.clone());
+            let error = details.validate().expect_err(&text);
+            assert_eq!(
+                error,
+                ProfileError::CredentialInEndpoint {
+                    field: ProfileField::ConnectString,
+                    pattern
+                }
+            );
+            assert!(!error.to_string().contains(secret), "{error}");
+            assert!(!format!("{error:?}").contains(secret), "{error:?}");
+            assert!(Profile::create(details).is_err());
+        }
+        // The plain-name fields are guarded too.
+        let mut host = sample();
+        host.endpoint = ProfileEndpoint::HostPort {
+            host: format!("scott/{secret}@db"),
+            port: 1521,
+            target: ServiceTarget::Sid("ORCL".to_owned()),
+        };
+        assert_eq!(
+            host.validate(),
+            Err(ProfileError::CredentialInEndpoint {
+                field: ProfileField::Host,
+                pattern: CredentialPattern::UserPasswordPrefix
+            })
+        );
+        let mut service = sample();
+        service.endpoint = ProfileEndpoint::HostPort {
+            host: "db".to_owned(),
+            port: 1521,
+            target: ServiceTarget::ServiceName(format!("ORDERS?password={secret}")),
+        };
+        assert_eq!(
+            service.validate(),
+            Err(ProfileError::CredentialInEndpoint {
+                field: ProfileField::ServiceName,
+                pattern: CredentialPattern::QueryParameter
+            })
+        );
+    }
+
+    #[test]
+    fn near_misses_are_not_credentials() {
+        for text in [
+            "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=h)(PORT=1521))\
+             (CONNECT_DATA=(SERVICE_NAME=PASSWORDS)))",
+            "(DESCRIPTION=(ADDRESS=(HOST=h)(PORT=1))(CONNECT_DATA=(SERVICE_NAME=PASSWORD)))",
+            "pw.example:1521/ORDERS",
+            "pw.example/ORDERS",
+            "tcps://db.example.internal:2484/ORDERS",
+            "//db:1521/ORDERS",
+            "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=h)(PORT=2484))\
+             (SECURITY=(SSL_SERVER_CERT_DN=\"EMAIL=dba@example.com,CN=db\")))",
+        ] {
+            assert_eq!(CredentialPattern::find(text), None, "{text}");
+            let mut details = sample();
+            details.endpoint = ProfileEndpoint::ConnectString(text.to_owned());
+            assert_eq!(details.validate(), Ok(()), "{text}");
+        }
+        let mut service = sample();
+        service.endpoint = ProfileEndpoint::HostPort {
+            host: "pw.example".to_owned(),
+            port: 1521,
+            target: ServiceTarget::ServiceName("PASSWORDS".to_owned()),
+        };
+        assert_eq!(service.validate(), Ok(()));
+    }
+
+    #[test]
+    fn debug_of_a_connect_string_prints_only_its_length() {
+        let text = "(DESCRIPTION=(ADDRESS=(HOST=secret-host.internal)(PORT=1521)))";
+        let endpoint = ProfileEndpoint::ConnectString(text.to_owned());
+        assert_eq!(
+            format!("{endpoint:?}"),
+            format!("ConnectString(<redacted, {} bytes>)", text.len())
+        );
+        let mut details = sample();
+        details.endpoint = endpoint;
+        let profile = Profile::create(details).expect("valid");
+        assert!(!format!("{profile:?}").contains("secret-host"));
+        assert!(format!("{:?}", sample().endpoint).contains("db.example.internal"));
     }
 }

@@ -98,13 +98,17 @@ pub(crate) fn decode_value(
 }
 
 /// One `profile` row, column for column.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// `Debug` prints the connect string's length only, like
+/// [`ProfileEndpoint`]'s.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct ProfileRow {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) database_type: String,
     pub(crate) environment: String,
     pub(crate) environment_label: Option<String>,
+    pub(crate) treat_as_production: i64,
     pub(crate) endpoint_kind: String,
     pub(crate) host: Option<String>,
     pub(crate) port: Option<i64>,
@@ -122,11 +126,49 @@ pub(crate) struct ProfileRow {
     pub(crate) modified_at: i64,
 }
 
+impl std::fmt::Debug for ProfileRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let connect_string = self
+            .connect_string
+            .as_ref()
+            .map(|text| format!("<redacted, {} bytes>", text.len()));
+        f.debug_struct("ProfileRow")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("database_type", &self.database_type)
+            .field("environment", &self.environment)
+            .field("environment_label", &self.environment_label)
+            .field("treat_as_production", &self.treat_as_production)
+            .field("endpoint_kind", &self.endpoint_kind)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("service_name", &self.service_name)
+            .field("sid", &self.sid)
+            .field("connect_string", &connect_string)
+            .field("auth_kind", &self.auth_kind)
+            .field("username", &self.username)
+            .field(
+                "password_in_credential_store",
+                &self.password_in_credential_store,
+            )
+            .field("role", &self.role)
+            .field("transport", &self.transport)
+            .field("ca_directory", &self.ca_directory)
+            .field(
+                "allow_unenforced_certificate_pin",
+                &self.allow_unenforced_certificate_pin,
+            )
+            .field("created_at", &self.created_at)
+            .field("modified_at", &self.modified_at)
+            .finish()
+    }
+}
+
 /// The column list, in [`ProfileRow`] order, for `SELECT` and `INSERT`.
 pub(crate) const PROFILE_COLUMNS: &str = "id, name, database_type, environment, \
-     environment_label, endpoint_kind, host, port, service_name, sid, connect_string, \
-     auth_kind, username, password_in_credential_store, role, transport, ca_directory, \
-     allow_unenforced_certificate_pin, created_at, modified_at";
+     environment_label, treat_as_production, endpoint_kind, host, port, service_name, sid, \
+     connect_string, auth_kind, username, password_in_credential_store, role, transport, \
+     ca_directory, allow_unenforced_certificate_pin, created_at, modified_at";
 
 impl ProfileRow {
     pub(crate) fn from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -136,21 +178,22 @@ impl ProfileRow {
             database_type: row.get(2)?,
             environment: row.get(3)?,
             environment_label: row.get(4)?,
-            endpoint_kind: row.get(5)?,
-            host: row.get(6)?,
-            port: row.get(7)?,
-            service_name: row.get(8)?,
-            sid: row.get(9)?,
-            connect_string: row.get(10)?,
-            auth_kind: row.get(11)?,
-            username: row.get(12)?,
-            password_in_credential_store: row.get(13)?,
-            role: row.get(14)?,
-            transport: row.get(15)?,
-            ca_directory: row.get(16)?,
-            allow_unenforced_certificate_pin: row.get(17)?,
-            created_at: row.get(18)?,
-            modified_at: row.get(19)?,
+            treat_as_production: row.get(5)?,
+            endpoint_kind: row.get(6)?,
+            host: row.get(7)?,
+            port: row.get(8)?,
+            service_name: row.get(9)?,
+            sid: row.get(10)?,
+            connect_string: row.get(11)?,
+            auth_kind: row.get(12)?,
+            username: row.get(13)?,
+            password_in_credential_store: row.get(14)?,
+            role: row.get(15)?,
+            transport: row.get(16)?,
+            ca_directory: row.get(17)?,
+            allow_unenforced_certificate_pin: row.get(18)?,
+            created_at: row.get(19)?,
+            modified_at: row.get(20)?,
         })
     }
 }
@@ -182,6 +225,7 @@ pub(crate) fn encode_profile(profile: &Profile) -> Option<ProfileRow> {
     };
     environment.clone_into(&mut row.environment);
     row.environment_label = label;
+    row.treat_as_production = i64::from(details.treat_as_production);
     match &details.endpoint {
         ProfileEndpoint::HostPort { host, port, target } => {
             row.host = Some(host.clone());
@@ -310,6 +354,7 @@ pub(crate) fn decode_profile(row: ProfileRow) -> Result<Profile, String> {
         name: row.name,
         database,
         environment,
+        treat_as_production: flag(row.treat_as_production, "treat_as_production")?,
         endpoint,
         authentication,
         role,

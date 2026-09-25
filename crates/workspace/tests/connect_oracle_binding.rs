@@ -17,7 +17,7 @@ use reldex_db_driver_api::{
 };
 use reldex_driver_oracle_thin::{
     DEFAULT_CONNECT_TIMEOUT, EXT_ALLOW_UNENFORCED_SERVER_CERT_DN, EXT_CONNECT_TIMEOUT_UNBOUNDED,
-    EXT_REWRITE_TRIGGER_DDL, EXT_WALLET_DIR, MAX_CONNECT_TIMEOUT, OracleThinDriver,
+    EXT_REWRITE_TRIGGER_DDL, EXT_WALLET_DIR, MAX_CONNECT_TIMEOUT, OracleThinDriver, sid_endpoint,
 };
 use reldex_workspace::settings::{
     CONNECT_TIMEOUT, ProfileScope, REWRITE_TRIGGER_DDL, SettingsLayer, TimeLimit,
@@ -34,6 +34,7 @@ fn details(endpoint: ProfileEndpoint, transport: Transport) -> ProfileDetails {
         name: "orders".to_owned(),
         database: DatabaseType::Oracle,
         environment: Environment::Development,
+        treat_as_production: false,
         endpoint,
         authentication: Authentication::Password {
             username: "app".to_owned(),
@@ -134,11 +135,14 @@ fn no_connect_limit_and_rewrite_off_use_the_drivers_own_switches() {
     assert_eq!(flag(&params, EXT_REWRITE_TRIGGER_DDL), Some(false));
 }
 
+/// The descriptor is the driver's own `sid_endpoint`, called with TLS
+/// exactly when the profile requires it (the descriptor's content is that
+/// function's to test, in the driver).
 #[test]
-fn a_sid_becomes_a_descriptor_whose_protocol_follows_the_transport() {
-    for (transport, protocol, mode) in [
-        (Transport::Plain, "(PROTOCOL=TCP)", TlsMode::Disabled),
-        (Transport::Tls, "(PROTOCOL=TCPS)", TlsMode::Required),
+fn a_sid_becomes_the_drivers_descriptor_with_tls_following_the_transport() {
+    for (transport, tls, mode) in [
+        (Transport::Plain, false, TlsMode::Disabled),
+        (Transport::Tls, true, TlsMode::Required),
     ] {
         let params = params(
             details(
@@ -153,16 +157,11 @@ fn a_sid_becomes_a_descriptor_whose_protocol_follows_the_transport() {
         )
         .expect("maps");
         let Endpoint::ConnectString(descriptor) = params.endpoint() else {
-            panic!("a SID is always a descriptor");
+            panic!("a SID is always a connect string");
         };
-        assert!(descriptor.contains(protocol), "{descriptor}");
-        assert!(
-            descriptor.contains("(HOST=10.0.0.5)(PORT=2484)"),
-            "{descriptor}"
-        );
-        assert!(
-            descriptor.contains("(CONNECT_DATA=(SID=ORCL))"),
-            "{descriptor}"
+        assert_eq!(
+            descriptor,
+            &sid_endpoint("10.0.0.5", 2484, "ORCL", tls).expect("plain names")
         );
         assert_eq!(params.tls(), mode);
     }

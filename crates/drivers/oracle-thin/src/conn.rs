@@ -241,23 +241,9 @@ fn build_config(params: &reldex_db_driver_api::ConnectionParams) -> DbResult<Pre
         } => {
             // `Endpoint::HostPort` promises an Easy Connect target, and
             // `Config::set_connect_string` accepts a full TNS descriptor in the
-            // same slot: a host of `(DESCRIPTION=(ADDRESS=(HOST=elsewhere)…)`
-            // would turn an interpolated "host:port/service" into a descriptor
-            // pointing somewhere else entirely, so an imported or synced
-            // connection profile could silently redirect the session. Validate
-            // the two free-text parts; a caller that really wants a descriptor
-            // says so through `Endpoint::ConnectString`.
-            validate_easy_connect(host, "host")?;
-            validate_easy_connect(service, "service name")?;
-            // Easy Connect defaults to plain TCP, so `TlsMode::Required` has to
-            // say `tcps://` explicitly — and the port has to be named, because
-            // upstream's parser defaults an unqualified port to 1521 whatever
-            // the protocol is.
-            if tls {
-                format!("tcps://{host}:{port}/{service}")
-            } else {
-                format!("{host}:{port}/{service}")
-            }
+            // same slot, so the two free-text parts must be plain names; see
+            // `crate::endpoint`, which also builds SID descriptors.
+            crate::endpoint::easy_connect(host, *port, service, tls)?
         }
         Endpoint::ConnectString(value) => value.clone(),
         _ => {
@@ -389,44 +375,6 @@ fn build_config(params: &reldex_db_driver_api::ConnectionParams) -> DbResult<Pre
         warnings,
         names_certificate_parameters: !certificate_request.is_empty(),
     })
-}
-
-/// The characters an Easy Connect host or service name may contain.
-///
-/// Host names, IPv4 literals and Oracle service names are all drawn from
-/// letters, digits, `.`, `-` and `_`; an IPv6 literal additionally needs `:`
-/// inside square brackets. Everything else — parentheses, `=`, `/`, whitespace,
-/// control characters — is refused, because those are what a descriptor is made
-/// of.
-fn validate_easy_connect(value: &str, what: &str) -> DbResult<()> {
-    let refuse = |reason: &str| {
-        Err(DbError::new(
-            ErrorKind::Configuration,
-            format!(
-                "the {what} in this connection's endpoint {reason}. This driver builds an \
-                 Easy Connect string from the host, port and service name, so they must be \
-                 plain names; supply a TNS descriptor through a connect-string endpoint \
-                 instead of hiding one in the {what}"
-            ),
-        ))
-    };
-    let (text, bracketed) = match value.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
-        Some(inner) => (inner, true),
-        None => (value, false),
-    };
-    if text.is_empty() {
-        return refuse("is empty");
-    }
-    if text.len() > 255 {
-        return refuse("is longer than 255 characters");
-    }
-    let allowed = |c: char| {
-        c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' || (bracketed && c == ':')
-    };
-    if !text.chars().all(allowed) {
-        return refuse("contains a character that is not allowed in a plain name");
-    }
-    Ok(())
 }
 
 /// Extension key: the size of the upstream statement cache. **Defaults to 0 on

@@ -28,6 +28,7 @@ fn details(name: &str) -> ProfileDetails {
         name: name.to_owned(),
         database: DatabaseType::Oracle,
         environment: Environment::Test,
+        treat_as_production: false,
         endpoint: ProfileEndpoint::ConnectString("db.example.internal:1521/ORDERS".to_owned()),
         authentication: Authentication::Password {
             username: "app".to_owned(),

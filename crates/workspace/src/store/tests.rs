@@ -10,8 +10,8 @@ use rusqlite::params;
 
 use super::*;
 use crate::profile::{
-    Authentication, DatabaseType, Environment, PasswordStorage, ProfileDetails, ProfileEndpoint,
-    ProfileError, ServiceTarget, TlsOptions, Transport,
+    Authentication, CredentialPattern, DatabaseType, Environment, PasswordStorage, ProfileDetails,
+    ProfileEndpoint, ProfileError, ProfileField, ServiceTarget, TlsOptions, Transport,
 };
 use crate::settings::{
     ByteLimit, CONNECT_TIMEOUT, FETCH_ROWS, FETCHES_IN_FLIGHT, ResolveContext,
@@ -27,6 +27,7 @@ fn details(name: &str) -> ProfileDetails {
         name: name.to_owned(),
         database: DatabaseType::Oracle,
         environment: Environment::Staging,
+        treat_as_production: false,
         endpoint: ProfileEndpoint::HostPort {
             host: "db.example.internal".to_owned(),
             port: 1521,
@@ -57,9 +58,14 @@ fn every_shape() -> Vec<ProfileDetails> {
     .enumerate()
     {
         let mut d = details(&format!("env {index}"));
+        d.treat_as_production = environment.production_by_default();
         d.environment = environment;
         out.push(d);
     }
+    let mut custom_production = details("custom production");
+    custom_production.environment = Environment::Custom("Live (EU)".to_owned());
+    custom_production.treat_as_production = true;
+    out.push(custom_production);
     let mut sid = details("sid");
     sid.endpoint = ProfileEndpoint::HostPort {
         host: "10.0.0.5".to_owned(),
@@ -162,11 +168,12 @@ fn update_keeps_the_creation_time_and_writes_the_new_details() {
     store.insert_profile(&profile).expect("insert");
     let mut changed = details("after");
     changed.environment = Environment::Production;
+    changed.treat_as_production = true;
     profile.update(changed).expect("valid");
     store.update_profile(&profile).expect("update");
     let stored = store.profile(profile.id()).expect("read").expect("present");
     assert_eq!(stored, profile);
-    assert!(stored.details().environment.is_production());
+    assert!(stored.treat_as_production());
 }
 
 #[test]
@@ -495,9 +502,216 @@ fn a_stored_row_is_validated_exactly_like_create() {
     ));
     let missing_flag = ProfileRow {
         password_in_credential_store: None,
-        ..row
+        ..row.clone()
     };
     assert!(codec::decode_profile(missing_flag).is_err());
+    // A production indicator that contradicts the environment is refused
+    // like it is at `create`.
+    let production_without_indicator = ProfileRow {
+        environment: "production".to_owned(),
+        treat_as_production: 0,
+        ..row.clone()
+    };
+    assert!(matches!(
+        codec::decode_profile(production_without_indicator),
+        Err(detail) if detail.contains("production indicator")
+    ));
+    let not_a_flag = ProfileRow {
+        treat_as_production: 2,
+        ..row
+    };
+    assert!(matches!(
+        codec::decode_profile(not_a_flag),
+        Err(detail) if detail.contains("treat_as_production")
+    ));
+}
+
+#[test]
+fn a_stored_connect_string_holding_a_credential_is_rejected_without_echoing_it() {
+    // A row edited outside Reldex, with a password pasted into its connect
+    // string: rejected on load like any invalid row, and neither the report
+    // nor the row's Debug repeats what it held.
+    let marker = "RldxPastedPassword-3e1f";
+    let mut store = store();
+    let profile = Profile::create(details("pasted")).expect("valid");
+    store.insert_profile(&profile).expect("insert");
+    store
+        .connection
+        .execute(
+            "UPDATE profile SET endpoint_kind = 'connect_string', host = NULL, port = NULL, \
+             service_name = NULL, connect_string = ?2 WHERE id = ?1",
+            params![
+                profile.id().to_string(),
+                format!("scott/{marker}@db:1521/ORDERS")
+            ],
+        )
+        .expect("raw update");
+    let loaded = store.profiles().expect("list");
+    assert!(loaded.value.is_empty());
+    assert_eq!(loaded.rejected.len(), 1);
+    let report = format!("{:?}", loaded.rejected[0]);
+    assert!(report.contains("UserPasswordPrefix"), "{report}");
+    assert!(!report.contains(marker), "{report}");
+    let error = store.profile(profile.id()).expect_err("rejected");
+    assert!(!error.to_string().contains(marker), "{error}");
+    assert!(!format!("{error:?}").contains(marker), "{error:?}");
+    let row = store
+        .connection
+        .query_row(
+            &format!("SELECT {PROFILE_COLUMNS} FROM profile"),
+            [],
+            ProfileRow::from_sql,
+        )
+        .expect("row");
+    assert!(!format!("{row:?}").contains(marker));
+}
+
+#[test]
+fn a_credential_in_an_endpoint_never_becomes_a_profile() {
+    let mut pasted = details("pasted");
+    pasted.endpoint =
+        ProfileEndpoint::ConnectString("(DESCRIPTION=(PASSWORD=x)(ADDRESS=(HOST=h)))".to_owned());
+    let expected = ProfileError::CredentialInEndpoint {
+        field: ProfileField::ConnectString,
+        pattern: CredentialPattern::PasswordKeyword,
+    };
+    assert_eq!(Profile::create(pasted.clone()), Err(expected.clone()));
+    let mut store = store();
+    let mut profile = Profile::create(details("clean")).expect("valid");
+    store.insert_profile(&profile).expect("insert");
+    assert_eq!(profile.update(pasted), Err(expected));
+    store
+        .update_profile(&profile)
+        .expect("unchanged profile saves");
+    assert_eq!(
+        store.profile(profile.id()).expect("read"),
+        Some(profile.clone())
+    );
+}
+
+#[test]
+fn an_uppercase_id_written_outside_reldex_still_names_its_profile() {
+    let mut store = store();
+    let profile = Profile::create(details("shouting")).expect("valid");
+    store.insert_profile(&profile).expect("insert");
+    store
+        .put_setting(Scope::Profile(profile.id()), FETCH_ROWS, 42)
+        .expect("put");
+    store
+        .connection
+        .execute_batch(
+            "UPDATE profile SET id = upper(id); \
+             UPDATE setting SET scope_id = upper(scope_id) WHERE scope = 'profile';",
+        )
+        .expect("raw update");
+    let stored_id: String = store
+        .connection
+        .query_row("SELECT id FROM profile", [], |row| row.get(0))
+        .expect("id");
+    assert_eq!(stored_id, profile.id().to_string().to_ascii_uppercase());
+
+    // Read, listed, and its overrides found, under the lowercase id.
+    assert_eq!(
+        store.profile(profile.id()).expect("read"),
+        Some(profile.clone())
+    );
+    assert_eq!(store.profiles().expect("list").value, vec![profile.clone()]);
+    assert_eq!(
+        store
+            .profile_settings(profile.id())
+            .expect("layer")
+            .value
+            .get(FETCH_ROWS),
+        Some(42)
+    );
+    // Updated and overridden in place, not duplicated.
+    let mut renamed = profile.clone();
+    renamed.update(details("quieter")).expect("valid");
+    store
+        .update_profile(&renamed)
+        .expect("update finds the row");
+    store
+        .put_setting(Scope::Profile(profile.id()), FETCH_ROWS, 43)
+        .expect("put finds the profile");
+    let settings: i64 = store
+        .connection
+        .query_row("SELECT count(*) FROM setting", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(settings, 1);
+    // Deleted together with its overrides.
+    assert!(store.delete_profile(profile.id()).expect("delete"));
+    let left: i64 = store
+        .connection
+        .query_row(
+            "SELECT (SELECT count(*) FROM profile) + (SELECT count(*) FROM setting)",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(left, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_and_file_the_store_creates_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "reldex-workspace-perm-{}-{}",
+        std::process::id(),
+        UnixTimeMs::now().as_millis()
+    ));
+    let directory = root.join("nested").join(super::APP_ID);
+    let store = Store::open_in_directory(&directory, StoreOptions::default()).expect("open");
+    let mode = |path: &std::path::Path| {
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode(&directory), 0o700);
+    assert_eq!(mode(&root.join("nested")), 0o700);
+    let file = directory.join(super::STORE_FILE_NAME);
+    assert_eq!(mode(&file), 0o600);
+    let mut wal = file.as_os_str().to_owned();
+    wal.push("-wal");
+    assert_eq!(mode(std::path::Path::new(&wal)), 0o600);
+    drop(store);
+    // A second open of the existing file changes nothing.
+    drop(Store::open_in_directory(&directory, StoreOptions::default()).expect("reopen"));
+    assert_eq!(mode(&file), 0o600);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn open_in_directory_creates_what_is_missing_and_reuses_what_exists() {
+    let root = std::env::temp_dir().join(format!(
+        "reldex-workspace-dir-{}-{}",
+        std::process::id(),
+        UnixTimeMs::now().as_millis()
+    ));
+    let directory = root.join("a").join("b");
+    let mut store = Store::open_in_directory(&directory, StoreOptions::default()).expect("open");
+    store
+        .put_setting(Scope::Application, FETCH_ROWS, 7)
+        .expect("put");
+    drop(store);
+    let store = Store::open_in_directory(&directory, StoreOptions::default()).expect("reopen");
+    assert_eq!(
+        store
+            .application_settings()
+            .expect("layer")
+            .value
+            .get(FETCH_ROWS),
+        Some(7)
+    );
+    assert_eq!(
+        store.path(),
+        Some(directory.join(super::STORE_FILE_NAME).as_path())
+    );
+    drop(store);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

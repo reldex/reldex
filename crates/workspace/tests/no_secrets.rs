@@ -77,6 +77,7 @@ fn a_password_used_for_a_connection_never_reaches_the_sqlite_file() {
         name: format!("orders {NAME_MARKER}"),
         database: DatabaseType::Oracle,
         environment: Environment::Production,
+        treat_as_production: true,
         endpoint: ProfileEndpoint::HostPort {
             host: "db.example.internal".to_owned(),
             port: 2484,
@@ -101,6 +102,7 @@ fn a_password_used_for_a_connection_never_reaches_the_sqlite_file() {
     store.insert_profile(&profile).expect("insert");
     let mut edited = profile.details().clone();
     edited.environment = Environment::Staging;
+    edited.treat_as_production = false;
     profile.update(edited).expect("valid");
     store.update_profile(&profile).expect("update");
     store
@@ -178,4 +180,67 @@ fn a_password_used_for_a_connection_never_reaches_the_sqlite_file() {
         contains(&closed_bytes, NAME_MARKER.as_bytes()),
         "positive control: the stored name must be found"
     );
+}
+
+/// A password pasted into an endpoint — the one free-text place a user could
+/// put one — is refused before a profile exists, so no store write can carry
+/// it: after every attempt the file and its WAL hold no trace of it.
+#[test]
+fn a_password_pasted_into_an_endpoint_is_refused_and_never_stored() {
+    let dir = TempDir::new("pasted");
+    let mut store = Store::open(dir.store_path()).expect("open");
+    let clean = ProfileDetails {
+        name: format!("clean {NAME_MARKER}"),
+        database: DatabaseType::Oracle,
+        environment: Environment::Development,
+        treat_as_production: false,
+        endpoint: ProfileEndpoint::ConnectString("db.example.internal:1521/ORDERS".to_owned()),
+        authentication: Authentication::Password {
+            username: "app".to_owned(),
+            storage: PasswordStorage::PromptEachTime,
+        },
+        role: SessionRole::Normal,
+        tls: TlsOptions::default(),
+    };
+    let mut profile = Profile::create(clean.clone()).expect("valid");
+    store.insert_profile(&profile).expect("insert");
+
+    for endpoint in [
+        ProfileEndpoint::ConnectString(format!(
+            "(DESCRIPTION=(ADDRESS=(HOST=db)(PORT=1521))(PASSWORD={SECRET_MARKER}))"
+        )),
+        ProfileEndpoint::ConnectString(format!("app/{SECRET_MARKER}@db:1521/ORDERS")),
+        ProfileEndpoint::ConnectString(format!("tcps://db:2484/ORDERS?password={SECRET_MARKER}")),
+        ProfileEndpoint::ConnectString(format!("(SECURITY=(WALLET_PASSWORD={SECRET_MARKER}))")),
+        ProfileEndpoint::HostPort {
+            host: format!("app/{SECRET_MARKER}@db"),
+            port: 1521,
+            target: ServiceTarget::ServiceName("ORDERS".to_owned()),
+        },
+    ] {
+        let pasted = ProfileDetails {
+            endpoint,
+            ..clean.clone()
+        };
+        let created = Profile::create(pasted.clone());
+        assert!(created.is_err(), "create must refuse");
+        let refused = profile.update(pasted).expect_err("update must refuse");
+        assert!(!refused.to_string().contains(SECRET_MARKER), "{refused}");
+        assert!(!format!("{refused:?}").contains(SECRET_MARKER));
+        // The unchanged profile still saves.
+        store.update_profile(&profile).expect("update");
+    }
+
+    let open_bytes = store_bytes(&dir.store_path());
+    drop(store);
+    let closed_bytes = store_bytes(&dir.store_path());
+    for bytes in [&open_bytes, &closed_bytes] {
+        for needle in encodings(SECRET_MARKER) {
+            assert!(!contains(bytes, &needle), "a refused password was stored");
+        }
+        assert!(
+            contains(bytes, NAME_MARKER.as_bytes()),
+            "positive control: the stored name must be found"
+        );
+    }
 }

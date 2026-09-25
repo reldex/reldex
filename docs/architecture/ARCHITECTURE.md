@@ -27,9 +27,10 @@ unresolved and must be answered by `reldex-core-poc` evidence, not by implementa
 +-----------------------------------------------------------+
 |  Boundary              Stable Rust FFI                     |  explicit, typed, versioned
 +-----------------------------------------------------------+
-|  Core (Rust)           db-core                             |  vendor-neutral, UI-independent
+|  Core (Rust)           db-core, workspace                  |  vendor-neutral, UI-independent
 |                        sessions, transactions, query,      |
-|                        results, metadata, workspace        |
+|                        results, metadata; settings,        |
+|                        profiles, local store               |
 +-----------------------------------------------------------+
 |  Driver contract       db-driver-api                       |  vendor-neutral traits + DbError
 +-----------------------------------------------------------+
@@ -325,11 +326,16 @@ Database Cursor -> Batch Fetch -> Result Store -> Virtual Table Model -> Visible
   refused before anything is written. The `Store` is `Send`, not `Sync`, and lives on the workspace
   service thread — never the UI thread. The vendor-specific residue of a profile (a SID endpoint,
   driver extension keys) goes through a `DriverBinding` the composition root supplies (M2.11), so the
-  crate names no vendor key.
+  crate names no vendor key and builds no vendor syntax: the SID descriptor is the driver's own
+  `sid_endpoint` (`crates/drivers/oracle-thin`), which the binding calls. Whether a profile shows the
+  production indicator is its own `treat_as_production` flag (M3.4 reads it), fixed for the named
+  environments and the user's choice for a custom one.
 - **No secret is written to SQLite**, by construction: no stored type and no column can hold one; a
   profile records only whether the credential store holds its password, under `CredentialKey` — the
   profile's UUID — and the password travels from there to `ConnectionParams` as a `Secret`
-  (ADR-0006 P7, tested on the bytes of a real file).
+  (ADR-0006 P7, tested on the bytes of a real file). Credential-looking text pasted into an
+  endpoint's host, service name, SID or connect string is refused at validation with a value-free
+  error, before a profile exists.
 - Credentials use platform secure storage (Windows Credential Manager, Apple Keychain, Android
   Keystore, Linux Secret Service) behind a single core abstraction. Passwords, credentials, keys,
   and tokens are never logged.
@@ -366,7 +372,7 @@ reviewed against the Phase 0 test database — see §13 item 10 for the still-op
 
 ```text
 crates/db-driver-api/          vendor-neutral driver contract + DbError
-crates/db-core/                sessions, transactions, query, results, metadata, workspace
+crates/db-core/                sessions, transactions, query, results, metadata
 crates/sql-text/               reldex-sql-text: vendor-neutral SQL/PL-SQL lexer + statement splitter (M2.4)
 crates/workspace/              reldex-workspace: settings + resolution, connection profiles, SQLite store (M2.9, ADR-0006)
 crates/drivers/oracle-thin/    thin driver: wraps Oracle's `oracledb` crate (ADR-0001); vendor code isolated here

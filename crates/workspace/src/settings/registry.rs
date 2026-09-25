@@ -10,8 +10,9 @@
 //! Settings are identified by [`SettingId`] everywhere a program chooses one,
 //! and by the typed handles below ([`CONNECT_TIMEOUT`], …) wherever the value
 //! is read or written, so the value's Rust type is fixed at compile time. The
-//! only string form is [`SettingId::storage_key`], which exists for the SQLite
-//! file and never crosses a layer boundary.
+//! only string form is the crate-private storage key, which exists for the
+//! SQLite file and never crosses a layer boundary; the FFI (M2.11) names a
+//! setting by a numeric id of its own, never by that key.
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -23,7 +24,11 @@ use super::value::{ByteLimit, SettingType, SettingValue, TimeLimit, ValueKind};
 ///
 /// `effective = worksheet ?? profile ?? application ?? built-in`: the highest
 /// level that holds a value wins, and [`Level::BuiltIn`] always holds one.
+///
+/// `#[non_exhaustive]`, like every enum a UI matches on here: a new level
+/// must not be a breaking change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum Level {
     /// The default compiled into Reldex. Always present, never stored.
     BuiltIn,
@@ -155,6 +160,9 @@ pub struct Bounds {
 /// `#[non_exhaustive]`: settings are added as features land (display options
 /// arrive with the result grid, M5). A setting is never renumbered or
 /// renamed; one that is retired stays readable so an older file loads.
+///
+/// `Display` prints the storage key, for logs and messages. The FFI (M2.11)
+/// identifies a setting by a numeric id it assigns, not by that text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum SettingId {
@@ -205,7 +213,7 @@ impl SettingId {
     /// Storage only: it never crosses a layer boundary, and nothing may parse
     /// meaning out of it. Never changed once released.
     #[must_use]
-    pub const fn storage_key(self) -> &'static str {
+    pub(crate) const fn storage_key(self) -> &'static str {
         self.descriptor().storage_key
     }
 
@@ -213,7 +221,7 @@ impl SettingId {
     /// build does not know may belong to a newer Reldex, and is reported and
     /// kept rather than deleted.
     #[must_use]
-    pub fn from_storage_key(key: &str) -> Option<Self> {
+    pub(crate) fn from_storage_key(key: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|id| id.storage_key() == key)
     }
 }
@@ -635,8 +643,13 @@ const DESCRIPTORS: [SettingDescriptor; 7] = [
         kind: ValueKind::ByteLimit,
         default: SettingValue::ByteLimit(ByteLimit::Bytes(nz(1_000_000))),
         levels: LevelSet::ALL,
+        // 2,000 bytes is the smallest buffer the first driver's server
+        // honours — a smaller request is silently raised to it (measured in
+        // M2.7) — so offering less would promise a limit that does not hold.
+        // The upper bound is the setting's own; a driver clamps to what its
+        // server accepts and reports the size in force.
         bounds: Some(Bounds {
-            min: 1,
+            min: 2_000,
             max: 1 << 30,
         }),
         unlimited: Unlimited::Allowed(NoLimitConsequence::ServerBuffersWithoutLimit),
@@ -737,6 +750,19 @@ mod tests {
         assert_eq!(
             SERVER_OUTPUT_BUFFER.default_value(),
             ByteLimit::Bytes(nz(1_000_000))
+        );
+        assert_eq!(
+            SERVER_OUTPUT_BUFFER.descriptor().bounds(),
+            Some(Bounds {
+                min: 2_000,
+                max: 1 << 30
+            })
+        );
+        assert!(
+            SERVER_OUTPUT_BUFFER
+                .descriptor()
+                .check_value(SettingValue::ByteLimit(ByteLimit::Bytes(nz(1_999))))
+                .is_err()
         );
 
         assert_eq!(FETCH_ROWS.default_value(), 1_000);

@@ -378,7 +378,7 @@ Six milestones. M1 is the de-risking gate and nothing downstream starts until it
 | M2.8 | `[x]` done 2026-09-24 — reviewed twice (2 must-fix fixed); see §B4 item 3 "As implemented" | Metadata catalog descriptor (`MetadataCatalog`) + Oracle dictionary SQL for the 9 object groups | `sonnet` | SPEC §16; spike S12 | Contract + driver | M2.3 | Each group returns a declared column contract; server-side name filter and row cap; permission failures classify as `ErrorKind::Permission`, not driver failure | M |
 | M2.9 ★ | `[ ]` todo | Settings model: three-level resolution with provenance; profile model; SQLite store | `opus` | SPEC §17/§20; owner decisions | `db-core` workspace/settings module + schema | — | `effective = worksheet ?? profile ?? application ?? built-in`, with the source reported; truth-table test; schema migration path; **no secret ever written to SQLite** | L |
 | M2.10 ★ | `[ ]` todo | Credential store: `CredentialStore` trait + Windows Credential Manager implementation | `opus` | SPEC §17; ARCHITECTURE §13 item 9 | `crates/secrets` + core wiring | M2.9 | Password round-trips through Credential Manager keyed by profile UUID; absence of a store means **prompt each time**, never a plaintext fallback; nothing secret in logs or `Debug`; licence of every new dep recorded | M |
-| M2.11 | `[ ]` todo | FFI surface for M2.5–M2.10 + regenerate and verify header | `sonnet` | M1.3 | `crates/ffi` extension | M2.5–M2.10 | `cbindgen --verify` clean; C smoke harness extended | M |
+| M2.11 | `[ ]` todo | FFI surface for M2.5–M2.10 + regenerate and verify header | `sonnet` | M1.3 | `crates/ffi` extension | M2.5–M2.10 | `cbindgen --verify` clean; C smoke harness extended. **M2.9 hand-off:** the production Oracle `DriverBinding` (lift `crates/workspace/tests/support/oracle_binding.rs`) maps extension keys only and wires the driver's `reldex_driver_oracle_thin::sid_endpoint` for SID endpoints; settings cross the ABI by a numeric id, never the storage key; `ProfileId` as 16 bytes (ADR-0006 P4) | M |
 | M2.12 | `[ ]` todo | Server output framing over `RAW`/`LENGTHB` with per-line UTF-8 decoding in Rust, so one invalid line loses only itself | `sonnet` | M2.7 review; ADR-0002 T2 "Known limit" | `oracle-thin` `server_output.rs` change + live test | M2.7 | Today a line that is not valid UTF-8 loses every line of its read (up to 4,096 good lines) through the crate's strict `from_utf8` (`db_value.rs:164`). After this, only that line is lost and it is reported. The `LENGTH4` == Rust char count assumption is gone. Single-byte database character sets no longer exceed `max_bytes` (≈3× today, review N7). | S |
 | M2.13 | `[ ]` todo | Per-statement server-output drain bound: a total cap reported through `dropped`/`failure`, or a cancel flag checked between reads like abandon | `opus` | M2.7 review; ADR-0002 T6 | `db-core` worker change + tests | M2.7, M4.7 | Today the drain has no length bound, cannot be cancelled on Oracle, and holds `Executed` back until it finishes (10M lines ≈ 2.5k round trips). After this, a statement's reply is never held longer than the bound, and what was not read is reported, never silent. This is safe because the next `PUT` purges leftovers (measured, T6). | S |
 
@@ -404,12 +404,19 @@ decision record is ADR-0002 amendment R1–R5, and what M2.11 has to do with `Op
 the row: (1) the output is a crate of its own, `crates/workspace` (`reldex-workspace`), not a
 `db-core` module, so `db-core` stays free of SQLite and keeps its "`db-driver-api` only" dependency
 rule (ADR-0006 P1); (2) the vendor-specific residue of a profile — a SID endpoint and the Oracle
-driver's extension keys — goes through a `DriverBinding` the composition root supplies; the reference
-Oracle binding is test code (`crates/workspace/tests/support/oracle_binding.rs`) and **M2.11 lifts it
-into `crates/ffi`**, together with the workspace service thread that owns the `Store` and a 16-byte
+driver's extension keys — goes through a `DriverBinding` the composition root supplies; the SID
+descriptor itself is built by the driver (`reldex_driver_oracle_thin::sid_endpoint`, next to its
+Easy Connect builder, live-tested), the reference Oracle binding is test code
+(`crates/workspace/tests/support/oracle_binding.rs`) that calls it, and **M2.11 lifts it into
+`crates/ffi`**, together with the workspace service thread that owns the `Store` and a 16-byte
 `ProfileId` in the ABI; (3) no `CredentialStore` trait is defined here — M2.10 owns it; the seam is
 `CredentialKey` (the profile UUID); (4) no display setting is registered yet, since none is decided
-(they come with M5). The C ABI is unchanged and `reldex.h` byte-identical.
+(they come with M5). The independent review (ACCEPT-WITH-FOLLOW-UPS) added: credential-looking text
+in an endpoint is refused with a value-free error and a connect string's `Debug` prints only its
+length (P7); a `treat_as_production` flag M3.4 reads instead of the environment enum (P3); the
+server-output buffer's lower bound is 2,000 bytes; store hardening — `0700`/`0600` on Unix, typed
+`ReadOnly`/`IncompleteHeader`/`SchemaMismatch`, case-insensitive ids, the four-wait open documented
+(P5); and a dependency-rule test. The C ABI is unchanged and `reldex.h` byte-identical.
 
 ---
 
@@ -422,12 +429,12 @@ into `crates/ffi`**, together with the workspace service thread that owns the `S
 | ID | Status | Title | Owner | Inputs | Outputs | Deps | Acceptance | Size |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | M3.1 | `[x]` done 2026-09-25 — reviewed (tab-bar palette must-fix landed); 9/9 offscreen tests; DPI 1×/1.5×/2× | App shell: window, docking-free fixed layout (sidebar / worksheet tabs / output panes), light+dark theme, high-DPI | `sonnet` | SPEC §14 | `ui/app` | M1 gate | Renders at 100/150/200% DPI; theme switch has no restart | M |
-| M3.2 | `[ ]` todo | Connection manager UI: list, create/edit/delete, environment, test-connect | `sonnet` | M2.9 | QML + `ProfileModel` | M2.11 | All `SPEC.md` §17 fields present; environments Dev/Test/UAT/Staging/Production/Custom | L |
+| M3.2 | `[ ]` todo | Connection manager UI: list, create/edit/delete, environment, test-connect | `sonnet` | M2.9 | QML + `ProfileModel` | M2.11 | All `SPEC.md` §17 fields present; environments Dev/Test/UAT/Staging/Production/Custom. **M2.9 hand-off:** endpoint text that looks like a credential is refused with `ProfileError::CredentialInEndpoint { field, pattern }` — show the field and the pattern, never echo the text; offer the "treat as production" choice for a Custom environment only (ADR-0006 P3/P7) | L |
 | M3.3 ★ | `[ ]` todo | Connect flow over the async path, with a bounded timeout and a cancellable "Connecting…" state | `opus` | §B3 | `SessionController` | M2.6, M2.11 | Cancelling a pending connect returns immediately and adopts nothing late; failures show kind + ORA code + cause chain | M |
-| M3.4 | `[ ]` todo | Production indicator: persistent, not colour-only (icon + text + tab badge) | `sonnet` | SPEC §17 | QML | M3.2 | Visible in every place a statement can be run; passes a greyscale check | S |
+| M3.4 | `[ ]` todo | Production indicator: persistent, not colour-only (icon + text + tab badge) | `sonnet` | SPEC §17 | QML | M3.2 | Visible in every place a statement can be run; passes a greyscale check. **M2.9 hand-off:** read `Profile::treat_as_production()`, not the `Environment` enum — always on for Production, the user's choice for Custom (ADR-0006 P3) | S |
 | M3.5 ★ | `[ ]` todo | TCPS UI described exactly as `SPEC.md` §8: user-supplied CA PEM, verification always on; surfaces the descriptor-guard warnings from C-6 | `opus` | SPEC §8; spike S8; PR #5 | QML + wording | M2.3 | No control implies mTLS, wallet files, OS trust store or revocation; `SSL_SERVER_CERT_DN` refusal explains the opt-out rather than failing blankly | M |
 | M3.6 | `[ ]` todo | Settings UI: application defaults, per-profile overrides, provenance shown ("inherited from profile") | `sonnet` | M2.9 | QML | M3.2 | Every default in the product is reachable here (owner rule: every default is user-configurable) | M |
-| M3.7 ★ | `[ ]` todo | Logging/diagnostics: `tracing` + rotating file sink, redaction layer, Qt messages forwarded through the FFI | `opus` | AGENTS "do not log secrets" | `crates/ffi` + core | M2.11 | A test asserts no password, PEM, or token reaches the log at any level; SQL text logged only at `debug` behind an explicit opt-in; connection strings redacted | M |
+| M3.7 ★ | `[ ]` todo | Logging/diagnostics: `tracing` + rotating file sink, redaction layer, Qt messages forwarded through the FFI | `opus` | AGENTS "do not log secrets" | `crates/ffi` + core | M2.11 | A test asserts no password, PEM, or token reaches the log at any level; SQL text logged only at `debug` behind an explicit opt-in; connection strings redacted. **M2.9 hand-off:** two connect-string echoes remain outside `reldex-workspace` (whose own `Debug` prints only a length): `ConnectionParams`' derived `Debug` (`db-driver-api` `params.rs:228`) and upstream `oracledb`'s `invalid connect string: {connect_string}: {reason}` | M |
 
 **Parallelism.** M3.1/M3.2/M3.6 (UI) run alongside M3.3/M3.5/M3.7 (integration). **Review:** M3.3, M3.5, M3.7.
 
