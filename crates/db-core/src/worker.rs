@@ -55,8 +55,8 @@ use std::thread;
 use reldex_db_driver_api::{
     CancelHandle, CancelKind, ColumnKind, ConnectionId, ConnectionParams, Cursor,
     DatabaseConnection, DatabaseDriver, DbError, DbResult, ErrorKind, LobLocator, ResultSetId,
-    RowBatch, SavepointName, ServerOutputSetting, SessionState, Statement, TransactionState,
-    Warning,
+    RowBatch, SavepointName, ServerOutputSetting, SessionState, Statement, StatementKind,
+    TransactionState, Warning,
 };
 
 use crate::events::{RequestId, SessionEvent};
@@ -755,6 +755,20 @@ impl Worker {
             // A server that commits around DDL commonly closes cursors too;
             // treat every open result as invalidated (ADR-0002 D2, "Lifecycle
             // of derived handles").
+            self.release_results();
+        } else if statement_kind == StatementKind::TransactionControl {
+            // A `COMMIT` or `ROLLBACK` typed as text ends the transaction
+            // exactly as the commands do, so it releases exactly what they
+            // release (ADR-0002 amendment X1). The kind cannot tell `COMMIT`
+            // from `SAVEPOINT` or `SET TRANSACTION`, and the core must not
+            // parse SQL to find out, so those two release as well: closing a
+            // result early is the safe error, keeping one the user believes
+            // is transaction-scoped is not. Done before the cursor below is
+            // registered, so a statement that returned one keeps it.
+            //
+            // The transaction tracking is deliberately left alone: the same
+            // ambiguity means this cannot be read as "resolved"
+            // (`SessionShared::note_statement`).
             self.release_results();
         }
 
