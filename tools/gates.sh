@@ -2,9 +2,8 @@
 # tools/gates.sh -- local pre-push / pre-PR gate (ADR-0005, 2026-09-24).
 #
 # Run this before opening or updating a PR. It is a fast local superset of
-# what hosted CI checks (plus the header check, a doc-lint on the crates
-# that are clean today, and, when discoverable/healthy on this machine, the
-# Qt UI build+test and the real-database integration suite), so most
+# what hosted CI checks (plus, when discoverable/healthy on this machine,
+# the Qt UI build+test and the real-database integration suite), so most
 # failures are caught here instead of waiting on a CI round trip.
 #
 # **CI remains the merge gate.** The repository is public specifically so
@@ -37,12 +36,8 @@
 #   test    cargo test --workspace
 #   header  bash crates/ffi/gen-header.sh --check (crates/ffi/include/reldex.h
 #           must not be stale -- ADR-0003 D7)
-#   doc     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps, scoped to the
-#           crates that are clean today (reldex-ffi, reldex-sql-text,
-#           reldex-db-driver-api, reldex-mobile-link-check,
-#           reldex-core-poc, reldex-workspace, reldex-secrets). reldex-driver-mock, reldex-db-core and
-#           reldex-driver-oracle-thin have pre-existing broken/private
-#           intra-doc links, unrelated to this script; not fixed here.
+#   doc     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps.
+#           Same command CI's `doc` job runs (.github/workflows/ci.yml).
 #   ui      bash ui/build.sh --test, only when Qt 6.8 + CMake + Ninja (and,
 #           on Windows, Visual Studio via vswhere.exe) are discoverable;
 #           otherwise SKIP with the specific reason.
@@ -77,7 +72,7 @@ NO_UI=0
 ONLY=""
 
 usage() {
-    sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -201,28 +196,8 @@ do_header() {
     bash crates/ffi/gen-header.sh --check
 }
 
-# Crates that document cleanly today under -D warnings. reldex-driver-mock,
-# reldex-db-core and reldex-driver-oracle-thin do NOT (pre-existing broken
-# and private intra-doc links, unrelated to this change). Scoping the gate
-# to the clean set, rather than fixing or silently dropping the doc gate
-# entirely, is the deliberate choice here.
-DOC_CLEAN_CRATES=(
-    reldex-ffi
-    reldex-sql-text
-    reldex-db-driver-api
-    reldex-mobile-link-check
-    reldex-core-poc
-    reldex-workspace
-    reldex-secrets
-)
-
 do_doc() {
-    local args=(doc --no-deps)
-    local c
-    for c in "${DOC_CLEAN_CRATES[@]}"; do
-        args+=(-p "$c")
-    done
-    RUSTDOCFLAGS="-D warnings" cargo "${args[@]}"
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 }
 
 # Reason string on stdout, exit 0 if discoverable / 1 if not.

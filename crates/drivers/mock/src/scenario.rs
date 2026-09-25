@@ -242,9 +242,9 @@ impl ScriptedError {
 pub struct QueryPlan {
     /// The result columns, in order.
     pub columns: Vec<ColumnSpec>,
-    /// The full result set. [`crate::MockCursor::fetch_batch`] slices this
-    /// according to the caller's requested batch size, so one plan can
-    /// exercise multi-batch fetching and exhaustion.
+    /// The full result set. [`Cursor::fetch_batch`](reldex_db_driver_api::Cursor::fetch_batch)
+    /// slices this according to the caller's requested batch size, so one
+    /// plan can exercise multi-batch fetching and exhaustion.
     pub rows: Vec<Vec<ScriptValue>>,
     /// Fault injection: if set, the `n`th call to `fetch_batch` (counting
     /// from 1) fails with this error instead of returning rows, modelling
@@ -451,7 +451,7 @@ impl fmt::Debug for BlockGate {
 /// race to get right. This is how the S15 FFI/UI spike's "a statement blocked
 /// for 10 seconds must not stall the rest of the UI" scenario is scripted —
 /// see `crates/drivers/mock/tests/block_for_duration.rs` for the full test,
-/// including that a shorter [`crate::Statement::with_deadline`] still fires as
+/// including that a shorter [`Statement::with_deadline`](reldex_db_driver_api::Statement::with_deadline) still fires as
 /// a timeout while the gate is not yet released, exactly as it does for any
 /// other blocked statement (ADR-0002 D2).
 ///

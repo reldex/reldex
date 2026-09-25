@@ -352,7 +352,7 @@ impl MockCursor {
 }
 
 impl Drop for MockCursor {
-    /// Dropping a cursor is driver work too; see [`MockLobStream`]'s `Drop`.
+    /// Dropping a cursor is driver work too; see `MockLobStream`'s `Drop`.
     fn drop(&mut self) {
         self.scenario.record_thread(self.connection_id);
     }
