@@ -8,13 +8,13 @@ use std::sync::Arc;
 
 use reldex_db_driver_api::{
     Column, ColumnData, ColumnMetadata, ConnectionId, DbError, DbResult, ErrorKind, LobKind,
-    LobLocator, LobStream, NullMask, Number, ResultSetId, RowBatch, SqlType, StatementKind,
-    TextColumn,
+    LobLocator, LobStream, NullMask, Number, ResultSetId, RowBatch, SessionState, SqlType,
+    StatementKind, TextColumn,
 };
 
 use super::{
     EndCause, FetchMore, FetchRequest, Fetched, LimitKind, LobCell, LobUnavailable, MoreRows,
-    ResultPhase, ResultStore, SegmentReply, StoreAction,
+    Phase, ResultPhase, ResultStore, SegmentReply, StoreAction,
 };
 use crate::ids::{ResultId, SessionId};
 use crate::session::{ExecuteOutcome, OutValues};
@@ -415,6 +415,33 @@ fn fetch_more_continues_the_same_cursor_one_step_or_without_limit() {
     assert!(!store.fetch_more(FetchMore::Step), "only at a cap");
 }
 
+/// The grid's own row ceiling is no setting, so "Fetch more" cannot raise it
+/// and says so rather than claiming it did.
+#[test]
+fn fetch_more_at_the_row_ceiling_refuses_and_changes_nothing() {
+    let mut store = store_capped(10);
+    run(&mut store, &mut FakeCursor::new(100));
+    // 2,147,483,647 rows are not fetched in a unit test: put the store where
+    // it would be.
+    store.phase = Phase::AtLimit {
+        limit: LimitKind::RowCeiling,
+        more: MoreRows::Yes,
+    };
+    let caps = store.state().caps();
+    for more in [FetchMore::Step, FetchMore::Unlimited] {
+        assert!(!store.fetch_more(more), "{more:?}");
+        assert_eq!(store.state().caps(), caps);
+        assert!(matches!(
+            store.state().phase(),
+            ResultPhase::AtLimit {
+                limit: LimitKind::RowCeiling,
+                ..
+            }
+        ));
+        assert!(pump(&mut store).is_empty());
+    }
+}
+
 #[test]
 fn with_close_cursor_at_limit_the_cursor_is_closed_and_fetch_more_is_gone() {
     let caps = caps(at(10), Cap::Unlimited)
@@ -618,6 +645,56 @@ fn the_session_ending_keeps_every_prefix_and_ends_what_was_not_complete() {
         complete.state().lobs_unavailable(),
         Some(LobUnavailable::SessionEnded)
     );
+}
+
+/// The session is lost under a fetch while more are queued behind it (review
+/// of M5.2): the result is `Failed` with the loss's classification — it says
+/// more than `Ended` — the queued reply is stale, and the LOB cells are
+/// unavailable because the **session** ended, not merely the cursor.
+#[test]
+fn a_fetch_that_loses_the_session_fails_the_result_and_its_lobs_end_with_the_session() {
+    let mut store = store(unlimited(), 10, 3, 40);
+    let mut cursor = FakeCursor::new(1_000);
+    run(&mut store, &mut cursor);
+    store.fetch_all();
+    let due = fetches(&pump(&mut store));
+    assert_eq!(due.len(), 3);
+
+    assert_eq!(
+        store.on_fetched(due[0].ticket(), cursor.answer(due[0])),
+        Fetched::Appended { rows: 10 }
+    );
+    let lost = DbError::new(
+        ErrorKind::NetworkLost,
+        "ORA-03113: end-of-file on communication channel",
+    );
+    assert_eq!(lost.session_state(), SessionState::Lost);
+    assert_eq!(
+        store.on_fetched(due[1].ticket(), Err(lost)),
+        Fetched::Failed
+    );
+    // The worker answers the queued fetch with the session's terminal error.
+    let terminal = DbError::new(ErrorKind::NetworkLost, "session is lost")
+        .with_session_state(SessionState::Lost);
+    assert_eq!(
+        store.on_fetched(due[2].ticket(), Err(terminal)),
+        Fetched::Stale
+    );
+    // The session's `Terminal` follows; it changes neither.
+    store.session_ended();
+
+    let state = store.state();
+    match state.phase() {
+        ResultPhase::Failed { after, error } => {
+            assert_eq!(after, 20);
+            assert_eq!(error.kind(), ErrorKind::NetworkLost);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(state.lobs_unavailable(), Some(LobUnavailable::SessionEnded));
+    assert_eq!(state.fetches_in_flight(), 0);
+    assert_eq!(text(&store, 19), "row 19", "the prefix stays readable");
+    assert!(pump(&mut store).is_empty());
 }
 
 #[test]
@@ -891,8 +968,8 @@ fn lob_cells_are_handles_until_the_transaction_ends_and_never_null_after() {
         panic!("a LOB column");
     };
     assert_eq!(ids, &[41, 0, 42]);
-    // 8 B per id plus the nominal charge for the two present cells.
-    assert!(segment.accounted_bytes() >= 3 * 8 + 2 * (256 - 8));
+    // 8 B per id plus the charge for the two present cells, 320 B each.
+    assert!(segment.accounted_bytes() >= 3 * 8 + 2 * (320 - 8));
 
     let mut store = ResultStore::new(
         result,

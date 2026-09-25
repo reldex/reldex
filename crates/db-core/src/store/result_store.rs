@@ -48,6 +48,11 @@
 //! store knows whether more rows exist. The byte cap is checked before every
 //! submit and requests shrink to fit it; what fetches already in flight carry
 //! when it is reached is the overshoot ADR-0004 accepted limitation 3 bounds.
+//! That bound trusts the declared widths: the observed width is capped at the
+//! declared one, so a column that declares less than it holds — a type
+//! rendered as text, JSON, an understated describe — can make a request carry
+//! more than its estimate, and the overshoot is then bounded by the rows
+//! requested at their actual width.
 //!
 //! # Replies and sequence
 //!
@@ -74,7 +79,7 @@ use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use reldex_db_driver_api::{ColumnMetadata, DbError, DbResult, StatementKind};
+use reldex_db_driver_api::{ColumnMetadata, DbError, DbResult, SessionState, StatementKind};
 
 use crate::events::RequestId;
 use crate::ids::{LobHandle, ResultId};
@@ -632,9 +637,19 @@ impl ResultStore {
     /// "Fetch more" at a cap: raises this result's caps by one more step of
     /// the same size, or lifts them, for this result only, and continues the
     /// same cursor. Returns whether it applied: only a result stopped at a
-    /// cap with its cursor still open can continue.
+    /// row or byte cap with its cursor still open can continue. At the grid's
+    /// own row ceiling ([`LimitKind::RowCeiling`]) nothing can be raised, so
+    /// it returns `false` and changes nothing.
     pub fn fetch_more(&mut self, more: FetchMore) -> bool {
-        if !matches!(self.phase, Phase::AtLimit { .. }) || self.cursor_closed || self.close_due {
+        if !matches!(
+            self.phase,
+            Phase::AtLimit {
+                limit: LimitKind::Rows | LimitKind::Bytes,
+                ..
+            }
+        ) || self.cursor_closed
+            || self.close_due
+        {
             return false;
         }
         self.caps = match more {
@@ -908,8 +923,16 @@ impl ResultStore {
         let outcome = match reply {
             Err(error) => {
                 // The worker closed the cursor after the failed fetch
-                // (ADR-0002 D2), and its LOBs with it.
-                self.lobs = Some(self.lobs.unwrap_or(LobUnavailable::ResultClosed));
+                // (ADR-0002 D2), and its LOBs with it. A failure that lost
+                // the session took every LOB of the session: say that. The
+                // phase stays `Failed`, which says more than `Ended`; the
+                // `Terminal` that follows leaves it (`session_ended`).
+                let reason = if error.session_state() == SessionState::Lost {
+                    LobUnavailable::SessionEnded
+                } else {
+                    LobUnavailable::ResultClosed
+                };
+                self.lobs = Some(self.lobs.unwrap_or(reason));
                 self.cursor_closed = true;
                 self.phase = Phase::Failed {
                     after: self.row_count(),

@@ -326,7 +326,7 @@ mod tests {
             "DOC",
             SqlType::CharacterLob { national: false },
         )];
-        assert_eq!(declared_row_width(&lob), 256 + 1);
+        assert_eq!(declared_row_width(&lob), 320 + 1);
         assert_eq!(declared_row_width(&[]), 1);
     }
 

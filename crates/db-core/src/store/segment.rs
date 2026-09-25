@@ -35,10 +35,15 @@ use crate::ids::{LobHandle, SessionId};
 use crate::store::scaled::{NumberValue, ScaledNumber};
 
 /// What one retained large-object cell is charged against the byte cap, in
-/// place of its 8-byte id: ADR-0004's nominal 256 bytes for the core-side
-/// structures plus an allowance for the driver's parked locator, until M5.5
-/// measures the real per-locator cost.
-pub(crate) const LOB_CELL_BYTES: usize = 256;
+/// place of its 8-byte id: its id, the parked-locator entry on the worker and
+/// the driver's locator.
+///
+/// ADR-0004 set a nominal 256 bytes. The independent review of M5.2 measured
+/// about **288 bytes** of client memory per parked temporary CLOB (one rough
+/// run: 5,000 CLOBs on 19c). This charges 320 bytes, the measurement plus
+/// about 10% for a single run's uncertainty. M5.5 measures the real cost and
+/// replaces the figure.
+pub(crate) const LOB_CELL_BYTES: usize = 320;
 
 /// How a `NUMBER` column of one segment is stored. See the module
 /// documentation.
@@ -355,8 +360,8 @@ impl ResultSegment {
 
     /// The bytes this segment holds, as the byte cap counts them
     /// (ADR-0004 RS3): the capacity of every value vector, buffer, offset
-    /// array and NULL mask, 256 bytes per LOB cell (ADR-0004's nominal
-    /// charge until M5.5 measures one), and the
+    /// array and NULL mask, 320 bytes per LOB cell (a measured estimate with
+    /// a margin, until M5.5 measures one), and the
     /// segment's own structs. Not the allocator's overhead, which is why the
     /// process's private bytes run a few percent above it (ADR-0004 Table 1).
     #[must_use]

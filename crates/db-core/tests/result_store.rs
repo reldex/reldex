@@ -754,6 +754,65 @@ fn losing_the_session_keeps_every_prefix() {
     assert_row(store, &spec, 99);
 }
 
+/// The network drops under a fetch while others are in flight (review of
+/// M5.2): the result is `Failed { after }` with the loss's classification,
+/// replies behind it are stale, the `Terminal` that follows leaves the phase,
+/// and the LOB cells are unavailable because the session ended.
+#[test]
+fn losing_the_session_mid_fetch_fails_the_result_and_ends_its_lobs_with_the_session() {
+    let scenario = support::scenario();
+    let rows = (0..1_000_i64).map(|n| vec![ScriptValue::from(n)]).collect();
+    let plan = QueryPlan::new(vec![ColumnSpec::new("N", SqlType::Number)], rows)
+        .with_fail_on_batch(
+            3,
+            ScriptedError::new(ErrorKind::NetworkLost, "connection reset mid-fetch")
+                .with_native(3113, "ORA-03113: end-of-file on communication channel"),
+        );
+    scenario.on_sql("SELECT n FROM t", Action::query(QuerySource::Fixed(plan)));
+    let mut consumer = Consumer::new(&scenario);
+    let outcome = consumer.execute("SELECT n FROM t");
+    let result = consumer
+        .results
+        .open(&outcome, policy(Cap::Unlimited, 10, 2))
+        .expect("a result")
+        .result();
+    consumer.idle();
+    consumer.fetched.clear();
+
+    consumer.store_mut(result).fetch_all();
+    consumer.until(SessionEvent::is_terminal);
+    consumer.idle();
+
+    assert_eq!(
+        &consumer.fetched[..2],
+        [Fetched::Appended { rows: 10 }, Fetched::Failed],
+        "{:?}",
+        consumer.fetched
+    );
+    assert!(
+        consumer.fetched[2..]
+            .iter()
+            .all(|fetched| *fetched == Fetched::Stale),
+        "every reply behind the loss is stale: {:?}",
+        consumer.fetched
+    );
+    let store = consumer.store(result);
+    let state = store.state();
+    match state.phase() {
+        ResultPhase::Failed { after, error } => {
+            assert_eq!(after, 20);
+            assert_eq!(error.kind(), ErrorKind::NetworkLost);
+            assert_eq!(error.native().map(NativeError::code), Some(3113));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(state.lobs_unavailable(), Some(LobUnavailable::SessionEnded));
+    assert!(
+        matches!(store.value(19, 0), Some(CellValue::Number(n)) if n.to_string() == "19"),
+        "the prefix stays readable"
+    );
+}
+
 #[test]
 fn a_discarded_result_drops_the_replies_still_in_flight() {
     let spec = big(10_000);

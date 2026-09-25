@@ -1171,9 +1171,11 @@ impl Worker {
             }
             Err(err) => {
                 self.shared.note_error(&err);
-                for lob in parked {
-                    self.lobs.remove(&lob);
-                }
+                // The rows fetched are lost, so the cursor cannot continue
+                // honestly: close it, with every LOB parked from it, exactly
+                // as a failed fetch does. The store records the result as
+                // failed and its cursor as closed; the worker now agrees.
+                let _ = self.close_result(id);
                 reply.answer(Err(err));
             }
         }
@@ -1338,6 +1340,7 @@ impl Worker {
     /// from it.
     fn close_result(&mut self, id: ResultSetId) -> DbResult<()> {
         self.lobs.retain(|_, parked| parked.result != Some(id));
+        release_spare_capacity(&mut self.lobs);
         match self.cursors.remove(&id) {
             None => Ok(()),
             Some(cursor) => {
@@ -1364,9 +1367,12 @@ impl Worker {
     /// driver's chance to release server-side state, and the contract makes it
     /// idempotent and safe after the connection is gone (ADR-0002 D2).
     fn release_results(&mut self) {
-        self.lobs.clear();
+        // A fresh map, not `clear()`: a cleared map keeps its capacity, and a
+        // result of many LOBs left about 160 bytes per LOB allocated after its
+        // transaction ended, which no byte cap sees (M5.2 review).
+        self.lobs = HashMap::new();
         let cursors: Vec<Box<dyn Cursor>> =
-            self.cursors.drain().map(|(_, cursor)| cursor).collect();
+            std::mem::take(&mut self.cursors).into_values().collect();
         for cursor in cursors {
             if self.torn.get() {
                 drop(cursor);
@@ -1507,5 +1513,49 @@ impl Worker {
         }
         let torn = &self.torn;
         call(torn, || connection.close())
+    }
+}
+
+/// Gives a map's storage back once it holds less than half of what it could.
+///
+/// Parked LOBs come and go by the thousand with a result; `retain` and
+/// `remove` keep the capacity they leave behind, which is client memory no
+/// byte cap counts. Shrinking only past half keeps the cost amortized O(1)
+/// per removal.
+fn release_spare_capacity<K: std::hash::Hash + Eq, V>(map: &mut HashMap<K, V>) {
+    if map.is_empty() {
+        *map = HashMap::new();
+    } else if map.capacity() > 2 * map.len() + 16 {
+        map.shrink_to_fit();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::release_spare_capacity;
+
+    #[test]
+    fn a_map_emptied_or_mostly_emptied_gives_its_storage_back() {
+        let mut map: HashMap<u64, [u8; 64]> = (0..5_000).map(|key| (key, [0; 64])).collect();
+        assert!(map.capacity() >= 5_000);
+
+        map.retain(|key, _| *key < 3_000);
+        release_spare_capacity(&mut map);
+        assert!(map.capacity() >= 3_000, "more than half left: kept");
+
+        map.retain(|key, _| *key < 10);
+        release_spare_capacity(&mut map);
+        assert!(
+            map.capacity() < 100,
+            "{} left for 10 entries",
+            map.capacity()
+        );
+        assert_eq!(map.len(), 10);
+
+        map.clear();
+        release_spare_capacity(&mut map);
+        assert_eq!(map.capacity(), 0);
     }
 }
