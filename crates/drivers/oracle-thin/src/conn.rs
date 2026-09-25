@@ -545,10 +545,10 @@ pub const EXT_WALLET_PASSWORD: &str = "oracle.wallet_password";
 /// (upstream gap U-18). This driver therefore submits such a statement inside
 /// `BEGIN EXECUTE IMMEDIATE q'…'; END;`, where a quoted string is invisible to
 /// that parser, and puts a [`Warning`] on the outcome saying so and carrying
-/// the exact text sent. See [`crate::rewrite`].
+/// the exact text sent. See the `rewrite` module.
 ///
 /// `ExtensionValue::Flag(false)` turns it off, and the statement is then
-/// refused with the explanatory error [`crate::error::explain_parsed_placeholders`]
+/// refused with the explanatory error `explain_parsed_placeholders`
 /// produces. Every other shape — including a malformed value — leaves the
 /// rewrite **on**, because here "on" is the working configuration rather than
 /// the risky one: this is the opposite default to
