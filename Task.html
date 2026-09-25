@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-25T08:20:00+07:00",
+  "updatedAt": "2026-09-25T08:33:29+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -677,6 +677,13 @@
       "status": "Accepted — owner decision 2026-09-24. The reldex GitHub account's Free-plan Actions minutes (2,000/month, private-repo only) were exhausted 2026-09-21 after >=100 workflow runs; every job since has failed in ~2s on a billing error. Of five options (reduce matrix, self-hosted runner, stop using Actions, wait, go public), the owner's first choice was 'stop using Actions' but switched the same day to making the repository public once the per-run cost (~40 billable min/PR, macOS x10 multiplier) showed a public repo gets Actions minutes free with no cap. ci.yml/ui.yml/mobile-cross-compile.yml are unchanged; hosted CI stays the merge gate; tools/gates.sh is added as a local pre-push/pre-PR check, not a CI replacement. The visibility flip itself is not yet executed — gated on a history exposure scan, run 2026-09-24: no credentials/keys/certificates ever committed; no files over 5 MB; one Android device serial in phase-0-android-device.md redacted at HEAD but present in history (accepted as low risk). Same decision also settles Community/Pro licensing (open since P0): Community edition is GPL-3.0-or-later, copyright (C) 2026 Supawit Nu-iat (LICENSE, COPYRIGHT); Reldex Pro is licensed separately by the copyright holder; external contributions will require a CLA to keep dual licensing possible. PRs #22, #24 and #25 merged 2026-09-21 to 09-24 on local verification only, while CI was down — stated here honestly, not glossed over.",
       "date": "2026-09-24",
       "link": "docs/decisions/0005-public-repository-for-hosted-ci.md"
+    },
+    {
+      "id": "ADR-0006",
+      "title": "Local persistence — settings with three-level resolution and provenance, connection profiles, one SQLite store (crates/workspace)",
+      "status": "Accepted 2026-09-24, revised 2026-09-25 with the independent review's follow-ups. Implements owner decisions already taken (2026-09-19 every default user-configurable with its level; 2026-09-20 app id, secrets only in the OS credential store, one SQLite file via rusqlite with bundled SQLite) — no new owner decision needed. A crate of its own beside db-core (db-core stays free of SQLite); vendor residue through a DriverBinding supplied by the composition root (M2.11); no secret in the file by type, by schema and by byte scan; credential-looking endpoint text refused. Accepted limitations recorded: no overall open deadline (up to four busy waits), one transaction per setting write, worksheet overrides keyed by id until M6.2, fetches_in_flight application-only.",
+      "date": "2026-09-24",
+      "link": "docs/decisions/0006-local-persistence-settings-profiles-sqlite.md"
     }
   ],
   "spikes": [
@@ -1192,8 +1199,8 @@
               "status": "done"
             },
             {
-              "title": "M2.9 ★ Settings model: three-level resolution with provenance; profile model; SQLite store (opus, review mandatory)",
-              "status": "todo"
+              "title": "M2.9 ★ Settings model: three-level resolution with provenance; profile model; SQLite store (opus, review mandatory) — done 2026-09-25: crates/workspace (reldex-workspace) — typed settings registry with worksheet ?? profile ?? application ?? built-in resolution and provenance (4³-state truth tables); connection profiles keyed by random UUID (= credential key) with no password field, a treat_as_production flag, and credential-looking endpoint text refused; one SQLite file (WAL, header identity/version, forward-only migration; foreign, newer and half-written files refused untouched; two open races found by looping and fixed); SID descriptor built by the driver (sid_endpoint, live-tested); no secret in the file (byte scan); independently reviewed (accept with follow-ups, all landed); ADR-0006",
+              "status": "done"
             },
             {
               "title": "M2.10 ★ Credential store: CredentialStore trait + Windows Credential Manager implementation (opus, review mandatory)",
@@ -1672,6 +1679,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-25",
+      "text": "M2.9 done: settings, connection profiles and the local SQLite store now exist as their own crate, with every setting resolved worksheet → profile → application → built-in and the source reported, and no password ever written to the file (checked on the file's bytes). Looping the concurrency tests found two real races when two windows open a brand-new file at once — the switch to WAL mode failing immediately, and the file's header being read across another window's commit so it looked foreign — and both were fixed and re-looped clean. After the independent review, a password pasted into a connect string, host, service name or SID is refused with an error that never repeats the text, and a refused save leaves no trace in the file. The review's other follow-ups also landed: a production flag the UI reads instead of guessing from the environment, the SID descriptor built by the driver itself and tested against the live database, and typed errors for read-only, half-written and altered files. Known limits stay stated in ADR-0006: an open has no overall deadline, and one live timing probe of upstream call-timeout behaviour (probe_call_timeout_cpu_bound, scenario 1) is flaky on main as well as on this branch."
+    },
     {
       "date": "2026-09-25",
       "text": "M6.7 closed as already delivered: the UI workflow has built the Qt project on Windows, Ubuntu and macOS, run the offscreen QML/QTest suite and the C smoke harness, and cached Qt and cargo since M1.4/M1.5. Nothing in CI changed; this change records the evidence (cold jobs 1.6–3.0 minutes per OS against the 25-minute budget from ADR-0003 K7, cache hits confirmed) and closes a real documentation gap — the licences of the four CI-only Actions were never written down."
