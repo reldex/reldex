@@ -127,6 +127,7 @@ mod error;
 mod event;
 mod format;
 mod hub;
+mod metadata;
 mod mock;
 mod session;
 mod splitter;
@@ -159,6 +160,13 @@ pub use hub::{
     ReldexHub, ReldexWakeFn, reldex_hub_create, reldex_hub_destroy, reldex_hub_list_sessions,
     reldex_hub_next_event, reldex_hub_pending_events, reldex_hub_session_count,
     reldex_hub_set_waker,
+};
+pub use metadata::{
+    ReldexMetadataObjectKind, ReldexMetadataQuery, ReldexMetadataRequest,
+    ReldexMetadataRequestKind, reldex_metadata_prepare, reldex_metadata_query_bind_count,
+    reldex_metadata_query_column, reldex_metadata_query_column_count,
+    reldex_metadata_query_reclassify_error, reldex_metadata_query_release,
+    reldex_metadata_query_sql,
 };
 pub use mock::{
     ReldexDriverKind, ReldexMockScenario, ReldexMockScenarioConfig, ReldexMockStatement,

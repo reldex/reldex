@@ -168,6 +168,19 @@ fn the_boundary_stays_small_enough_to_audit() {
     // hour". This is a smoke alarm, not a budget: if the boundary grows past
     // it, the growth should be a deliberate, reviewed decision rather than
     // something that happened.
+    //
+    // Raised once, deliberately, in M2.11: that task adds six FFI families in
+    // one change (server output control, statement splitting, metadata,
+    // settings/profiles/the local store's composition root, credentials, and
+    // history/worksheets/layout) on top of the session family this limit was
+    // originally sized for. 12,000 is not "however big M2.11 happens to
+    // land" — it is sized with headroom above the actual total so the next
+    // *unplanned* crossing is still a signal, and ADR-0003's M2.11 amendment
+    // records the new number and the reasoning next to this one. Growing
+    // past 12,000 without raising this again, deliberately, is the bug this
+    // test exists to catch; reaching it is also the cue to consider whether
+    // the composition-root families (M2.11 items 5-7) belong in a sibling
+    // crate of their own rather than growing `crates/ffi` further.
     let mut files = Vec::new();
     rust_files(&workspace_root().join("crates/ffi/src"), &mut files);
     let lines: usize = files
@@ -176,8 +189,9 @@ fn the_boundary_stays_small_enough_to_audit() {
         .map(|text| text.lines().count())
         .sum();
     assert!(
-        lines < 6_000,
+        lines < 12_000,
         "crates/ffi/src is {lines} lines; ADR-0003 D2 expects a boundary a reviewer can read \
-         in one sitting"
+         in one sitting (raised once already, in M2.11 — see the comment above and ADR-0003's \
+         M2.11 amendment)"
     );
 }
