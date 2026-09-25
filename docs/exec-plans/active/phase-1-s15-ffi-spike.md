@@ -1295,3 +1295,209 @@ of `5b50cbf`. PR #19 touched `ui/CMakeLists.txt`, `ui/build.sh`,
 `phase-1-toolchain.md` and `ui/README.md`. **This task edited none of those
 except `ui/README.md`**, and the two README edits do not overlap: #19's is the
 AddressSanitizer section, this task's is the instrumentation section above it.
+
+## M6.9 — cold first paint follow-up (2026-09-25)
+
+M1's exit-gate item named "the ~800 ms cold first paint" as something not
+ADR-0003's but not to be lost. M6.9 investigates the fix candidates this
+report named and either implements the ones proven to help or reports why
+not. **Result: no code change.** Every low-risk candidate tested gave no
+material gain over a *fresh* baseline (itself lower than this report's
+903.55 ms — see below, and see why before reading anything else here as "cold
+first paint got fixed"), and the two candidates with real potential each
+require either a genuine behaviour change or more than a minimal adapter
+change, so both are recorded as a recommendation for M4.x rather than
+implemented against today's harness. Measured on the same machine as the rest
+of this report (`AMD Ryzen 7 5700G` / dual-GPU, Windows 11, build 26200),
+branch `phase-1/m6-9-cold-first-paint` over `origin/main` at `1fddf9a`,
+`bash ui/build.sh --release` (Release, unchanged CMake config), `RELDEX_UI_METRICS=1
+RELDEX_S15_AUTORUN=1 RELDEX_S15_ROWS=1000000 RELDEX_S15_RUNS=1
+RELDEX_S15_START_DELAY_MS=0` per cold run — the exact K2 method above, against
+`Harness.qml` (unchanged; `Main.qml`, M3.1's app shell, has no `TableView` yet
+— see "Does the baseline still mean what K2 measured" below).
+
+**Machine state, checked before every batch, per this task's own
+constraint.** Two other workers ran `cargo`/`rustc` builds on this machine
+throughout. Before each batch, `tasklist` was checked for
+`cargo`/`rustc`/`cl`/`link`/`cmake`/`ninja`/`clang`, and the batch waited
+(polling every 15 s, up to 15 min) until none were running; one batch found
+the machine busy again between the check and the first launch and re-waited
+before recording anything. Every number below was captured with zero matching
+processes running at launch time. Display: awake and in interactive use by
+other sessions throughout (consistent with this report's "round 2"; the
+`DwmFlush` probe itself was not re-run — see Limitations). No system, display
+or power setting was changed; no synthetic input was sent.
+
+### Does the baseline still mean what K2 measured
+
+`Harness.qml` is byte-for-byte what M1.8 measured (`git diff` against
+`5b50cbf`'s copy is empty apart from path). M3.1 (merged 2026-09-25, the same
+day as this task) replaced `Main.qml` — the app's default window — with the
+real shell (`Sidebar`/`WorksheetArea`/`OutputPanes`/`StatusBar`); its result
+pane is a `Text` placeholder (`WorksheetArea.qml`), not a `TableView`. So:
+
+- The 903.55 ms / 15.85 ms numbers this task reproduces are still about
+  `Harness.qml`'s `TableView`, exactly as K2 measured them — M3.1 did not
+  touch that file.
+- **They are no longer about what a user sees by default.** Launching
+  `Reldex.exe` without `--harness` today pays the ~185–191 ms D3D11
+  device-creation cost (any `QQuickWindow` does), but not the ~370–550 ms
+  delegate-instantiation polish, because there is no `TableView` to
+  instantiate — M4.x's real result grid is what will reintroduce it, and
+  should read this section before it does.
+
+### Fresh baseline vs the S15 number — the biggest single finding
+
+| | n | min | median | max | mean | CoV |
+| --- | --- | --- | --- | --- | --- | --- |
+| S15 (2026-09-20), cold, execute→first frame | 30 | — | 903.55 | 1,551.91 (p95 979.23) | — | — |
+| **M6.9 fresh baseline (2026-09-25), same scenario** | **12** | **389.56** | **576.19** | **898.95** | 567.05 | **23.1%** |
+| M6.9 fresh baseline, execute→rows inserted | 12 | 2.06 | 186.00 | 350.78 | 158.15 | 63.4% |
+
+**The baseline moved by itself, with zero code change, before any candidate
+was tried.** `Harness.qml`, `Bridge`, `SessionController` and `Metrics` are
+identical to what S15 measured; only the calendar date, five days of this
+machine's use, and this run's own five-to-twelve-sample noise separate these
+two rows. The median dropped ~36% (903.55 → 576.19 ms) and the highest single
+sample (898.95 ms) is close to S15's *median*. The likely cause is D3D11
+shader/pipeline and OS file-cache state warmed by everyday use of this
+machine since 2026-09-20 (S15 itself named DXGI adapter enumeration and
+driver-side caching as machine state, not application state) — nothing in
+`crates/**` or `ui/**` changed the number. **This is why every candidate
+below is judged against 576.19 ms, not 903.55 ms**, per this task's own
+instruction, and it is also why a reader must not credit M6.9 with a "36%
+win" — that movement happened before any candidate was tested.
+
+Coefficient of variation is reported because it matters here: 23.1% on the
+metric K2 is judged on, and 63.4% on the intermediate "rows inserted" mark,
+which is consistent with the diagnosis below (rows-inserted races the D3D11
+blocking sync, so its own latency is close to bimodal).
+
+### Breakdown, reproduced fresh (Qt's own scenegraph timing)
+
+Same method as S15 ("K2 — what the cold first paint is made of"),
+`QT_LOGGING_RULES="qt.scenegraph.time.*=true;qt.scenegraph.general=true;qt.rhi.general=true"`
+through `RELDEX_S15_LOG` (`Reldex.exe` is GUI-subsystem, no console), one run
+per row count:
+
+| Rows | first-execute frame `polish` | first-execute frame `blockedForSync` | second frame `polish` / `blockedForSync` |
+| --- | --- | --- | --- |
+| 1 | 0 ms | 191 ms | 0 / 1 ms |
+| 1,000 | 366 ms | 188 ms | — |
+| 1,000,000 | 372 ms | 185 ms | — |
+
+Same shape as S15 (identical at 1,000/1,000,000 rows, absent at 1 row — the
+first screenful of delegates, not the first row), smaller in absolute terms
+(185–191 ms D3D11 vs S15's 249–271 ms; 366–372 ms polish vs S15's 551–579 ms)
+— consistent with the same machine-state drift the baseline shows. `185 to
+191 + 366 to 372 ≈ 551–563 ms`, which lands inside this session's 389.56–898.95 ms
+range and close to its 576.19 ms median: **the two named costs still account
+for essentially the whole number**, same conclusion as S15, fresh evidence.
+
+`QT_DEBUG_PLUGINS=1` (captured through the same log sink) produced 48
+plugin-factory-loader lines for platform-plugin discovery at startup — a
+short, fixed cost with no visible per-run timing blowup, and no room for it
+to be large given the arithmetic above. **DLL/plugin loading is not what
+dominates the cold number, confirmed fresh.**
+
+Fresh warm-path check (`RELDEX_S15_RUNS=31`, run 1 dropped, n=30): execute→first
+frame **p50 16.38 ms**, p95 16.61, max 16.62 — S15 measured 15.85 ms. Within
+noise of one vsync period; **the warm path is unaffected**, as it must be
+since nothing changed.
+
+### Candidates measured
+
+| Candidate | Category | n | median (first frame) | CoV | vs 576.19 ms baseline | Verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| `QSG_RENDER_LOOP=basic` | D3D11 share | 8 | 594.78 ms | 4.1% | +18.6 ms (noise) | No material gain |
+| `QQuickWindow::setGraphicsApi` explicit | D3D11 share | — | — | — | — | Not run: S15's own environment table already shows D3D11 selected without an override; an explicit call would be confirming, not changing, the default |
+| Pre-creating the window earlier (a hidden warm-up `QQuickWindow` ahead of `engine.loadFromModule`) | D3D11 share | — | — | — | — | Not run: Qt Quick's RHI/D3D11 device is per-window; sharing it with the real window needs `QQuickGraphicsConfiguration::setDevice()`-style explicit resource sharing, which is materially more than a minimal change and was not attempted under this task's time budget |
+| `Loader { asynchronous: true }` around the `TableView` | delegate share | — | — | — | — | Investigated, not run (see below) |
+| Pre-warm the delegate with a throwaway small query before the real one | delegate share | — | — | — | — | Investigated, not run — real behaviour change, see below |
+
+**`QSG_RENDER_LOOP=basic`, in full**: median first-frame 594.78 ms (n=8, min
+563.16, max 641.15) against the 576.19 ms fresh baseline — a difference well
+inside both samples' own noise, so **no material gain**. Its one real effect
+is variance: CoV drops from 23.1% (baseline, n=12) to 4.1% (n=8) — a far more
+predictable number, not a faster one. That is not nothing (a single-threaded
+render loop removes a GUI/render-thread handoff this report's K1 section
+already measures), but changing the render loop is a decision with a blast
+radius across K1's own numbers (frame pacing, GUI/render-thread split) that
+this task did not re-verify, so it is reported and not adopted for a tie on
+the metric this task is scored on.
+
+**`Loader.asynchronous`, why it was not implemented.** The candidate spreads
+delegate creation over frames instead of one 551 ms `polishItems` pass — but
+`ScrollDriver::attach(window, flickable)` (`Harness.qml`'s
+`Component.onCompleted`) needs the real `TableView` item to exist *before* the
+measured run starts, and an async `Loader`'s item does not exist until
+incubation completes. Wiring this correctly means deferring
+`scrollDriver.attach()` and the run's own start until `Loader.status ===
+Loader.Ready` — more than a minimal change — and it introduces a real risk to
+what K2 measures: `Metrics::firstFrameAfterInsert` only requires *a* frame to
+swap after the model has rows, not that the `TableView` exists yet. An async
+`Loader` could report a better K2 number by swapping an empty frame while the
+grid is still incubating, which would be measuring the harness's own
+deferral, not a user seeing their result sooner. This is not a reason to
+discard the idea — `QQmlIncubationController` tuning belongs with it — but it
+needs a real result grid (M4.x) and a metric that can tell "empty frame" from
+"populated frame" apart, neither of which exists yet.
+
+**Pre-warming the delegate, why it was not implemented.** This is the
+candidate with the largest measured ceiling: the fresh warm-path number
+(16.38 ms) *is* what a pre-warmed second execute already costs, per this same
+report's own K2 method — S15 found the delegate polish "drops to 7–10 ms on
+the second execute in the same process," and this task's fresh warm-path scan
+confirms the shape still holds. If a throwaway small query ran once before
+the user's first real one, the real one's cold number should approach
+D3D11 (~185 ms) plus a warm execute (~16 ms) — roughly a third of today's
+576 ms median. It was not implemented here because it is a genuine behaviour
+change (an extra, transient execute against the model), `SessionController`'s
+`mockRows` is already a writable property so the plumbing exists, but
+`Bridge::run()` is shared with `tst_bridge.cpp` and, more importantly, there
+is no real `TableView` for it to warm today (see "Does the baseline still
+mean" above) — adding it now would be dead code exercised only by the
+harness. **Recommended verbatim for M4.x**: when the real result grid lands,
+execute a tiny (few-row) throwaway query against it during startup, before
+the connection/worksheet UI is interactive, so the one-time delegate
+instantiation is paid while the user is not waiting on a query.
+
+### Recommendation for the owner's K2 ruling
+
+Unchanged in substance from S15's own recommendation, now with two additional
+facts: the cold number moved ~36% between 2026-09-20 and 2026-09-25 with zero
+application-code change (machine/driver state, not this task, not ADR-0003),
+and part of the *remaining* cold cost is itself an artifact of the harness's
+own "execute from `Component.onCompleted`" pattern — a human pressing
+"Execute" after looking at a rendered window would not contend with D3D11
+device creation the way this synthetic cold-start does. The delegate-polish
+share (366–551 ms across both measurement sessions) is the part a real user
+would still pay on their first query, and it has a named, measured,
+not-yet-applicable fix (pre-warm the delegate) waiting for M4.x's result
+grid. Recommend the owner still rule K2 as the warm path (passes by ~9–55×
+depending on session); record the cold number as a known, diagnosed, Qt-side
+one-time cost with a concrete mitigation deferred to M4.x, not as a boundary
+failure.
+
+### Limitations (M6.9)
+
+- **The `DwmFlush` compositor probe was not re-run.** S15's round 1 vs round 2
+  showed this matters (throttled vs live compositor). This task's numbers
+  were taken on a machine in continuous interactive use by other workers
+  throughout (strong indirect evidence the compositor was live, not
+  throttled), but the direct probe from S15's method was not repeated.
+- **Only one candidate reached a full ≥5-run batch** (`QSG_RENDER_LOOP=basic`).
+  `QQuickWindow::setGraphicsApi` and the window-pre-creation idea were reasoned
+  about, not measured, because the former is confirmed already-default from
+  S15's own environment table and the latter needed more implementation than
+  this task's minimal-change bar allows; both are named rather than silently
+  dropped.
+- **The delegate-instantiation candidates (`Loader.asynchronous`, the
+  pre-warm query) were reasoned and partially evidenced (the warm-path number
+  is the pre-warm candidate's ceiling) but not built and measured as code**,
+  because the current app shell has no `TableView` for either to act on — see
+  "Does the baseline still mean what K2 measured".
+- **CoV on "rows inserted" (63.4%) is high enough that its median (186.00 ms)
+  should be read as "contended with D3D11 device creation," not as a stable
+  per-run cost** — consistent with, not a correction to, S15's own framing of
+  this column as "contention, not work."
