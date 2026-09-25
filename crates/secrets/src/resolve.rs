@@ -201,7 +201,10 @@ mod tests {
             StoreState::Fails(CredentialError::Denied),
             StoreState::Fails(CredentialError::Malformed),
             StoreState::Fails(CredentialError::NotFound),
-            StoreState::Fails(CredentialError::TooLarge { max_bytes: 2560 }),
+            StoreState::Fails(CredentialError::TooLarge { max_bytes: 2555 }),
+            StoreState::Fails(CredentialError::InvalidSecret),
+            StoreState::Fails(CredentialError::Locked { code: 5 }),
+            StoreState::Fails(CredentialError::Locked { code: 258 }),
             StoreState::Fails(CredentialError::Backend { code: 1783 }),
         ];
         let mut rows = 0;
@@ -240,7 +243,7 @@ mod tests {
             );
             rows += 3;
         }
-        assert_eq!(rows, 27);
+        assert_eq!(rows, 36);
     }
 
     #[test]

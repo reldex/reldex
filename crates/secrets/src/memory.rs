@@ -7,6 +7,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use reldex_db_driver_api::Secret;
 use reldex_workspace::CredentialKey;
 
+use crate::format::check_storable;
 use crate::store::{CredentialError, CredentialStore, CredentialStoreKind};
 
 /// A [`CredentialStore`] that keeps passwords in a map for the life of the
@@ -17,7 +18,9 @@ use crate::store::{CredentialError, CredentialStore, CredentialStoreKind};
 ///
 /// It follows the trait's contract exactly — `get` of an absent key is
 /// `Ok(None)`, `delete` of one is [`CredentialError::NotFound`], `put`
-/// replaces — and adds two test hooks: [`MemoryCredentialStore::fail_with`]
+/// replaces and refuses a control character with
+/// [`CredentialError::InvalidSecret`] like every platform store (it has no
+/// size limit; that is per backend) — and adds two test hooks: [`MemoryCredentialStore::fail_with`]
 /// makes every call fail with a chosen error, and
 /// [`MemoryCredentialStore::reads`] counts `get` calls, so a test can prove a
 /// store was *not* consulted. `Debug` prints only how many entries it holds.
@@ -99,6 +102,10 @@ impl CredentialStore for MemoryCredentialStore {
         if let Some(failure) = state.failure {
             return Err(failure);
         }
+        // The same content rule as every platform store (ADR-0007 S8), so a
+        // test cannot save what the product would refuse. No size limit:
+        // that is per backend.
+        check_storable(secret)?;
         state.entries.insert(*key, secret.clone());
         Ok(())
     }

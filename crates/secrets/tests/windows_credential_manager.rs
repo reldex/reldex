@@ -20,8 +20,8 @@ use std::collections::HashSet;
 use std::process::{Command, Stdio};
 
 use reldex_secrets::{
-    CredentialError, CredentialKey, CredentialStore, CredentialStoreKind, MAX_SECRET_BYTES,
-    PasswordSource, PromptReason, Secret, WindowsCredentialManager, resolve_password,
+    CredentialError, CredentialKey, CredentialStore, CredentialStoreKind, PasswordSource,
+    PromptReason, Secret, WindowsCredentialManager, resolve_password,
 };
 use reldex_workspace::{
     Authentication, DatabaseType, Environment, PasswordStorage, Profile, ProfileDetails,
@@ -29,6 +29,7 @@ use reldex_workspace::{
 };
 
 const STORE: WindowsCredentialManager = WindowsCredentialManager::new();
+const MAX_SECRET_BYTES: usize = WindowsCredentialManager::MAX_SECRET_BYTES;
 
 /// Deletes the given keys however the test ends; "not found" is fine.
 struct Cleanup(Vec<CredentialKey>);
@@ -117,7 +118,8 @@ fn unicode_empty_and_long_passwords_round_trip_byte_exact() {
 
 #[test]
 fn a_password_over_the_limit_is_refused_and_nothing_is_written() {
-    assert_eq!(MAX_SECRET_BYTES, 2560);
+    // 2,560 bytes of blob less the 5-byte `RLDX` v1 prefix.
+    assert_eq!(MAX_SECRET_BYTES, 2555);
     let key = fresh_key();
     let _cleanup = Cleanup(vec![key]);
 
@@ -161,6 +163,93 @@ fn deleting_nothing_is_not_found() {
     assert_eq!(STORE.delete(&fresh_key()), Err(CredentialError::NotFound));
 }
 
+/// A profile whose password is "saved in the credential store".
+fn saved_password_profile() -> Profile {
+    Profile::create(ProfileDetails::new(
+        "Orders (test)",
+        DatabaseType::Oracle,
+        Environment::Test,
+        ProfileEndpoint::HostPort {
+            host: "db.example.internal".to_owned(),
+            port: 1521,
+            target: ServiceTarget::ServiceName("ORDERS".to_owned()),
+        },
+        Authentication::Password {
+            username: "app_owner".to_owned(),
+            storage: PasswordStorage::CredentialStore,
+        },
+    ))
+    .expect("valid profile")
+}
+
+/// Writes a generic credential under `target` the way a user would by hand.
+/// `cmdkey` stores the password as UTF-16LE.
+fn cmdkey_generic(target: &str, password: &str) {
+    let output = Command::new("cmdkey")
+        .arg(format!("/generic:{target}"))
+        .arg("/user:someone")
+        .arg(format!("/pass:{password}"))
+        .output()
+        .expect("cmdkey runs");
+    assert!(output.status.success(), "cmdkey /generic failed");
+}
+
+/// The review's must-fix: an entry Reldex did not write — here `cmdkey`'s
+/// UTF-16 of "Hunter2x" (valid UTF-8 with NULs) and of Thai "กข" (bytes
+/// `01 0E 02 0E`, valid UTF-8 without a NUL) — must never be handed to a
+/// database as the password, where a wrong password counts towards the
+/// account's failed-login limit. It is `Malformed`, and the connect flow
+/// asks the user.
+///
+/// Each case uses a profile of its own and removes the entry with Reldex's
+/// own `delete`. The test deliberately does not `put` over a `cmdkey` entry:
+/// `cmdkey` saves with enterprise (roaming) persistence, and writing a
+/// local-machine entry over it leaves the roaming copy behind, which
+/// reappears after a later delete once the process exits (measured: 5 of 6
+/// runs; ADR-0007 S4 "Residual"). Overwriting a Reldex entry is covered by
+/// the other tests.
+#[test]
+fn an_entry_written_by_another_tool_is_malformed_and_prompts() {
+    for foreign in ["Hunter2x", "กข"] {
+        let profile = saved_password_profile();
+        let key = profile.credential_key();
+        let _cleanup = Cleanup(vec![key]);
+        let target = WindowsCredentialManager::target_name(&key);
+
+        cmdkey_generic(&target, foreign);
+        assert!(listed_targets().contains(&target), "cmdkey wrote {target}");
+        assert_eq!(
+            STORE.get(&key).map(|found| found.is_some()),
+            Err(CredentialError::Malformed),
+            "{foreign}"
+        );
+        assert!(
+            matches!(
+                resolve_password(&profile, &STORE),
+                PasswordSource::PromptRequired(PromptReason::StoreFailed(
+                    CredentialError::Malformed
+                ))
+            ),
+            "{foreign}"
+        );
+        STORE
+            .delete(&key)
+            .expect("Reldex's delete removes a foreign entry too");
+        assert!(!listed_targets().contains(&target), "{target} removed");
+    }
+}
+
+#[test]
+fn a_password_with_a_control_character_is_refused_and_nothing_is_written() {
+    let key = fresh_key();
+    let _cleanup = Cleanup(vec![key]);
+    assert_eq!(
+        STORE.put(&key, &Secret::new("tab\there")),
+        Err(CredentialError::InvalidSecret)
+    );
+    assert!(STORE.get(&key).expect("get").is_none(), "nothing written");
+}
+
 #[test]
 fn nothing_the_store_returns_renders_a_secret() {
     let key = fresh_key();
@@ -180,21 +269,7 @@ fn nothing_the_store_returns_renders_a_secret() {
 
 #[test]
 fn resolve_password_uses_the_real_store_and_prompts_once_it_is_gone() {
-    let profile = Profile::create(ProfileDetails::new(
-        "Orders (test)",
-        DatabaseType::Oracle,
-        Environment::Test,
-        ProfileEndpoint::HostPort {
-            host: "db.example.internal".to_owned(),
-            port: 1521,
-            target: ServiceTarget::ServiceName("ORDERS".to_owned()),
-        },
-        Authentication::Password {
-            username: "app_owner".to_owned(),
-            storage: PasswordStorage::CredentialStore,
-        },
-    ))
-    .expect("valid profile");
+    let profile = saved_password_profile();
     let key = profile.credential_key();
     let _cleanup = Cleanup(vec![key]);
 
@@ -248,13 +323,15 @@ fn worker_process_for_the_concurrency_test() {
     });
 }
 
-/// Measured before the fix (ADR-0007 S4): concurrent writers of *different*
-/// targets lose updates — an entry just written reads back as absent, and
-/// deleted entries reappear once their process exits (14 of 600 cycles with
-/// two threads, 18 of 600 with two processes). The store now holds a
-/// session-wide named mutex around every call. Two processes of two threads
-/// each, 60 keys apiece, must lose nothing: every read-back succeeds in the
-/// workers and, after both have exited, no key is left behind.
+/// Measured before the fix (ADR-0007 S4): with local-machine persistence,
+/// concurrent writers of *different* targets lose updates. A read straight
+/// after a delete is clean, yet the deleted entry reappears later, while the
+/// writer is still running; across processes a just-written entry can also
+/// read back as absent (18 of 600 cycles left behind with two processes).
+/// The store now holds a per-user named mutex around every call. Two
+/// processes of two threads each, 60 keys apiece, must lose nothing: every
+/// read-back succeeds in the workers and, after both have exited, no key is
+/// left behind.
 #[test]
 fn concurrent_reldex_processes_lose_no_update() {
     let per_process = 60;

@@ -57,10 +57,12 @@ pub trait CredentialStore: Send + Sync {
     ///
     /// # Errors
     ///
-    /// [`CredentialError`]: the store is unavailable or refused access, the
-    /// secret is larger than the store accepts
-    /// ([`CredentialError::TooLarge`]; nothing is written), or the platform
-    /// failed.
+    /// [`CredentialError`]: the store is unavailable or refused access; the
+    /// secret is larger than this backend accepts
+    /// ([`CredentialError::TooLarge`]; the limit is per backend — for
+    /// Windows it is `WindowsCredentialManager::MAX_SECRET_BYTES`) or
+    /// contains a control character ([`CredentialError::InvalidSecret`]),
+    /// and nothing is written; or the platform failed.
     fn put(&self, key: &CredentialKey, secret: &Secret) -> Result<(), CredentialError>;
 
     /// Removes the password stored under `key`.
@@ -123,9 +125,10 @@ impl CredentialStoreKind {
 /// Why a credential store call failed.
 ///
 /// Value-free by construction: no variant holds a key, a target name or a
-/// secret — only the class of failure and, for [`CredentialError::Backend`],
-/// the platform's numeric error code — so `Debug` and `Display` are safe to
-/// log and to show. The caller already knows which profile it asked about.
+/// secret — only the class of failure and, for [`CredentialError::Backend`]
+/// and [`CredentialError::Locked`], the platform's numeric error code — so
+/// `Debug` and `Display` are safe to log and to show. The caller already
+/// knows which profile it asked about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CredentialError {
@@ -137,17 +140,34 @@ pub enum CredentialError {
     /// Nothing is stored under the key ([`CredentialStore::delete`] only;
     /// [`CredentialStore::get`] reports absence as `Ok(None)`).
     NotFound,
-    /// The store refused access (Windows `ERROR_ACCESS_DENIED`).
+    /// The store refused access (Windows `ERROR_ACCESS_DENIED` from the
+    /// credential call itself).
     Denied,
-    /// The secret is larger than the store accepts; nothing was written.
+    /// The secret is larger than this backend accepts; nothing was written.
     TooLarge {
-        /// The largest secret the store accepts, in UTF-8 bytes.
+        /// The largest secret the backend accepts, in UTF-8 bytes.
         max_bytes: usize,
     },
-    /// The stored entry is not a password Reldex wrote: its bytes are not
-    /// UTF-8 (for example an entry created by hand with another tool under
-    /// Reldex's name). The entry is left as it is.
+    /// The secret contains a control character (U+0000–U+001F), which no
+    /// Reldex store keeps (ADR-0007 S8); nothing was written. The password
+    /// can still be typed at every connect.
+    InvalidSecret,
+    /// The stored entry is not a password Reldex wrote: it lacks the
+    /// versioned Reldex prefix, carries a version this build does not read,
+    /// or its payload is not UTF-8 text free of control characters — for
+    /// example an entry created by hand with `cmdkey` under Reldex's name.
+    /// Never sent to a database; the entry is left as it is and the user is
+    /// asked instead (ADR-0007 S8).
     Malformed,
+    /// The lock every Reldex process takes around a store call could not be
+    /// taken: another process has held it past the wait (`258`,
+    /// `WAIT_TIMEOUT`), or an object of that name refuses access (`5`,
+    /// `ERROR_ACCESS_DENIED` — for example one created by another program
+    /// with a restrictive security descriptor). Nothing was read or written.
+    Locked {
+        /// The platform's error code.
+        code: i64,
+    },
     /// Any other platform failure, with the platform's own error code (a
     /// Win32 error code on Windows), preserved for diagnostics.
     Backend {
@@ -168,8 +188,15 @@ impl fmt::Display for CredentialError {
                 f,
                 "the password is longer than the credential store accepts ({max_bytes} bytes)"
             ),
+            Self::InvalidSecret => f.write_str(
+                "the password contains a control character, which the credential store does not keep",
+            ),
             Self::Malformed => f.write_str(
                 "the credential store's entry for this profile is not a password Reldex saved",
+            ),
+            Self::Locked { code } => write!(
+                f,
+                "the credential store is locked by another process (platform error {code})"
             ),
             Self::Backend { code } => {
                 write!(f, "the credential store failed (platform error {code})")
@@ -180,33 +207,18 @@ impl fmt::Display for CredentialError {
 
 impl std::error::Error for CredentialError {}
 
-/// Turns bytes read from a platform store into a [`Secret`] without leaving
-/// an unwiped copy behind: a valid buffer becomes the secret's own storage
-/// (no copy), an invalid one is wiped before it is dropped.
-#[cfg(any(windows, test))]
-pub(crate) fn secret_from_utf8(bytes: Vec<u8>) -> Result<Secret, CredentialError> {
-    use zeroize::Zeroize;
-
-    match String::from_utf8(bytes) {
-        Ok(text) => Ok(Secret::new(text)),
-        Err(error) => {
-            let mut bytes = error.into_bytes();
-            bytes.zeroize();
-            Err(CredentialError::Malformed)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const ALL_ERRORS: [CredentialError; 6] = [
+    const ALL_ERRORS: [CredentialError; 8] = [
         CredentialError::Unavailable,
         CredentialError::NotFound,
         CredentialError::Denied,
-        CredentialError::TooLarge { max_bytes: 2560 },
+        CredentialError::TooLarge { max_bytes: 2555 },
+        CredentialError::InvalidSecret,
         CredentialError::Malformed,
+        CredentialError::Locked { code: 258 },
         CredentialError::Backend { code: 1783 },
     ];
 
@@ -228,12 +240,20 @@ mod tests {
                 ),
                 ("Denied", "the credential store refused access"),
                 (
-                    "TooLarge { max_bytes: 2560 }",
-                    "the password is longer than the credential store accepts (2560 bytes)"
+                    "TooLarge { max_bytes: 2555 }",
+                    "the password is longer than the credential store accepts (2555 bytes)"
+                ),
+                (
+                    "InvalidSecret",
+                    "the password contains a control character, which the credential store does not keep"
                 ),
                 (
                     "Malformed",
                     "the credential store's entry for this profile is not a password Reldex saved"
+                ),
+                (
+                    "Locked { code: 258 }",
+                    "the credential store is locked by another process (platform error 258)"
                 ),
                 (
                     "Backend { code: 1783 }",
@@ -256,24 +276,5 @@ mod tests {
         ] {
             assert!(!kind.describe().is_empty());
         }
-    }
-
-    #[test]
-    fn utf8_bytes_become_the_secret_and_anything_else_is_malformed() {
-        let thai = "รหัสผ่าน-ทดสอบ-🔑".as_bytes().to_vec();
-        assert_eq!(
-            secret_from_utf8(thai).expect("valid UTF-8").expose(),
-            "รหัสผ่าน-ทดสอบ-🔑"
-        );
-        assert!(secret_from_utf8(Vec::new()).expect("empty").is_empty());
-        // UTF-16LE "é" (what a tool writing UTF-16 would store) is not UTF-8.
-        assert_eq!(
-            secret_from_utf8(vec![0xE9, 0x00]).map(|_| ()),
-            Err(CredentialError::Malformed)
-        );
-        assert_eq!(
-            secret_from_utf8(vec![0xFF; 4]).map(|_| ()),
-            Err(CredentialError::Malformed)
-        );
     }
 }

@@ -14,7 +14,9 @@
 //!   which backend is in use. Errors are [`CredentialError`], which never
 //!   carries a value.
 //! - `WindowsCredentialManager` (Windows only) — generic credentials under
-//!   `Reldex/profile/<uuid>`, persisted for this user on this machine.
+//!   `Reldex/profile/<uuid>`, persisted for this user on this machine, each
+//!   blob a versioned Reldex entry (`RLDX`, version 1, then the password) so
+//!   an entry Reldex did not write is never sent to a database.
 //! - [`NoCredentialStore`] — what every other platform gets for now: it keeps
 //!   nothing, so the password is asked for at every connect.
 //! - [`platform_default`] — the right one of the two for this build.
@@ -57,6 +59,7 @@
 //! are later tasks; until each lands, [`platform_default`] returns
 //! [`NoCredentialStore`] there.
 
+mod format;
 mod none;
 mod resolve;
 mod store;
@@ -75,7 +78,7 @@ pub use none::NoCredentialStore;
 pub use resolve::{PasswordSource, PromptReason, resolve_password};
 pub use store::{CredentialError, CredentialStore, CredentialStoreKind};
 #[cfg(windows)]
-pub use wincred::{COMMENT, MAX_SECRET_BYTES, WindowsCredentialManager};
+pub use wincred::WindowsCredentialManager;
 
 /// The credential store for this build's platform: the Windows Credential
 /// Manager on Windows, [`NoCredentialStore`] everywhere else.
@@ -146,6 +149,16 @@ mod tests {
         assert_eq!(
             store.get(&key).expect("get").expect("present").expose(),
             "second"
+        );
+
+        assert_eq!(
+            store.put(&key, &Secret::new("control\u{0}character")),
+            Err(CredentialError::InvalidSecret)
+        );
+        assert_eq!(
+            store.get(&key).expect("get").expect("present").expose(),
+            "second",
+            "a refused write leaves the old password"
         );
 
         store.delete(&key).expect("delete");
