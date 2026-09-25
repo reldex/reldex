@@ -2,7 +2,7 @@
 //! [`Store::load_worksheets`], [`Store::delete_worksheet`],
 //! [`Store::save_layout`], [`Store::load_layout`].
 //!
-//! Non-transactional state only — see [`crate::worksheet`]'s module
+//! Non-transactional state only — see `crate::worksheet`'s module
 //! documentation. Nothing here reads or writes a session id or a
 //! transaction flag; there is no column for either.
 

@@ -18,7 +18,7 @@ impl Store {
     ///
     /// Never captures a bind value: [`HistoryEntry`] has no field for one.
     /// The statement text is stored verbatim by design — see
-    /// [`crate::history`]'s module documentation for why the
+    /// `crate::history`'s module documentation for why the
     /// credential-pattern guard does not run on it.
     ///
     /// # Errors

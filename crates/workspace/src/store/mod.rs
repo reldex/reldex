@@ -1,6 +1,6 @@
 //! The SQLite store: one file holding profiles and settings (owner decision
-//! 2026-09-20, `phase-1.md` §C.3 item 8), query history (M4.10, [`mod@history`])
-//! and workspace state (M6.2, [`mod@worksheet`]).
+//! 2026-09-20, `phase-1.md` §C.3 item 8), query history (M4.10, `store::history`)
+//! and workspace state (M6.2, `store::worksheet`).
 //!
 //! # Threading contract
 //!

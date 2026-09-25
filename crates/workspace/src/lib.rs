@@ -60,8 +60,8 @@
 //! its only other dependencies are `rusqlite` and `uuid`
 //! (`tests/dependency_rules.rs` checks all of it).
 //!
-//! Query history ([`history`], M4.10) and workspace state ([`worksheet`],
-//! [`layout`], M6.2) are store-side only here: schema, validation, bounded
+//! Query history ([`HistoryEntry`], M4.10) and workspace state ([`Worksheet`],
+//! [`Layout`], M6.2) are store-side only here: schema, validation, bounded
 //! trimming and no-secrets guarantees. Re-running a history entry, restoring
 //! a workspace on startup and everything FFI/UI is M2.11/M3/M4/M6 work. The
 //! metadata cache and the credential store itself (M2.10) are not built here.
