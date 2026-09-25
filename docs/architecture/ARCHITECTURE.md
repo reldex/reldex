@@ -27,10 +27,11 @@ unresolved and must be answered by `reldex-core-poc` evidence, not by implementa
 +-----------------------------------------------------------+
 |  Boundary              Stable Rust FFI                     |  explicit, typed, versioned
 +-----------------------------------------------------------+
-|  Core (Rust)           db-core, workspace                  |  vendor-neutral, UI-independent
+|  Core (Rust)           db-core, workspace, secrets         |  vendor-neutral, UI-independent
 |                        sessions, transactions, query,      |
 |                        results, metadata; settings,        |
-|                        profiles, local store               |
+|                        profiles, local store; credential   |
+|                        store                               |
 +-----------------------------------------------------------+
 |  Driver contract       db-driver-api                       |  vendor-neutral traits + DbError
 +-----------------------------------------------------------+
@@ -350,6 +351,25 @@ Database Cursor -> Batch Fetch -> Result Store -> Virtual Table Model -> Visible
 - Credentials use platform secure storage (Windows Credential Manager, Apple Keychain, Android
   Keystore, Linux Secret Service) behind a single core abstraction. Passwords, credentials, keys,
   and tokens are never logged.
+- **The credential store (M2.10, [ADR-0007](../decisions/0007-credential-store.md)).**
+  `crates/secrets` (`reldex-secrets`) holds the `CredentialStore` trait: `get`/`put`/`delete` a
+  `Secret` under a `CredentialKey`, plus `kind()`/`describe()`, `Send + Sync`, and a value-free
+  `CredentialError`. It depends on `reldex-workspace` (the key and `Profile`), the driver contract
+  (`Secret`) and `zeroize`, and on Windows `windows-sys`. Nothing below it depends on it, so the
+  SQLite store can never reach a password. The Windows backend keeps one `CRED_TYPE_GENERIC` entry
+  per profile under `Reldex/profile/<uuid>`, with `CRED_PERSIST_LOCAL_MACHINE` (this user on this
+  machine, never roamed). Its blob is a versioned Reldex entry: `RLDX`, the version byte `0x01`, then
+  the UTF-8 password, at most 2,555 bytes and with no control character. Anything else under that
+  name is `Malformed`, so it is never sent to a database and the user is prompted instead. Every call
+  holds a per-user named mutex, and a lock that cannot be taken is `Locked`. The mutex is there
+  because, with local-machine persistence, concurrent Credential Manager writes of different targets
+  were measured to lose updates. Every other platform gets `NoCredentialStore` from
+  `platform_default()` until its own backend lands: every call fails with `Unavailable` and the
+  password is asked for at every connect. The connect flow's rule is one function,
+  `resolve_password(profile, store) -> PasswordSource::{FromStore, PromptRequired(reason),
+  NotNeeded}`: every store failure becomes a prompt with a reason, never a fallback. Store calls
+  block (they are calls into the OS security service) and belong on the workspace service thread.
+  `Secret` wipes its buffer with `zeroize` on drop.
 - Entitlements resolve through one centralized feature service, not scattered `is_pro` checks
   (`SPEC.md` §22).
 
@@ -386,12 +406,18 @@ crates/db-driver-api/          vendor-neutral driver contract + DbError
 crates/db-core/                sessions, transactions, query, results, metadata
 crates/sql-text/               reldex-sql-text: vendor-neutral SQL/PL-SQL lexer + statement splitter (M2.4)
 crates/workspace/              reldex-workspace: settings + resolution, connection profiles, SQLite store (M2.9, ADR-0006)
+crates/secrets/                reldex-secrets: CredentialStore trait, Windows Credential Manager, resolve_password (M2.10, ADR-0007)
 crates/drivers/oracle-thin/    thin driver: wraps Oracle's `oracledb` crate (ADR-0001); vendor code isolated here
 crates/drivers/mock/           test-support/mock driver for core tests
-crates/ffi/                    reldex-ffi: the stable C ABI (ADR-0003); the only crate allowed `unsafe`
+crates/ffi/                    reldex-ffi: the stable C ABI (ADR-0003); the only crate allowed `unsafe` (besides one file, below)
 crates/reldex-core-poc/        Phase 0 validation harness (no full UI)
 docs/architecture/, docs/decisions/, docs/exec-plans/
 ```
+
+`unsafe` is denied workspace-wide. Only three places opt out: `crates/ffi` (ADR-0003 D2); the
+spike-S6 link probe `crates/mobile-link-check`; and one file, `crates/secrets/src/wincred.rs`,
+which makes the Windows Credential Manager calls (ADR-0007 S5), fenced the same way as the FFI.
+`crates/ffi/tests/fences.rs` enforces the list.
 
 `crates/sql-text` (package `reldex-sql-text`, M2.4) sits beside `db-driver-api` rather than inside
 `db-core`: it has no dependency on either, its `SqlDialect` parameter is supplied by a driver
@@ -505,11 +531,16 @@ Until then, no code should assume an answer.
    permission-dependent metadata/monitoring failures separable from driver failures.
 8. **Metadata cache design.** Cache keying and per-database identity isolation, TTL and
    invalidation strategy, and behavior at 100,000+ objects.
-9. **Credential storage abstraction.** What single core abstraction spans the four platform secure
-   stores, and what is the fallback when none is available? *Partly settled:* the fallback is **none**
-   — prompt each time, never plaintext (owner decision 2026-09-20, `phase-1.md` §C.3 item 7) — and the
-   key is the profile's UUID (`reldex_workspace::CredentialKey`, ADR-0006 P7). The trait and the
-   Windows Credential Manager implementation are M2.10.
+9. **Credential storage abstraction — RESOLVED by [ADR-0007](../decisions/0007-credential-store.md).**
+   The single abstraction is `reldex_secrets::CredentialStore`: `get`/`put`/`delete` a `Secret`
+   under `reldex_workspace::CredentialKey` (the profile's UUID, ADR-0006 P7), plus `kind()` and
+   `describe()`. It returns value-free `CredentialError`s and is implemented once per platform. The
+   fallback when no store is available is **none**: `NoCredentialStore` fails every call with
+   `Unavailable`, and `resolve_password` turns that, and every other store failure, into a prompt
+   with a reason, never plaintext (owner decision 2026-09-20, `phase-1.md` §C.3 item 7). Windows
+   Credential Manager is implemented (M2.10). Apple Keychain, Android Keystore and Linux Secret
+   Service are later tasks; until each lands, `platform_default()` returns `NoCredentialStore` on
+   that platform.
 10. **Crate layout.** Final workspace layout, crate boundaries, and feature flags (provisional in §11).
     Proposed resolution in part (the FFI/UI tier's crate layout — `crates/ffi`, `crates/sql-text`,
     `ui/`): [ADR-0003](../decisions/0003-qt-rust-integration.md) (**Proposed** — the `crates/ffi`

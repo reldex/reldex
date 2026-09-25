@@ -6,13 +6,15 @@
 //!
 //! Secrets live in [`Secret`], which redacts itself in `Debug` and implements no
 //! `Display`, so a `Debug` of a whole [`ConnectionParams`] is safe to log
-//! (`AGENTS.md`, "Code quality"). [`Secret`] also overwrites its buffer on drop,
-//! but that is a best-effort hygiene measure, not a guarantee — see its
-//! documentation.
+//! (`AGENTS.md`, "Code quality"). [`Secret`] also wipes its buffer on drop
+//! (with `zeroize`), but that is a hygiene measure, not a guarantee that no
+//! copy survives in memory — see its documentation.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
+
+use zeroize::Zeroize;
 
 /// A credential value that never renders itself.
 ///
@@ -22,18 +24,18 @@ use std::time::Duration;
 ///   password cannot reach a log through an ordinary `{:?}` of any struct that
 ///   contains one. That is the property `AGENTS.md` requires, and it is tested.
 /// - [`Secret::expose`] is the single, greppable place the plaintext is read.
+/// - [`Drop`] wipes the buffer — its whole capacity, not just its length —
+///   with `zeroize`, whose volatile writes the compiler may not elide (a plain
+///   `fill(0)` just before a free is a dead store it may remove). Every
+///   [`Clone`] is a separate buffer wiped the same way. ADR-0007 S6.
 ///
-/// What it does **not** promise: that the plaintext is gone from memory.
-/// [`Drop`] overwrites the buffer with zeros, which is useful hygiene but is not
-/// a guarantee. The compiler is free to elide a write to memory that is about to
-/// be freed; the `String` the caller passed to [`Secret::new`] was already a
-/// separate copy; [`Clone`] makes more; and the allocator, the OS page cache and
-/// any swap file are outside this crate's reach. Treating the wipe as a security
-/// control would be exactly the kind of overclaim `SPEC.md` §2 rules out.
-///
-/// A dependency that does this properly (`zeroize`) is deliberately deferred to
-/// the credential-storage ADR (`ARCHITECTURE.md` §13 item 9), where secure
-/// storage at rest (`SPEC.md` §17) is decided as a whole.
+/// What it does **not** promise: that the plaintext is gone from memory. A
+/// `String` passed to [`Secret::new`] becomes the secret's buffer without a
+/// copy, but a `&str` is copied and its source is the caller's; a `String`
+/// that reallocated while it was being built left its old buffer behind; and
+/// the allocator, the OS page cache and any swap file are outside this crate's
+/// reach. Treating the wipe as a security control would be exactly the kind of
+/// overclaim `SPEC.md` §2 rules out.
 pub struct Secret {
     bytes: Vec<u8>,
 }
@@ -62,10 +64,10 @@ impl Secret {
 }
 
 impl Drop for Secret {
-    /// Best-effort wipe. See the type documentation: this is hygiene, not a
-    /// guarantee, and nothing in Reldex may rely on it.
+    /// Wipes the buffer. See the type documentation: this is hygiene, not a
+    /// guarantee that no copy survives, and nothing in Reldex may rely on it.
     fn drop(&mut self) {
-        self.bytes.fill(0);
+        self.bytes.zeroize();
     }
 }
 

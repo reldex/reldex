@@ -462,6 +462,9 @@ Passwords must use platform secure storage where available:
 - Android Keystore
 - Linux Secret Service
 
+Where no secure store is available, the password is asked for at every connect. There is never a
+plaintext fallback (owner decision 2026-09-20; [ADR-0007](docs/decisions/0007-credential-store.md)).
+
 ## 18. Mobile
 
 Mobile connects directly when the driver/platform supports it.

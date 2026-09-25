@@ -46,7 +46,7 @@ ui/tests/                    C smoke harness (no Qt), QTest, qmltest
 
 - `#![deny(unsafe_op_in_unsafe_fn)]`, `#![warn(clippy::undocumented_unsafe_blocks)]`, `#![deny(clippy::missing_safety_doc)]`; every `unsafe` block carries a `// SAFETY:` comment.
 - No business logic: every exported function is *validate arguments → call `db-core` → marshal*. A reviewer must be able to read the whole crate in an hour.
-- A `dependency_rules`-style test (mirroring `crates/db-core/tests/dependency_rules.rs`) asserts no other crate gains `unsafe_code` allowance.
+- A `dependency_rules`-style test (mirroring `crates/db-core/tests/dependency_rules.rs`) asserts no other crate gains `unsafe_code` allowance. *(Note, 2026-09-25: [ADR-0007](0007-credential-store.md) S5 adds one file, `crates/secrets/src/wincred.rs`, the Windows Credential Manager calls, to that test's list under this same fence. The test now names allowed files as well as crates.)*
 - Miri over the crate's Rust-side unit tests (handle registry, string marshalling, event drain); an ASan/UBSan build of the C smoke harness on Linux CI.
 - Panic containment: **every** `extern "C"` function body is wrapped in `catch_unwind`; a caught panic becomes `RELDEX_STATUS_PANIC` plus a thread-local last-error. Honest caveat: `oracledb` 26.0.0-beta.3 can abort the process during unwinding (ADR-0002 K6, spike U-4) — this boundary cannot contain that, and the ADR must say so rather than claim safety it does not have.
 

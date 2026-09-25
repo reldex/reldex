@@ -56,10 +56,19 @@ env:
   # depends on it — listed explicitly anyway, the same way `reldex-db-core`
   # is, so a break in it is attributed to itself rather than discovered only
   # as a mysterious failure two crates downstream.
+  # `reldex-workspace` and `reldex-secrets` were added with the M2.10 review:
+  # mobile shares the profile model and the credential abstraction, so both
+  # must at least build here — `reldex-workspace` with its bundled SQLite C
+  # build (the NDK/Xcode toolchain compiles it), and `reldex-secrets` with
+  # `NoCredentialStore`, the only backend these targets have until the
+  # Keychain/Keystore tasks (ADR-0007). Cross-compile evidence only, as for
+  # everything in this job.
   S6_PACKAGES: >-
     -p reldex-db-driver-api
     -p reldex-db-core
     -p reldex-sql-text
+    -p reldex-workspace
+    -p reldex-secrets
     -p reldex-driver-oracle-thin
     -p reldex-mobile-link-check
     -p reldex-ffi
