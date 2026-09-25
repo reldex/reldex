@@ -421,7 +421,7 @@ into `crates/ffi`**, together with the workspace service thread that owns the `S
 
 | ID | Status | Title | Owner | Inputs | Outputs | Deps | Acceptance | Size |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| M3.1 | `[ ]` todo | App shell: window, docking-free fixed layout (sidebar / worksheet tabs / output panes), light+dark theme, high-DPI | `sonnet` | SPEC §14 | `ui/app` | M1 gate | Renders at 100/150/200% DPI; theme switch has no restart | M |
+| M3.1 | `[x]` done 2026-09-25 — reviewed (tab-bar palette must-fix landed); 9/9 offscreen tests; DPI 1×/1.5×/2× | App shell: window, docking-free fixed layout (sidebar / worksheet tabs / output panes), light+dark theme, high-DPI | `sonnet` | SPEC §14 | `ui/app` | M1 gate | Renders at 100/150/200% DPI; theme switch has no restart | M |
 | M3.2 | `[ ]` todo | Connection manager UI: list, create/edit/delete, environment, test-connect | `sonnet` | M2.9 | QML + `ProfileModel` | M2.11 | All `SPEC.md` §17 fields present; environments Dev/Test/UAT/Staging/Production/Custom | L |
 | M3.3 ★ | `[ ]` todo | Connect flow over the async path, with a bounded timeout and a cancellable "Connecting…" state | `opus` | §B3 | `SessionController` | M2.6, M2.11 | Cancelling a pending connect returns immediately and adopts nothing late; failures show kind + ORA code + cause chain | M |
 | M3.4 | `[ ]` todo | Production indicator: persistent, not colour-only (icon + text + tab badge) | `sonnet` | SPEC §17 | QML | M3.2 | Visible in every place a statement can be run; passes a greyscale check | S |

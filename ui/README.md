@@ -1,14 +1,18 @@
 # Reldex UI
 
 CMake + Corrosion + Qt Quick project holding the thin C++/Qt adapter over the
-`reldex-ffi` C ABI, plus the smallest QML surface spike S15 needs.
+`reldex-ffi` C ABI, the app shell, and the smallest QML surface spike S15
+needed.
 
 Scope, per `AGENTS.md`: **M1.5** built the project skeleton (one `CoreInfo`
 singleton exposing `reldex_abi_version()`, one window, one test). **M1.6**
 added the adapter proper — `Bridge`, `SessionController`, `ResultTableModel`
-and `Metrics` — and a `TableView` over the model. There is still no editor, no
-toolbar, no theming and no settings; those are M3 onward, and building them
-here would pre-empt the decision S15 exists to make.
+and `Metrics` — and a `TableView` over the model, with no editor, toolbar,
+theming or settings yet, so as not to pre-empt the decision S15 existed to
+make. **M3.1** built the real app shell described below (fixed layout,
+light/dark theme, high-DPI) and moved M1.6's QML surface to `Harness.qml`,
+still reachable for the S15 measurement work — see "App shell (M3.1)". There
+is still no editor and no connection manager; those are M3.2 onward.
 
 ## Prerequisites
 
@@ -67,9 +71,23 @@ ui/adapter/                   reldex_adapter: thin static lib + QML module (Reld
   SessionController.{h,cpp}    open / execute / fetch / close; state and errors as properties
   ResultTableModel.{h,cpp}     QAbstractTableModel over borrowed batch views
   Metrics.{h,cpp}              S15 instrumentation, off by default
-ui/app/                       Reldex executable + Main.qml (Reldex.App QML module)
+  AppSettings.{h,cpp}          M3.1: in-memory theme override (System/Light/Dark) singleton;
+                               TODO in the header for binding it to the real M2.9 settings model
+ui/app/                       Reldex executable + Reldex.App QML module
+  Main.qml                     M3.1: the real app shell (sidebar / worksheet tabs / output
+                               panes / status bar) -- see "App shell (M3.1)" below
+  Harness.qml                  M1.6's QML surface, moved here at M3.1: TableView + run() button
+                               for the S15 measurement work, still reachable (see below)
+  Theme.qml                    M3.1: QML singleton, light/dark semantic colour tokens
+  Sidebar.qml                  M3.1: object-browser placeholder tree + connections placeholder
+  WorksheetArea.qml            M3.1: worksheet tab bar + editor/result placeholder split
+  OutputPanes.qml               M3.1: Messages/DBMS_OUTPUT placeholder tabs
+  StatusBar.qml                M3.1: session-state placeholder, production-indicator slot,
+                               theme override picker
 ui/tests/                     QTest binaries, run via CTest
-  tst_coreinfo.cpp             ABI version + Main.qml loads offscreen with no QML warning
+  tst_coreinfo.cpp             ABI version; Main.qml (shell) and Harness.qml (S15 surface) both
+                               load offscreen with no QML warning; M3.1 app-shell checks (theme
+                               toggle, sidebar/output-pane collapse, Thai sample text, DPI)
   tst_bridge.cpp               drain budget/re-post, re-entrancy, deleteLater, error model,
                                blocked statement, routing
   tst_resultmodel.cpp          QAbstractItemModelTester, cell content, headers before the first
@@ -82,6 +100,148 @@ ui/tests/ffi_smoke/           Qt-free C/C++ smoke harness for reldex-ffi (M1.4);
                               see "The ffi_smoke harness" below
 ui/build.sh                   One-command build (bash-first; see AGENTS.md)
 ```
+
+## App shell (M3.1)
+
+`ui/app/Main.qml` is a fixed, docking-free layout (`SPEC.md` §14; no persisted
+panel layout, that is M6.2):
+
+```text
+ApplicationWindow
+ |- SplitView (horizontal)
+     |- Sidebar.qml            object-browser placeholder + connections placeholder
+     `- SplitView (vertical)
+         |- WorksheetArea.qml  tab bar + [editor placeholder | result placeholder] (SplitView)
+         `- OutputPanes.qml    Messages / DBMS_OUTPUT placeholder tabs
+ `- StatusBar.qml              session-state placeholder, production-indicator slot, theme picker
+```
+
+Every split is a real `SplitView` handle (draggable, remembered for the
+session only -- persistence is M6.2). Sidebar and output panes collapse with
+**Ctrl+B** and **Ctrl+J** respectively (VSCode's own bindings for the same
+two affordances, chosen because they are already muscle memory for a large
+share of this product's target users); both call a plain QML function on the
+root window (`toggleSidebar()`/`toggleOutputPane()`), which is also what
+`ui/tests/tst_coreinfo.cpp` calls directly rather than simulating real key
+events (offscreen window activation is not reliable enough across three CI
+platforms to make that the automated check -- it was exercised interactively
+instead, running the real app, see "Running the shell vs the harness" below).
+
+**`Theme.tokens.border` is a low-contrast divider by design, not an
+affordance.** It draws every pane seam and `SplitView` handle at rest
+(contrast against `background`: 1.29:1 light, 1.59:1 dark -- deliberately
+far under WCAG's 3:1 non-text minimum, since a divider's job here is to be
+present without competing with content). That means border colour alone must
+never be the only cue that something is interactive or draggable: the
+`SplitView` handle already gets a second, high-contrast cue on top of it
+(`Theme.tokens.accent` while `SplitHandle.pressed`), and any future control
+that leans on a border for its boundary needs the same kind of second cue.
+M6.4 (accessibility baseline) checks this project-wide; this note exists so
+that check has something written down to check against.
+
+### Running the shell vs the harness
+
+`ui/app/main.cpp` picks which QML component to load:
+
+- **default**: `Main.qml`, the real app shell above;
+- **`Harness.qml`** (M1.6's QML surface, unchanged, still the home of the S15
+  scroll-driver measurement work): whenever `--harness` is passed on the
+  command line, or `RELDEX_UI_HARNESS` is set, or -- the *existing* env gate,
+  so every documented repro command elsewhere in this file keeps working
+  unmodified -- `RELDEX_S15_AUTORUN`, `RELDEX_S15_SCROLL` or
+  `RELDEX_S15_RUNS` is set.
+
+```bash
+./build/ui-Release/Reldex.exe                # the app shell
+./build/ui-Release/Reldex.exe --harness       # the S15 harness
+RELDEX_S15_AUTORUN=1 ./build/ui-Release/Reldex.exe   # harness (existing gate)
+```
+
+### Theme: light/dark, system-follow, live override
+
+`ui/app/Theme.qml` is a QML singleton exposing semantic colour tokens
+(`Theme.tokens.background`, `.surface`, `.text`, `.accent`, `.border`,
+`.selection`, `.error`/`.warning`/`.info`, and an `editor*` set for M4.1) for
+a `light` and a `dark` palette. `Theme.isDark` is a plain expression over two
+reactive inputs, so every consumer that binds to `Theme.tokens.*` re-evaluates
+immediately when either changes -- no window or `QQmlEngine` recreation,
+which is the row-M3.1 acceptance criterion ("theme switch has no restart"):
+
+- `Application.styleHints.colorScheme` -- the live OS light/dark preference
+  (Qt 6.5+), followed by default;
+- `AppSettings.themeOverride` (`ui/adapter/AppSettings.h`) -- System (default)
+  / Light / Dark, reachable today from the status bar's theme picker (the
+  only settings surface that exists before M3.6). It is a plain in-memory
+  `Q_PROPERTY` with a `TODO` in the header for binding it to the real M2.9
+  settings model once that exists; no persistence is added by this task.
+
+**Style: Basic, not Fusion.** `main.cpp` calls
+`QQuickStyle::setStyle("Basic")` before the first QML load (checked in code
+review, not just by inspection: `tst_coreinfo.cpp`'s `initTestCase()` does the
+same, for the same reason). Basic was chosen because every themed control in
+this shell is re-skinned through its `palette` property bound to `Theme`
+tokens (Qt 6.5+, live, no restart) rather than through native platform chrome
+-- Basic is the style Qt documents as built for exactly that, it ships inside
+the already-installed `qtdeclarative` module (no new dependency), and it does
+not spend cycles querying a native theme engine that an offscreen CI runner
+cannot open (Fusion and the native "Windows" style both do; harmless but
+noisy `OpenThemeData() failed` warnings were observed from both before this
+was pinned down explicitly in the test binary too).
+
+**Tab bar contrast.** Basic's own `TabButton.qml` reads exactly four palette
+roles -- `window`/`windowText` for the *selected* tab, `dark`/`brightText` for
+every other one (`button`/`buttonText`/`highlight`, set in an earlier
+revision of this task, are not read by it at all, which is what left an
+unset-`dark` tab rendering near-black in every theme). `WorksheetArea.qml`
+and `OutputPanes.qml` bind all four to `Theme` tokens; contrast, computed
+against `Theme`'s actual token values (WCAG relative-luminance formula):
+
+| Tab state | Roles | Light | Dark |
+| --- | --- | --- | --- |
+| selected | `window`/`windowText` = `accent`/`accentText` | 6.70:1 | 6.55:1 |
+| unselected | `dark`/`brightText` = `surfaceAlt`/`textMuted` | 5.06:1 | 5.69:1 |
+
+Both states clear WCAG's 4.5:1 normal-text minimum in both themes with
+headroom.
+
+### High-DPI
+
+Every size in the shell's QML is a plain number, which Qt Quick always treats
+as device-independent pixels; no raster image asset exists anywhere in the
+shell (icons are Unicode/font glyphs, e.g. the sidebar's expand/collapse
+markers, satisfying "SVG or font-based, no raster PNGs" without adding an SVG
+asset pipeline this milestone does not otherwise need). Verified offscreen
+(`tst_coreinfo.exe appShellRendersAtCurrentScaleFactor`, registered three
+times in `ui/tests/CMakeLists.txt` under `QT_SCALE_FACTOR=1|1.5|2`, since that
+variable is read once at QPA start-up and cannot vary within one process) and
+by grabbing the rendered window to PNG by hand
+(`RELDEX_UI_DPI_GRAB_DIR=<dir> QT_SCALE_FACTOR=<n> ./tst_coreinfo.exe
+appShellRendersAtCurrentScaleFactor`, not part of the ctest assertions, not
+committed):
+
+| `QT_SCALE_FACTOR` | Logical window size | Grabbed pixel size |
+| --- | --- | --- |
+| 1 (100%) | 1280 × 800 | 1280 × 800 |
+| 1.5 (150%) | 1280 × 800 | 1920 × 1200 |
+| 2 (200%) | 1280 × 800 | 2560 × 1600 |
+
+The logical size stays fixed and the rendered pixel size scales exactly with
+the factor, at all three levels.
+
+### i18n and accessibility baseline
+
+Every user-visible string in the shell's own QML goes through `qsTr()` (full
+`.ts` catalogues and `lrelease` integration are M6.3). One fixed Thai sample
+string appears in the sidebar (`thaiSampleSidebar`, a placeholder
+object-browser row) and one in the status bar (`thaiSampleStatusBar`) --
+not translated text, they exist only to prove the font can shape Thai and the
+label is not clipped or zero-width; `tst_coreinfo.cpp` checks
+`Text.contentWidth > 0` for both rather than a screenshot. `Accessible.role`
+and `Accessible.name` are set on the four main regions (sidebar, worksheet
+area, output panes, status bar) as the M6.4 baseline hook; the offscreen test
+reads them back with the public `QAccessible::queryAccessibleInterface()` API
+(the same technique Qt's own Quick autotests use), not the
+`QQuickAccessibleAttached` private header.
 
 ## The adapter (M1.6)
 
@@ -828,4 +988,7 @@ module (`Qt6Charts`, `Qt6WebEngineCore`, etc.) is present.
   It is a `qWarning()` from Qt's font subsystem, not a QML warning, so it
   does not fail `tst_coreinfo` (which only asserts on `QQmlEngine::warnings`
   emissions) — but it will show up in CTest/CI logs and is worth knowing
-  about rather than mistaking for a real regression.
+  about rather than mistaking for a real regression. It also means every
+  screenshot taken on this dev machine (including the DPI grabs above) shows
+  tofu boxes instead of real glyphs; `appShellThaiSampleTextIsNotZeroWidth`
+  checks shaped width for exactly this reason, not a screenshot.

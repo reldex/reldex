@@ -13,12 +13,45 @@
 #include <QEventLoop>
 #include <QString>
 #include <QThread>
+#include <QtQuick/QQuickItem>
 
 #include <Bridge.h>
 #include <ResultTableModel.h>
 #include <SessionController.h>
 
 namespace adapter_test {
+
+/// Finds a descendant by `objectName`, walking the **visual** item tree
+/// (`QQuickItem::childItems()`) rather than `QObject::findChild()`'s
+/// `QObject::children()`.
+///
+/// M3.1 finding: a `Repeater`/`ListView`/`GridView` delegate is reparented
+/// into the scene *visually* (`setParentItem`) but is not necessarily a
+/// `QObject` child of anything in that visual chain -- `ui/README.md`
+/// already documents this for `Repeater` ("a Repeater owns its delegates and
+/// only re-parents them *visually*"), and it holds for `ListView` too:
+/// `QObject::findChild()` silently does not see into a `ListView`'s
+/// delegates at all, with no warning and no error, just a null result. Use
+/// this instead of `findChild<QQuickItem *>()` for anything that might be
+/// produced by one of those.
+inline QQuickItem *findVisualChild(QQuickItem *root, const QString &name)
+{
+    if (root == nullptr) {
+        return nullptr;
+    }
+    const QList<QQuickItem *> children = root->childItems();
+    for (QQuickItem *child : children) {
+        if (child->objectName() == name) {
+            return child;
+        }
+    }
+    for (QQuickItem *child : children) {
+        if (QQuickItem *found = findVisualChild(child, name)) {
+            return found;
+        }
+    }
+    return nullptr;
+}
 
 /// Runs the event loop until `predicate()` holds, or the deadline passes.
 ///

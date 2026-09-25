@@ -116,7 +116,7 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 
 ### M3 — Connect: shell, connection manager, first real session
 
-- [ ] M3.1 App shell: window, docking-free fixed layout (sidebar / worksheet tabs / output panes), light+dark theme, high-DPI (sonnet)
+- [x] M3.1 App shell: window, docking-free fixed layout (sidebar / worksheet tabs / output panes), light+dark theme, high-DPI (sonnet) —  — done 2026-09-25: app shell (`ui/app/{Main,Sidebar,WorksheetArea,OutputPanes,StatusBar,Theme}.qml`) — fixed three-region layout, light/dark tokens driven by the system colour scheme with an in-memory override (`AppSettings`, persisted at M3.6), Basic style palette bound to the tokens, high-DPI verified offscreen at 1×/1.5×/2×; independently reviewed (tab-bar palette must-fix landed); 9/9 offscreen tests; old S15 harness kept behind `--harness`
 - [ ] M3.2 Connection manager UI: list, create/edit/delete, environment, test-connect (sonnet)
 - [ ] M3.3 ★ Connect flow over the async path, with a bounded timeout and a cancellable "Connecting…" state (opus, review mandatory)
 - [ ] M3.4 Production indicator: persistent, not colour-only (icon + text + tab badge) (sonnet)
