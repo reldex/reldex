@@ -281,7 +281,9 @@ Database Cursor -> Batch Fetch -> Result Store -> Virtual Table Model -> Visible
 - The result store's layout, paging and bounded-memory policy are set by
   [ADR-0004](../decisions/0004-result-store.md): compacted columnar segments owned by the core,
   on-demand fetching bounded in bytes per round trip, and per-result row and byte caps that are
-  user settings.
+  user settings. The core side is implemented in `db-core`'s `store` module (M5.2 Stage A:
+  `ResultStore`, `ResultSegment`, `SessionResults`, with the caps registered in
+  `crates/workspace`); the C ABI 4 that lets the grid read segments is M5.2's second stage.
 - Apache Arrow may be used internally *only where benchmarks justify it*, and UI APIs must not
   depend on Arrow (`SPEC.md` §12; `ROADMAP.md` Phase 3).
 - Avoid unnecessary allocation and copying here; changes require a recorded baseline and

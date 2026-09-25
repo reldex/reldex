@@ -29,6 +29,7 @@ use crate::events::{CompletedOperation, RequestId, SessionEvent};
 use crate::ids::{LobHandle, ResultId, SessionId};
 use crate::session::{CloseError, ExecuteOutcome, FetchedBatch};
 use crate::shared::SessionShared;
+use crate::store::{FetchTicket, SegmentReply};
 
 /// A value a request replies with, and the [`SessionEvent`] it becomes.
 ///
@@ -124,6 +125,24 @@ impl ReplyPayload for FetchedBatch {
             request,
             result,
             batch: value,
+        }
+    }
+}
+
+impl ReplyPayload for SegmentReply {
+    type Subject = FetchTicket;
+
+    fn into_event(
+        session: SessionId,
+        request: RequestId,
+        fetch: Self::Subject,
+        value: DbResult<Self>,
+    ) -> SessionEvent {
+        SessionEvent::FetchedSegment {
+            session,
+            request,
+            fetch,
+            segment: value,
         }
     }
 }

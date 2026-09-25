@@ -1,0 +1,6 @@
+test,rows,accounted_bytes,bytes_per_row,segments,constant_time_lookup,requests,first_request_rows,largest_request_rows,wall_ms,notes
+a_hundred_thousand_varying_rows_arrive_intact,100000,6757141,67.6,101,true,101,63,1000,1964,"every cell checked; first request sized by declared widths (VARCHAR2 expression described at 4000 bytes)"
+wide_rows_are_sized_by_declared_width_and_stop_at_the_byte_cap,1080,16770028,15527.8,65,false,65,16,17,616,"16 MiB byte cap: AtLimit{Bytes, Unknown}; first page 33 rows in 93 ms; wire array 100 rows (no statement hint); two of four columns repeat per row (TTC-compressed)"
+exact_and_inexact_numbers_read_back_exactly_across_segments,5000,262568,52.5,5,true,7,1000,1000,84,"scales per segment [1, 2, 2, 2, 2]; LEVEL/7 kept as Number"
+a_lob_column_is_read_through_parked_handles,50,,,,,,,,,"every CLOB read through its handle on the worker; NULL stays NULL"
+a_typed_commit_ends_an_open_result_and_its_lob_cells,100,,,,,,,,,"Ended{TransactionEnded}; prefix readable; LOB cell unavailable; the old LOB handle and the cursor both fail on the worker"

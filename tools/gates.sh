@@ -30,7 +30,7 @@
 # Stages, in order: fmt, clippy, test, header, doc, ui, db.
 #   fmt     cargo fmt --all -- --check
 #   clippy  cargo clippy --workspace --all-targets -- -D warnings, plus the
-#           oracle-thin oracle-it feature build and the reldex-ffi
+#           oracle-it feature builds (oracle-thin, reldex-core-poc) and the reldex-ffi
 #           --no-default-features build (ADR-0003 A8: a cargo feature must
 #           never change the ABI; the default-mock build must stay clean too)
 #   test    cargo test --workspace
@@ -41,8 +41,8 @@
 #   ui      bash ui/build.sh --test, only when Qt 6.8 + CMake + Ninja (and,
 #           on Windows, Visual Studio via vswhere.exe) are discoverable;
 #           otherwise SKIP with the specific reason.
-#   db      the whole reldex-driver-oracle-thin `oracle-it` integration
-#           suite against tools/oracle-test-db/, only when the
+#   db      the reldex-driver-oracle-thin and reldex-core-poc `oracle-it`
+#           integration suites against tools/oracle-test-db/, only when the
 #           `reldex-oracle19c` container reports healthy (this script may
 #           `docker start` it, nothing else with docker); otherwise SKIP
 #           with the specific reason. Never prints the container's
@@ -184,6 +184,8 @@ do_clippy() {
     # must also stay clippy-clean, and so must the FFI boundary built with
     # no concrete driver at all (the shape a real product build takes).
     cargo clippy -p reldex-driver-oracle-thin --all-targets --features oracle-it -- -D warnings || rc=1
+    # The live tests that need db-core as well as the driver (M5.2 onward).
+    cargo clippy -p reldex-core-poc --all-targets --features oracle-it -- -D warnings || rc=1
     cargo clippy -p reldex-ffi --no-default-features -- -D warnings || rc=1
     return "${rc}"
 }
@@ -281,13 +283,21 @@ db_health_reason() {
     return 1
 }
 
+run_db_suites() {
+    local rc=0
+    bash tools/oracle-test-db/run-it.sh || rc=1
+    # The live tests that need db-core as well as the driver (M5.2 onward).
+    RELDEX_IT_PACKAGE=reldex-core-poc bash tools/oracle-test-db/run-it.sh || rc=1
+    return "${rc}"
+}
+
 maybe_run_db() {
     local reason
     if ! reason=$(db_health_reason); then
         skip_stage db "${reason}"
         return
     fi
-    run_timed db bash tools/oracle-test-db/run-it.sh
+    run_timed db run_db_suites
 }
 
 # --- run selected stages, in order --------------------------------------

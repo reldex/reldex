@@ -67,6 +67,19 @@
 //! states is literally true: of everything a fetch produces, only plain data
 //! crosses a thread boundary.
 //!
+//! # The Result Store
+//!
+//! A result a UI shows is retained in a [`ResultStore`] (ADR-0004): the
+//! fetched prefix as immutable [`ResultSegment`]s, each one a batch compacted
+//! **on the worker thread** — `NUMBER` re-encoded as a scaled `i64` where that
+//! is exact, text and byte buffers copied to their exact size, every LOB locator
+//! parked and replaced by an id — before its reply leaves the worker
+//! ([`DatabaseSession::submit_fetch_segment`],
+//! [`SessionEvent::FetchedSegment`]). The store decides what to fetch from
+//! the view's demand and the row and byte caps, and reports a typed
+//! [`ResultState`]. [`SessionResults`] holds a session's stores and ends
+//! them, deterministically, whenever the transaction or the session ends.
+//!
 //! # Two ways to be answered
 //!
 //! Every request can be answered either through its own [`Completion`] — the
@@ -99,6 +112,7 @@ mod registry;
 mod reply;
 mod session;
 mod shared;
+mod store;
 mod worker;
 
 pub use events::{
@@ -113,6 +127,13 @@ pub use session::{
     SessionManager,
 };
 pub use shared::SessionLifecycle;
+pub use store::{
+    Cap, CapSource, CellValue, DEFAULT_FETCHES_IN_FLIGHT, DEFAULT_ROUND_TRIP_BYTES, EndCause,
+    FetchMore, FetchRequest, FetchTicket, Fetched, GRID_ROW_CEILING, LimitKind, LobCell,
+    LobUnavailable, MoreRows, NumberValue, Observed, ResultCaps, ResultPhase, ResultPolicy,
+    ResultSegment, ResultState, ResultStore, ScaledNumber, SegmentColumn, SegmentData,
+    SegmentReply, SessionResults, Sourced, StoreAction,
+};
 
 // Re-exported so most callers need only this crate for session-level work,
 // without reaching into `reldex-db-driver-api` directly for vendor-neutral
