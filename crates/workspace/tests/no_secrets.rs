@@ -20,15 +20,25 @@ use reldex_workspace::settings::{
     CONNECT_TIMEOUT, FETCH_ROWS, SERVER_OUTPUT_ENABLED, STATEMENT_TIME_LIMIT, TimeLimit,
 };
 use reldex_workspace::{
-    Authentication, ConnectSettings, CredentialKey, DatabaseType, Environment, PasswordStorage,
-    Profile, ProfileDetails, ProfileEndpoint, ResolveContext, Scope, ServiceTarget, Store,
-    TlsOptions, Transport, WorksheetId, connection_params,
+    Authentication, ConnectSettings, CredentialKey, DatabaseType, Environment, HistoryEntry,
+    HistoryOutcome, HistoryPage, PasswordStorage, Profile, ProfileDetails, ProfileEndpoint,
+    ResolveContext, Scope, ServiceTarget, Store, TlsOptions, Transport, Worksheet, WorksheetId,
+    WorksheetState, connection_params,
 };
 use support::oracle_binding::OracleThinBinding;
 use support::{TempDir, bytes_of, contains, store_files};
 
 const SECRET_MARKER: &str = "RldxSecretMarker-7f3c2a9e-must-never-be-stored";
 const NAME_MARKER: &str = "RldxNameMarker-5b1d0c44";
+/// A marker embedded in *legitimate SQL text* — a history statement and a
+/// worksheet's editor text — sitting in a credential-looking position (an
+/// `IDENTIFIED BY` clause). Unlike [`SECRET_MARKER`], this one **must** be
+/// found: the statement/text columns store SQL verbatim by design, and the
+/// credential-pattern guard (`CredentialPattern`, `crate::ProfileDetails::
+/// validate`) applies only to a profile's endpoint fields, never to history
+/// or worksheet text (`docs/decisions/
+/// 0006-local-persistence-settings-profiles-sqlite.md`, accepted limitation).
+const SQL_TEXT_MARKER: &str = "RldxSqlTextMarker-2a6f19bd";
 
 /// Stands in for the M2.10 credential store: keyed by profile id, holds a
 /// `Secret`, and is the only place the password ever lives.
@@ -115,13 +125,28 @@ fn a_password_used_for_a_connection_never_reaches_the_sqlite_file() {
             TimeLimit::NoLimit,
         )
         .expect("put");
-    let worksheet = WorksheetId::new_random();
+    let worksheet_id = WorksheetId::new_random();
+    let ddl_with_a_credential_looking_clause =
+        format!("ALTER USER app_owner IDENTIFIED BY \"{SQL_TEXT_MARKER}\"");
+    let worksheet = Worksheet::new(
+        worksheet_id,
+        Some(profile.id()),
+        WorksheetState {
+            title: format!("scratch {NAME_MARKER}"),
+            text: ddl_with_a_credential_looking_clause.clone(),
+            caret: 0,
+            scroll: 0,
+        },
+        0,
+    )
+    .expect("the credential-pattern guard does not apply to worksheet text");
+    store.save_worksheet(&worksheet).expect("save");
     store
-        .put_setting(Scope::Worksheet(worksheet), SERVER_OUTPUT_ENABLED, true)
+        .put_setting(Scope::Worksheet(worksheet_id), SERVER_OUTPUT_ENABLED, true)
         .expect("put");
     store
         .put_setting(
-            Scope::Worksheet(worksheet),
+            Scope::Worksheet(worksheet_id),
             STATEMENT_TIME_LIMIT,
             TimeLimit::NoLimit,
         )
@@ -129,6 +154,24 @@ fn a_password_used_for_a_connection_never_reaches_the_sqlite_file() {
     store
         .clear_setting(Scope::Application, FETCH_ROWS.id())
         .expect("clear");
+    // A history entry for the same statement: the statement column is user
+    // SQL, stored verbatim, and is never scanned for credential-looking
+    // patterns either — only bind values would need to be kept out, and
+    // `HistoryEntry` has no field that could carry one.
+    store
+        .record_history(HistoryEntry {
+            profile: profile.id(),
+            executed_at: reldex_workspace::UnixTimeMs::now(),
+            statement: ddl_with_a_credential_looking_clause.clone(),
+            outcome: HistoryOutcome::Succeeded,
+            elapsed_ms: 4,
+            row_count: None,
+        })
+        .expect("record history; the credential-pattern guard does not apply to SQL text");
+    let history = store
+        .history(profile.id(), HistoryPage::first(1))
+        .expect("history");
+    assert_eq!(history[0].statement, ddl_with_a_credential_looking_clause);
     let reloaded = store.profile(profile.id()).expect("read").expect("present");
     let app = store.application_settings().expect("load").value;
     let prof = store.profile_settings(profile.id()).expect("load").value;
@@ -154,7 +197,13 @@ fn a_password_used_for_a_connection_never_reaches_the_sqlite_file() {
     assert!(!format!("{reloaded:?}").contains(SECRET_MARKER));
     assert!(!format!("{store:?}").contains(SECRET_MARKER));
 
-    // While open: the data may still be in the WAL, so search both.
+    // While open: the data may still be in the WAL, so search both. The real
+    // secret (SECRET_MARKER) must never appear anywhere, including in the
+    // new history and worksheet rows written above; the SQL-text marker
+    // (SQL_TEXT_MARKER), sitting in a credential-looking `IDENTIFIED BY`
+    // clause inside legitimate SQL, must be found in both — that is the
+    // accepted, by-design difference between a captured secret and captured
+    // SQL text.
     let open_bytes = store_bytes(&dir.store_path());
     for needle in encodings(SECRET_MARKER) {
         assert!(
@@ -165,6 +214,11 @@ fn a_password_used_for_a_connection_never_reaches_the_sqlite_file() {
     assert!(
         contains(&open_bytes, NAME_MARKER.as_bytes()),
         "positive control: the stored name must be found"
+    );
+    assert!(
+        contains(&open_bytes, SQL_TEXT_MARKER.as_bytes()),
+        "SQL text is stored verbatim by design, including in a \
+         credential-looking clause"
     );
 
     // After close: checkpointed into the main file.
@@ -179,6 +233,11 @@ fn a_password_used_for_a_connection_never_reaches_the_sqlite_file() {
     assert!(
         contains(&closed_bytes, NAME_MARKER.as_bytes()),
         "positive control: the stored name must be found"
+    );
+    assert!(
+        contains(&closed_bytes, SQL_TEXT_MARKER.as_bytes()),
+        "SQL text is stored verbatim by design, including in a \
+         credential-looking clause"
     );
 }
 
