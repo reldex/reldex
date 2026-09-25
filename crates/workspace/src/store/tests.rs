@@ -14,9 +14,10 @@ use crate::profile::{
     ProfileEndpoint, ProfileError, ProfileField, ServiceTarget, TlsOptions, Transport,
 };
 use crate::settings::{
-    ByteLimit, CONNECT_TIMEOUT, FETCH_ROWS, FETCHES_IN_FLIGHT, ResolveContext,
+    ByteLimit, CONNECT_TIMEOUT, EntryLimit, FETCH_ROWS, FETCHES_IN_FLIGHT, ResolveContext,
     SERVER_OUTPUT_BUFFER, SERVER_OUTPUT_ENABLED, STATEMENT_TIME_LIMIT, TimeLimit,
 };
+use crate::worksheet::{Worksheet, WorksheetState};
 
 fn store() -> Store {
     Store::open_in_memory().expect("in-memory store")
@@ -44,6 +45,15 @@ fn details(name: &str) -> ProfileDetails {
 
 /// One profile of every shape the model has, so a round trip covers every
 /// column and every enumeration word.
+fn worksheet_state() -> WorksheetState {
+    WorksheetState {
+        title: "scratch".to_owned(),
+        text: "select 1;".to_owned(),
+        caret: 0,
+        scroll: 0,
+    }
+}
+
 fn every_shape() -> Vec<ProfileDetails> {
     let mut out = Vec::new();
     for (index, environment) in [
@@ -226,6 +236,9 @@ fn every_setting_kind_round_trips_at_every_level_it_allows() {
     let profile = Profile::create(details("p")).expect("valid");
     store.insert_profile(&profile).expect("insert");
     let worksheet = WorksheetId::new_random();
+    store
+        .save_worksheet(&Worksheet::new(worksheet, None, worksheet_state(), 0).expect("valid"))
+        .expect("save worksheet");
     let seconds = |n| TimeLimit::Seconds(NonZeroU32::new(n).expect("non-zero"));
 
     let values = [
@@ -244,6 +257,10 @@ fn every_setting_kind_round_trips_at_every_level_it_allows() {
         (
             SettingId::ServerOutputBuffer,
             SettingValue::ByteLimit(ByteLimit::Unlimited),
+        ),
+        (
+            SettingId::HistoryMaxEntriesPerProfile,
+            SettingValue::EntryLimit(EntryLimit::Unlimited),
         ),
     ];
     assert_eq!(values.len(), SettingId::ALL.len(), "one value per setting");
@@ -358,6 +375,9 @@ fn put_replaces_and_clear_restores_inheritance() {
     assert!(store.application_settings().expect("load").value.is_empty());
 
     let worksheet = WorksheetId::new_random();
+    store
+        .save_worksheet(&Worksheet::new(worksheet, None, worksheet_state(), 0).expect("valid"))
+        .expect("save worksheet");
     store
         .put_setting(Scope::Worksheet(worksheet), FETCH_ROWS, 5)
         .expect("put");

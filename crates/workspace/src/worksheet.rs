@@ -260,8 +260,8 @@ mod tests {
 
     #[test]
     fn new_stamps_both_timestamps_equal() {
-        let worksheet = Worksheet::new(WorksheetId::new_random(), None, state("select 1;"), 0)
-            .expect("valid");
+        let worksheet =
+            Worksheet::new(WorksheetId::new_random(), None, state("select 1;"), 0).expect("valid");
         assert_eq!(worksheet.created_at(), worksheet.updated_at());
     }
 
@@ -277,9 +277,7 @@ mod tests {
             Err(WorksheetError::TitleControlCharacter)
         );
         assert_eq!(worksheet, before);
-        worksheet
-            .update_state(state("select 2;"))
-            .expect("valid");
+        worksheet.update_state(state("select 2;")).expect("valid");
         assert_eq!(worksheet.state().text, "select 2;");
         assert!(worksheet.updated_at() >= before.updated_at());
         assert_eq!(worksheet.created_at(), before.created_at());

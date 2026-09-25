@@ -395,7 +395,14 @@ mod tests {
                 to: SCHEMA_VERSION
             }
         );
-        for table in ["profile", "setting", "history", "worksheet", "worksheet_setting", "layout"] {
+        for table in [
+            "profile",
+            "setting",
+            "history",
+            "worksheet",
+            "worksheet_setting",
+            "layout",
+        ] {
             let exists: i64 = connection
                 .query_row(
                     "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = ?1",
@@ -421,7 +428,10 @@ mod tests {
             migrate_with(&mut connection, &v1_only, 1).expect("migrate to 1"),
             Migrated { from: 0, to: 1 }
         );
-        let v1_and_v2 = [Migration { to: 1, apply: v1 }, Migration { to: 2, apply: v2 }];
+        let v1_and_v2 = [
+            Migration { to: 1, apply: v1 },
+            Migration { to: 2, apply: v2 },
+        ];
         assert_eq!(
             migrate_with(&mut connection, &v1_and_v2, 2).expect("migrate to 2"),
             Migrated { from: 1, to: 2 }

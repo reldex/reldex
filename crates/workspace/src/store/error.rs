@@ -7,9 +7,11 @@ use std::path::PathBuf;
 
 use rusqlite::ErrorCode;
 
-use crate::ids::ProfileId;
+use crate::history::HistoryError;
+use crate::ids::{ProfileId, WorksheetId};
 use crate::profile::ProfileError;
 use crate::settings::SettingError;
+use crate::worksheet::WorksheetError;
 
 /// Why a store operation failed. Every failure is one of these; none panics.
 #[derive(Debug)]
@@ -77,6 +79,12 @@ pub enum StoreError {
     ProfileNotFound(ProfileId),
     /// A profile with this id already exists.
     ProfileExists(ProfileId),
+    /// A history entry failed validation and was not written.
+    InvalidHistory(HistoryError),
+    /// A worksheet failed validation and was not written.
+    InvalidWorksheet(WorksheetError),
+    /// No worksheet has this id.
+    WorksheetNotFound(WorksheetId),
     /// A stored row could not be read back as a model value.
     InvalidRow {
         /// What was wrong with it.
@@ -124,6 +132,9 @@ impl fmt::Display for StoreError {
             Self::InvalidSetting(error) => write!(f, "{error}"),
             Self::ProfileNotFound(id) => write!(f, "no profile {id}"),
             Self::ProfileExists(id) => write!(f, "profile {id} already exists"),
+            Self::InvalidHistory(error) => write!(f, "{error}"),
+            Self::InvalidWorksheet(error) => write!(f, "{error}"),
+            Self::WorksheetNotFound(id) => write!(f, "no worksheet {id}"),
             Self::InvalidRow { detail } => write!(f, "a stored row is invalid: {detail}"),
             Self::Sqlite { code, detail } => write!(f, "SQLite error {code}: {detail}"),
         }
@@ -136,6 +147,8 @@ impl std::error::Error for StoreError {
             Self::CreateDirectory { source, .. } => Some(source),
             Self::InvalidProfile(error) => Some(error),
             Self::InvalidSetting(error) => Some(error),
+            Self::InvalidHistory(error) => Some(error),
+            Self::InvalidWorksheet(error) => Some(error),
             _ => None,
         }
     }
@@ -150,6 +163,18 @@ impl From<ProfileError> for StoreError {
 impl From<SettingError> for StoreError {
     fn from(error: SettingError) -> Self {
         Self::InvalidSetting(error)
+    }
+}
+
+impl From<HistoryError> for StoreError {
+    fn from(error: HistoryError) -> Self {
+        Self::InvalidHistory(error)
+    }
+}
+
+impl From<WorksheetError> for StoreError {
+    fn from(error: WorksheetError) -> Self {
+        Self::InvalidWorksheet(error)
     }
 }
 

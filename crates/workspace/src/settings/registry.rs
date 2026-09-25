@@ -745,7 +745,10 @@ mod tests {
             );
             let numeric = matches!(
                 descriptor.kind(),
-                ValueKind::Count | ValueKind::TimeLimit | ValueKind::ByteLimit
+                ValueKind::Count
+                    | ValueKind::TimeLimit
+                    | ValueKind::ByteLimit
+                    | ValueKind::EntryLimit
             );
             assert_eq!(descriptor.bounds().is_some(), numeric, "{id}");
             if let Some(bounds) = descriptor.bounds() {
