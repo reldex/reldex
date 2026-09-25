@@ -5,18 +5,21 @@
 //! Two properties:
 //!
 //! 1. the workspace still **denies** `unsafe_code`;
-//! 2. the only crates that opt out are this one — the single FFI boundary —
-//!    and `mobile-link-check`, the disposable spike-S6 link probe whose whole
-//!    reason to exist is one `extern "C"` symbol.
+//! 2. the only code that opts out is this crate — the single FFI boundary —,
+//!    `mobile-link-check`, the disposable spike-S6 link probe whose whole
+//!    reason to exist is one `extern "C"` symbol, and one *file* of
+//!    `reldex-secrets`: the Windows Credential Manager calls (ADR-0007 S5),
+//!    not the rest of that crate.
 //!
-//! A third crate appearing here is not a lint failure to be silenced; it is an
+//! Another entry here is not a lint failure to be silenced; it is an
 //! architecture decision that needs an ADR.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Crate directories (relative to `crates/`) allowed to opt out, with why.
-const ALLOWED: [(&str, &str); 2] = [
+/// Paths (relative to `crates/`) allowed to opt out, with why: a crate
+/// directory allows every file in it, a file path allows that file only.
+const ALLOWED: [(&str, &str); 3] = [
     (
         "ffi",
         "the single FFI boundary; ADR-0003 D2 makes it the one exception",
@@ -25,7 +28,20 @@ const ALLOWED: [(&str, &str); 2] = [
         "mobile-link-check",
         "a build/link probe for spike S6, not product code",
     ),
+    (
+        "secrets/src/wincred.rs",
+        "the Credential Manager calls, Windows only; ADR-0007 S5",
+    ),
 ];
+
+fn is_allowed(relative: &str) -> bool {
+    ALLOWED.iter().any(|(path, _)| {
+        relative == *path
+            || relative
+                .strip_prefix(path)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
 
 fn workspace_root() -> PathBuf {
     // `CARGO_MANIFEST_DIR` is `<root>/crates/ffi`.
@@ -54,7 +70,7 @@ fn rust_files(root: &Path, into: &mut Vec<PathBuf>) {
 }
 
 #[test]
-fn only_the_ffi_boundary_and_the_link_probe_allow_unsafe_code() {
+fn only_the_ffi_boundary_the_link_probe_and_the_credential_calls_allow_unsafe_code() {
     let root = workspace_root();
     let crates = root.join("crates");
     let mut files = Vec::new();
@@ -79,20 +95,19 @@ fn only_the_ffi_boundary_and_the_link_probe_allow_unsafe_code() {
             .unwrap_or(file)
             .to_string_lossy()
             .replace('\\', "/");
-        let owner = relative.split('/').next().unwrap_or_default().to_owned();
-        if owner == "ffi" {
+        if relative.starts_with("ffi/") {
             found_ffi = true;
         }
-        if !ALLOWED.iter().any(|(name, _)| *name == owner) {
+        if !is_allowed(&relative) {
             offenders.push(relative);
         }
     }
 
     assert!(
         offenders.is_empty(),
-        "these files opt out of the workspace's `unsafe_code = \"deny\"` but are not the FFI \
-         boundary: {offenders:?}. Adding a third such crate is an architecture decision \
-         (ADR-0003 D2), not a lint to silence."
+        "these files opt out of the workspace's `unsafe_code = \"deny\"` but are not on the \
+         allowed list: {offenders:?}. Adding one is an architecture decision (ADR-0003 D2, \
+         ADR-0007 S5), not a lint to silence."
     );
     assert!(
         found_ffi,
