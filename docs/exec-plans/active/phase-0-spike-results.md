@@ -954,6 +954,15 @@ assumed when Reldex chooses one.
 > **Cause identified, 2026-09-25.** The independent review of ADR-0004 (M5.1)
 > traced this to upstream's O(packets²) response reassembly on a pre-23ai
 > server — see U-19 in §5 below.
+>
+> *ADR-0004 pointer, 2026-09-25.* This result is why ADR-0004 RS2 bounds each
+> fetch by **bytes per round trip** rather than by a row count. The fetch-size
+> question (§9 "What the owner has to decide" item 12; `phase-1.md` §C.3
+> item 10) is re-asked as a bytes budget. The driver-level numbers are in
+> `docs/exec-plans/active/phase-1-m5-1-data/driver-fetch-probe.csv`: the same
+> 1,000 rows take 4.4 ms, 22 ms or 23 s depending on row width. A probe must
+> make every row's values different, because TTC compresses a value that
+> repeats the previous row's and hides the cost.
 
 ---
 
@@ -3759,7 +3768,9 @@ own. Their verdicts against `SPEC.md` §8's operations list:
     within run-to-run noise of each other. This is one machine and one run: it
     is enough to forbid assuming "bigger is faster", not enough to pick a
     number. A short follow-up measurement across row shapes and a real network
-    should precede the choice.
+    should precede the choice. *(2026-09-25: the cause is now known — U-19, a
+    client-side cost quadratic in the bytes per fetch on 19c; see the notes under
+    S14 and ADR-0004 RS2. The question becomes a bytes-per-round-trip budget.)*
 
     **Owner decision (2026-09-19):** no number is chosen now. The default will
     be set from a benchmark during Phase 1 UI work; until then the driver's
