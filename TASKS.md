@@ -140,7 +140,7 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 
 ### M5 — Results at scale
 
-- [ ] M5.1 ★ ADR-0004 — Result Store representation, paging and bounded-memory policy (opus, review mandatory)
+- [x] M5.1 ★ ADR-0004 — Result Store representation, paging and bounded-memory policy (opus, review mandatory) —  — done 2026-09-25: ADR-0004 Accepted by the lead after an independent review (returned once; doc-only fixes landed) — per-batch column segments (NUMBER as scaled i64 when exact; measured 118 B/row vs 443 today for ten NUMBER columns, no per-segment fixed cost), demand-driven paging one batch ahead, row/byte caps as settings with their source (desktop 1,000,000 / 512 MiB; mobile 100,000 / 64 MiB unmeasured), transaction end deterministically ends a result, spill/Arrow deferred to P3 with reopening benchmarks, C ABI 4 shape for M5.2; the review traced the 'bigger fetches are slower' curve to an upstream O(packets²) re-parse on pre-23ai servers (Issue J / U-19 draft), so round trips are bounded by bytes; owner-review points listed
 - [ ] M5.2 ★ Result Store implementation in `db-core` + FFI batch lifetime rules (opus, review mandatory)
 - [ ] M5.3 Grid features: row numbers, NULL visualization, column resize/reorder, type-aware formatting via the bulk formatter, search-in-results (sonnet)
 - [ ] M5.4 Copy: cell, row, range, with/without headers (sonnet)
