@@ -9,14 +9,18 @@ use reldex_db_driver_api::SessionRole;
 use rusqlite::params;
 
 use super::*;
+use crate::history::{HistoryEntry, HistoryOutcome, HistoryPage, MAX_STATEMENT_BYTES};
+use crate::layout::{Layout, PaneSizes, WindowGeometry};
 use crate::profile::{
     Authentication, CredentialPattern, DatabaseType, Environment, PasswordStorage, ProfileDetails,
     ProfileEndpoint, ProfileError, ProfileField, ServiceTarget, TlsOptions, Transport,
 };
 use crate::settings::{
-    ByteLimit, CONNECT_TIMEOUT, FETCH_ROWS, FETCHES_IN_FLIGHT, ResolveContext,
-    SERVER_OUTPUT_BUFFER, SERVER_OUTPUT_ENABLED, STATEMENT_TIME_LIMIT, TimeLimit,
+    ByteLimit, CONNECT_TIMEOUT, EntryLimit, FETCH_ROWS, FETCHES_IN_FLIGHT,
+    HISTORY_MAX_ENTRIES_PER_PROFILE, ResolveContext, SERVER_OUTPUT_BUFFER, SERVER_OUTPUT_ENABLED,
+    STATEMENT_TIME_LIMIT, TimeLimit,
 };
+use crate::worksheet::{MAX_WORKSHEET_TEXT_BYTES, Worksheet, WorksheetState};
 
 fn store() -> Store {
     Store::open_in_memory().expect("in-memory store")
@@ -44,6 +48,15 @@ fn details(name: &str) -> ProfileDetails {
 
 /// One profile of every shape the model has, so a round trip covers every
 /// column and every enumeration word.
+fn worksheet_state() -> WorksheetState {
+    WorksheetState {
+        title: "scratch".to_owned(),
+        text: "select 1;".to_owned(),
+        caret: 0,
+        scroll: 0,
+    }
+}
+
 fn every_shape() -> Vec<ProfileDetails> {
     let mut out = Vec::new();
     for (index, environment) in [
@@ -226,6 +239,9 @@ fn every_setting_kind_round_trips_at_every_level_it_allows() {
     let profile = Profile::create(details("p")).expect("valid");
     store.insert_profile(&profile).expect("insert");
     let worksheet = WorksheetId::new_random();
+    store
+        .save_worksheet(&Worksheet::new(worksheet, None, worksheet_state(), 0).expect("valid"))
+        .expect("save worksheet");
     let seconds = |n| TimeLimit::Seconds(NonZeroU32::new(n).expect("non-zero"));
 
     let values = [
@@ -244,6 +260,10 @@ fn every_setting_kind_round_trips_at_every_level_it_allows() {
         (
             SettingId::ServerOutputBuffer,
             SettingValue::ByteLimit(ByteLimit::Unlimited),
+        ),
+        (
+            SettingId::HistoryMaxEntriesPerProfile,
+            SettingValue::EntryLimit(EntryLimit::Unlimited),
         ),
     ];
     assert_eq!(values.len(), SettingId::ALL.len(), "one value per setting");
@@ -358,6 +378,9 @@ fn put_replaces_and_clear_restores_inheritance() {
     assert!(store.application_settings().expect("load").value.is_empty());
 
     let worksheet = WorksheetId::new_random();
+    store
+        .save_worksheet(&Worksheet::new(worksheet, None, worksheet_state(), 0).expect("valid"))
+        .expect("save worksheet");
     store
         .put_setting(Scope::Worksheet(worksheet), FETCH_ROWS, 5)
         .expect("put");
@@ -758,4 +781,626 @@ fn profile_error_converts_into_a_store_error() {
         StoreError::InvalidProfile(ProfileError::PortZero)
     ));
     assert!(!error.to_string().is_empty());
+}
+
+// ---- history (M4.10) ------------------------------------------------------
+
+fn history_entry(profile: ProfileId, statement: &str) -> HistoryEntry {
+    HistoryEntry {
+        profile,
+        executed_at: UnixTimeMs::now(),
+        statement: statement.to_owned(),
+        outcome: HistoryOutcome::Succeeded,
+        elapsed_ms: 12,
+        row_count: Some(3),
+    }
+}
+
+#[test]
+fn history_round_trips_including_thai_emoji_and_a_1_mib_statement() {
+    let mut store = store();
+    let profile = Profile::create(details("p")).expect("valid");
+    store.insert_profile(&profile).expect("insert");
+
+    let thai = HistoryEntry {
+        outcome: HistoryOutcome::Failed {
+            native_code: Some(1017),
+        },
+        ..history_entry(profile.id(), "select ผู้ใช้, '🎉' from dual;")
+    };
+    let big_statement = "x".repeat(MAX_STATEMENT_BYTES);
+    let big = HistoryEntry {
+        outcome: HistoryOutcome::TimedOut,
+        row_count: None,
+        ..history_entry(profile.id(), &big_statement)
+    };
+    let cancelled = HistoryEntry {
+        outcome: HistoryOutcome::Cancelled,
+        ..history_entry(profile.id(), "begin long_running; end;")
+    };
+
+    let thai_id = store.record_history(thai.clone()).expect("record");
+    let big_id = store.record_history(big.clone()).expect("record");
+    let cancelled_id = store.record_history(cancelled.clone()).expect("record");
+    assert!(thai_id < big_id && big_id < cancelled_id, "ids increase");
+
+    let page = store
+        .history(profile.id(), HistoryPage::first(10))
+        .expect("history");
+    assert_eq!(page.len(), 3);
+    assert_eq!(page[0].id, cancelled_id);
+    assert_eq!(page[0].outcome, HistoryOutcome::Cancelled);
+    assert_eq!(page[1].id, big_id);
+    assert_eq!(page[1].statement, big_statement);
+    assert_eq!(page[1].outcome, HistoryOutcome::TimedOut);
+    assert_eq!(page[1].row_count, None);
+    assert_eq!(page[2].id, thai_id);
+    assert_eq!(page[2].statement, thai.statement);
+    assert_eq!(
+        page[2].outcome,
+        HistoryOutcome::Failed {
+            native_code: Some(1017)
+        }
+    );
+    assert_eq!(page[2].elapsed_ms, 12);
+    assert_eq!(page[2].row_count, Some(3));
+}
+
+#[test]
+fn history_pages_newest_first_and_before_narrows_further() {
+    let mut store = store();
+    let profile = Profile::create(details("p")).expect("valid");
+    store.insert_profile(&profile).expect("insert");
+    let ids: Vec<_> = (0..5)
+        .map(|n| {
+            store
+                .record_history(history_entry(profile.id(), &format!("select {n}")))
+                .expect("record")
+        })
+        .collect();
+
+    let first_page = store
+        .history(profile.id(), HistoryPage::first(2))
+        .expect("history");
+    assert_eq!(
+        first_page.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![ids[4], ids[3]]
+    );
+    let next_page = store
+        .history(profile.id(), HistoryPage::after(2, first_page[1].id))
+        .expect("history");
+    assert_eq!(
+        next_page.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![ids[2], ids[1]]
+    );
+}
+
+#[test]
+fn history_is_trimmed_fifo_to_a_small_bound_inside_the_insert_transaction() {
+    let mut store = store();
+    let profile = Profile::create(details("p")).expect("valid");
+    store.insert_profile(&profile).expect("insert");
+    store
+        .put_setting(
+            Scope::Application,
+            HISTORY_MAX_ENTRIES_PER_PROFILE,
+            EntryLimit::count(3).expect("non-zero"),
+        )
+        .expect("put");
+
+    let ids: Vec<_> = (0..4)
+        .map(|n| {
+            store
+                .record_history(history_entry(profile.id(), &format!("select {n}")))
+                .expect("record")
+        })
+        .collect();
+    let remaining = store
+        .history(profile.id(), HistoryPage::first(10))
+        .expect("history");
+    assert_eq!(remaining.len(), 3, "trimmed to the bound");
+    let remaining_ids: Vec<_> = remaining.iter().map(|r| r.id).collect();
+    assert!(!remaining_ids.contains(&ids[0]), "the oldest entry is gone");
+    assert_eq!(remaining_ids, vec![ids[3], ids[2], ids[1]], "newest first");
+}
+
+#[test]
+fn history_default_bound_trims_the_1001st_insert_keeping_the_newest_1000() {
+    let mut store = store();
+    let profile = Profile::create(details("p")).expect("valid");
+    store.insert_profile(&profile).expect("insert");
+
+    let ids: Vec<_> = (0..1_001)
+        .map(|n| {
+            store
+                .record_history(history_entry(profile.id(), &format!("select {n}")))
+                .expect("record")
+        })
+        .collect();
+    let kept = store
+        .history(profile.id(), HistoryPage::first(2_000))
+        .expect("history");
+    assert_eq!(kept.len(), 1_000, "trimmed to the default bound");
+    let kept_ids: std::collections::HashSet<_> = kept.iter().map(|r| r.id).collect();
+    assert!(
+        !kept_ids.contains(&ids[0]),
+        "the oldest of the 1,001 is gone"
+    );
+    for id in &ids[1..] {
+        assert!(kept_ids.contains(id), "every later entry survives");
+    }
+}
+
+#[test]
+fn history_no_limit_is_never_trimmed() {
+    let mut store = store();
+    let profile = Profile::create(details("p")).expect("valid");
+    store.insert_profile(&profile).expect("insert");
+    store
+        .put_setting(
+            Scope::Application,
+            HISTORY_MAX_ENTRIES_PER_PROFILE,
+            EntryLimit::Unlimited,
+        )
+        .expect("put");
+    for n in 0..1_500 {
+        store
+            .record_history(history_entry(profile.id(), &format!("select {n}")))
+            .expect("record");
+    }
+    let kept = store
+        .history(profile.id(), HistoryPage::first(2_000))
+        .expect("history");
+    assert_eq!(kept.len(), 1_500, "no limit trims nothing");
+}
+
+#[test]
+fn deleting_a_profile_deletes_its_history() {
+    let mut store = store();
+    let keep = Profile::create(details("keep")).expect("valid");
+    let gone = Profile::create(details("gone")).expect("valid");
+    store.insert_profile(&keep).expect("insert");
+    store.insert_profile(&gone).expect("insert");
+    store
+        .record_history(history_entry(keep.id(), "select 1 from dual"))
+        .expect("record");
+    store
+        .record_history(history_entry(gone.id(), "select 2 from dual"))
+        .expect("record");
+
+    assert!(store.delete_profile(gone.id()).expect("delete"));
+    assert!(
+        store
+            .history(gone.id(), HistoryPage::first(10))
+            .expect("history")
+            .is_empty(),
+        "cascade-deleted"
+    );
+    assert_eq!(
+        store
+            .history(keep.id(), HistoryPage::first(10))
+            .expect("history")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn record_history_refuses_an_unknown_profile_and_writes_nothing() {
+    let mut store = store();
+    let stranger = ProfileId::new_random();
+    assert!(matches!(
+        store.record_history(history_entry(stranger, "select 1 from dual")),
+        Err(StoreError::ProfileNotFound(id)) if id == stranger
+    ));
+    let count: i64 = store
+        .connection
+        .query_row("SELECT count(*) FROM history", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn record_history_refuses_an_empty_statement_and_writes_nothing() {
+    let mut store = store();
+    let profile = Profile::create(details("p")).expect("valid");
+    store.insert_profile(&profile).expect("insert");
+    assert!(matches!(
+        store.record_history(history_entry(profile.id(), "   ")),
+        Err(StoreError::InvalidHistory(_))
+    ));
+    let count: i64 = store
+        .connection
+        .query_row("SELECT count(*) FROM history", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn clear_history_removes_only_that_profiles_entries() {
+    let mut store = store();
+    let a = Profile::create(details("a")).expect("valid");
+    let b = Profile::create(details("b")).expect("valid");
+    store.insert_profile(&a).expect("insert");
+    store.insert_profile(&b).expect("insert");
+    store
+        .record_history(history_entry(a.id(), "select 1"))
+        .expect("record");
+    store
+        .record_history(history_entry(b.id(), "select 2"))
+        .expect("record");
+    assert_eq!(store.clear_history(a.id()).expect("clear"), 1);
+    assert!(
+        store
+            .history(a.id(), HistoryPage::first(10))
+            .expect("history")
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .history(b.id(), HistoryPage::first(10))
+            .expect("history")
+            .len(),
+        1
+    );
+}
+
+/// `history_meta.count` for `profile`, or 0 if it has no row yet — the same
+/// value [`Store::record_history`]'s upsert would start from.
+fn meta_count(store: &Store, profile: ProfileId) -> i64 {
+    store
+        .connection
+        .query_row(
+            "SELECT count FROM history_meta WHERE profile_id = ?1",
+            params![profile.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
+}
+
+/// `COUNT(*)` of `profile`'s actual rows in `history` — the ground truth
+/// `history_meta.count` must always agree with.
+fn real_count(store: &Store, profile: ProfileId) -> i64 {
+    store
+        .connection
+        .query_row(
+            "SELECT count(*) FROM history WHERE profile_id = ?1",
+            params![profile.to_string()],
+            |row| row.get(0),
+        )
+        .expect("count")
+}
+
+#[test]
+fn history_meta_count_always_matches_the_real_row_count() {
+    let mut store = store();
+    let profile = Profile::create(details("p")).expect("valid");
+    store.insert_profile(&profile).expect("insert");
+
+    // No counter row before the first insert.
+    assert_eq!(meta_count(&store, profile.id()), 0);
+    assert_eq!(real_count(&store, profile.id()), 0);
+
+    // Ordinary inserts, under the (default, 1,000) bound: the counter tracks
+    // every one of them.
+    for n in 0..10 {
+        store
+            .record_history(history_entry(profile.id(), &format!("select {n}")))
+            .expect("record");
+        assert_eq!(
+            meta_count(&store, profile.id()),
+            real_count(&store, profile.id()),
+            "after insert {n}"
+        );
+    }
+    assert_eq!(meta_count(&store, profile.id()), 10);
+
+    // A small bound: the trim inside record_history keeps the counter and
+    // the real row count in lock-step through repeated steady-state trims.
+    store
+        .put_setting(
+            Scope::Application,
+            HISTORY_MAX_ENTRIES_PER_PROFILE,
+            EntryLimit::count(3).expect("non-zero"),
+        )
+        .expect("put");
+    for n in 10..20 {
+        store
+            .record_history(history_entry(profile.id(), &format!("select {n}")))
+            .expect("record");
+        assert_eq!(
+            meta_count(&store, profile.id()),
+            real_count(&store, profile.id()),
+            "after trimmed insert {n}"
+        );
+    }
+    assert_eq!(meta_count(&store, profile.id()), 3);
+
+    // clear_history drops the counter along with the rows, not merely to 0
+    // but to "no row", the same state an unseen profile starts from.
+    store.clear_history(profile.id()).expect("clear");
+    assert_eq!(meta_count(&store, profile.id()), 0);
+    assert_eq!(real_count(&store, profile.id()), 0);
+
+    // And the very next insert recreates it correctly from that state.
+    store
+        .record_history(history_entry(profile.id(), "select 'after clear'"))
+        .expect("record");
+    assert_eq!(meta_count(&store, profile.id()), 1);
+    assert_eq!(real_count(&store, profile.id()), 1);
+}
+
+#[test]
+fn lowering_the_limit_is_caught_up_in_one_pass_on_the_next_insert() {
+    let mut store = store();
+    let profile = Profile::create(details("p")).expect("valid");
+    store.insert_profile(&profile).expect("insert");
+    for n in 0..10 {
+        store
+            .record_history(history_entry(profile.id(), &format!("select {n}")))
+            .expect("record");
+    }
+    assert_eq!(meta_count(&store, profile.id()), 10, "no bound trimmed yet");
+
+    // Lowering the limit does not retroactively trim anything by itself —
+    // only the next insert's own transaction does, in one O(k) pass.
+    store
+        .put_setting(
+            Scope::Application,
+            HISTORY_MAX_ENTRIES_PER_PROFILE,
+            EntryLimit::count(2).expect("non-zero"),
+        )
+        .expect("put");
+    assert_eq!(
+        real_count(&store, profile.id()),
+        10,
+        "lowering the setting alone writes nothing"
+    );
+
+    store
+        .record_history(history_entry(profile.id(), "select 'the catch-up insert'"))
+        .expect("record");
+    assert_eq!(
+        real_count(&store, profile.id()),
+        2,
+        "one insert's transaction caught the whole excess up to the new bound"
+    );
+    assert_eq!(meta_count(&store, profile.id()), 2);
+}
+
+#[test]
+fn deleting_a_profile_cascades_its_history_meta_row_too() {
+    let mut store = store();
+    let profile = Profile::create(details("p")).expect("valid");
+    store.insert_profile(&profile).expect("insert");
+    store
+        .record_history(history_entry(profile.id(), "select 1"))
+        .expect("record");
+    assert_eq!(meta_count(&store, profile.id()), 1);
+
+    assert!(store.delete_profile(profile.id()).expect("delete"));
+
+    // `history_meta`'s own FK (`ON DELETE CASCADE`) removed the row; a
+    // profile that no longer exists has no counter to leak.
+    let orphaned: i64 = store
+        .connection
+        .query_row("SELECT count(*) FROM history_meta", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(orphaned, 0);
+}
+
+// ---- worksheets and layout (M6.2) -----------------------------------------
+
+fn worksheet_of(profile: Option<ProfileId>, title: &str, text: &str) -> Worksheet {
+    Worksheet::new(
+        WorksheetId::new_random(),
+        profile,
+        WorksheetState {
+            title: title.to_owned(),
+            text: text.to_owned(),
+            caret: 3,
+            scroll: 7,
+        },
+        0,
+    )
+    .expect("valid")
+}
+
+#[test]
+fn worksheet_round_trips_including_thai_emoji_and_a_1_mib_text() {
+    let mut store = store();
+    let profile = Profile::create(details("p")).expect("valid");
+    store.insert_profile(&profile).expect("insert");
+
+    let big_text = "x".repeat(MAX_WORKSHEET_TEXT_BYTES);
+    let thai = worksheet_of(
+        Some(profile.id()),
+        "แบบสอบถาม 🎉",
+        "select ผู้ใช้ from dual; -- 🎉",
+    );
+    let untitled = worksheet_of(None, "", &big_text);
+
+    store.save_worksheet(&thai).expect("save");
+    store.save_worksheet(&untitled).expect("save");
+
+    let loaded = store.load_worksheets().expect("load");
+    assert!(loaded.rejected.is_empty(), "{:?}", loaded.rejected);
+    assert_eq!(loaded.value.len(), 2);
+    let by_id = |id| {
+        loaded
+            .value
+            .iter()
+            .find(|worksheet| worksheet.id() == id)
+            .expect("present")
+    };
+    assert_eq!(by_id(thai.id()), &thai);
+    assert_eq!(by_id(untitled.id()).state().text, big_text);
+    assert_eq!(by_id(untitled.id()).profile(), None);
+}
+
+#[test]
+fn save_worksheet_upserts_keeping_the_creation_time() {
+    let mut store = store();
+    let mut worksheet = worksheet_of(None, "first", "select 1;");
+    store.save_worksheet(&worksheet).expect("save");
+    let created = worksheet.created_at();
+
+    worksheet
+        .update_state(WorksheetState {
+            title: "renamed".to_owned(),
+            text: "select 2;".to_owned(),
+            caret: 9,
+            scroll: 1,
+        })
+        .expect("valid");
+    worksheet.set_tab_order(2);
+    store.save_worksheet(&worksheet).expect("save again");
+
+    let loaded = store.load_worksheets().expect("load");
+    assert_eq!(loaded.value.len(), 1, "upserted, not duplicated");
+    let stored = &loaded.value[0];
+    assert_eq!(stored.state().title, "renamed");
+    assert_eq!(stored.tab_order(), 2);
+    assert_eq!(
+        stored.created_at(),
+        created,
+        "creation time kept as first stored"
+    );
+    assert!(stored.updated_at() >= created);
+}
+
+#[test]
+fn save_worksheet_refuses_an_unknown_profile_and_writes_nothing() {
+    let mut store = store();
+    let stranger = ProfileId::new_random();
+    let worksheet = worksheet_of(Some(stranger), "t", "select 1;");
+    assert!(matches!(
+        store.save_worksheet(&worksheet),
+        Err(StoreError::ProfileNotFound(id)) if id == stranger
+    ));
+    assert!(store.load_worksheets().expect("load").value.is_empty());
+}
+
+#[test]
+fn worksheet_scoped_settings_require_an_existing_worksheet() {
+    let mut store = store();
+    let stranger = WorksheetId::new_random();
+    assert!(matches!(
+        store.put_setting(Scope::Worksheet(stranger), FETCH_ROWS, 5),
+        Err(StoreError::WorksheetNotFound(id)) if id == stranger
+    ));
+}
+
+#[test]
+fn delete_worksheet_cascades_its_settings_and_clears_it_from_the_layout() {
+    let mut store = store();
+    let worksheet = worksheet_of(None, "t", "select 1;");
+    store.save_worksheet(&worksheet).expect("save");
+    store
+        .put_setting(Scope::Worksheet(worksheet.id()), FETCH_ROWS, 42)
+        .expect("put");
+    store
+        .save_layout(&Layout {
+            active_worksheet: Some(worksheet.id()),
+            ..Layout::default()
+        })
+        .expect("save layout");
+
+    assert!(store.delete_worksheet(worksheet.id()).expect("delete"));
+    assert!(
+        !store
+            .delete_worksheet(worksheet.id())
+            .expect("delete again")
+    );
+    assert!(
+        store
+            .worksheet_settings(worksheet.id())
+            .expect("load")
+            .value
+            .is_empty(),
+        "settings cascade-deleted"
+    );
+    let layout = store.load_layout().expect("load").expect("saved");
+    assert_eq!(
+        layout.active_worksheet, None,
+        "FK ON DELETE SET NULL clears the dangling reference"
+    );
+}
+
+#[test]
+fn load_layout_is_none_until_saved() {
+    let store = store();
+    assert_eq!(store.load_layout().expect("load"), None);
+}
+
+#[test]
+fn layout_round_trips_and_replaces_the_single_row() {
+    let mut store = store();
+    let profile = Profile::create(details("p")).expect("valid");
+    store.insert_profile(&profile).expect("insert");
+    let worksheet = worksheet_of(Some(profile.id()), "t", "select 1;");
+    store.save_worksheet(&worksheet).expect("save");
+
+    let first = Layout {
+        active_worksheet: Some(worksheet.id()),
+        active_profile: Some(profile.id()),
+        panes: PaneSizes {
+            object_browser_width: Some(240),
+            result_pane_height: Some(180),
+        },
+        window: WindowGeometry {
+            x: Some(10),
+            y: Some(20),
+            width: Some(1280),
+            height: Some(800),
+            maximized: false,
+        },
+    };
+    store.save_layout(&first).expect("save");
+    assert_eq!(store.load_layout().expect("load"), Some(first));
+
+    store.save_layout(&Layout::default()).expect("save again");
+    assert_eq!(
+        store.load_layout().expect("load"),
+        Some(Layout::default()),
+        "one row, replaced not accumulated"
+    );
+}
+
+#[test]
+fn save_layout_refuses_an_unknown_worksheet_or_profile() {
+    let mut store = store();
+    let stranger_worksheet = WorksheetId::new_random();
+    assert!(matches!(
+        store.save_layout(&Layout {
+            active_worksheet: Some(stranger_worksheet),
+            ..Layout::default()
+        }),
+        Err(StoreError::WorksheetNotFound(id)) if id == stranger_worksheet
+    ));
+    let stranger_profile = ProfileId::new_random();
+    assert!(matches!(
+        store.save_layout(&Layout {
+            active_profile: Some(stranger_profile),
+            ..Layout::default()
+        }),
+        Err(StoreError::ProfileNotFound(id)) if id == stranger_profile
+    ));
+    assert_eq!(store.load_layout().expect("load"), None, "nothing written");
+}
+
+#[test]
+fn deleting_a_profile_clears_it_from_the_layout() {
+    let mut store = store();
+    let profile = Profile::create(details("p")).expect("valid");
+    store.insert_profile(&profile).expect("insert");
+    store
+        .save_layout(&Layout {
+            active_profile: Some(profile.id()),
+            ..Layout::default()
+        })
+        .expect("save");
+    store.delete_profile(profile.id()).expect("delete");
+    let layout = store.load_layout().expect("load").expect("saved");
+    assert_eq!(layout.active_profile, None);
 }

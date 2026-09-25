@@ -73,6 +73,30 @@ impl From<ByteLimit> for ServerOutputBuffer {
     }
 }
 
+/// A count of entries, or explicitly unlimited.
+///
+/// The same shape as [`ByteLimit`] — a bounded count or an explicit
+/// "unlimited" — used for a setting that bounds how many *rows* of something
+/// are kept (query history, M4.10) rather than how many bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EntryLimit {
+    /// At most this many entries.
+    Count(NonZeroU32),
+    /// No limit: whatever holds the entries grows without bound.
+    Unlimited,
+}
+
+impl EntryLimit {
+    /// A limit of `count` entries; `None` for zero, which is not a limit.
+    #[must_use]
+    pub const fn count(count: u32) -> Option<Self> {
+        match NonZeroU32::new(count) {
+            Some(count) => Some(Self::Count(count)),
+            None => None,
+        }
+    }
+}
+
 /// Which of the value types a setting holds.
 ///
 /// `#[repr(u8)]` so the typed handles can compare kinds in a `const`
@@ -90,6 +114,8 @@ pub enum ValueKind {
     Count = 3,
     /// A [`ByteLimit`].
     ByteLimit = 4,
+    /// An [`EntryLimit`].
+    EntryLimit = 5,
 }
 
 impl ValueKind {
@@ -116,6 +142,8 @@ pub enum SettingValue {
     Count(u32),
     /// A [`ValueKind::ByteLimit`] value.
     ByteLimit(ByteLimit),
+    /// A [`ValueKind::EntryLimit`] value.
+    EntryLimit(EntryLimit),
 }
 
 impl SettingValue {
@@ -127,6 +155,7 @@ impl SettingValue {
             Self::TimeLimit(_) => ValueKind::TimeLimit,
             Self::Count(_) => ValueKind::Count,
             Self::ByteLimit(_) => ValueKind::ByteLimit,
+            Self::EntryLimit(_) => ValueKind::EntryLimit,
         }
     }
 }
@@ -137,6 +166,7 @@ mod sealed {
     impl Sealed for u32 {}
     impl Sealed for super::TimeLimit {}
     impl Sealed for super::ByteLimit {}
+    impl Sealed for super::EntryLimit {}
 }
 
 /// A Rust type that is the value of some setting kind.
@@ -214,6 +244,21 @@ impl SettingType for ByteLimit {
     }
 }
 
+impl SettingType for EntryLimit {
+    const KIND: ValueKind = ValueKind::EntryLimit;
+
+    fn into_value(self) -> SettingValue {
+        SettingValue::EntryLimit(self)
+    }
+
+    fn from_value(value: SettingValue) -> Option<Self> {
+        match value {
+            SettingValue::EntryLimit(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +267,7 @@ mod tests {
     fn a_zero_limit_is_not_a_limit() {
         assert_eq!(TimeLimit::seconds(0), None);
         assert_eq!(ByteLimit::bytes(0), None);
+        assert_eq!(EntryLimit::count(0), None);
         assert_eq!(
             TimeLimit::seconds(600).and_then(TimeLimit::as_duration),
             Some(Duration::from_secs(600))
@@ -241,6 +287,7 @@ mod tests {
         check(7_u32, SettingValue::Bool(true));
         check(TimeLimit::NoLimit, SettingValue::Count(1));
         check(ByteLimit::Unlimited, SettingValue::Bool(false));
+        check(EntryLimit::Unlimited, SettingValue::Bool(false));
     }
 
     #[test]

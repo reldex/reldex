@@ -15,8 +15,9 @@ use reldex_db_driver_api::SessionRole;
 use reldex_workspace::settings::FETCH_ROWS;
 use reldex_workspace::store::SCHEMA_VERSION;
 use reldex_workspace::{
-    Authentication, DatabaseType, Environment, PasswordStorage, Profile, ProfileDetails,
-    ProfileEndpoint, Scope, Store, StoreError, StoreOptions, TlsOptions,
+    Authentication, DatabaseType, Environment, HistoryEntry, HistoryOutcome, HistoryPage,
+    PasswordStorage, Profile, ProfileDetails, ProfileEndpoint, ProfileId, Scope, Store, StoreError,
+    StoreOptions, TlsOptions, UnixTimeMs,
 };
 use rusqlite::Connection;
 use support::TempDir;
@@ -115,6 +116,77 @@ fn a_writer_that_finds_the_lock_held_gets_busy_and_writes_nothing() {
     store
         .insert_profile(&profile)
         .expect("insert after release");
+}
+
+#[test]
+fn history_writes_follow_the_same_busy_and_patient_rules_as_settings() {
+    // record_history is one more `IMMEDIATE` write (with a trim folded into
+    // it) alongside put_setting/insert_profile — it must behave exactly the
+    // same under contention: refused with `Busy` and nothing written while
+    // another connection holds the lock, and a patient writer's call lands
+    // only after that lock is released.
+    let dir = TempDir::new("history-busy");
+    let mut impatient_store = Store::open_with(dir.store_path(), impatient()).expect("open");
+    let profile = Profile::create(details("history")).expect("valid");
+    impatient_store.insert_profile(&profile).expect("insert");
+
+    let lock = hold_write_lock(&dir.store_path());
+    let profile_id = profile.id();
+    assert!(matches!(
+        impatient_store.record_history(history_entry(profile_id)),
+        Err(StoreError::Busy)
+    ));
+
+    // A patient writer on a second handle, waiting for the same lock.
+    let mut patient_store = Store::open_with(
+        dir.store_path(),
+        StoreOptions::default().with_busy_timeout(PATIENT),
+    )
+    .expect("open");
+    let started = Arc::new(Barrier::new(2));
+    let signal = Arc::clone(&started);
+    let waiter = thread::spawn(move || {
+        signal.wait();
+        patient_store
+            .record_history(history_entry(profile_id))
+            .map(|_| patient_store)
+    });
+    started.wait();
+    lock.execute_batch("ROLLBACK").expect("release");
+    drop(lock);
+    let patient_store = waiter
+        .join()
+        .expect("waiter thread")
+        .expect("the patient write succeeds");
+
+    // Nothing from the refused write, exactly one from the patient one.
+    let recorded = patient_store
+        .history(profile_id, HistoryPage::first(10))
+        .expect("history");
+    assert_eq!(recorded.len(), 1, "only the patient write landed");
+
+    // And the impatient handle writes too, once the lock is free.
+    impatient_store
+        .record_history(history_entry(profile_id))
+        .expect("write after release");
+    assert_eq!(
+        impatient_store
+            .history(profile_id, HistoryPage::first(10))
+            .expect("history")
+            .len(),
+        2
+    );
+}
+
+fn history_entry(profile: ProfileId) -> HistoryEntry {
+    HistoryEntry {
+        profile,
+        executed_at: UnixTimeMs::now(),
+        statement: "select 1 from dual".to_owned(),
+        outcome: HistoryOutcome::Succeeded,
+        elapsed_ms: 1,
+        row_count: Some(1),
+    }
 }
 
 #[test]

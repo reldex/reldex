@@ -7,9 +7,11 @@ use std::path::PathBuf;
 
 use rusqlite::ErrorCode;
 
-use crate::ids::ProfileId;
+use crate::history::HistoryError;
+use crate::ids::{ProfileId, WorksheetId};
 use crate::profile::ProfileError;
 use crate::settings::SettingError;
+use crate::worksheet::WorksheetError;
 
 /// Why a store operation failed. Every failure is one of these; none panics.
 #[derive(Debug)]
@@ -77,6 +79,12 @@ pub enum StoreError {
     ProfileNotFound(ProfileId),
     /// A profile with this id already exists.
     ProfileExists(ProfileId),
+    /// A history entry failed validation and was not written.
+    InvalidHistory(HistoryError),
+    /// A worksheet failed validation and was not written.
+    InvalidWorksheet(WorksheetError),
+    /// No worksheet has this id.
+    WorksheetNotFound(WorksheetId),
     /// A stored row could not be read back as a model value.
     InvalidRow {
         /// What was wrong with it.
@@ -124,6 +132,9 @@ impl fmt::Display for StoreError {
             Self::InvalidSetting(error) => write!(f, "{error}"),
             Self::ProfileNotFound(id) => write!(f, "no profile {id}"),
             Self::ProfileExists(id) => write!(f, "profile {id} already exists"),
+            Self::InvalidHistory(error) => write!(f, "{error}"),
+            Self::InvalidWorksheet(error) => write!(f, "{error}"),
+            Self::WorksheetNotFound(id) => write!(f, "no worksheet {id}"),
             Self::InvalidRow { detail } => write!(f, "a stored row is invalid: {detail}"),
             Self::Sqlite { code, detail } => write!(f, "SQLite error {code}: {detail}"),
         }
@@ -136,6 +147,8 @@ impl std::error::Error for StoreError {
             Self::CreateDirectory { source, .. } => Some(source),
             Self::InvalidProfile(error) => Some(error),
             Self::InvalidSetting(error) => Some(error),
+            Self::InvalidHistory(error) => Some(error),
+            Self::InvalidWorksheet(error) => Some(error),
             _ => None,
         }
     }
@@ -153,6 +166,35 @@ impl From<SettingError> for StoreError {
     }
 }
 
+impl From<HistoryError> for StoreError {
+    fn from(error: HistoryError) -> Self {
+        Self::InvalidHistory(error)
+    }
+}
+
+impl From<WorksheetError> for StoreError {
+    fn from(error: WorksheetError) -> Self {
+        Self::InvalidWorksheet(error)
+    }
+}
+
+/// Whether SQLite's own message proves a schema difference — the file's
+/// tables do not match what its header's version promises — rather than some
+/// other bug behind the same generic `SQLITE_ERROR`/prepare-failure shape.
+///
+/// Deliberately conservative: only the message shapes this build's own SQL
+/// would produce against a `history`/`worksheet`/`setting`/… table someone
+/// altered outside Reldex. A message this does not recognise stays
+/// [`StoreError::Sqlite`] — silence, not a guess, because mislabelling a
+/// Reldex-side SQL bug as "schema mismatch" would send a user chasing the
+/// wrong cause.
+fn is_schema_mismatch_message(detail: &str) -> bool {
+    detail.contains("no such table")
+        || detail.contains("no such column")
+        || detail.contains("has no column named")
+        || (detail.contains("columns but") && detail.contains("values"))
+}
+
 impl From<rusqlite::Error> for StoreError {
     fn from(error: rusqlite::Error) -> Self {
         match &error {
@@ -164,18 +206,33 @@ impl From<rusqlite::Error> for StoreError {
                         Self::Corrupt { detail }
                     }
                     ErrorCode::ReadOnly => Self::ReadOnly,
+                    // A bare `SQLITE_ERROR` from a failed `prepare` — SQLite's
+                    // own generic bucket for a *lot* of unrelated failures,
+                    // not only "no such table"/"no such column" (a malformed
+                    // expression, a bad type mismatch, a bug in this crate's
+                    // own SQL text all land here too). Only narrow this to
+                    // `SchemaMismatch` when the message itself names a
+                    // missing/mismatched table or column — never on the bare
+                    // error code alone, which would mislabel a future
+                    // Reldex-side SQL bug as "file altered outside Reldex".
+                    ErrorCode::Unknown if is_schema_mismatch_message(&detail) => {
+                        Self::SchemaMismatch { detail }
+                    }
                     _ => Self::Sqlite {
                         code: failure.extended_code,
                         detail,
                     },
                 }
             }
-            // A statement SQLite could not prepare. This build's SQL is fixed
-            // and tested, so against a file at a version it understands this
-            // means the file's tables are not what that version promises.
-            rusqlite::Error::SqlInputError { msg, .. } => Self::SchemaMismatch {
-                detail: msg.clone(),
-            },
+            // A statement SQLite could not prepare, with SQLite's own
+            // diagnostic pinpointing the offending token. Same narrowing as
+            // `ErrorCode::Unknown` above: this shape also carries ordinary
+            // syntax errors, not only "no such column".
+            rusqlite::Error::SqlInputError { msg, .. } if is_schema_mismatch_message(msg) => {
+                Self::SchemaMismatch {
+                    detail: msg.clone(),
+                }
+            }
             _ => Self::Sqlite {
                 code: -1,
                 detail: error.to_string(),
@@ -201,5 +258,68 @@ impl StoreError {
             }
             _ => Self::from(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    use super::*;
+
+    #[test]
+    fn schema_mismatch_message_recognises_the_documented_shapes() {
+        assert!(is_schema_mismatch_message("no such table: history"));
+        assert!(is_schema_mismatch_message("no such column: bogus"));
+        assert!(is_schema_mismatch_message(
+            "table history has no column named bogus"
+        ));
+        assert!(is_schema_mismatch_message(
+            "table history has 7 columns but 8 values were supplied"
+        ));
+    }
+
+    #[test]
+    fn schema_mismatch_message_rejects_an_unrelated_sqlite_error() {
+        assert!(!is_schema_mismatch_message("near \"FRM\": syntax error"));
+        assert!(!is_schema_mismatch_message(
+            "database disk image is malformed"
+        ));
+        assert!(!is_schema_mismatch_message("UNIQUE constraint failed: t.x"));
+    }
+
+    /// A file missing a table its schema version promises — the case this
+    /// mapping exists for — still maps to `SchemaMismatch`, not a bare
+    /// `Sqlite`, regardless of which rusqlite error shape carries it.
+    #[test]
+    fn a_missing_table_maps_to_schema_mismatch_not_a_bare_sqlite_error() {
+        let connection = Connection::open_in_memory().expect("open");
+        let error = connection
+            .execute("SELECT * FROM this_table_does_not_exist", [])
+            .expect_err("missing table is an error");
+        let mapped = StoreError::from(error);
+        assert!(
+            matches!(&mapped, StoreError::SchemaMismatch { detail } if detail.contains("no such table")),
+            "expected SchemaMismatch naming the missing table, got {mapped:?}"
+        );
+    }
+
+    /// A syntax error in this build's own SQL is a Reldex bug, not a file
+    /// altered outside Reldex — the must-fix this narrowing exists for: it
+    /// must never be mislabelled `SchemaMismatch`.
+    #[test]
+    fn an_unrelated_sql_bug_stays_a_bare_sqlite_error_not_schema_mismatch() {
+        let connection = Connection::open_in_memory().expect("open");
+        connection
+            .execute("CREATE TABLE t (x INTEGER)", [])
+            .expect("create");
+        let error = connection
+            .execute("SELECT * FRM t", [])
+            .expect_err("malformed SQL is an error");
+        let mapped = StoreError::from(error);
+        assert!(
+            matches!(&mapped, StoreError::Sqlite { .. }),
+            "expected a bare Sqlite error for a syntax bug, got {mapped:?}"
+        );
     }
 }
