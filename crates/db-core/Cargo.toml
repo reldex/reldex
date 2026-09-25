@@ -19,3 +19,10 @@ serde_json = "1"
 # Test-support driver (docs/architecture/ARCHITECTURE.md §4); see
 # tests/dependency_rules.rs for why this dev-only edge is allowed.
 reldex-driver-mock = { path = "../drivers/mock" }
+
+# ADR-0004 (M5.1) evidence: bytes per retained row and append cost of three
+# result-store representations. A plain binary that prints CSV; it does
+# nothing unless `cargo bench` passes it `--bench`. See the file's header.
+[[bench]]
+name = "result_store_shapes"
+harness = false

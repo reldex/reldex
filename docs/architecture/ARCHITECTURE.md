@@ -278,6 +278,9 @@ Database Cursor -> Batch Fetch -> Result Store -> Virtual Table Model -> Visible
 - The result store supports typed values, explicit NULL representation, batches, bounded memory,
   lazy large-value (LOB) access, streaming export, and efficient random access (`SPEC.md` §12).
 - Export streams; it never materializes a full result in memory (`SPEC.md` §21).
+- The result store's layout, paging and bounded-memory policy are proposed in
+  [ADR-0004](../decisions/0004-result-store.md): compacted columnar segments owned by the core,
+  on-demand fetching, and per-result row and byte caps that are user settings.
 - Apache Arrow may be used internally *only where benchmarks justify it*, and UI APIs must not
   depend on Arrow (`SPEC.md` §12; `ROADMAP.md` Phase 3).
 - Avoid unnecessary allocation and copying here; changes require a recorded baseline and
@@ -512,8 +515,15 @@ Until then, no code should assume an answer.
    criterion fired and the ADR re-opened, and on 2026-09-19 the owner decided to accept the limitation
    — stay on `oracledb`, ship the pre-armed deadline with an honest UI, and pursue upstream fixes —
    rather than change drivers (ADR-0001 "Owner decision (2026-09-19)").
-6. **Result store representation.** What is the in-memory row/batch layout, bounded-memory policy,
-   and spill/eviction behavior? Does Arrow earn its place by benchmark (deferred to Phase 3)?
+6. **Result store representation — PROPOSED resolution: [ADR-0004](../decisions/0004-result-store.md)
+   (Proposed; lead acceptance and owner review pending).** The core (`db-core`'s `ResultStore`, one
+   per open result) retains the fetched prefix as immutable columnar segments, one per fetched
+   batch, compacted on the session worker (`NUMBER` as scaled `i64` where exact, exact-size text,
+   LOB ids with the locator parked on the worker). The view states demand and the core fetches on
+   demand with one batch of read-ahead. Per-result `results.max_rows` / `results.max_bytes` caps are
+   user settings (desktop 1,000,000 rows / 512 MiB, mobile 100,000 / 64 MiB) with a typed, honest
+   limit state. No eviction; spill and Arrow are deferred to Phase 3 with the benchmarks that would
+   reopen them. The C ABI moves to 4: batches are borrowed from the store, not transferred.
 7. **Error model shape — RESOLVED by [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) D3.**
    `DbError{kind, message, native, position, session_state, retryable, source}`; `ErrorKind` is a
    stable, `#[non_exhaustive]`, vendor-neutral category set including `Permission`, which keeps
