@@ -184,22 +184,15 @@ impl TextColumn {
         &self.offsets
     }
 
-    /// Gives back the capacity the column holds beyond its values.
-    ///
-    /// A driver reserves text space before it knows how long the values will
-    /// be, and grows it by doubling, so a fetched column typically holds
-    /// several hundred bytes per row that no value uses. A consumer that
-    /// *retains* the column — the result store (ADR-0004 RS1) — calls this
-    /// once, on the thread that owns it, before keeping it. The layout and
-    /// every value are unchanged; the allocator can often shrink in place.
-    pub fn shrink_to_fit(&mut self) {
-        self.buffer.shrink_to_fit();
-        self.offsets.shrink_to_fit();
-    }
-
     /// The heap bytes this column holds: the capacity of its buffer and of
     /// its offsets, whether used or not. What a consumer that bounds its
     /// memory by bytes counts (ADR-0004 RS3).
+    ///
+    /// A driver reserves text space before it knows how long the values will
+    /// be, and grows it by doubling, so a fetched column typically holds
+    /// spare capacity no value uses. `Clone` allocates exactly what the
+    /// values use, which is how a consumer that *retains* the column — the
+    /// result store (ADR-0004 RS1) — sheds it.
     #[must_use]
     pub fn heap_bytes(&self) -> usize {
         self.buffer.capacity() + self.offsets.capacity() * std::mem::size_of::<usize>()
@@ -277,13 +270,6 @@ impl BytesColumn {
     #[must_use]
     pub fn offsets(&self) -> &[usize] {
         &self.offsets
-    }
-
-    /// Gives back the capacity the column holds beyond its values; see
-    /// [`TextColumn::shrink_to_fit`].
-    pub fn shrink_to_fit(&mut self) {
-        self.buffer.shrink_to_fit();
-        self.offsets.shrink_to_fit();
     }
 
     /// The heap bytes this column holds; see [`TextColumn::heap_bytes`].
@@ -1332,37 +1318,29 @@ mod tests {
     }
 
     #[test]
-    fn shrinking_keeps_every_value_and_releases_the_slack() {
-        // A driver reserves before it knows the lengths (ADR-0004 RS1): the
-        // retained form keeps the same layout, only tighter.
+    fn heap_bytes_count_the_spare_capacity_a_clone_sheds() {
+        // A driver reserves before it knows the lengths (ADR-0004 RS1). The
+        // result store retains a copy made by `Clone`, which must keep the
+        // layout and every value and hold exactly what the values use.
         let mut text = TextColumn::with_capacity(1_000, 16_000);
         text.push("alpha");
         text.push("");
         text.push("ข้อมูล");
-        let before = text.heap_bytes();
-        let values: Vec<String> = (0..text.len())
-            .map(|row| text.get(row).expect("row").to_owned())
-            .collect();
-        text.shrink_to_fit();
-        assert!(
-            text.heap_bytes() < before,
-            "{} !< {before}",
-            text.heap_bytes()
-        );
-        assert!(
-            text.heap_bytes() >= text.buffer().len() + size_of_val(text.offsets()),
-            "heap bytes count at least what is used"
-        );
-        for (row, value) in values.iter().enumerate() {
-            assert_eq!(text.get(row), Some(value.as_str()));
-        }
+        let used = text.buffer().len() + size_of_val(text.offsets());
+        assert!(text.heap_bytes() >= 16_000 + 1_000 * size_of::<usize>());
+        let copy = text.clone();
+        assert_eq!(copy.heap_bytes(), used);
+        assert_eq!(copy, text);
 
         let mut bytes = BytesColumn::with_capacity(100, 1_000);
         bytes.push(&[1, 2, 3]);
-        let before = bytes.heap_bytes();
-        bytes.shrink_to_fit();
-        assert!(bytes.heap_bytes() < before);
-        assert_eq!(bytes.get(0), Some(&[1_u8, 2, 3][..]));
+        assert!(bytes.heap_bytes() >= 1_000);
+        let copy = bytes.clone();
+        assert_eq!(
+            copy.heap_bytes(),
+            copy.buffer().len() + size_of_val(copy.offsets())
+        );
+        assert_eq!(copy.get(0), Some(&[1_u8, 2, 3][..]));
     }
 
     #[test]

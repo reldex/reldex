@@ -13,15 +13,17 @@
 //! | Kind | Kept as |
 //! | --- | --- |
 //! | `NUMBER`, every non-NULL value scaling exactly (scale ≤ 18, mantissa in `i64`) | one `i64` per row plus one scale for the column |
-//! | `NUMBER`, otherwise | the driver's `Vec<Number>`, unchanged |
-//! | text, JSON, unsupported-as-text, bytes | the driver's buffer + offsets, shrunk to their exact size |
-//! | timestamps, booleans, binary floats | the driver's vector, shrunk to its exact size |
+//! | `NUMBER`, otherwise | the driver's `Vec<Number>`, at its exact size |
+//! | text, JSON, unsupported-as-text, bytes | the driver's buffer + offsets, at their exact size |
+//! | timestamps, booleans, binary floats | the driver's vector, at its exact size |
 //! | large objects | one `u64` id per row (0 for NULL); the locator stays parked on the worker |
 //! | NULL | the driver's bit mask, unchanged |
 //!
-//! Nothing is copied that can be moved: the driver's vectors and buffers are
-//! taken over and shrunk in place where the allocator can
-//! (`TextColumn::shrink_to_fit`). The only per-cell work is the `NUMBER`
+//! A driver vector with no spare capacity is moved in as it is. One with spare
+//! capacity — a driver reserves before it knows the lengths — is copied into
+//! an exact allocation, and the batch is freed only once every column is
+//! copied; `Spent` below says why that beats shrinking in place, with the
+//! numbers. The only per-cell work beyond that copy is the `NUMBER`
 //! re-encoding and the LOB parking.
 
 use reldex_db_driver_api::{
@@ -370,15 +372,65 @@ impl ResultSegment {
     }
 }
 
-/// Moves a vector in and drops its spare capacity.
-fn exact<T>(mut values: Vec<T>) -> Vec<T> {
-    values.shrink_to_fit();
-    values
+/// The batch's own buffers, kept until every column has been copied out of
+/// them, then freed together.
+///
+/// A column whose buffers have spare capacity is **copied** into exact
+/// allocations rather than shrunk in place, and its original is only freed
+/// once the whole batch is copied. Both halves matter to what the process
+/// really holds, which the byte cap cannot see (ADR-0004 accepted limitation
+/// 2). Measured on `text5date2` at 1,000,000 rows, private bytes over the
+/// accounted ones (`phase-1-m5-2-data/README.md`):
+///
+/// - `shrink_to_fit` in place: +59%. Each buffer's spare tail becomes a free
+///   fragment between retained segments that the next batch's growing
+///   buffers cannot use.
+/// - Copying, freeing each column's original at once: +14–17%. The next
+///   column's copy lands inside the block just freed and splits it.
+/// - Copying while the whole batch is alive, then freeing it: the copies sit
+///   side by side, and the batch's buffers come back as one region the next
+///   batch is built in.
+type Spent = Vec<ColumnData>;
+
+/// A vector holding exactly its contents: moved in when it has no spare
+/// capacity, otherwise copied, with the original kept in `spent`.
+fn exact<T: Clone>(values: Vec<T>, spent: &mut Spent, wrap: fn(Vec<T>) -> ColumnData) -> Vec<T> {
+    if values.capacity() == values.len() {
+        return values;
+    }
+    let copy = values.as_slice().to_vec();
+    spent.push(wrap(values));
+    copy
+}
+
+/// [`exact`] for a text column: its buffer and its offsets.
+fn exact_text(
+    values: TextColumn,
+    spent: &mut Spent,
+    wrap: fn(TextColumn) -> ColumnData,
+) -> TextColumn {
+    if values.heap_bytes() == values.buffer().len() + size_of_val(values.offsets()) {
+        return values;
+    }
+    // A derived `Clone` allocates each vector at exactly its length.
+    let copy = values.clone();
+    spent.push(wrap(values));
+    copy
+}
+
+/// [`exact`] for a bytes column.
+fn exact_bytes(values: BytesColumn, spent: &mut Spent) -> BytesColumn {
+    if values.heap_bytes() == values.buffer().len() + size_of_val(values.offsets()) {
+        return values;
+    }
+    let copy = values.clone();
+    spent.push(ColumnData::Bytes(values));
+    copy
 }
 
 /// Chooses how a `NUMBER` column of one segment is stored: scaled when every
 /// non-NULL value scales exactly at one common scale, otherwise unchanged.
-fn compact_numbers(values: Vec<Number>, nulls: &NullMask) -> NumberStorage {
+fn compact_numbers(values: Vec<Number>, nulls: &NullMask, spent: &mut Spent) -> NumberStorage {
     let mut scale = 0_u8;
     for (row, value) in values.iter().enumerate() {
         if nulls.is_null(row) {
@@ -386,7 +438,7 @@ fn compact_numbers(values: Vec<Number>, nulls: &NullMask) -> NumberStorage {
         }
         match ScaledNumber::required_scale(value) {
             Some(needed) => scale = scale.max(needed),
-            None => return NumberStorage::Decimal(exact(values)),
+            None => return NumberStorage::Decimal(exact(values, spent, ColumnData::Number)),
         }
     }
     let mut scaled = Vec::with_capacity(values.len());
@@ -400,9 +452,10 @@ fn compact_numbers(values: Vec<Number>, nulls: &NullMask) -> NumberStorage {
             // One value whose mantissa does not fit an i64 at this scale
             // keeps the whole segment column lossless (ADR-0004 accepted
             // limitation 9).
-            None => return NumberStorage::Decimal(exact(values)),
+            None => return NumberStorage::Decimal(exact(values, spent, ColumnData::Number)),
         }
     }
+    spent.push(ColumnData::Number(values));
     NumberStorage::Scaled {
         values: scaled,
         scale,
@@ -422,29 +475,34 @@ pub(crate) fn compact_batch(
 ) -> DbResult<ResultSegment> {
     let rows = batch.row_count();
     let mut columns = Vec::with_capacity(batch.column_count());
+    let mut spent = Spent::with_capacity(batch.column_count());
     for column in batch.into_columns() {
         let (data, nulls) = column.into_parts();
         let storage = match data {
-            ColumnData::Boolean(values) => Storage::Boolean(exact(values)),
-            ColumnData::Number(values) => Storage::Number(compact_numbers(values, &nulls)),
-            ColumnData::Float(values) => Storage::Float(exact(values)),
-            ColumnData::Double(values) => Storage::Double(exact(values)),
-            ColumnData::Text(mut values) => {
-                values.shrink_to_fit();
-                Storage::Text(values)
+            ColumnData::Boolean(values) => {
+                Storage::Boolean(exact(values, &mut spent, ColumnData::Boolean))
             }
-            ColumnData::Bytes(mut values) => {
-                values.shrink_to_fit();
-                Storage::Bytes(values)
+            ColumnData::Number(values) => {
+                Storage::Number(compact_numbers(values, &nulls, &mut spent))
             }
-            ColumnData::Timestamp(values) => Storage::Timestamp(exact(values)),
-            ColumnData::Json(mut values) => {
-                values.shrink_to_fit();
-                Storage::Json(values)
+            ColumnData::Float(values) => {
+                Storage::Float(exact(values, &mut spent, ColumnData::Float))
             }
-            ColumnData::Unsupported(mut values) => {
-                values.shrink_to_fit();
-                Storage::Unsupported(values)
+            ColumnData::Double(values) => {
+                Storage::Double(exact(values, &mut spent, ColumnData::Double))
+            }
+            ColumnData::Text(values) => {
+                Storage::Text(exact_text(values, &mut spent, ColumnData::Text))
+            }
+            ColumnData::Bytes(values) => Storage::Bytes(exact_bytes(values, &mut spent)),
+            ColumnData::Timestamp(values) => {
+                Storage::Timestamp(exact(values, &mut spent, ColumnData::Timestamp))
+            }
+            ColumnData::Json(values) => {
+                Storage::Json(exact_text(values, &mut spent, ColumnData::Json))
+            }
+            ColumnData::Unsupported(values) => {
+                Storage::Unsupported(exact_text(values, &mut spent, ColumnData::Unsupported))
             }
             ColumnData::Lob(locators) => {
                 let mut ids = Vec::with_capacity(locators.len());
@@ -473,6 +531,8 @@ pub(crate) fn compact_batch(
         columns.push(SegmentColumn { nulls, storage });
     }
     let columns = columns.into_boxed_slice();
+    // Every copy is made: the batch's buffers go back together.
+    drop(spent);
     let accounted_bytes = size_of::<ResultSegment>()
         // The `Arc`'s two counters.
         + 2 * size_of::<usize>()

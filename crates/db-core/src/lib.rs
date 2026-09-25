@@ -72,7 +72,7 @@
 //! A result a UI shows is retained in a [`ResultStore`] (ADR-0004): the
 //! fetched prefix as immutable [`ResultSegment`]s, each one a batch compacted
 //! **on the worker thread** — `NUMBER` re-encoded as a scaled `i64` where that
-//! is exact, text and byte buffers shrunk to their contents, every LOB locator
+//! is exact, text and byte buffers copied to their exact size, every LOB locator
 //! parked and replaced by an id — before its reply leaves the worker
 //! ([`DatabaseSession::submit_fetch_segment`],
 //! [`SessionEvent::FetchedSegment`]). The store decides what to fetch from
