@@ -909,6 +909,32 @@ workspace `Cargo.toml` one directory up. Its `[lib] name = "reldex_ffi"`
 (underscored) is what Corrosion uses for the generated CMake target names:
 `reldex_ffi-static` and `reldex_ffi-shared`.
 
+### CI-only dependencies (M6.7)
+
+`.github/workflows/ui.yml` — the workflow this section's "now exercised on
+every PR" line above refers to — pulls in four GitHub Actions to build and
+test this project on `windows-latest`/`ubuntu-latest`/`macos-latest`. None
+of them are shipped in a Reldex binary or installer, so they are separate
+from the "Dependencies"/"Licence note" sections above (which cover what
+ships) and from the M6.5 NOTICES artefact:
+
+- `actions/checkout` (MIT)
+- `dtolnay/rust-toolchain` (MIT)
+- `Swatinem/rust-cache` (LGPL-3.0) — CI-only tooling; nothing in this
+  repository links against it
+- `jurplel/install-qt-action` (MIT) — the action's own code is MIT; it
+  installs Qt itself under the LGPLv3-dynamic-linking terms already
+  documented in "Licence note" below. `cache: true` keys its cache on the
+  pinned Qt `version:`/`modules:`/host/arch, so a Qt version bump
+  invalidates the cache automatically
+
+Every `uses:` line pins a full commit SHA with the release tag kept as a
+trailing comment, per this repository's Actions-pinning convention (see
+`ci.yml`'s own jobs for the same pattern). Job names, measured durations
+and cache-hit evidence are in `docs/exec-plans/active/phase-1.md`'s "M6.7
+as implemented" note; ADR-0003 K7 has the original spike's cold numbers
+against the 25-minute budget.
+
 ## Library kind and DLL deployment
 
 ADR-0003 D8/D9 leaves desktop linkage as "cdylib on desktop, staticlib
