@@ -197,6 +197,24 @@ and a later `delete` can leave the other tool's copy behind; it reappears after 
 leads to a prompt; it is never sent to a database. The M2.14 sweep removes it too, and the
 integration tests never `put` over a `cmdkey` entry.
 
+**CI incident, diagnosed (2026-09-25).** This exact residual raced against itself: on Windows CI
+run 36163250370 (PR #39, a docs-only change), `concurrent_reldex_processes_lose_no_update` failed
+once — `assertion failed: STORE.get(key).expect("get").is_none()` inside a worker process, right
+after a delete that had itself reported success. `cargo test --workspace` uses the default test
+harness, which runs every `#[test]` in `tests/windows_credential_manager.rs` concurrently; the log
+showed `an_entry_written_by_another_tool_is_malformed_and_prompts` — the one test that writes
+through `cmdkey` directly, unlocked — running at the same moment (16:51:45.9–46.2) as the
+concurrency test's 1.5 s window. That is the residual above, self-inflicted by test scheduling
+rather than by another real Reldex user or process: the two `cmdkey` writes landed in the middle of
+360 locked calls and the file-rewrite-as-a-whole behaviour resurrected a just-deleted entry, the
+same class of loss this section already documents for an unlocked writer. The lock itself is
+unaffected — the very next CI run, and every rerun since, passed — so the fix is test isolation, not
+a lock change: the suite now holds an in-process `RwLock` that lets its ordinary (locked) tests run
+together but gives `an_entry_written_by_another_tool_is_malformed_and_prompts`'s unlocked `cmdkey`
+writes exclusive access, so they never again overlap a locked call from this binary. It cannot, and
+is not meant to, cover a *real* other application — that residual stands as described above, with
+M2.14 as its remedy.
+
 **Hygiene.** `put` builds the S8 entry in one exact-capacity buffer that is wiped when dropped.
 `get` copies the blob into a vector with exact capacity (no reallocation, so no stray copy), wipes
 the system's copy with `zeroize` before `CredFree`, and wipes bytes that fail decoding. A read entry

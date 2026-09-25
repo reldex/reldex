@@ -35,23 +35,47 @@ fn a_statement_blocked_for_a_fixed_duration_then_succeeds() {
         ),
     );
 
+    // No absolute wall-clock lower bound here (house rule established in
+    // `da04004`, `crates/drivers/oracle-thin/tests/s4_cancel.rs`: a fixed
+    // bound with ~0 margin against real timer precision is a test defect,
+    // not a driver bug). CI run 36168477927 (`test (windows-latest)`, PR #41)
+    // failed the previous `elapsed >= block_for` assertion at
+    // `elapsed = 39.9744ms` against a scripted `block_for = 40ms` -- only
+    // 25.6us short. On Windows, `std::thread::sleep` below and `Instant`
+    // (`QueryPerformanceCounter`) do not share a clock, so a genuinely
+    // 40ms-long block can measure a few tens of microseconds short of 40ms.
+    //
+    // The actual fact this test needs to prove -- "the call really blocked,
+    // it did not return early" -- does not need a duration figure at all:
+    // `execute()` cannot legitimately return before the controller thread
+    // releases the gate, so compare the two `Instant`s directly instead of
+    // either one against a constant. A regression that bypassed the block
+    // entirely (what this test guards against) would return almost
+    // immediately, long before `released_at`, and fail the assertion below
+    // regardless of how long `block_for` is -- a relative invariant, not a
+    // wall-clock one.
     let controller = Arc::clone(&gate);
-    std::thread::spawn(move || {
+    let controller_thread = std::thread::spawn(move || {
         std::thread::sleep(block_for);
+        let released_at = Instant::now();
         controller.release();
+        released_at
     });
 
     let mut connection = connect(&scenario);
-    let started = Instant::now();
     let outcome = connection
         .execute(&Statement::new("BEGIN DBMS_SESSION.SLEEP(10); END;"))
         .expect("the statement blocks and then succeeds");
-    let elapsed = started.elapsed();
+    let returned_at = Instant::now();
+    let released_at = controller_thread
+        .join()
+        .expect("the controller thread must not panic");
 
     assert_eq!(outcome.statement_kind(), StatementKind::PlSqlBlock);
     assert!(
-        elapsed >= block_for,
-        "the call must actually have blocked for the fixed duration: took {elapsed:?}"
+        returned_at >= released_at,
+        "the call returned at {returned_at:?}, before the controller released the gate at \
+         {released_at:?} -- it must not resolve before being released"
     );
 }
 

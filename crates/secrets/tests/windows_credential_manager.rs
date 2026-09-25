@@ -13,11 +13,29 @@
 //! witness that an entry really is in the Credential Manager under the
 //! documented target name — it lists target names and never prints a
 //! password.
+//!
+//! One test, [`an_entry_written_by_another_tool_is_malformed_and_prompts`],
+//! writes through `cmdkey` itself — a second process calling `CredWriteW`
+//! directly, outside `WindowsCredentialManager`'s own per-user lock
+//! (ADR-0007 S4). The default test harness runs every `#[test]` in this
+//! binary concurrently, so left alone, that unlocked write can land in the
+//! middle of another test's locked calls and resurrect a just-deleted entry
+//! or drop a write — the "residual" race the lock does not cover, because
+//! it cannot cover callers outside Reldex. That is a real limitation of the
+//! platform, disclosed in the ADR; it is not what the other tests are
+//! proving, and self-inflicting it made
+//! `concurrent_reldex_processes_lose_no_update` fail once on CI (2026-09-25,
+//! run 36163250370: `assertion failed:
+//! STORE.get(key).expect("get").is_none()` inside a worker process, timed
+//! to land while `cmdkey` was mid-write). [`FOREIGN_WRITE_ISOLATION`] keeps
+//! that one test's unlocked write from overlapping any other test's locked
+//! calls.
 
 #![cfg(windows)]
 
 use std::collections::HashSet;
 use std::process::{Command, Stdio};
+use std::sync::{RwLock, RwLockReadGuard};
 
 use reldex_secrets::{
     CredentialError, CredentialKey, CredentialStore, CredentialStoreKind, PasswordSource,
@@ -30,6 +48,24 @@ use reldex_workspace::{
 
 const STORE: WindowsCredentialManager = WindowsCredentialManager::new();
 const MAX_SECRET_BYTES: usize = WindowsCredentialManager::MAX_SECRET_BYTES;
+
+/// In-process isolation between this suite's ordinary tests (many readers,
+/// safe to run together: `WindowsCredentialManager`'s own per-user lock
+/// already serializes their real Credential Manager calls against each
+/// other and against other Reldex processes) and
+/// [`an_entry_written_by_another_tool_is_malformed_and_prompts`]'s `cmdkey`
+/// writes (the sole writer, which must run alone). See the module doc
+/// comment for why this exists.
+static FOREIGN_WRITE_ISOLATION: RwLock<()> = RwLock::new(());
+
+/// Takes the shared side of [`FOREIGN_WRITE_ISOLATION`] for the rest of the
+/// caller's scope. Every test that talks to the real store, other than the
+/// foreign-write test itself, takes this first.
+fn isolated() -> RwLockReadGuard<'static, ()> {
+    FOREIGN_WRITE_ISOLATION
+        .read()
+        .expect("isolation lock poisoned")
+}
 
 /// Deletes the given keys however the test ends; "not found" is fine.
 struct Cleanup(Vec<CredentialKey>);
@@ -62,6 +98,7 @@ fn listed_targets() -> HashSet<String> {
 
 #[test]
 fn a_password_round_trips_under_the_profiles_uuid() {
+    let _isolation = isolated();
     let key = fresh_key();
     let _cleanup = Cleanup(vec![key]);
     let target = WindowsCredentialManager::target_name(&key);
@@ -90,6 +127,7 @@ fn a_password_round_trips_under_the_profiles_uuid() {
 
 #[test]
 fn unicode_empty_and_long_passwords_round_trip_byte_exact() {
+    let _isolation = isolated();
     let key = fresh_key();
     let _cleanup = Cleanup(vec![key]);
     let cases = [
@@ -118,6 +156,7 @@ fn unicode_empty_and_long_passwords_round_trip_byte_exact() {
 
 #[test]
 fn a_password_over_the_limit_is_refused_and_nothing_is_written() {
+    let _isolation = isolated();
     // 2,560 bytes of blob less the 5-byte `RLDX` v1 prefix.
     assert_eq!(MAX_SECRET_BYTES, 2555);
     let key = fresh_key();
@@ -143,6 +182,7 @@ fn a_password_over_the_limit_is_refused_and_nothing_is_written() {
 
 #[test]
 fn put_replaces_and_other_profiles_are_untouched() {
+    let _isolation = isolated();
     let (a, b) = (fresh_key(), fresh_key());
     let _cleanup = Cleanup(vec![a, b]);
     STORE.put(&a, &Secret::new("a-first")).expect("put a");
@@ -160,6 +200,7 @@ fn put_replaces_and_other_profiles_are_untouched() {
 
 #[test]
 fn deleting_nothing_is_not_found() {
+    let _isolation = isolated();
     assert_eq!(STORE.delete(&fresh_key()), Err(CredentialError::NotFound));
 }
 
@@ -210,6 +251,9 @@ fn cmdkey_generic(target: &str, password: &str) {
 /// the other tests.
 #[test]
 fn an_entry_written_by_another_tool_is_malformed_and_prompts() {
+    let _isolation = FOREIGN_WRITE_ISOLATION
+        .write()
+        .expect("isolation lock poisoned");
     for foreign in ["Hunter2x", "กข"] {
         let profile = saved_password_profile();
         let key = profile.credential_key();
@@ -241,6 +285,7 @@ fn an_entry_written_by_another_tool_is_malformed_and_prompts() {
 
 #[test]
 fn a_password_with_a_control_character_is_refused_and_nothing_is_written() {
+    let _isolation = isolated();
     let key = fresh_key();
     let _cleanup = Cleanup(vec![key]);
     assert_eq!(
@@ -252,6 +297,7 @@ fn a_password_with_a_control_character_is_refused_and_nothing_is_written() {
 
 #[test]
 fn nothing_the_store_returns_renders_a_secret() {
+    let _isolation = isolated();
     let key = fresh_key();
     let _cleanup = Cleanup(vec![key]);
     STORE
@@ -269,6 +315,7 @@ fn nothing_the_store_returns_renders_a_secret() {
 
 #[test]
 fn resolve_password_uses_the_real_store_and_prompts_once_it_is_gone() {
+    let _isolation = isolated();
     let profile = saved_password_profile();
     let key = profile.credential_key();
     let _cleanup = Cleanup(vec![key]);
@@ -334,6 +381,7 @@ fn worker_process_for_the_concurrency_test() {
 /// left behind.
 #[test]
 fn concurrent_reldex_processes_lose_no_update() {
+    let _isolation = isolated();
     let per_process = 60;
     let batches: Vec<Vec<CredentialKey>> = (0..2)
         .map(|_| (0..per_process).map(|_| fresh_key()).collect())
