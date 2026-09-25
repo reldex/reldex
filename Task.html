@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-25T08:33:29+07:00",
+  "updatedAt": "2026-09-25T20:46:55+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -526,6 +526,11 @@
     }
   ],
   "risks": [
+    {
+      "title": "macOS Qt CI job flaked once on a transient copy failure (2026-09-25) — mitigated",
+      "detail": "On PR #34 the qt-build (macos-latest) job failed while deploying libreldex_ffi.dylib next to a test binary: the file had been written 17 s earlier and the build ordering was correct, but the copy syscall itself hit a transient 'No such file or directory' on macOS. The M1.4 retry helper only retried the existence check and then copied once, so this gap was not covered.",
+      "mitigation": "PR #37 makes the helper retry the check-and-copy as one unit within the same ~10 s budget; the macOS job then passed 4/4 reruns. The root cause of the transient ENOENT (ninja/Corrosion/APFS interaction) remains un-diagnosed, as M1.4 already recorded; if it recurs despite the retry, escalate to a single copy target. Never merge on a red job; rerun only that job and record it."
+    },
     {
       "title": "On-demand Cancel unavailable — accepted limitation (owner decision 2026-09-19)",
       "detail": "The owner decided on 2026-09-19 to stay on oracledb and ship the pre-armed per-statement deadline with an honest UI rather than change drivers. SPEC.md §24.8 remains an unmet Definition-of-Done target until upstream ships a break/cancel API (ADR-0001 'Owner decision (2026-09-19)').",
@@ -1373,8 +1378,8 @@
               "status": "todo"
             },
             {
-              "title": "M6.9 Cold first paint ≈800–900 ms (D3D11 device creation ≈250 ms + first delegate-instantiation polish ≈551 ms) vs SPEC.md §19 startup target — investigate fix candidates named in the S15 report (sonnet)",
-              "status": "todo"
+              "title": "M6.9 Cold first paint ≈800–900 ms (D3D11 device creation ≈250 ms + first delegate-instantiation polish ≈551 ms) vs SPEC.md §19 startup target — investigate fix candidates named in the S15 report (sonnet) —  — done 2026-09-25: investigation complete, no code change adopted — fresh baseline on main is median 576 ms (n=12, CoV 23%) vs S15's 903.55 ms with a byte-identical harness (driver/OS-cache drift, not a fix); QSG_RENDER_LOOP=basic gives no material gain; D3D11 sync ≈ 190 ms + first delegate polish ≈ 370 ms at 1,000+ rows reproduce S15's shape; warm path 16 ms unchanged; recommendation for the K2 ruling unchanged (rule on the warm path); measured fix path (pre-warm the result delegate) deferred to M4.x when the real grid ships; raw data under phase-1-s15-data/m6-9/",
+              "status": "done"
             }
           ]
         },
@@ -1679,6 +1684,14 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-25",
+      "text": "macOS CI flake understood and mitigated: the failed copy of the FFI library was a transient filesystem error on the copy call itself, not a build-ordering bug (ordering was verified correct). The retry helper now retries the copy as well as the existence check; four reruns of the macOS job passed. The underlying transient error is still not root-caused and stays listed as a risk."
+    },
+    {
+      "date": "2026-09-25",
+      "text": "M6.9 closed with a negative result, honestly: no startup change was adopted. Measured fresh under the same instrumentation as S15, cold first paint on today's main is 576 ms median versus 903.55 ms five days ago with an identical harness, so the number moved on its own (driver and OS caches), not because of any fix. The only candidate that reached a full batch (the basic render loop) gained nothing. The cost keeps its diagnosed shape — a one-time D3D11 device sync of about 190 ms and the first delegate polish of about 370 ms at 1,000+ rows — and the warm path stays at 16 ms. The recommendation for the owner's K2 ruling is unchanged: rule on the warm path; the measured fix (pre-warming the result delegate) waits for the real result grid in M4. Also recorded as a risk: the macOS Qt CI job flaked once on a parallel-build race copying the FFI library; a rerun passed."
+    },
     {
       "date": "2026-09-25",
       "text": "M2.9 done: settings, connection profiles and the local SQLite store now exist as their own crate, with every setting resolved worksheet → profile → application → built-in and the source reported, and no password ever written to the file (checked on the file's bytes). Looping the concurrency tests found two real races when two windows open a brand-new file at once — the switch to WAL mode failing immediately, and the file's header being read across another window's commit so it looked foreign — and both were fixed and re-looped clean. After the independent review, a password pasted into a connect string, host, service name or SID is refused with an error that never repeats the text, and a refused save leaves no trace in the file. The review's other follow-ups also landed: a production flag the UI reads instead of guessing from the environment, the SID descriptor built by the driver itself and tested against the live database, and typed errors for read-only, half-written and altered files. Known limits stay stated in ADR-0006: an open has no overall deadline, and one live timing probe of upstream call-timeout behaviour (probe_call_timeout_cpu_bound, scenario 1) is flaky on main as well as on this branch."
