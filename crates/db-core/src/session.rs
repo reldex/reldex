@@ -194,6 +194,18 @@ pub struct ServerOutputLog {
     /// How many reads failed since the last take, including the one in
     /// [`ServerOutputLog::failure`].
     pub failures: u32,
+    /// How many lines, across every read since the last take, were not valid
+    /// UTF-8 on the wire and were delivered with U+FFFD in place of the
+    /// invalid bytes rather than dropped — the completion-path twin of
+    /// [`crate::SessionEvent::ServerOutput`]'s `invalid_utf8_lines`.
+    ///
+    /// This is the full count for every line **drained from the server**,
+    /// not only the ones [`ServerOutputLog::lines`] had room to retain: once
+    /// the bound above starts refusing lines (see [`ServerOutputLog::dropped`]),
+    /// a refused line's own validity cannot be attributed individually, so
+    /// the count is never reduced to account for it — consistent with
+    /// `dropped` itself never hiding what was lost. Zero normally.
+    pub invalid_utf8_lines: u32,
 }
 
 impl ServerOutputLog {
@@ -203,10 +215,14 @@ impl ServerOutputLog {
     /// The most bytes of text kept between two takes.
     pub const MAX_RETAINED_BYTES: usize = 1024 * 1024;
 
-    /// Whether nothing was collected: no lines, no drops, no failure.
+    /// Whether nothing was collected: no lines, no drops, no failure, no
+    /// invalid UTF-8.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.lines.is_empty() && self.dropped == 0 && self.failures == 0
+        self.lines.is_empty()
+            && self.dropped == 0
+            && self.failures == 0
+            && self.invalid_utf8_lines == 0
     }
 }
 

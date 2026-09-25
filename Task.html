@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-25T07:44:00+07:00",
+  "updatedAt": "2026-09-25T07:58:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1204,8 +1204,8 @@
               "status": "todo"
             },
             {
-              "title": "M2.12 Server output framing over RAW/LENGTHB with per-line UTF-8 decoding, so one invalid line loses only itself (sonnet; M2.7 review follow-up)",
-              "status": "todo",
+              "title": "M2.12 Server output framing over RAW/LENGTHB with per-line UTF-8 decoding, so one invalid line loses only itself (sonnet; M2.7 review follow-up) —  — done 2026-09-25: RAW framing — SYS.UTL_I18N.STRING_TO_RAW plus a 5-digit byte-length prefix per line in LONG RAW OUT binds, per-frame UTF-8 decoding in Rust, invalid bytes replaced by U+FFFD and counted in invalid_utf8_lines on the ServerOutput event and the completion log (mock can script it); independently reviewed (1 must-fix landed: the count had been dropped in db-core); live 6/6 + 9/9, 32,767-byte lines byte-exact, 120k fuzz inputs, no perf regression",
+              "status": "done",
               "note": "Today a line that is not valid UTF-8 loses every line of its read (up to 4,096 good lines)."
             },
             {
@@ -1672,6 +1672,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-25",
+      "text": "M2.12 done: one bad line no longer loses a read. Server-output lines now travel as raw bytes with a per-line length prefix and are decoded in Rust one line at a time, so a line with invalid UTF-8 comes through with replacement characters and a count instead of failing the whole batch. Independent review found the count was being dropped inside the core before reaching the event and the completion log; that is fixed and tested on both paths, and the mock driver can now script it. Verified on the real database (15/15 live tests), at the 32,767-byte line ceiling, and with 120,000 fuzzed inputs; no performance change (10,000 lines still in 5 round trips)."
+    },
     {
       "date": "2026-09-25",
       "text": "M3.1 done: the app shell exists. Main window with a fixed sidebar / worksheet-tab / output-pane layout, light and dark themes driven by the system colour scheme (with an in-memory override until M3.6 persists it), and high-DPI verified offscreen at 1x, 1.5x and 2x. Independent review caught a real defect — Qt's Basic style reads different palette roles for tab buttons than the ones first bound, leaving unselected tabs near-black — fixed and confirmed in light and dark grabs with WCAG contrast measured. The old S15 harness stays reachable behind a flag. No business logic in QML."

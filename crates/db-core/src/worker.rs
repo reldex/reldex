@@ -919,7 +919,16 @@ impl Worker {
                     // that says otherwise must not make this loop spin.
                     let done = chunk.is_drained() || chunk.is_empty();
                     if !chunk.is_empty() {
-                        self.deliver_server_output(request, chunk.into_lines(), None);
+                        // Read before `into_lines()` takes the lines out: the
+                        // chunk has nothing else worth keeping once its lines
+                        // are gone.
+                        let invalid_utf8_lines = chunk.invalid_utf8_lines();
+                        self.deliver_server_output(
+                            request,
+                            chunk.into_lines(),
+                            invalid_utf8_lines,
+                            None,
+                        );
                     }
                     if done {
                         return;
@@ -928,7 +937,7 @@ impl Worker {
                 Err(err) => {
                     self.shared.note_error(&err);
                     self.note_transaction_state_after(Some(&err));
-                    self.deliver_server_output(request, Vec::new(), Some(err));
+                    self.deliver_server_output(request, Vec::new(), 0, Some(err));
                     return;
                 }
             }
@@ -937,11 +946,14 @@ impl Worker {
 
     /// Sends one read's output where the statement's reply is going: the
     /// event stream for an event-path request, the completion-path log
-    /// otherwise.
+    /// otherwise. `invalid_utf8_lines` is the chunk's own count (see
+    /// [`reldex_db_driver_api::ServerOutputChunk::invalid_utf8_lines`]),
+    /// carried through unchanged rather than dropped at this boundary.
     fn deliver_server_output(
         &self,
         request: Option<RequestId>,
         lines: Vec<Box<str>>,
+        invalid_utf8_lines: u32,
         failure: Option<DbError>,
     ) {
         if request.is_some() {
@@ -950,9 +962,11 @@ impl Worker {
                 lines,
                 dropped: 0,
                 failure,
+                invalid_utf8_lines,
             });
         } else {
-            self.shared.collect_server_output(lines, failure);
+            self.shared
+                .collect_server_output(lines, invalid_utf8_lines, failure);
         }
     }
 

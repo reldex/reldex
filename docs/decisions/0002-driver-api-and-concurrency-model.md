@@ -17,7 +17,8 @@ review), 2026-09-19 (owner confirmation), 2026-09-20 (connect-time warning chann
 2026-09-20 (connection created on a helper thread, C-5), 2026-09-20 (column storage readable, M1.3),
 2026-09-20 (`LobStream: Sync` and `ExecuteOutcome` non-exhaustive, M1.3 review),
 2026-09-20 (`SqlDialect` descriptor, M2.4), 2026-09-21 (`SqlDialect` splitter-safety review, M2.4),
-2026-09-24 (server output, M2.7 — amendment T)
+2026-09-24 (server output, M2.7 — amendment T), 2026-09-24 (server-output framing moved to
+`RAW`/`LENGTHB` with per-line UTF-8 decoding, M2.12 — amendment T update)
 
 ## Context
 
@@ -1924,12 +1925,62 @@ what was tried, in order:
    user's schema first, so an object called `DBMS_OUTPUT` there would capture the call. This is
    deliberately **not** tested on the shared test database.
 
-   **Known limit (follow-up M2.12).** The packed value is decoded as a whole by the crate's
-   strict UTF-8 conversion. So a single line that is not valid UTF-8 fails the entire read, up
-   to 4,096 good lines with it. The framing also assumes that `LENGTH4` equals Rust's `char`
-   count, which holds for AL32UTF8 and valid data. On a single-byte database character set a
-   chunk can exceed `max_bytes` by about 3×. M2.12 moves the framing to `RAW`/`LENGTHB` with
-   per-line decoding in Rust, so an invalid line loses only itself.
+   **Fixed by M2.12 (2026-09-24).** The packed value used to be decoded as a whole by the
+   crate's strict UTF-8 conversion, so a single line that was not valid UTF-8 failed the entire
+   read, up to 4,096 good lines with it — reproduced live with
+   `PUT_LINE(UTL_RAW.CAST_TO_VARCHAR2('41FF42'))` between two good lines, which lost all three
+   to `DataConversion`. The framing also assumed that `LENGTH4` equalled Rust's `char` count,
+   true only for a Unicode database character set; on a single-byte one a chunk could exceed
+   `max_bytes` by about 3× once decoded.
+
+   `crates/drivers/oracle-thin/src/server_output.rs` now packs `RAW`, not `VARCHAR2`. Each line
+   is converted to UTF-8 bytes on the server **before** it is measured or packed —
+   `SYS.UTL_I18N.STRING_TO_RAW(line, 'AL32UTF8')` — so the five-digit prefix that follows is
+   always a byte count in UTF-8, on any database character set; `LENGTH4` is gone. Both binds
+   (packed buffer and tail) are `LONG RAW` rather than `LONG`, for the same "no client-side
+   ceiling below 32,767 bytes" reason `LONG` was chosen in the first place —
+   `DB_TYPE_LONG_RAW`'s `buffer_size_factor` is the same `2147483647` as `DB_TYPE_LONG`'s. This
+   also sidesteps the defect directly: `oracledb`'s decode path for `RAW`/`LONG RAW`
+   (`ORA_TYPE_NUM_RAW | ORA_TYPE_NUM_LONG_RAW` in `db_value.rs`) is a plain byte copy with no
+   UTF-8 validation at all, unlike the `LONG`/`VARCHAR2` path it replaces. Decoding — and
+   recovering from an invalid line — is now this module's own job, one line at a time: a line
+   whose bytes are not valid UTF-8 is still delivered, with the invalid sequences replaced by
+   U+FFFD, and counted in the new `ServerOutputChunk::invalid_utf8_lines()` rather than
+   silently accepted or dropped. `ServerOutputChunk` gained that one field, additively
+   (`with_invalid_utf8_lines`, defaulting to zero). `db-core`'s own fix round (this branch) carries
+   the count the rest of the way rather than discarding it at that boundary: it is now a field on
+   both `SessionEvent::ServerOutput` (per event) and `ServerOutputLog` (cumulative across the
+   completion-path log, counted in full even for lines the log's bound later refuses) — see
+   `phase-1-m2-5-event-queue.md` §7.5 for what remains, which is only M2.11 mapping the field
+   across the C ABI.
+
+   **Verified against the live test database, not assumed.** `SYS.UTL_I18N.STRING_TO_RAW`
+   exists and is executable by `RELDEX_TEST` on 19c, and passes an already-malformed
+   AL32UTF8 byte sequence straight through unchanged rather than raising or repairing it —
+   `STRING_TO_RAW(UTL_RAW.CAST_TO_VARCHAR2('41FF42'), 'AL32UTF8')` returns `41FF42` — which is
+   exactly what lets the invalid line reach Rust for per-line recovery instead of being caught
+   (or silently fixed) on the server. The review's exact reproduction now returns all three
+   lines, with the middle one `A\u{FFFD}B` and `invalid_utf8_lines() == 1`, and the session
+   stays usable. `NLS_CHARACTERSET` on that database is `AL32UTF8`, confirmed by query, which
+   is this module's tested and documented configuration (see the residual limit below).
+
+   **Residual limit, accepted rather than solved.** A PL/SQL `RAW` local variable is capped at
+   32,767 bytes, the same ceiling `DBMS_OUTPUT` imposes on one line. On `AL32UTF8` that is a
+   non-issue: the database already stores UTF-8, so `STRING_TO_RAW` is a byte-identical no-op
+   and a line already ≤ 32,767 bytes stays that size. On a single-byte database character set, a
+   line whose non-ASCII repertoire fills that limit can expand past it once converted to UTF-8;
+   the block then fails with a PL/SQL numeric/value error, surfaced as this call's `DbError` —
+   reported, not a silent truncation and not a process abort, but also not solved. Solving it
+   would mean streaming the conversion through a LOB rather than a scalar `RAW`, out of scope
+   for M2.12.
+
+   The round-trip cost is unchanged: the same 10,000-line fixture still drains in 5 round trips
+   at db-core's default chunk sizes, measured on both the M2.7 and the M2.12 test files against
+   the same database. `max_bytes` is now honoured in exact UTF-8 bytes rather than
+   database-charset bytes or characters: measured with 40 lines of 750 UTF-8 bytes each (Thai)
+   at `max_bytes = 2,000`, every chunk's packed lines stayed within budget, and only a chunk's
+   own trailing unframed line — never more than one line — was allowed to exceed it
+   (`tests/m2_12_server_output_raw.rs`).
 
 **Measured** (`tests/m2_7_server_output.rs`, round trips counted by the server in `v$mystat`
 "SQL*Net roundtrips to/from client", net of the measuring query):
@@ -2052,6 +2103,15 @@ Also **not read** when:
   The lines the server still held are read after the next statement, unless that statement prints
   first, in which case `DBMS_OUTPUT` discards them. The `failure` is what tells the user the pane
   is incomplete.
+* **An invalid-UTF-8 line is not a failed read (M2.12).** Before M2.12, one line that was not
+  valid UTF-8 was indistinguishable from a framing defect: both failed the whole read with
+  `DataConversion` and lost every other line in it. That is no longer true. A *framing* error —
+  a malformed length prefix, a frame shorter than it claims, the server's own line count and the
+  decoded count disagreeing — is still exactly this: `DataConversion`, the read's lines lost, `T2`
+  unchanged. A line whose *content* fails to decode as UTF-8 is not a framing error: it is
+  delivered like any other line, with U+FFFD in place of the invalid bytes, and counted in
+  `ServerOutputChunk::invalid_utf8_lines()`. It costs nothing beyond itself, and it never turns a
+  read into a failure.
 
 ### T6 — bounded memory, and the queue bound becomes `3R + U + 3`
 
