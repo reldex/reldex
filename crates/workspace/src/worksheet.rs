@@ -10,8 +10,10 @@
 //! [`Worksheet`] has no field for a session id, a "connected" flag or a
 //! transaction state, and cannot be given one — restoring it must never
 //! imply that a database session exists, let alone one with an open
-//! transaction (`SPEC.md` §20, ADR-0002 E7). Reopening the database
-//! connection, if any, is entirely the caller's decision, made after the
+//! transaction (`SPEC.md` §20/§24.16 — "save and restore non-transactional
+//! workspace state" — and ADR-0002 D2, where transaction state lives in
+//! `DatabaseSession`, not in anything this crate persists). Reopening the
+//! database connection, if any, is entirely the caller's decision, made after the
 //! workspace is restored, not by this crate.
 //!
 //! [`crate::Profile`] is the same story one level up: a saved profile is
@@ -81,7 +83,13 @@ impl std::error::Error for WorksheetError {}
 /// other Unicode text; any whitespace, including the control characters an
 /// editor legitimately contains). Only the title — shown on one line in a tab
 /// bar — refuses control characters.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` prints [`WorksheetState::text`]'s length, never its text — the
+/// same style as [`crate::ProfileEndpoint`]'s connect string and
+/// [`crate::HistoryEntry`]'s statement: worksheet text can legitimately
+/// contain `IDENTIFIED BY "…"`. [`Worksheet`]'s own (derived) `Debug`
+/// inherits this redaction through its `state` field.
+#[derive(Clone, PartialEq, Eq)]
 pub struct WorksheetState {
     /// The tab's title. May be empty (an untitled worksheet).
     pub title: String,
@@ -93,6 +101,17 @@ pub struct WorksheetState {
     pub caret: u32,
     /// The scroll position, in the editor's own unit.
     pub scroll: u32,
+}
+
+impl fmt::Debug for WorksheetState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorksheetState")
+            .field("title", &self.title)
+            .field("text", &format!("<redacted, {} bytes>", self.text.len()))
+            .field("caret", &self.caret)
+            .field("scroll", &self.scroll)
+            .finish()
+    }
 }
 
 impl WorksheetState {
@@ -322,5 +341,31 @@ mod tests {
         let profile = ProfileId::new_random();
         worksheet.set_profile(Some(profile));
         assert_eq!(worksheet.profile(), Some(profile));
+    }
+
+    #[test]
+    fn debug_redacts_the_worksheet_text_on_both_state_and_worksheet() {
+        let secret_looking = "ALTER USER app_owner IDENTIFIED BY \"Hunter2\"";
+        let mut worksheet_state = state(secret_looking);
+        worksheet_state.title = "scratch".to_owned();
+        let printed = format!("{worksheet_state:?}");
+        assert!(!printed.contains("Hunter2"), "{printed}");
+        assert!(!printed.contains(secret_looking), "{printed}");
+        assert!(
+            printed.contains(&format!("<redacted, {} bytes>", secret_looking.len())),
+            "{printed}"
+        );
+        // The title is not redacted — only the editor text is sensitive here.
+        assert!(printed.contains("scratch"), "{printed}");
+
+        let worksheet =
+            Worksheet::new(WorksheetId::new_random(), None, worksheet_state, 0).expect("valid");
+        let printed = format!("{worksheet:?}");
+        assert!(!printed.contains("Hunter2"), "{printed}");
+        assert!(!printed.contains(secret_looking), "{printed}");
+        assert!(
+            printed.contains(&format!("<redacted, {} bytes>", secret_looking.len())),
+            "{printed}"
+        );
     }
 }

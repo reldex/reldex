@@ -132,7 +132,12 @@ impl std::error::Error for HistoryError {}
 ///
 /// Never carries a bind value — only the statement text as submitted. See
 /// the module documentation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` prints [`HistoryEntry::statement`]'s length, never its text — the
+/// same style as [`crate::ProfileEndpoint`]'s connect string: a statement can
+/// legitimately contain `IDENTIFIED BY "…"`, and a log line is not the place
+/// for it.
+#[derive(Clone, PartialEq, Eq)]
 pub struct HistoryEntry {
     /// Which profile's worksheet ran it.
     pub profile: ProfileId,
@@ -146,6 +151,22 @@ pub struct HistoryEntry {
     pub elapsed_ms: u64,
     /// Rows affected or returned, when known.
     pub row_count: Option<u64>,
+}
+
+impl fmt::Debug for HistoryEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HistoryEntry")
+            .field("profile", &self.profile)
+            .field("executed_at", &self.executed_at)
+            .field(
+                "statement",
+                &format!("<redacted, {} bytes>", self.statement.len()),
+            )
+            .field("outcome", &self.outcome)
+            .field("elapsed_ms", &self.elapsed_ms)
+            .field("row_count", &self.row_count)
+            .finish()
+    }
 }
 
 impl HistoryEntry {
@@ -172,7 +193,10 @@ impl HistoryEntry {
 }
 
 /// One stored history entry, as read back.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` redacts [`HistoryRecord::statement`] the same way
+/// [`HistoryEntry`]'s does.
+#[derive(Clone, PartialEq, Eq)]
 pub struct HistoryRecord {
     /// Its id.
     pub id: HistoryId,
@@ -188,6 +212,23 @@ pub struct HistoryRecord {
     pub elapsed_ms: u64,
     /// Rows affected or returned, when known.
     pub row_count: Option<u64>,
+}
+
+impl fmt::Debug for HistoryRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HistoryRecord")
+            .field("id", &self.id)
+            .field("profile", &self.profile)
+            .field("executed_at", &self.executed_at)
+            .field(
+                "statement",
+                &format!("<redacted, {} bytes>", self.statement.len()),
+            )
+            .field("outcome", &self.outcome)
+            .field("elapsed_ms", &self.elapsed_ms)
+            .field("row_count", &self.row_count)
+            .finish()
+    }
 }
 
 /// One page of a profile's history, newest first.
@@ -281,5 +322,42 @@ mod tests {
             row_count: None,
         };
         assert_eq!(ddl.validate(), Ok(()));
+    }
+
+    #[test]
+    fn debug_redacts_the_statement_text_on_both_entry_and_record() {
+        let secret_looking = "ALTER USER app_owner IDENTIFIED BY \"Hunter2\"";
+        let entry = HistoryEntry {
+            profile: ProfileId::new_random(),
+            executed_at: UnixTimeMs::now(),
+            statement: secret_looking.to_owned(),
+            outcome: HistoryOutcome::Succeeded,
+            elapsed_ms: 4,
+            row_count: None,
+        };
+        let printed = format!("{entry:?}");
+        assert!(!printed.contains("Hunter2"), "{printed}");
+        assert!(!printed.contains(secret_looking), "{printed}");
+        assert!(
+            printed.contains(&format!("<redacted, {} bytes>", secret_looking.len())),
+            "{printed}"
+        );
+
+        let record = HistoryRecord {
+            id: HistoryId::from_row_id(1),
+            profile: entry.profile,
+            executed_at: entry.executed_at,
+            statement: secret_looking.to_owned(),
+            outcome: entry.outcome,
+            elapsed_ms: entry.elapsed_ms,
+            row_count: entry.row_count,
+        };
+        let printed = format!("{record:?}");
+        assert!(!printed.contains("Hunter2"), "{printed}");
+        assert!(!printed.contains(secret_looking), "{printed}");
+        assert!(
+            printed.contains(&format!("<redacted, {} bytes>", secret_looking.len())),
+            "{printed}"
+        );
     }
 }
