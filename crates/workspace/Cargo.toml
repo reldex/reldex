@@ -54,6 +54,12 @@ uuid = { version = "1.26.1", default-features = false, features = ["std", "v4"] 
 # the only place allowed to name a concrete driver (ADR-0006 "Driver binding").
 reldex-driver-oracle-thin = { path = "../drivers/oracle-thin" }
 
+# Only `tests/result_pipeline_defaults.rs`, which pins the result settings'
+# built-in defaults to the ones `reldex-db-core` falls back on, so the two
+# cannot drift. A dev-dependency: the crate itself still does not depend on
+# `db-core` (ADR-0006 "Crate boundary"; `tests/dependency_rules.rs`).
+reldex-db-core = { path = "../db-core" }
+
 # Only `tests/dependency_rules.rs`, to parse `cargo metadata` JSON — the same
 # use, and the same version, as `reldex-db-core`'s own dependency-rule test.
 serde_json = "1"

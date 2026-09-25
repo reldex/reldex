@@ -568,9 +568,15 @@ pub const STATEMENT_TIME_LIMIT: Setting<TimeLimit> = Setting::new(SettingId::Sta
 /// An upper bound, not the number every round trip carries (ADR-0006
 /// amendment "Result caps"): the Result Store sizes each request by a
 /// per-round-trip byte budget and the describe's declared column widths, and
-/// asks for at most this many rows (ADR-0004 RS2). It is also the statement's
-/// fetch-size hint, which a driver may fix at execute (ADR-0004 accepted
-/// limitation 11).
+/// asks for at most this many rows (ADR-0004 RS2).
+///
+/// It is **not** passed as the statement's fetch-size hint on the product
+/// path. The adapter's execute sets no hint, so on Oracle the driver's wire
+/// array stays `oracledb`'s default of 100 rows, fixed at execute. That is a
+/// lead decision for M5.2 Stage B: a larger wire array brings back the
+/// per-fetch cost of ADR-0004 Table 3a, so this setting is not passed until
+/// M5.6 has measured a budget or upstream ships a setter for the array size
+/// after execute (ADR-0004 accepted limitations 11 and 12).
 pub const FETCH_ROWS: Setting<u32> = Setting::new(SettingId::FetchRows);
 
 /// How many fetches one result may have outstanding at once. Default **2**
