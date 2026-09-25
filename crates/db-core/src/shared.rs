@@ -756,7 +756,22 @@ impl SessionShared {
     /// oldest is the same "keep what is already promised, count the rest"
     /// rule the event queue applies, because the start of a run is where an
     /// error usually is.
-    pub(crate) fn collect_server_output(&self, lines: Vec<Box<str>>, failure: Option<DbError>) {
+    ///
+    /// `invalid_utf8_lines` is added to [`ServerOutputLog::invalid_utf8_lines`]
+    /// unconditionally, whether or not `lines` itself ends up kept or refused
+    /// by the prefix bound above: it counts invalid lines among every line
+    /// this read **drained from the server**, not only the ones the log had
+    /// room to retain. The chunk that reported the count is gone by the time
+    /// a truncated line would need re-checking, so there is no way to
+    /// attribute it to specific retained-vs-refused lines; counting the full
+    /// amount is the same "never silent" choice [`ServerOutputLog::dropped`]
+    /// makes for line counts.
+    pub(crate) fn collect_server_output(
+        &self,
+        lines: Vec<Box<str>>,
+        invalid_utf8_lines: u32,
+        failure: Option<DbError>,
+    ) {
         let mut collected = self
             .collected_output
             .lock()
@@ -764,6 +779,10 @@ impl SessionShared {
         for line in lines {
             collected.push(line);
         }
+        collected.log.invalid_utf8_lines = collected
+            .log
+            .invalid_utf8_lines
+            .saturating_add(invalid_utf8_lines);
         if let Some(failure) = failure {
             let log = &mut collected.log;
             log.failures = log.failures.saturating_add(1);
@@ -876,14 +895,14 @@ mod tests {
         // not fit, then one small enough to fit on its own. Keeping the third
         // would leave a hole where the second was.
         let first = line(ServerOutputLog::MAX_RETAINED_BYTES - 10, 'a');
-        shared.collect_server_output(vec![first.clone(), line(100, 'b')], None);
-        shared.collect_server_output(vec![line(5, 'c')], None);
+        shared.collect_server_output(vec![first.clone(), line(100, 'b')], 0, None);
+        shared.collect_server_output(vec![line(5, 'c')], 0, None);
         let log = shared.take_collected_server_output();
         assert_eq!(log.lines, vec![first]);
         assert_eq!(log.dropped, 2, "both later lines are counted");
 
         // A take empties the log and it accepts lines again.
-        shared.collect_server_output(vec![line(5, 'd')], None);
+        shared.collect_server_output(vec![line(5, 'd')], 0, None);
         let log = shared.take_collected_server_output();
         assert_eq!(log.lines, vec![line(5, 'd')]);
         assert_eq!(log.dropped, 0);
@@ -895,12 +914,37 @@ mod tests {
         let lines = (0..ServerOutputLog::MAX_RETAINED_LINES + 3)
             .map(|n| n.to_string().into_boxed_str())
             .collect();
-        shared.collect_server_output(lines, None);
-        shared.collect_server_output(vec![Box::from("late")], None);
+        shared.collect_server_output(lines, 0, None);
+        shared.collect_server_output(vec![Box::from("late")], 0, None);
         let log = shared.take_collected_server_output();
         assert_eq!(log.lines.len(), ServerOutputLog::MAX_RETAINED_LINES);
         assert_eq!(log.lines.first().map(AsRef::as_ref), Some("0"));
         assert_eq!(log.dropped, 4);
+    }
+
+    #[test]
+    fn invalid_utf8_lines_accumulate_past_the_prefix_bound() {
+        // The rule stated on `collect_server_output`: this counter is the
+        // full count of invalid lines among everything drained, even once
+        // the log itself has started refusing lines — unlike `lines`, it is
+        // not reduced to only what the bounded prefix kept.
+        let shared = SessionShared::new(SessionId::allocate());
+        let lines = (0..ServerOutputLog::MAX_RETAINED_LINES + 3)
+            .map(|n| n.to_string().into_boxed_str())
+            .collect();
+        shared.collect_server_output(lines, 2, None);
+        shared.collect_server_output(vec![Box::from("late")], 1, None);
+        let log = shared.take_collected_server_output();
+        assert_eq!(log.dropped, 4, "the refused lines are still counted too");
+        assert_eq!(
+            log.invalid_utf8_lines, 3,
+            "both reads' counts survive even though some of their lines were refused"
+        );
+
+        // A take empties the log and it accepts counts again.
+        shared.collect_server_output(vec![Box::from("next")], 1, None);
+        let log = shared.take_collected_server_output();
+        assert_eq!(log.invalid_utf8_lines, 1);
     }
 
     #[test]

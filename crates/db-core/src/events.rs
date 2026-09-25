@@ -529,6 +529,18 @@ pub enum SessionEvent {
         /// [`SessionEvent::Terminal`] like any other. An event carrying a
         /// failure is **never dropped**, even at the cap; see [`EventCaps`].
         failure: Option<DbError>,
+        /// How many of `lines` were not valid UTF-8 on the wire and were
+        /// delivered with U+FFFD in place of the invalid bytes rather than
+        /// dropped — the same count
+        /// [`reldex_db_driver_api::ServerOutputChunk::invalid_utf8_lines`]
+        /// reports for the chunk this event carries. Zero normally; the
+        /// affected lines are still present in `lines`, so the UI can mark
+        /// them rather than show mojibake with no explanation. Added in
+        /// M2.12's fix round: previously read off the chunk and then
+        /// silently discarded at this boundary
+        /// (`docs/exec-plans/active/phase-1-m2-5-event-queue.md` §7.5) —
+        /// M2.11 still owns mapping it across the C ABI.
+        invalid_utf8_lines: u32,
     },
     /// [`crate::DatabaseSession::has_possibly_active_transaction`] flipped.
     ///
@@ -1025,6 +1037,7 @@ impl Inner {
                 lines,
                 dropped,
                 failure,
+                invalid_utf8_lines,
             } => {
                 let dropped = dropped.saturating_add(state.dropped_lines);
                 state.dropped_lines = 0;
@@ -1033,6 +1046,7 @@ impl Inner {
                     lines,
                     dropped,
                     failure,
+                    invalid_utf8_lines,
                 }
             }
             other => other,
@@ -1376,6 +1390,7 @@ mod tests {
             lines: (0..lines).map(|i| format!("line {i}").into()).collect(),
             dropped: 0,
             failure: None,
+            invalid_utf8_lines: 0,
         }
     }
 
@@ -1473,6 +1488,7 @@ mod tests {
             lines: (0..lines).map(|i| format!("line {i}").into()).collect(),
             dropped: 0,
             failure: Some(reldex_db_driver_api::DbError::internal("the read failed")),
+            invalid_utf8_lines: 0,
         }
     }
 

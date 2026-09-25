@@ -472,7 +472,7 @@ the interim pump as `RELDEX_EVENT_UNKNOWN`. What M2.11 has to add:
 
 | `SessionEvent` | `ReldexEventKind` | fields to fill |
 | --- | --- | --- |
-| `ServerOutput { session, lines, dropped, failure }` | **new** `SERVER_OUTPUT` | `line_count`; the lines behind an accessor or an arena as `(pointer, length)` UTF-8, **never** NUL-terminated, because a line may contain `\n` or NUL and an empty line is a real line; `dropped` (lines refused before this event, so "output truncated"); `error` from `failure` (a failed read, so "output incomplete, because …"). There is no `request`: a `ServerOutput` between an execute's `EXECUTING` and its `EXECUTED` belongs to that execute, except in the two cases under "Ordering" below. |
+| `ServerOutput { session, lines, dropped, failure, invalid_utf8_lines }` | **new** `SERVER_OUTPUT` | `line_count`; the lines behind an accessor or an arena as `(pointer, length)` UTF-8, **never** NUL-terminated, because a line may contain `\n` or NUL and an empty line is a real line; `dropped` (lines refused before this event, so "output truncated"); `error` from `failure` (a failed read, so "output incomplete, because …"); `invalid_utf8_lines` (M2.12 — how many of this event's own lines had invalid UTF-8 on the wire, delivered with U+FFFD in place of the bad bytes rather than dropped; the affected lines are still among `lines`, so the pane can mark them). There is no `request`: a `ServerOutput` between an execute's `EXECUTING` and its `EXECUTED` belongs to that execute, except in the two cases under "Ordering" below. |
 | `ServerOutputConfigured { session, request, result }` | a reply: **new** `SERVER_OUTPUT_CONFIGURED`, or `COMPLETED` with a new `completed_operation` value | `request`, `error` when `Err`, and the setting **in force** — enabled, unlimited, and buffer bytes. Oracle clamps a requested size into 2,000..=1,000,000, and the pane must show the real one. |
 
 Entry point: one `reldex_session_set_server_output(session, request, mode, buffer_bytes)` onto
@@ -513,3 +513,20 @@ Rules the adapter must keep:
   `failure` not attributed to any of them.
 * **`SessionEvent::ServerOutput` is `#[non_exhaustive]`.** Match it with `..`, because its fields
   are expected to grow (follow-up M2.13 may add a per-statement truncation report).
+* **`ServerOutputChunk`'s M2.12 field is already carried through `db-core`; this mapping is what
+  still owes it to the C ABI.**
+  `crates/db-driver-api/src/server_output.rs::ServerOutputChunk::invalid_utf8_lines()` — how many
+  of a chunk's lines were not valid UTF-8 on the wire and were delivered with U+FFFD in place of
+  the bad bytes rather than dropped (ADR-0002 amendment T, M2.12 update). `db-core`'s M2.12 fix
+  round wired this all the way through: `worker::drain_server_output` reads the chunk's count
+  before calling `chunk.into_lines()` and threads it through `deliver_server_output`, which sets it
+  on `SessionEvent::ServerOutput`'s `invalid_utf8_lines` field for the event path, or adds it —
+  unconditionally, not only for lines the log kept — to `ServerOutputLog::invalid_utf8_lines` for
+  the completion path via `collect_server_output`. Neither is dropped at the `db-core` boundary any
+  more; `crates/db-core/tests/server_output.rs` covers both paths
+  (`invalid_utf8_lines_the_driver_reports_ride_on_the_server_output_event` and
+  `the_completion_path_log_counts_invalid_utf8_lines_past_the_truncation_bound`). What remains for
+  M2.11 is exactly what this table's `ServerOutput` row now says: map `invalid_utf8_lines` across
+  the C ABI next to `dropped`. The pane's reason to care: a line reported this way is not corrupt
+  data lost to a bug, it is exactly what the server held, and the UI should be able to mark it
+  rather than show mojibake with no explanation.

@@ -79,21 +79,32 @@ impl ServerOutputSetting {
 ///
 /// Returned by [`crate::DatabaseConnection::take_server_output`]. The lines
 /// are the lines the server holds, **exactly**: an empty line is an empty
-/// string (never dropped, never merged into its neighbour), and text is
-/// whatever the server's character set converts to — nothing is trimmed,
-/// normalised or re-encoded beyond that conversion.
+/// string (never dropped, never merged into its neighbour), and each line is
+/// decoded as UTF-8 **independently of the others** (ADR-0002 amendment T,
+/// M2.12) — one line's bytes being invalid never costs the rest of the chunk.
+/// A line whose bytes are not valid UTF-8 is still delivered, with the
+/// invalid sequences replaced by U+FFFD, and counted in
+/// [`ServerOutputChunk::invalid_utf8_lines`] rather than silently accepted or
+/// dropped.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ServerOutputChunk {
     lines: Vec<Box<str>>,
     drained: bool,
+    invalid_utf8_lines: u32,
 }
 
 impl ServerOutputChunk {
     /// A chunk of `lines`. `drained` says whether the driver knows the server
-    /// now holds nothing more; see [`ServerOutputChunk::is_drained`].
+    /// now holds nothing more; see [`ServerOutputChunk::is_drained`]. No line
+    /// is reported invalid; see [`ServerOutputChunk::with_invalid_utf8_lines`]
+    /// for a driver that must report some.
     #[must_use]
     pub const fn new(lines: Vec<Box<str>>, drained: bool) -> Self {
-        Self { lines, drained }
+        Self {
+            lines,
+            drained,
+            invalid_utf8_lines: 0,
+        }
     }
 
     /// An empty chunk from a server that holds nothing.
@@ -102,7 +113,19 @@ impl ServerOutputChunk {
         Self {
             lines: Vec::new(),
             drained: true,
+            invalid_utf8_lines: 0,
         }
+    }
+
+    /// Records that `invalid_utf8_lines` of this chunk's lines were not valid
+    /// UTF-8 on the wire and were delivered with U+FFFD in place of the
+    /// offending bytes — see [`ServerOutputChunk::invalid_utf8_lines`].
+    /// Additive: a driver with nothing to report never calls this, and the
+    /// count stays zero.
+    #[must_use]
+    pub const fn with_invalid_utf8_lines(mut self, invalid_utf8_lines: u32) -> Self {
+        self.invalid_utf8_lines = invalid_utf8_lines;
+        self
     }
 
     /// The lines, in order.
@@ -132,6 +155,16 @@ impl ServerOutputChunk {
     #[must_use]
     pub const fn is_drained(&self) -> bool {
         self.drained
+    }
+
+    /// How many of [`ServerOutputChunk::lines`] were not valid UTF-8 on the
+    /// wire. Such a line is still present in `lines`, with each invalid byte
+    /// sequence replaced by U+FFFD, never dropped and never allowed to cost
+    /// the other lines of the same chunk. Zero normally; the caller decides
+    /// whether and how to flag the affected lines in the UI.
+    #[must_use]
+    pub const fn invalid_utf8_lines(&self) -> u32 {
+        self.invalid_utf8_lines
     }
 
     /// Takes the lines out.
@@ -177,6 +210,11 @@ mod tests {
         assert_eq!(chunk.len(), 2, "an empty line must not vanish");
         assert_eq!(chunk.lines()[0].as_ref(), "");
         assert!(!chunk.is_drained());
+        assert_eq!(
+            chunk.invalid_utf8_lines(),
+            0,
+            "nothing was reported invalid"
+        );
         assert_eq!(chunk.into_lines().len(), 2);
     }
 
@@ -188,5 +226,17 @@ mod tests {
             chunk.is_drained(),
             "an empty chunk must let the caller stop"
         );
+        assert_eq!(chunk.invalid_utf8_lines(), 0);
+    }
+
+    #[test]
+    fn invalid_utf8_lines_is_additive_and_defaults_to_zero() {
+        let plain = ServerOutputChunk::new(vec!["a".into()], true);
+        assert_eq!(plain.invalid_utf8_lines(), 0);
+
+        let flagged = ServerOutputChunk::new(vec!["a".into(), "b\u{FFFD}c".into()], true)
+            .with_invalid_utf8_lines(1);
+        assert_eq!(flagged.invalid_utf8_lines(), 1);
+        assert_eq!(flagged.len(), 2, "the invalid line is still delivered");
     }
 }
