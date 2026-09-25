@@ -202,8 +202,13 @@ fn the_first_fetch_is_due_at_once_and_sized_by_the_declared_widths() {
     // 256 KiB / (44 + 4008 + 1) = 64 rows: a declared VARCHAR2(4000) keeps
     // the blind first round trip small.
     let mut wide = store(unlimited(), 1_000, 2, 4_000);
+    wide.fetch_all();
     let due = fetches(&pump(&mut wide));
-    assert_eq!(due.len(), 1, "one first fetch, whatever the demand");
+    assert_eq!(
+        due.len(),
+        1,
+        "one first fetch, whatever the demand, and none beside it until it          is answered: only one request is sized blind"
+    );
     assert_eq!(due[0].max_rows().get(), 64);
     assert_eq!(due[0].ticket().sequence(), 0);
     assert!(matches!(wide.state().phase(), ResultPhase::Fetching));
@@ -691,42 +696,56 @@ fn a_reply_out_of_sequence_is_asserted_and_never_appended() {
 
 // ------------------------------------------------------------- the lookup
 
-#[test]
-fn rows_map_to_segments_by_division_until_a_short_segment_forces_a_search() {
+/// Appends segments of the given sizes to a fresh store, in order.
+fn store_with_segments(sizes: &[usize]) -> ResultStore {
     let mut store = store(unlimited(), 10, 1, 40);
     store.fetch_all();
-    let mut cursor = FakeCursor::new(1_000);
-    // Three full segments and a last one of any size keep division valid.
-    for size in [10, 10, 10, 7] {
-        let fetch = fetches(&pump(&mut store))[0];
+    extend_segments(&mut store, sizes, &mut FakeCursor::new(1_000));
+    store
+}
+
+fn extend_segments(store: &mut ResultStore, sizes: &[usize], cursor: &mut FakeCursor) {
+    for &size in sizes {
+        let fetch = fetches(&pump(store))[0];
         let fetch = FetchRequest {
             max_rows: nz(size),
             ..fetch
         };
         store.on_fetched(fetch.ticket(), cursor.answer(fetch));
     }
-    assert!(store.lookup_is_constant_time());
+}
+
+fn assert_every_row_found(store: &ResultStore) {
     for row in 0..store.row_count() {
-        assert_eq!(text(&store, row), format!("row {row}"));
-    }
-    // The short segment stops being last: rows now need a binary search, and
-    // every one must still land in the right segment.
-    for size in [10, 3, 10] {
-        let fetch = fetches(&pump(&mut store))[0];
-        let fetch = FetchRequest {
-            max_rows: nz(size),
-            ..fetch
-        };
-        store.on_fetched(fetch.ticket(), cursor.answer(fetch));
-    }
-    assert!(!store.lookup_is_constant_time());
-    assert_eq!(store.row_count(), 60);
-    for row in 0..store.row_count() {
-        assert_eq!(text(&store, row), format!("row {row}"), "row {row}");
+        assert_eq!(text(store, row), format!("row {row}"), "row {row}");
         let (segment, first) = store.segment_for_row(row).expect("in range");
         assert!(row >= first && row < first + segment.row_count());
     }
-    assert!(store.segment_for_row(60).is_none());
+    assert!(store.segment_for_row(store.row_count()).is_none());
+}
+
+#[test]
+fn rows_map_to_segments_by_division_until_a_short_segment_forces_a_search() {
+    // Equal segments and a last one of any size keep division valid.
+    let mut store = store_with_segments(&[10, 10, 10, 7]);
+    assert!(store.lookup_is_constant_time());
+    assert_every_row_found(&store);
+
+    // So does a first segment of its own size: the first request is sized
+    // by declared widths, the rest by what was observed.
+    let first_differs = store_with_segments(&[4, 10, 10, 10, 3]);
+    assert!(first_differs.lookup_is_constant_time());
+    assert_eq!(first_differs.row_count(), 37);
+    assert_every_row_found(&first_differs);
+
+    // The short segment stops being last: rows now need a binary search, and
+    // every one must still land in the right segment.
+    let mut cursor = FakeCursor::new(1_000);
+    cursor.position = 37;
+    extend_segments(&mut store, &[10, 3, 10], &mut cursor);
+    assert!(!store.lookup_is_constant_time());
+    assert_eq!(store.row_count(), 60);
+    assert_every_row_found(&store);
 }
 
 // ----------------------------------------------------- values and accounting

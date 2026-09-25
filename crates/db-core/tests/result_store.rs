@@ -536,14 +536,15 @@ impl Consumer {
     }
 
     /// Submits a transaction-ending command the way the product must:
-    /// announced to the stores first.
+    /// announced to the stores once the session accepted it, before the
+    /// next pump.
     fn end_transaction(
         &mut self,
         submit: impl FnOnce(&DatabaseSession, RequestId),
     ) -> SessionEvent {
         let request = self.request();
-        self.results.transaction_end_submitted();
         submit(&self.session, request);
+        self.results.transaction_end_submitted();
         self.reply(request)
     }
 }

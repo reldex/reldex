@@ -127,6 +127,11 @@ impl SessionResults {
     /// A commit, rollback or rollback-to-savepoint **command** was just
     /// submitted on this session: every store stops submitting until its
     /// reply is observed (ADR-0004 RS2, "How the store learns it").
+    ///
+    /// Call it once the session has **accepted** the command, and before
+    /// pumping again. A refused submit produces no reply, so announcing it
+    /// would pause the stores for good; and since pumping happens on the
+    /// same thread, no fetch can be submitted between the two calls.
     pub fn transaction_end_submitted(&mut self) {
         self.transaction_ends_pending += 1;
         for store in &mut self.stores {

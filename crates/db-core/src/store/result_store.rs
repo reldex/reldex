@@ -16,7 +16,9 @@
 //! # The fetch policy (ADR-0004 RS2)
 //!
 //! 1. The first fetch is due at once, whatever the demand, sized by the
-//!    describe's declared column widths against the round-trip budget.
+//!    describe's declared column widths against the round-trip budget. No
+//!    other fetch is submitted until it is answered, so only one request is
+//!    ever sized blind, and every later one by the width observed.
 //! 2. After that the store keeps one fetch of read-ahead: a fetch is due
 //!    while `retained + requested-and-unanswered < demand + rows per round
 //!    trip`, with at most `fetches_in_flight` outstanding, and only inside
@@ -391,8 +393,10 @@ pub struct ResultStore {
     segments: Vec<Arc<ResultSegment>>,
     /// The first row of each segment.
     starts: Vec<usize>,
-    /// Whether every segment but the last holds as many rows as the first,
-    /// which makes finding a row a division (ADR-0004 accepted limitation 10).
+    /// Whether every segment between the first and the last holds as many
+    /// rows as the second, which makes finding a row a division (ADR-0004
+    /// accepted limitation 10). The first is exempt: it is sized blind, by
+    /// declared widths, and commonly differs from the rest.
     uniform: bool,
     retained_rows: usize,
     segment_bytes: usize,
@@ -514,9 +518,11 @@ impl ResultStore {
             + self.starts.capacity() * size_of::<usize>()
     }
 
-    /// Whether finding a row is a division (every segment but the last holds
-    /// the same number of rows) rather than a binary search over the
-    /// segments' first rows (ADR-0004 accepted limitation 10).
+    /// Whether finding a row is a division (every segment between the first
+    /// and the last holds the same number of rows) rather than a binary
+    /// search over the segments' first rows (ADR-0004 accepted limitation
+    /// 10). The first segment may differ: the first request is sized by the
+    /// describe's declared widths, the rest by the rows observed.
     #[must_use]
     pub const fn lookup_is_constant_time(&self) -> bool {
         self.uniform
@@ -580,8 +586,12 @@ impl ResultStore {
         }
         let last = self.segments.len().checked_sub(1)?;
         if self.uniform {
-            let rows = self.segments.first()?.row_count();
-            return Some((row / rows).min(last));
+            let first = self.segments.first()?.row_count();
+            if row < first {
+                return Some(0);
+            }
+            let rows = self.segments.get(1)?.row_count();
+            return Some((1 + (row - first) / rows).min(last));
         }
         // How many segments start at or before `row`, less one.
         self.starts
@@ -653,7 +663,8 @@ impl ResultStore {
     /// A commit, rollback or rollback-to-savepoint **command** was submitted
     /// on the store's session: stop submitting until it is answered
     /// ([`ResultStore::transaction_end_answered`]). Fetches already submitted
-    /// run first and are kept.
+    /// run first and are kept. Announce only a command the session accepted:
+    /// see [`crate::SessionResults::transaction_end_submitted`].
     pub fn transaction_end_submitted(&mut self) {
         self.transaction_ends_pending += 1;
     }
@@ -759,6 +770,9 @@ impl ResultStore {
             || self.exhausted
             || self.transaction_ends_pending > 0
             || self.in_flight.len() >= self.policy.fetches_in_flight().get()
+            // Until the first reply there is no observed width, and a second
+            // request would be sized blind too.
+            || (self.retained_rows == 0 && !self.in_flight.is_empty())
         {
             return None;
         }
@@ -935,12 +949,12 @@ impl ResultStore {
     }
 
     fn append(&mut self, segment: Arc<ResultSegment>) {
-        // The segment that was last is about to become one that is not; if it
-        // is shorter or longer than the first, rows no longer map to segments
-        // by division.
-        if self.segments.len() >= 2
-            && let (Some(first), Some(last)) = (self.segments.first(), self.segments.last())
-            && first.row_count() != last.row_count()
+        // The segment that was last is about to become one that is not. If
+        // it is not the first, and it is shorter or longer than the second,
+        // rows no longer map to segments by division.
+        if self.segments.len() >= 3
+            && let (Some(second), Some(last)) = (self.segments.get(1), self.segments.last())
+            && second.row_count() != last.row_count()
         {
             self.uniform = false;
         }
