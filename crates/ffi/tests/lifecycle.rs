@@ -193,6 +193,13 @@ fn a_close_with_a_possibly_open_transaction_refuses_to_decide_for_the_user() {
     assert!(!closed.session_still_open);
     assert_eq!(closed.session_state, ReldexSessionState::Closed as i32);
 
+    // A session-ending close is followed by exactly one `Terminal` (M2.11):
+    // the rollback the caller asked for resolved the transaction, so it is
+    // not a loss.
+    let terminal = harness.next_event();
+    assert_eq!(terminal.kind, ReldexEventKind::Terminal as i32);
+    assert!(!terminal.transaction_possibly_lost);
+
     // Nothing more is accepted, and nothing more is answered.
     assert_eq!(
         harness.execute(session, 5, ReldexMockStatement::GeneratedQuery),

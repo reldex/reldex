@@ -50,6 +50,14 @@ static SESSIONS: AtomicUsize = AtomicUsize::new(0);
 static BATCHES: AtomicUsize = AtomicUsize::new(0);
 static ERRORS: AtomicUsize = AtomicUsize::new(0);
 static ARENAS: AtomicUsize = AtomicUsize::new(0);
+/// Every owned, caller-released object M2.11 added — server output line
+/// sets, metadata queries, profiles/profile lists, history pages and
+/// worksheets/worksheet lists — share one counter rather than one field each:
+/// each is small, released promptly, and the point of this diagnostic is
+/// "did everything handed out come back", not a breakdown per family. A
+/// family that turns out to need its own count can move to a dedicated field
+/// later (additive, per D7).
+static MISC_OBJECTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Which counter an object belongs to.
 #[derive(Clone, Copy)]
@@ -59,6 +67,10 @@ pub(crate) enum Kind {
     Batch,
     Error,
     Arena,
+    /// See [`MISC_OBJECTS`].
+    ServerOutputLines,
+    /// See [`MISC_OBJECTS`].
+    WorkspaceObject,
 }
 
 impl Kind {
@@ -69,6 +81,7 @@ impl Kind {
             Self::Batch => &BATCHES,
             Self::Error => &ERRORS,
             Self::Arena => &ARENAS,
+            Self::ServerOutputLines | Self::WorkspaceObject => &MISC_OBJECTS,
         }
     }
 }
@@ -124,6 +137,7 @@ pub unsafe extern "C" fn reldex_live_counts(out: *mut ReldexLiveCounts) -> Relde
             batches: BATCHES.load(Ordering::Relaxed),
             errors: ERRORS.load(Ordering::Relaxed),
             arenas: ARENAS.load(Ordering::Relaxed),
+            misc_objects: MISC_OBJECTS.load(Ordering::Relaxed),
         };
         // SAFETY: delegated to this function's contract for `out`.
         if unsafe { write_out_struct(out, counts) } {
@@ -158,12 +172,24 @@ pub struct ReldexLiveCounts {
     pub errors: usize,
     /// Text arenas created by `reldex_text_arena_create`.
     pub arenas: usize,
+    /// Everything else M2.11 added that the caller owns and releases: server
+    /// output line sets, metadata queries, profiles and profile lists,
+    /// history pages, and worksheets and worksheet lists.
+    pub misc_objects: usize,
 }
 
 // SAFETY: `#[repr(C)]`, `struct_size` first, every other field a `usize` —
 // valid when zeroed.
 unsafe impl CStruct for ReldexLiveCounts {
-    const MIN_SIZE: usize = size_of::<Self>();
+    // The size **before** M2.11 added `misc_objects`: an older caller's
+    // struct (compiled against a header that predates that field) must still
+    // be accepted, per the D7 prefix rule that lets fields be appended
+    // without breaking older callers. `offset_of!` gives that old size
+    // exactly and portably (unlike a hard-coded byte count, which the
+    // pre-M2.11 struct's platform-dependent padding would make wrong on at
+    // least one target): `misc_objects` is the newest field, appended last,
+    // so its offset in the current layout equals the old struct's size.
+    const MIN_SIZE: usize = std::mem::offset_of!(Self, misc_objects);
 }
 
 impl Default for ReldexLiveCounts {
@@ -176,6 +202,7 @@ impl Default for ReldexLiveCounts {
             batches: 0,
             errors: 0,
             arenas: 0,
+            misc_objects: 0,
         }
     }
 }

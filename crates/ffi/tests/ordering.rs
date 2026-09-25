@@ -146,6 +146,10 @@ fn a_request_that_races_a_close_still_gets_its_one_reply() {
         answered, expected,
         "every accepted request is answered exactly once, in order"
     );
+    // The close ended the session (`Rollback` resolves it), so exactly one
+    // `Terminal` follows (M2.11).
+    let terminal = harness.next_event();
+    assert_eq!(terminal.kind, ReldexEventKind::Terminal as i32);
     assert!(harness.poll_event().is_none());
 }
 
@@ -223,6 +227,13 @@ fn a_panic_in_the_pump_answers_every_request_behind_it_instead_of_stranding_them
         lost >= 1,
         "the session must be reported lost, not merely failed"
     );
+    // The panic ended the session, same as any other way a session can end,
+    // so exactly one `Terminal` follows every reply the containment answered
+    // (M2.11) — conservatively `transaction_possibly_lost`, since nothing
+    // resolved whatever the session held.
+    let terminal = harness.next_event();
+    assert_eq!(terminal.kind, ReldexEventKind::Terminal as i32);
+    assert!(terminal.transaction_possibly_lost);
     assert!(
         harness.poll_event().is_none(),
         "and nothing is answered twice"

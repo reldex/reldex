@@ -8,7 +8,92 @@ use reldex_db_core::{CloseError, ExecuteOutcome, StatementKind};
 
 use crate::batch::ReldexBatch;
 use crate::error::{ReldexError, ReldexSessionState};
-use crate::strings::CStruct;
+use crate::strings::{CStruct, OwnedStr, ReldexStr};
+
+/// The lines of one `RELDEX_EVENT_KIND_SERVER_OUTPUT` event.
+///
+/// Owned by the caller from the moment the event is drained; release with
+/// [`reldex_server_output_lines_release`]. Each line is NUL-terminated like
+/// every outbound [`ReldexStr`] (`len` is authoritative even for a line that
+/// legitimately contains an embedded NUL byte — the same rule the rest of
+/// this boundary already promises).
+pub struct ReldexServerOutputLines {
+    lines: Vec<OwnedStr>,
+}
+
+impl Drop for ReldexServerOutputLines {
+    fn drop(&mut self) {
+        crate::counters::destroyed(crate::counters::Kind::ServerOutputLines);
+    }
+}
+
+impl ReldexServerOutputLines {
+    pub(crate) fn new(lines: Vec<Box<str>>) -> Self {
+        crate::counters::created(crate::counters::Kind::ServerOutputLines);
+        Self {
+            lines: lines.into_iter().map(OwnedStr::new).collect(),
+        }
+    }
+}
+
+/// How many lines `lines` holds.
+///
+/// # Safety
+///
+/// `lines` must be null (reported as 0) or a live
+/// [`ReldexServerOutputLines`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reldex_server_output_lines_count(
+    lines: *const ReldexServerOutputLines,
+) -> usize {
+    crate::status::entry_value(0, || {
+        if lines.is_null() {
+            return 0;
+        }
+        // SAFETY: delegated to this function's contract.
+        unsafe { &*lines }.lines.len()
+    })
+}
+
+/// Line `index`, or the empty string when `index` is out of range.
+///
+/// # Safety
+///
+/// `lines` must be null (reported as empty) or a live
+/// [`ReldexServerOutputLines`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reldex_server_output_lines_get(
+    lines: *const ReldexServerOutputLines,
+    index: usize,
+) -> ReldexStr {
+    crate::status::entry_value(ReldexStr::empty(), || {
+        if lines.is_null() {
+            return ReldexStr::empty();
+        }
+        // SAFETY: delegated to this function's contract.
+        unsafe { &*lines }
+            .lines
+            .get(index)
+            .map_or_else(ReldexStr::empty, OwnedStr::as_reldex_str)
+    })
+}
+
+/// Releases the lines of a drained `RELDEX_EVENT_KIND_SERVER_OUTPUT` event.
+///
+/// # Safety
+///
+/// `lines` must be null (a no-op) or a pointer this library handed out that
+/// has not already been released.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reldex_server_output_lines_release(lines: *mut ReldexServerOutputLines) {
+    crate::status::entry_value((), || {
+        if lines.is_null() {
+            return;
+        }
+        // SAFETY: delegated to this function's contract.
+        drop(unsafe { Box::from_raw(lines) });
+    });
+}
 
 /// Which request an event is the reply to.
 ///
@@ -33,6 +118,76 @@ pub enum ReldexEventKind {
     /// Reply to `reldex_session_close`. Read `close_outcome`: a close can fail
     /// and leave the session **open**.
     SessionClosed = 5,
+    /// Reply to `reldex_session_commit`, `reldex_session_rollback`,
+    /// `reldex_session_savepoint`, `reldex_session_rollback_to_savepoint` or
+    /// `reldex_session_ping`. Read `completed_operation` to know which one.
+    Completed = 6,
+    /// Reply to `reldex_session_set_server_output`. `server_output_mode` and
+    /// `server_output_buffer_bytes` carry the setting **actually in force**,
+    /// which a driver may have adjusted.
+    ServerOutputConfigured = 7,
+    /// Unsolicited: lines the server produced out of band (M2.7), collected
+    /// after the statement that produced them and delivered before that
+    /// statement's own `Executed`/`Completed`/`SessionClosed` reply. See
+    /// `server_output_lines`, `server_output_dropped` and
+    /// `server_output_invalid_utf8_lines`; `error` carries a failed read.
+    ///
+    /// M2.11 delivers this only on the **completion path**
+    /// (`reldex-db-core`'s `DatabaseSession::take_server_output`, drained
+    /// after every reply while output is on) — never as a fully unsolicited,
+    /// mid-statement event, which needs the event-queue switch this crate has
+    /// not made yet (see the crate's module documentation, "What is
+    /// interim here"). A caller sees a session's output attributed to the
+    /// request whose reply immediately follows it, which is correct for
+    /// every case except the two rare mid-statement exceptions
+    /// `docs/exec-plans/active/phase-1-m2-5-event-queue.md` §7.5 documents.
+    ServerOutput = 8,
+    /// The session ended. Delivered for a connect that failed
+    /// (`RELDEX_EVENT_KIND_OPENED` with an error) and for a
+    /// `reldex_session_close` that actually closed the session — **not**
+    /// for the hub being destroyed while a session's statement cannot be
+    /// interrupted (ADR-0003 A17: the caller has already released its hub
+    /// pointer by then, so nothing could observe it). Read
+    /// `transaction_possibly_lost` (`SPEC.md` §10: never hide a transaction
+    /// loss).
+    Terminal = 9,
+}
+
+/// Which operation a `RELDEX_EVENT_KIND_COMPLETED` event answers.
+///
+/// `0` is reserved for an operation this header predates.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReldexCompletedOperation {
+    /// An operation this header does not know.
+    Unknown = 0,
+    /// `reldex_session_commit`.
+    Commit = 1,
+    /// `reldex_session_rollback`.
+    Rollback = 2,
+    /// `reldex_session_savepoint`.
+    Savepoint = 3,
+    /// `reldex_session_rollback_to_savepoint`.
+    RollbackToSavepoint = 4,
+    /// `reldex_session_ping`.
+    Ping = 5,
+}
+
+/// Whether server output is on for a session, and with what buffer — the
+/// setting `RELDEX_EVENT_KIND_SERVER_OUTPUT_CONFIGURED` reports **in force**.
+///
+/// `0` is reserved for a mode this header predates.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReldexServerOutputMode {
+    /// A mode this header does not know.
+    Unknown = 0,
+    /// The server does not buffer output for this session.
+    Disabled = 1,
+    /// The server buffers output with no limit other than its own memory.
+    EnabledUnlimited = 2,
+    /// The server buffers output up to `server_output_buffer_bytes`.
+    EnabledBytes = 3,
 }
 
 /// What kind of statement the server ran, as far as the driver could tell.
@@ -184,12 +339,44 @@ pub struct ReldexEvent {
     pub committed_implicitly: bool,
     /// `SessionClosed`: whether the session is still open and usable.
     pub session_still_open: bool,
+    /// `Completed`: a [`ReldexCompletedOperation`].
+    pub completed_operation: i32,
+    /// `ServerOutputConfigured`: a [`ReldexServerOutputMode`] — the mode
+    /// **actually in force**.
+    pub server_output_mode: i32,
+    /// `ServerOutputConfigured`, when `server_output_mode` is
+    /// `RELDEX_SERVER_OUTPUT_MODE_ENABLED_BYTES`: the buffer size actually in
+    /// force, which the server may have clamped from what was requested.
+    pub server_output_buffer_bytes: u64,
+    /// `ServerOutput`: how many lines were dropped for this session since the
+    /// previous delivered `ServerOutput`, because the session's completion-path
+    /// log was full (`reldex-db-core`'s `ServerOutputLog::MAX_RETAINED_LINES` /
+    /// `MAX_RETAINED_BYTES`). Zero normally; non-zero means the UI must say
+    /// "output truncated".
+    pub server_output_dropped: u32,
+    /// `ServerOutput`: how many of `server_output_lines` were not valid UTF-8
+    /// on the wire and were delivered with U+FFFD in place of the invalid
+    /// bytes rather than dropped (M2.12).
+    pub server_output_invalid_utf8_lines: u32,
+    /// `ServerOutput`: the lines, in order. The caller owns them; release with
+    /// [`reldex_server_output_lines_release`]. Null when there are none (which
+    /// still happens with `error` set, or `server_output_dropped` non-zero, or
+    /// both — a `ServerOutput` event is never produced with nothing to say).
+    pub server_output_lines: *mut ReldexServerOutputLines,
+    /// `Terminal`: whether this session ended while it may still have held an
+    /// unresolved transaction. **This is the authoritative answer and a
+    /// consumer must surface it** (`SPEC.md` §10: never silently commit or
+    /// hide transaction loss).
+    pub transaction_possibly_lost: bool,
 }
 
 // SAFETY: `#[repr(C)]`, `struct_size` first, every field an integer, a `bool`
 // or a raw pointer — all valid as zero.
 unsafe impl CStruct for ReldexEvent {
-    const MIN_SIZE: usize = size_of::<Self>();
+    // The size before M2.11 appended `completed_operation` through
+    // `transaction_possibly_lost` — see `ReldexLiveCounts`'s `MIN_SIZE` for
+    // why this is computed with `offset_of!` rather than hard-coded.
+    const MIN_SIZE: usize = std::mem::offset_of!(Self, completed_operation);
 }
 
 impl Default for ReldexEvent {
@@ -217,6 +404,13 @@ impl Default for ReldexEvent {
             has_rows_affected: false,
             committed_implicitly: false,
             session_still_open: false,
+            completed_operation: ReldexCompletedOperation::Unknown as i32,
+            server_output_mode: ReldexServerOutputMode::Unknown as i32,
+            server_output_buffer_bytes: 0,
+            server_output_dropped: 0,
+            server_output_invalid_utf8_lines: 0,
+            server_output_lines: std::ptr::null_mut(),
+            transaction_possibly_lost: false,
         }
     }
 }
@@ -245,6 +439,13 @@ pub(crate) struct QueuedEvent {
     pub(crate) warning_count: usize,
     pub(crate) committed_implicitly: bool,
     pub(crate) session_still_open: bool,
+    pub(crate) completed_operation: ReldexCompletedOperation,
+    pub(crate) server_output_mode: ReldexServerOutputMode,
+    pub(crate) server_output_buffer_bytes: u64,
+    pub(crate) server_output_dropped: u32,
+    pub(crate) server_output_invalid_utf8_lines: u32,
+    pub(crate) server_output_lines: Option<Box<ReldexServerOutputLines>>,
+    pub(crate) transaction_possibly_lost: bool,
 }
 
 impl QueuedEvent {
@@ -267,7 +468,65 @@ impl QueuedEvent {
             warning_count: 0,
             committed_implicitly: false,
             session_still_open: false,
+            completed_operation: ReldexCompletedOperation::Unknown,
+            server_output_mode: ReldexServerOutputMode::Unknown,
+            server_output_buffer_bytes: 0,
+            server_output_dropped: 0,
+            server_output_invalid_utf8_lines: 0,
+            server_output_lines: None,
+            transaction_possibly_lost: false,
         }
+    }
+
+    /// `Completed`: which operation this answers.
+    pub(crate) const fn with_completed_operation(
+        mut self,
+        operation: ReldexCompletedOperation,
+    ) -> Self {
+        self.completed_operation = operation;
+        self
+    }
+
+    /// `ServerOutputConfigured`: the setting actually in force.
+    pub(crate) fn with_server_output_setting(
+        mut self,
+        setting: reldex_db_driver_api::ServerOutputSetting,
+    ) -> Self {
+        use reldex_db_driver_api::{ServerOutputBuffer, ServerOutputSetting};
+        match setting {
+            ServerOutputSetting::Disabled => {
+                self.server_output_mode = ReldexServerOutputMode::Disabled;
+            }
+            ServerOutputSetting::Enabled(ServerOutputBuffer::Unlimited) => {
+                self.server_output_mode = ReldexServerOutputMode::EnabledUnlimited;
+            }
+            ServerOutputSetting::Enabled(ServerOutputBuffer::Bytes(bytes)) => {
+                self.server_output_mode = ReldexServerOutputMode::EnabledBytes;
+                self.server_output_buffer_bytes = u64::from(bytes.get());
+            }
+        }
+        self
+    }
+
+    /// `ServerOutput`: the lines collected on the completion path, plus what
+    /// was dropped or failed.
+    pub(crate) fn with_server_output_log(mut self, log: reldex_db_core::ServerOutputLog) -> Self {
+        self.server_output_dropped = log.dropped;
+        self.server_output_invalid_utf8_lines = log.invalid_utf8_lines;
+        if !log.lines.is_empty() {
+            self.server_output_lines = Some(Box::new(ReldexServerOutputLines::new(log.lines)));
+        }
+        if let Some(failure) = log.failure {
+            self.error = Some(Box::new(ReldexError::from_db_error(&failure)));
+        }
+        self
+    }
+
+    /// `Terminal`: whether the session ended with a transaction possibly
+    /// still unresolved.
+    pub(crate) const fn with_transaction_possibly_lost(mut self, lost: bool) -> Self {
+        self.transaction_possibly_lost = lost;
+        self
     }
 
     pub(crate) fn with_error(mut self, error: ReldexError) -> Self {
@@ -355,6 +614,15 @@ impl QueuedEvent {
             has_rows_affected: self.rows_affected.is_some(),
             committed_implicitly: self.committed_implicitly,
             session_still_open: self.session_still_open,
+            completed_operation: self.completed_operation as i32,
+            server_output_mode: self.server_output_mode as i32,
+            server_output_buffer_bytes: self.server_output_buffer_bytes,
+            server_output_dropped: self.server_output_dropped,
+            server_output_invalid_utf8_lines: self.server_output_invalid_utf8_lines,
+            server_output_lines: self
+                .server_output_lines
+                .map_or(std::ptr::null_mut(), Box::into_raw),
+            transaction_possibly_lost: self.transaction_possibly_lost,
             ..ReldexEvent::default()
         }
     }

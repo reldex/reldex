@@ -143,15 +143,21 @@ pub use error::{
     ReldexError, ReldexErrorKind, ReldexErrorView, ReldexSessionState, reldex_error_free,
     reldex_error_view, reldex_last_error_clear, reldex_last_error_take,
 };
-pub use event::{ReldexCloseOutcome, ReldexEvent, ReldexEventKind, ReldexStatementKind};
+pub use event::{
+    ReldexCloseOutcome, ReldexCompletedOperation, ReldexEvent, ReldexEventKind,
+    ReldexServerOutputLines, ReldexServerOutputMode, ReldexStatementKind,
+    reldex_server_output_lines_count, reldex_server_output_lines_get,
+    reldex_server_output_lines_release,
+};
 pub use format::{
     ReldexArenaView, ReldexBytesStyle, ReldexFormatOptions, ReldexTextArena, ReldexTimestampStyle,
     reldex_batch_format_column, reldex_text_arena_clear, reldex_text_arena_count,
     reldex_text_arena_create, reldex_text_arena_release, reldex_text_arena_view,
 };
 pub use hub::{
-    ReldexHub, ReldexWakeFn, reldex_hub_create, reldex_hub_destroy, reldex_hub_next_event,
-    reldex_hub_pending_events, reldex_hub_set_waker,
+    ReldexHub, ReldexWakeFn, reldex_hub_create, reldex_hub_destroy, reldex_hub_list_sessions,
+    reldex_hub_next_event, reldex_hub_pending_events, reldex_hub_session_count,
+    reldex_hub_set_waker,
 };
 pub use mock::{
     ReldexDriverKind, ReldexMockScenario, ReldexMockScenarioConfig, ReldexMockStatement,
@@ -160,9 +166,12 @@ pub use mock::{
 pub use session::{
     ReldexCancelKind, ReldexCancelOutcome, ReldexCloseDisposition, ReldexOpenOptions,
     ReldexRequestId, ReldexResultId, ReldexSessionId, reldex_hub_open_session,
-    reldex_session_close, reldex_session_close_result, reldex_session_connect_warnings,
-    reldex_session_execute, reldex_session_fetch, reldex_session_request_cancel,
-    reldex_session_result_column, reldex_session_result_column_count,
+    reldex_session_close, reldex_session_close_result, reldex_session_commit,
+    reldex_session_connect_warnings, reldex_session_execute, reldex_session_fetch,
+    reldex_session_ping, reldex_session_request_cancel, reldex_session_result_column,
+    reldex_session_result_column_count, reldex_session_rollback,
+    reldex_session_rollback_to_savepoint, reldex_session_savepoint,
+    reldex_session_set_server_output,
 };
 pub use status::ReldexStatus;
 pub use strings::{RELDEX_UTF16_OFFSET_INVALID, ReldexStr, reldex_utf16_offset};
