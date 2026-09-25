@@ -44,8 +44,11 @@ pub(crate) struct ServerOutputScript {
 }
 
 struct ScriptState {
-    /// Lines a statement writes when it runs, by statement text.
-    outputs: Vec<(Matcher, Vec<String>)>,
+    /// Lines a statement writes when it runs, by statement text, with how
+    /// many of those lines are scripted to count as invalid UTF-8 (the
+    /// trailing lines of the list, by convention — see
+    /// [`Scenario::on_sql_output_with_invalid_utf8_lines`]).
+    outputs: Vec<(Matcher, Vec<String>, u32)>,
     set: Behavior,
     take: Behavior,
     /// Parks every `take` until released.
@@ -86,7 +89,40 @@ impl Scenario {
         self.server_output
             .lock()
             .outputs
-            .push((Matcher::Exact(sql.into()), lines));
+            .push((Matcher::Exact(sql.into()), lines, 0));
+    }
+
+    /// [`Scenario::on_sql_output`], plus `invalid_utf8_lines` of the scripted
+    /// `lines` (the last `invalid_utf8_lines` of them) reported as if they had
+    /// arrived on the wire as invalid UTF-8 — a driver's
+    /// [`reldex_db_driver_api::ServerOutputChunk::invalid_utf8_lines`], scripted
+    /// rather than produced by real corrupt bytes, so `db-core`'s handling of
+    /// the count can be tested without a live, misbehaving database.
+    ///
+    /// The mock never actually corrupts the line text (it stores `String`,
+    /// always valid UTF-8); what it fakes is only the count a real driver
+    /// would report for those lines. The marker travels with each scripted
+    /// line, so it survives however
+    /// [`reldex_db_driver_api::DatabaseConnection::take_server_output`] happens
+    /// to chunk them: a read's
+    /// [`reldex_db_driver_api::ServerOutputChunk::invalid_utf8_lines`] is the
+    /// number of *its own* lines that were marked, whichever chunk they land
+    /// in.
+    pub fn on_sql_output_with_invalid_utf8_lines(
+        &self,
+        sql: impl Into<String>,
+        lines: Vec<String>,
+        invalid_utf8_lines: u32,
+    ) {
+        debug_assert!(
+            u64::from(invalid_utf8_lines) <= lines.len() as u64,
+            "cannot mark more lines invalid than the statement prints"
+        );
+        self.server_output.lock().outputs.push((
+            Matcher::Exact(sql.into()),
+            lines,
+            invalid_utf8_lines,
+        ));
     }
 
     /// Makes every future `set_server_output` fail with `error`.
@@ -134,13 +170,13 @@ impl Scenario {
         self.server_output.lock().counts
     }
 
-    fn scripted_output(&self, sql: &str) -> Option<Vec<String>> {
+    fn scripted_output(&self, sql: &str) -> Option<(Vec<String>, u32)> {
         self.server_output
             .lock()
             .outputs
             .iter()
-            .find(|(matcher, _)| matcher.matches(sql))
-            .map(|(_, lines)| lines.clone())
+            .find(|(matcher, ..)| matcher.matches(sql))
+            .map(|(_, lines, invalid_utf8_lines)| (lines.clone(), *invalid_utf8_lines))
     }
 
     fn record_set(&self) -> DbResult<()> {
@@ -164,10 +200,14 @@ impl Scenario {
 }
 
 /// One connection's server-side output buffer.
+///
+/// Each buffered line carries whether it was scripted as invalid UTF-8, so
+/// [`ConnectionOutput::take`] can report the right count for *its own* chunk
+/// regardless of how the buffer happens to be split across reads.
 #[derive(Default)]
 pub(crate) struct ConnectionOutput {
     setting: ServerOutputSetting,
-    lines: VecDeque<String>,
+    lines: VecDeque<(String, bool)>,
 }
 
 impl ConnectionOutput {
@@ -177,8 +217,15 @@ impl ConnectionOutput {
         if !self.setting.is_enabled() {
             return;
         }
-        if let Some(lines) = scenario.scripted_output(sql) {
-            self.lines.extend(lines);
+        if let Some((lines, invalid_utf8_lines)) = scenario.scripted_output(sql) {
+            let total = lines.len();
+            let first_invalid = total.saturating_sub(invalid_utf8_lines as usize);
+            self.lines.extend(
+                lines
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, line)| (line, index >= first_invalid)),
+            );
         }
     }
 
@@ -205,8 +252,9 @@ impl ConnectionOutput {
         scenario.record_take()?;
         let mut lines: Vec<Box<str>> = Vec::new();
         let mut bytes = 0_usize;
+        let mut invalid_utf8_lines = 0_u32;
         while lines.len() < max_lines.get() {
-            let Some(next) = self.lines.front() else {
+            let Some((next, _)) = self.lines.front() else {
                 break;
             };
             // At least one line per chunk, however long: a line is never
@@ -215,12 +263,20 @@ impl ConnectionOutput {
                 break;
             }
             bytes = bytes.saturating_add(next.len());
-            if let Some(line) = self.lines.pop_front() {
+            if let Some((line, marked_invalid)) = self.lines.pop_front() {
+                if marked_invalid {
+                    invalid_utf8_lines += 1;
+                }
                 lines.push(line.into_boxed_str());
             }
         }
         let drained = self.lines.is_empty();
-        Ok(ServerOutputChunk::new(lines, drained))
+        let chunk = ServerOutputChunk::new(lines, drained);
+        Ok(if invalid_utf8_lines > 0 {
+            chunk.with_invalid_utf8_lines(invalid_utf8_lines)
+        } else {
+            chunk
+        })
     }
 }
 

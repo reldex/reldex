@@ -803,6 +803,49 @@ fn at_the_cap_output_is_dropped_and_counted_so_delivered_plus_dropped_is_exact()
         .expect("close");
 }
 
+// --------------------------------------------- event path: invalid UTF-8
+
+#[test]
+fn invalid_utf8_lines_the_driver_reports_ride_on_the_server_output_event() {
+    // M2.12's fix round: `ServerOutputChunk::invalid_utf8_lines()` must not be
+    // silently discarded at the `db-core` boundary. It rides on
+    // `SessionEvent::ServerOutput` exactly the way `dropped` does.
+    let scenario = scenario();
+    let invalid_block = "BEGIN print_invalid; END;";
+    scenario.on_sql(
+        invalid_block,
+        Action::Execute {
+            statement_kind: StatementKind::PlSqlBlock,
+            rows_affected: None,
+            opens_transaction: false,
+        },
+    );
+    scenario.on_sql_output_with_invalid_utf8_lines(invalid_block, lines("bad", 3), 2);
+    let (session, queue) = support::open_events(&scenario);
+    session
+        .submit_set_server_output(RequestId(1), ON)
+        .expect("accepted");
+    let _ = support::drain_n(&queue, 1);
+
+    let seen = submit_and_collect(&session, &queue, 2, invalid_block);
+    let (delivered, invalid_total) = seen.iter().fold(
+        (0_usize, 0_u32),
+        |(delivered, invalid), event| match event {
+            SessionEvent::ServerOutput {
+                lines,
+                invalid_utf8_lines,
+                ..
+            } => (delivered + lines.len(), invalid + invalid_utf8_lines),
+            _ => (delivered, invalid),
+        },
+    );
+    assert_eq!(delivered, 3, "every scripted line was still delivered");
+    assert_eq!(
+        invalid_total, 2,
+        "the driver's per-chunk count survives the trip through db-core"
+    );
+}
+
 // ------------------------------------------------- completion path: bound
 
 #[test]
@@ -838,6 +881,51 @@ fn the_completion_path_log_is_bounded_and_counts_what_it_refused() {
     assert!(
         session.take_server_output().is_empty(),
         "taking empties the log"
+    );
+    session
+        .close(Some(CloseDisposition::Rollback))
+        .expect("close");
+}
+
+#[test]
+fn the_completion_path_log_counts_invalid_utf8_lines_past_the_truncation_bound() {
+    // The rule stated on `ServerOutputLog::invalid_utf8_lines`: the count is
+    // the full count of invalid lines among everything drained from the
+    // server, not only the ones the bounded log had room to retain. Every
+    // line the trailing `extra` count marks invalid is one of the lines
+    // `the_completion_path_log_is_bounded_and_counts_what_it_refused` shows
+    // get refused by the log's bound, so this is the same scenario with the
+    // refused lines scripted invalid.
+    let extra = 5;
+    let total = ServerOutputLog::MAX_RETAINED_LINES + extra;
+    let scenario = scenario();
+    let large = "BEGIN print_a_lot_invalid; END;";
+    scenario.on_sql(
+        large,
+        Action::Execute {
+            statement_kind: StatementKind::PlSqlBlock,
+            rows_affected: None,
+            opens_transaction: false,
+        },
+    );
+    scenario.on_sql_output_with_invalid_utf8_lines(large, lines("x", total), extra as u32);
+    let session = support::open(&scenario);
+    assert_eq!(session.set_server_output(ON).wait().expect("enable"), ON);
+    session
+        .execute(Statement::new(large))
+        .wait()
+        .expect("large block");
+
+    let log = session.take_server_output();
+    assert_eq!(log.lines.len(), ServerOutputLog::MAX_RETAINED_LINES);
+    assert_eq!(log.dropped as usize, extra, "the refused lines are counted");
+    assert_eq!(
+        log.invalid_utf8_lines, extra as u32,
+        "counted in full even though the affected lines were themselves refused"
+    );
+    assert!(
+        session.take_server_output().is_empty(),
+        "taking empties the invalid-UTF-8 count along with everything else"
     );
     session
         .close(Some(CloseDisposition::Rollback))

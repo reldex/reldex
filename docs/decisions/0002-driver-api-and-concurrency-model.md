@@ -1947,9 +1947,12 @@ what was tried, in order:
    whose bytes are not valid UTF-8 is still delivered, with the invalid sequences replaced by
    U+FFFD, and counted in the new `ServerOutputChunk::invalid_utf8_lines()` rather than
    silently accepted or dropped. `ServerOutputChunk` gained that one field, additively
-   (`with_invalid_utf8_lines`, defaulting to zero) — see `phase-1-m2-5-event-queue.md` for what
-   this means for M2.11's mapping, which has not landed yet and today discards the count along
-   with the rest of the chunk's shape when it copies out `into_lines()`.
+   (`with_invalid_utf8_lines`, defaulting to zero). `db-core`'s own fix round (this branch) carries
+   the count the rest of the way rather than discarding it at that boundary: it is now a field on
+   both `SessionEvent::ServerOutput` (per event) and `ServerOutputLog` (cumulative across the
+   completion-path log, counted in full even for lines the log's bound later refuses) — see
+   `phase-1-m2-5-event-queue.md` §7.5 for what remains, which is only M2.11 mapping the field
+   across the C ABI.
 
    **Verified against the live test database, not assumed.** `SYS.UTL_I18N.STRING_TO_RAW`
    exists and is executable by `RELDEX_TEST` on 19c, and passes an already-malformed
