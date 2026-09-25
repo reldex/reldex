@@ -23,8 +23,8 @@
 //! returns a [`Completion`] the caller can [`Completion::wait`] on,
 //! [`Completion::poll`], or [`Completion::wait_timeout`] — deliberately shaped
 //! so a later FFI/Qt adapter can turn completions into events instead of
-//! dedicating a thread to each one. See [`mod@worker`] for the queueing policy
-//! and for what a caught driver panic does.
+//! dedicating a thread to each one. See the `worker` module for the queueing
+//! policy and for what a caught driver panic does.
 //!
 //! Cancellation is the one thing that reaches a session from outside that
 //! queue: [`DatabaseSession::cancel`] calls the driver's

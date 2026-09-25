@@ -1,5 +1,11 @@
 name: CI
 
+# Jobs in this workflow: `test` (fmt/clippy/test across the windows/ubuntu/
+# macos matrix), `header` (crates/ffi/include/reldex.h staleness check), and
+# `doc` (RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps, added
+# 2026-09-25 once the whole workspace documented cleanly -- see
+# tools/gates.sh's `doc` stage, which runs the same command locally).
+
 on:
   push:
     branches: [main]
@@ -87,3 +93,29 @@ jobs:
         # depend on the executable bit surviving a checkout made on Windows
         # (this repository has `core.fileMode=false`).
         run: bash crates/ffi/gen-header.sh --check
+
+  # Every crate in the workspace documents cleanly under `-D warnings`
+  # (housekeeping/rustdoc-workspace, 2026-09-25). One runner is enough --
+  # rustdoc's link resolution does not vary by platform -- and it is
+  # separate from `test` so it does not slow the matrix down.
+  doc:
+    name: cargo doc --workspace
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: doc
+
+      - name: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps

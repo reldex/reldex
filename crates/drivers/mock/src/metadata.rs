@@ -237,7 +237,7 @@ impl<'a> MetadataFixture<'a> {
     /// before a caller applies
     /// [`PreparedMetadataQuery::reclassify_error`]. Deliberately *not*
     /// scripted as [`ErrorKind::Permission`] directly: this mock's
-    /// [`mimic_oracle_permission_classifier`] reclassifies it the same way
+    /// `mimic_oracle_permission_classifier` reclassifies it the same way
     /// the Oracle driver's does, so a `db-core`/M6.1 test that forgets to
     /// call `reclassify_error` sees the wrong `ErrorKind` here too, instead
     /// of a false-positive `Permission` that would hide the omission. Use

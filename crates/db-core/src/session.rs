@@ -483,7 +483,7 @@ impl<T> fmt::Debug for Completion<T> {
 
 /// Per-session resource bounds.
 ///
-/// A session's command queue is unbounded on purpose (see [`crate::worker`]),
+/// A session's command queue is unbounded on purpose (see the `worker` module),
 /// so what has to be bounded instead is what a session can *accumulate*. These
 /// are deliberately simple caps with clear errors rather than a policy engine:
 /// the point is that a runaway caller gets a reportable failure instead of an
@@ -663,9 +663,9 @@ impl Default for SessionLimits {
 /// large-object locator it produced, for the session's whole lifetime; no
 /// database or network call this type makes ever runs on the calling thread
 /// (ADR-0002 D1/D2). Requests submitted from any thread are processed by that
-/// worker strictly in the order they were sent — see [`crate::worker`] for the
-/// queueing policy, including what happens to requests queued behind a blocked
-/// statement.
+/// worker strictly in the order they were sent — see the `worker` module for
+/// the queueing policy, including what happens to requests queued behind a
+/// blocked statement.
 ///
 /// Cloning is deliberately not offered: a session is owned once, matching
 /// "a worksheet owns a stable database session" (`SPEC.md` §9). It is `Send`
