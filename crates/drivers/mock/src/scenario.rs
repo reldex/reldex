@@ -671,7 +671,7 @@ pub enum Matcher {
 }
 
 impl Matcher {
-    fn matches(&self, sql: &str) -> bool {
+    pub(crate) fn matches(&self, sql: &str) -> bool {
         match self {
             Self::Exact(expected) => sql.trim() == expected.trim(),
             Self::Predicate(predicate) => predicate(sql),
@@ -690,7 +690,7 @@ impl fmt::Debug for Matcher {
 
 /// How one scripted connection-level operation behaves.
 #[derive(Clone)]
-enum Behavior {
+pub(crate) enum Behavior {
     Succeed,
     Fail(ScriptedError),
     /// A driver call that panics outright (spike U-4). Only `connect` scripts
@@ -699,7 +699,7 @@ enum Behavior {
 }
 
 impl Behavior {
-    fn apply(&self) -> Result<(), DbError> {
+    pub(crate) fn apply(&self) -> Result<(), DbError> {
         match self {
             Self::Succeed => Ok(()),
             Self::Fail(error) => Err(error.build()),
@@ -780,6 +780,10 @@ struct Inner {
 /// a loop or execute the same query twice.
 pub struct Scenario {
     inner: Mutex<Inner>,
+    /// Scripted server output (`DBMS_OUTPUT`-like); see
+    /// [`crate::server_output`]. Kept apart from `inner` so its bookkeeping
+    /// lives beside the code that uses it.
+    pub(crate) server_output: crate::server_output::ServerOutputScript,
 }
 
 impl Default for Scenario {
@@ -807,6 +811,7 @@ impl Default for Scenario {
                 thread_ids: HashMap::new(),
                 counts: Counts::default(),
             }),
+            server_output: crate::server_output::ServerOutputScript::default(),
         }
     }
 }

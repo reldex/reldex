@@ -23,7 +23,7 @@
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
-use reldex_db_driver_api::{CancelKind, ConnectionId, DbResult, Warning};
+use reldex_db_driver_api::{CancelKind, ConnectionId, DbResult, ServerOutputSetting, Warning};
 
 use crate::events::{CompletedOperation, RequestId, SessionEvent};
 use crate::ids::{LobHandle, ResultId, SessionId};
@@ -142,6 +142,23 @@ impl ReplyPayload for Vec<u8> {
             request,
             lob,
             bytes: value,
+        }
+    }
+}
+
+impl ReplyPayload for ServerOutputSetting {
+    type Subject = ();
+
+    fn into_event(
+        session: SessionId,
+        request: RequestId,
+        (): Self::Subject,
+        value: DbResult<Self>,
+    ) -> SessionEvent {
+        SessionEvent::ServerOutputConfigured {
+            session,
+            request,
+            result: value,
         }
     }
 }

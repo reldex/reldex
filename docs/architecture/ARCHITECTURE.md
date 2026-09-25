@@ -209,6 +209,31 @@ exit: it issues every abandon first and then waits for all of them against **one
 so shutting down N stuck sessions costs one `DROP_SHUTDOWN_TIMEOUT` in total rather than N of them,
 after which each remaining worker is detached and releases its connection when its call returns.
 
+### Server output
+
+Server output (`DBMS_OUTPUT` on Oracle Database; `SPEC.md` §9, §24 item 10) is a **per-session**
+switch, off by default, and its cost is paid only by a session that turned it on (ADR-0002
+amendment T). The contract is vendor-neutral — `Capabilities::server_output`,
+`DatabaseConnection::set_server_output(ServerOutputSetting)` and
+`take_server_output(max_lines, max_bytes)`, both defaulting to `Unsupported` — and every vendor
+statement lives in the driver (`crates/drivers/oracle-thin/src/server_output.rs`). Turning it on or
+off is an ordinary request with one reply and one round trip. While it is on, the session's worker
+reads the server's buffer after **every `execute`, whether it succeeded or failed, and before that
+statement's reply**, in bounded chunks until the buffer is empty. On the event path the chunks are
+`ServerOutput` events between the statement's `Executing` and its `Executed`, so a consumer
+attributes them by position. On the completion path they go into a bounded per-session log that
+`DatabaseSession::take_server_output` hands over without a round trip. A read that fails never
+replaces the statement's reply: it travels on the output stream as a `failure`, and a read that
+loses the connection ends the session through the same loss path as any other call. Output the
+consumer cannot keep up with is dropped and counted by the existing `ServerOutput` drop policy
+(ADR-0002 E5), never silently. While output is off the worker makes no call at all, and the driver
+adds nothing to `execute`. Nothing is read after a fetch, commit, rollback, savepoint, ping or
+close, so output written while rows are fetched arrives with the next statement's read. The same
+happens to the output of a statement that failed and left the session needing validation: no read
+is made until the next command's ping, so its lines arrive with the next statement's read, ahead
+of that statement's own. Both exceptions are documented on `SessionEvent::ServerOutput` and in
+ADR-0002 T4.
+
 ## 7. FFI and Qt adapter boundary
 
 ```text
@@ -261,6 +286,31 @@ Database Cursor -> Batch Fetch -> Result Store -> Virtual Table Model -> Visible
 - All metadata loading is lazy and flows through the generic `MetadataProvider`; vendor dictionary
   SQL lives in the vendor provider. A local SQLite metadata cache may be used with TTL, refresh,
   invalidation, and per-database identity isolation (`SPEC.md` §16).
+- **Metadata catalog descriptor (M2.8).** `DatabaseDriver::metadata_catalog()` (`db-driver-api`,
+  `metadata` module) returns a `&dyn MetadataCatalog` that, for each vendor-neutral request
+  (`Schemas`, `ObjectsOfKind`, `ColumnsOf`), builds an ordinary `Statement` plus a declared column
+  contract; `db-core` runs it through the normal execute/fetch path like any other query — there is
+  no separate metadata result type, no paging, and no caching at this layer. Vendor dictionary SQL
+  stays in the driver crate (Oracle's lives in `oracle-thin`'s `metadata` module, over `ALL_*`
+  views); the column contract (names, order, logical types) is fixed and identical across drivers,
+  built from shared functions in `db-driver-api` so drivers cannot drift from it. An optional name
+  filter is always a bound parameter — case-insensitive "contains", with `%`/`_`/escape-char
+  wildcard characters in the filter text escaped so they match literally, never string-concatenated
+  into SQL, and an unfiltered request's `LIKE` pattern falls back to a constant `'%'`, never to the
+  column's own value (a stored name containing `\` would otherwise raise `ORA-01424` and fail the
+  whole listing). The mandatory row-cap `limit` is enforced server-side by requesting `limit + 1`
+  rows; getting back exactly `limit + 1` is the caller's signal that the result was truncated. A
+  dictionary query that fails for lack of privilege is reclassified into `ErrorKind::Permission` by
+  a `MetadataErrorClassifier` function pointer carried on the returned `PreparedMetadataQuery`
+  itself (`PreparedMetadataQuery::reclassify_error`) rather than a separate method a caller could
+  forget to call. On Oracle this reclassifies `ORA-00942` and `ORA-01039` — both "not visible" from
+  a statement that always names a dictionary object the driver chose, which always exists — and only
+  for the catalog's own queries; it does not change how the same ambiguous codes are classified for
+  ordinary user SQL. `ORA-01031` needs no reclassification (already `Permission` unconditionally,
+  for any SQL); `ORA-00990` ("missing or invalid privilege" in a `GRANT` statement's own syntax) is
+  a parse-time error unrelated to this catalog's read-only `SELECT`s and correctly stays `Syntax`.
+  This descriptor is the narrow driver-level contract; the lazy/cached `MetadataProvider` described
+  above remains a separate, not-yet-built `db-core`-level consumer.
 - SQLite local persistence covers profiles (without plaintext secrets), workspace, query history,
   metadata cache, favorites, snippets, settings, UI layout, feature state (`SPEC.md` §20).
 - Credentials use platform secure storage (Windows Credential Manager, Apple Keychain, Android

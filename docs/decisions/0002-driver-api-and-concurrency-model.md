@@ -16,7 +16,8 @@ mis-splits, see "the `SqlDialect` descriptor" §J4
 review), 2026-09-19 (owner confirmation), 2026-09-20 (connect-time warning channel, C-6),
 2026-09-20 (connection created on a helper thread, C-5), 2026-09-20 (column storage readable, M1.3),
 2026-09-20 (`LobStream: Sync` and `ExecuteOutcome` non-exhaustive, M1.3 review),
-2026-09-20 (`SqlDialect` descriptor, M2.4), 2026-09-21 (`SqlDialect` splitter-safety review, M2.4)
+2026-09-20 (`SqlDialect` descriptor, M2.4), 2026-09-21 (`SqlDialect` splitter-safety review, M2.4),
+2026-09-24 (server output, M2.7 — amendment T)
 
 ## Context
 
@@ -1837,6 +1838,334 @@ review's parked-statement repro). The whole `db-core` event and registry set: 30
 2 concurrent loops, no failures. `reldex.h` is byte-identical (`gen-header.sh --check`), because the
 C ABI is M2.11's.
 
+## Amendment: server output (2026-09-24, task M2.7)
+
+Built to `docs/exec-plans/active/phase-1.md` §B4.2, which lists server output as one of the three
+additive contract items Phase 1 needs. **The driver contract grows by one capability flag and two
+defaulted methods**, so existing drivers need no code at all. `db-core` grows by one request, one
+event field and one reply. Numbering: `T` = text output. §B4.2's own interpretation notes ("B4.2 as
+implemented") quote the plan sentence each decision below departs from.
+
+### T1 — the contract: a typed setting, a bounded read, and `Unsupported` by default
+
+```rust
+// db-driver-api::server_output
+pub enum ServerOutputBuffer { Unlimited, Bytes(NonZeroU32) }
+pub enum ServerOutputSetting { Disabled /* default */, Enabled(ServerOutputBuffer) }
+pub struct ServerOutputChunk { /* lines: Vec<Box<str>>, drained: bool */ }
+
+// db-driver-api::session
+Capabilities::server_output() -> bool                       // `with_server_output(bool)`; false in `none()`
+DatabaseConnection::set_server_output(&mut self, ServerOutputSetting)
+    -> DbResult<ServerOutputSetting>                         // default: Err(Unsupported)
+DatabaseConnection::take_server_output(&mut self, max_lines: NonZeroUsize, max_bytes: NonZeroUsize)
+    -> DbResult<ServerOutputChunk>                           // default: Err(Unsupported)
+```
+
+§B4.2 sketched `set_server_output(enabled, buffer)` and `take_server_output() -> Vec<Box<str>>`.
+Both were changed:
+
+* **One enum instead of a pair.** "Off, with a buffer of 0 bytes" is representable as a pair and
+  meaningless. `Bytes` is `NonZeroU32` because a zero-byte buffer is not a setting.
+* **`set` returns the setting in force.** Oracle's `ENABLE(n)` clamps `n` into
+  2,000..=1,000,000 bytes and says nothing (measured on 19.3: `ENABLE(100)` overflows at 2,000
+  bytes, `ENABLE(2_000_000)` at 1,000,000). A UI that shows the size it asked for would show the
+  wrong one.
+* **`take` is bounded and says whether it emptied the buffer.** An unlimited buffer read into one
+  `Vec` would have no bound at all. `ServerOutputChunk::is_drained` lets the caller stop without
+  an extra call when the driver knows the buffer is empty.
+
+Rules for an implementer, stated on the trait:
+
+* Each call is **one round trip**.
+* Neither call is a user statement, so neither changes the connection's transaction tracking.
+* A chunk never splits a line.
+* When any line is buffered, a chunk returns **at least one**, even when that line alone exceeds
+  `max_bytes`. So `max_bytes` is a target, and a caller always makes progress.
+* A chunk may hold one line beyond `max_bytes`: the line that did not fit. A driver may learn a
+  line's size only by taking it from the server, and a taken line cannot be put back. A caller
+  bounding memory therefore allows `max_bytes` plus one maximum-length line.
+* An empty chunk means drained.
+* Only complete lines are returned. A partial line (a `PUT` with no line end) is not invented.
+* An empty line is an empty string.
+
+Vendor SQL lives only in the driver (invariant 2).
+
+### T2 — Oracle: one packed block per round trip, because `GET_LINES` is out of reach
+
+`crates/drivers/oracle-thin/src/server_output.rs` holds every `DBMS_OUTPUT` statement. Here is
+what was tried, in order:
+
+1. **`DBMS_OUTPUT.GET_LINES` with an array OUT bind: not available.** `GET_LINES` returns a
+   `DBMS_OUTPUT.CHARARR`, a PL/SQL index-by table, and `oracledb` `=26.0.0-beta.3` has no
+   collection binds. `Metadata::is_array` is set only for DML `RETURNING`, and
+   `BindParameters::Slice` is the `executemany` row array.
+2. **`GET_LINE` once per call: rejected.** It costs one round trip per line, so 10,000 lines
+   need 10,001 round trips. §B4.2 and the brief rule it out.
+3. **Pack many lines into one `VARCHAR` OUT bind: rejected.** A pure OUT `VARCHAR` bind is sized
+   from the type's 4,000-character default. The server refuses more than 16,000 bytes into it
+   (`ORA-06502`), which is less than one legal `DBMS_OUTPUT` line (32,767 bytes).
+4. **Chosen: the same block with `LONG` OUT binds.** A `LONG` OUT bind has no client-side ceiling
+   below PL/SQL's 32,767 bytes. The block loops `GET_LINE` **on the server** and appends each
+   line to a `VARCHAR2(32767)`, prefixed by its length as five ASCII digits. The length is
+   `LENGTH4`, in code points, which is what a Rust `char` counts. Framing is by length, never by a
+   delimiter, because a line can contain anything, including `\n`, NUL or digits. A line the
+   server has handed out cannot be put back, so the one line that does not fit comes back
+   **unframed in a second bind**, and the block stops. Every call therefore makes progress, and a
+   32,767-byte line always fits. The block also returns the line count and whether `GET_LINE`
+   reported the buffer empty.
+
+   The Rust side validates the framing strictly: five digits, then exactly that many characters,
+   and exactly the count the server reported. Any mismatch is `ErrorKind::DataConversion` on a
+   still-usable session. The lines of that one read are lost and reported (T5). Nothing is
+   guessed.
+
+   Every call names the package `SYS.DBMS_OUTPUT`. An unqualified name resolves through the
+   user's schema first, so an object called `DBMS_OUTPUT` there would capture the call. This is
+   deliberately **not** tested on the shared test database.
+
+   **Known limit (follow-up M2.12).** The packed value is decoded as a whole by the crate's
+   strict UTF-8 conversion. So a single line that is not valid UTF-8 fails the entire read, up
+   to 4,096 good lines with it. The framing also assumes that `LENGTH4` equals Rust's `char`
+   count, which holds for AL32UTF8 and valid data. On a single-byte database character set a
+   chunk can exceed `max_bytes` by about 3×. M2.12 moves the framing to `RAW`/`LENGTHB` with
+   per-line decoding in Rust, so an invalid line loses only itself.
+
+**Measured** (`tests/m2_7_server_output.rs`, round trips counted by the server in `v$mystat`
+"SQL*Net roundtrips to/from client", net of the measuring query):
+
+* 10,000 short lines (138,894 packed bytes) drain in **5 round trips** at the core's default
+  chunk sizes (4,096 lines / 32 KiB). Every `take_server_output` call is exactly one round trip.
+* During the design probe, 10,003 lines including a 32,767-byte line and an empty line took
+  **6 round trips**.
+* A drain costs ⌈packed bytes / ~32 KiB⌉ round trips, plus one when the last chunk ended on its
+  line or byte limit, or on a tail line. That extra call is needed because the block cannot learn
+  that the buffer is empty without calling `GET_LINE` once more.
+
+**`DBMS_OUTPUT` behaviour, measured on 19.3 (AL32UTF8) and asserted by those tests:**
+
+* Thai, emoji (including ZWJ sequences and flags), combining marks, and two 32,767-byte lines
+  (three-byte Thai and four-byte emoji) come back byte for byte at chunk sizes (4096, 32 KiB),
+  (3, 64) and (1, 1).
+* `PUT_LINE('')`, `PUT_LINE(NULL)` and `NEW_LINE` are each one empty line.
+* A `PUT` with no line end is never returned. Once a read has happened, `DBMS_OUTPUT` discards the
+  unfinished part at the next `PUT`, as in SQL*Plus. So a statement that ends with an unfinished
+  `PUT` loses it, and this is reported here rather than worked around.
+* Overflow is `ORA-20000` with `ORU-10027` in the message. It is **the statement's error**, with
+  its native code preserved and the session usable. The lines written before it are still
+  buffered, and they drain.
+* A block that raises keeps what it printed.
+* `DISABLE` purges the buffer.
+* Output written while output is off is discarded by the server, not buffered.
+* Enable and disable are one round trip each.
+* Output a function writes while rows are fetched stays buffered and comes back ahead of the next
+  statement's own lines.
+
+### T3 — the core: a per-session switch, set by an ordinary request
+
+The worker holds a `ServerOutputSetting`, initially `Disabled`. `DatabaseSession::submit_set_server_output(request, setting)`
+and `set_server_output(setting) -> Completion<ServerOutputSetting>` are the two shapes of one worker
+command. `both_paths!` tests them alike. The event-path reply is
+`SessionEvent::ServerOutputConfigured { session, request, result }`, which is an ordinary reply
+with an ordinary slot. The effects:
+
+* One driver call, so one round trip.
+* On a driver without the capability, `Unsupported` with **no** driver call.
+* On success the worker stores the setting **in force** that the driver returned.
+* A failed call leaves the setting unchanged and goes through the loss path every driver call
+  takes (`note_error`, then `note_transaction_state_after`).
+
+### T4 — the drain rule: after every `execute`, before its reply
+
+While the setting is enabled, the worker reads after **every `execute`, whether it succeeded or
+failed**. It reads in chunks of `SessionLimits::server_output_chunk_lines` (4,096) and
+`server_output_chunk_bytes` (32 KiB) until a chunk is drained or empty. Each chunk is delivered as
+it arrives, and only then is the statement's reply sent. For one event-path execute the stream is:
+
+`Executing` → `TransactionStateChanged` (if the state flipped) → `ServerOutput`* → `Executed`
+
+Checked against the five ordering guarantees of `phase-1.md` §B2 (E1–E3):
+
+1. *Production order per session.* The reads run on the session's one worker thread, between the
+   statement and its reply, so no other request's events can interleave.
+2. *Exactly one reply per request.* This is the reason for **before**. A read that fails is
+   reported while the reply is still unsent, on the output stream (T5), so it needs neither a
+   second reply nor a change to the first one. Reading *after* the reply would leave a failed read
+   with nowhere to go except a second answer, or silence.
+3. *`Terminal` exactly once, after the queued replies.* A read that loses the connection sets the
+   lifecycle to `Lost`, the reply still follows, and `Terminal` comes after it as for any loss.
+4. *`Executing` precedes `Executed`.* Unchanged. The output sits strictly between them.
+5. *No cross-session order.* Unchanged.
+
+The second reason for **before** is attribution. A `ServerOutput` carries no request id, and needs
+none: every `ServerOutput` lies inside exactly one execute's `Executing`…`Executed` window, and
+normally belongs to that execute. There are **two exceptions**, listed below: output written during
+a fetch, and output of a statement that left the session needing validation. In both, the lines
+arrive inside the *next* execute's window, ahead of that execute's own lines. They are delayed,
+and they are misattributed, but they are not lost. On the completion path, "before" means the
+output is already in the log when `Completion::wait` returns.
+
+**Not read** after a fetch, commit, rollback, savepoint, rollback-to-savepoint, ping or close:
+
+* None of those runs user PL/SQL, except a fetch that calls a printing function. That output stays
+  buffered and arrives inside the next execute's window (measured, T2).
+* A read after every fetch batch would add a round trip to the hot path of every large result,
+  for output that is almost never there.
+
+Also **not read** when:
+
+* the session is not `Usable`. A `Lost` session has no connection, and a `NeedsValidation` session
+  must be pinged before its next use, which that next command does. This is the **second
+  exception**: a statement that fails with a `NeedsValidation` error (for example `Timeout`)
+  leaves its output on the server. That output is read after the next execute, inside its window
+  (`tests/server_output.rs::output_of_a_statement_that_needs_validation_arrives_in_the_next_executes_window`).
+  Reading at once was rejected, because it would need a ping first, which holds back the error
+  reply on a connection that may be dead. On Oracle today the case is mostly moot: a call timeout
+  during a blocked call loses the session, and the output goes with it;
+* an abandon has been requested. `begin_abandon` sets a flag **before** it requests the cancel,
+  and the drain checks it before every read. A read already in flight completes, because it cannot
+  be interrupted, and no further read starts.
+
+### T5 — failure semantics
+
+* **A failed read never masks, delays or replaces the statement's result.** On the event path it
+  is `ServerOutput { lines: [], failure: Some(err) }`, and the drain stops. On the completion path
+  it is `ServerOutputLog::failure` (the first failure) and `failures` (all of them). Then the
+  statement's own reply goes out unchanged, success or failure.
+* **A read that finds the session lost takes M2.6's path.** `note_error` moves the lifecycle to
+  `Lost`, and `note_transaction_state_after(Some(err))` records `Unknown` (R6). The reply follows,
+  and then `Terminal { Lost, transaction_possibly_lost }`.
+
+  **This deliberately over-reports on an exact-state driver.** A take cannot change the
+  transaction (T1). So after, say, a `SELECT` on a driver whose transaction state is exact and
+  `Inactive`, a lost read still ends in `transaction_possibly_lost: true`, a false positive. The
+  code is kept this way on purpose. It is the same rule every driver call follows (R6: a call that
+  lost the connection is not trusted to have left the cached state true), and the error only runs
+  in the safe direction: a user told "possibly lost" who had nothing open loses nothing, while the
+  opposite mistake hides a loss that `SPEC.md` §10 forbids hiding. The Oracle driver is not exact
+  (`exact_transaction_state: false`), so it reports `Unknown` after any statement anyway.
+* **A failing statement's output is still read.** For the user, that output is usually the
+  diagnosis.
+* **Overflow is not a read failure.** ORU-10027 is the statement's own error, native code 20000,
+  and the lines before it are read as usual.
+* **What a failed read leaves behind is not guaranteed.** The lines that read had taken are lost.
+  The lines the server still held are read after the next statement, unless that statement prints
+  first, in which case `DBMS_OUTPUT` discards them. The `failure` is what tells the user the pane
+  is incomplete.
+
+### T6 — bounded memory, and the queue bound becomes `3R + U + 3`
+
+* **The worker holds at most one chunk.** A chunk is up to 4,096 lines: a 32 KiB target plus at
+  most one line of up to 32,767 bytes, so under 64 KiB of text on Oracle.
+* **It reads to the end even when the consumer is slow, because leftovers are not safely
+  delayed.** Measured on 19.3 (`tests/m2_7_server_output.rs::lines_a_read_leaves_behind_are_purged_by_the_next_put_not_overflowed`):
+  * The first `PUT` after a read **purges** whatever that read left, so leftovers never overflow
+    a sized buffer later. With `ENABLE(2000)`, printing 19 × 100 bytes, reading 1 line, then
+    printing 19 × 100 bytes again does not overflow. The 18 leftovers are simply gone, and
+    nothing counts them.
+  * A statement that prints nothing leaves them in place, and they are read after it, inside its
+    window.
+
+  Reading to the end is what makes every line either delivered or dropped **and counted** (the
+  bullet below).
+* **What that costs, and what is deferred.** The drain has no total bound. On a driver that
+  cannot interrupt a call it cannot be cancelled either; only an abandon stops it, between reads.
+  And the statement's `Executed` waits until it finishes: 10 million lines is about 2,500 round
+  trips. A per-statement bound is recorded as follow-up **M2.13** in `phase-1.md`. It would be a
+  total cap reported through `dropped`/`failure`, or a cancel flag checked between reads like the
+  abandon flag. Either is safe *because* the next `PUT` purges what is left.
+* **The event path reuses E5 unchanged.** At the per-session cap the incoming `ServerOutput` is
+  refused, and its lines are counted and carried on the next delivered one, or in
+  `pending_dropped_lines`. There is no second mechanism. A test at the cap asserts **delivered +
+  dropped == produced** exactly.
+* **One addition.** A `ServerOutput` that carries a failure is never refused: past the cap it is
+  admitted without lines, and any lines it had are counted as dropped. Silently losing "your
+  output is incomplete" would be worse than one event over the cap. Each execute produces at most
+  one such event, and it is queued ahead of that execute's reply, which holds a slot. So these
+  events add at most `R`, and the published bound becomes **`3R + U + 3`** (E2/E5, updated in
+  `events.rs`, `session.rs` and `phase-1.md` §B2). A session that never enabled output cannot
+  produce one, and stays at `2R + U + 3`.
+* **The completion path has a stream-less shape.** `DatabaseSession::take_server_output() ->
+  ServerOutputLog` hands over a per-session log. The log keeps at most 10,000 lines and 1 MiB
+  between takes and counts the rest in `dropped`. It is always a **prefix** of the output: once
+  one line is refused, every later line is refused until the next take, even one small enough to
+  fit. The log is per session, not per statement. Completions that are pipelined and taken once
+  get their output mixed, and `failure` is then not attributed to any of them. Taking it costs no
+  round trip.
+  Putting output on `ExecuteOutcome` instead was rejected, because a failed statement has no
+  outcome and its output is the output that matters most.
+
+### T7 — lifecycle
+
+* **The setting belongs to the worker, and dies with the session.** A new session, including the
+  new session a reconnect creates, starts `Disabled`. Nothing re-enables output on it.
+* **A session is never replaced silently (§5), so no path carries the setting over.** Tested with
+  two sessions on both paths.
+* **No read is attempted after an abandon has been requested, or once the session has ended.**
+
+### T8 — "no round trip when off" is structural, and tested twice
+
+* **By construction.**
+  * The worker's drain returns before any driver call when the setting is `Disabled`, which is
+    its initial value.
+  * The Oracle driver issues `DBMS_OUTPUT` only from `set_server_output` and `take_server_output`.
+    Every `DBMS_OUTPUT` statement it has is in `server_output.rs`, and `execute` calls none of
+    them.
+* **With the mock.** The mock counts `set_server_output` and `take_server_output` calls on
+  arrival. On both paths, a session that never enabled output runs a printing block, a failing
+  block, an insert, a query and its fetch, a commit and a ping with both counters at **zero**.
+  After a disable they stop increasing.
+* **On the real database.** A statement that calls `PUT_LINE` on a session that never enabled
+  output costs **one** round trip, exactly like `BEGIN NULL; END;`.
+
+### T9 — the C ABI
+
+**Unchanged.** `reldex.h` is byte-identical, and `gen-header.sh --check` is clean. Server
+output is not reachable from C yet. The interim pump in `crates/ffi` drives sessions through
+`Completion`s and never sees a `SessionEvent`, and the ABI has no entry point that turns output
+on. So an FFI caller's sessions stay at the default, off, and cost nothing. M2.11 switches the
+adapter to the event path, and at that point it must map `ServerOutput` and
+`ServerOutputConfigured` and add the entry point. Both variants are new, so a mapping written
+before them would send them to `RELDEX_EVENT_UNKNOWN`. The mapping, the entry point and the
+adapter's rules are in `phase-1-m2-5-event-queue.md` §7.5.
+
+*Evidence:*
+
+* `crates/db-core/tests/server_output.rs`: 33 tests, 13 of them on both paths through
+  `both_paths!`. They cover:
+  * zero calls when never enabled;
+  * one call each to enable and disable;
+  * refusal without a call when the driver lacks the capability;
+  * a failed enable leaving output off;
+  * output in place by the time of the reply;
+  * a failing statement's output;
+  * chunking (1,000 lines in 16 reads of 64);
+  * a failed read not masking the result;
+  * a lost read following R6;
+  * no read after a statement that lost the session;
+  * no read while validation is pending, with that output arriving in the next execute's window;
+  * per-session lifetime;
+  * `Executing` < `ServerOutput` < `Executed`;
+  * `TransactionStateChanged` before the output;
+  * no read after a fetch;
+  * delivered + dropped == produced at the cap;
+  * the bounded completion-path log;
+  * abandon during a blocked read, driven by blocking hooks with no sleeps and no timing bounds.
+* `crates/db-core/src/events.rs`: 2 unit tests showing that a failure-carrying `ServerOutput` is
+  admitted at the cap without its lines.
+* `crates/db-core/src/shared.rs`: 2 unit tests showing that the completion-path log stays a
+  prefix at both of its bounds. The first replays the review's probe: 1 MiB − 10 B, then 100 B,
+  then 5 B.
+* `crates/db-driver-api`: 5 unit tests.
+* `crates/drivers/oracle-thin/src/server_output.rs`: 6 offline tests covering framing
+  (Thai/emoji/combining, delimiter-like content, malformed framing as an error) and clamping.
+* `crates/drivers/oracle-thin/tests/m2_7_server_output.rs`: 9 real-database tests, behind
+  `oracle-it`. The ninth shows that leftovers are purged, not overflowed.
+* Every `server_output` test was looped 30 times solo (960 runs), and the whole `db-core` suite
+  30 times in parallel, with no failures.
+* A mutation check turned off the "off" guard and the abandon check. 9 tests failed, and passed
+  again once the checks were restored.
+
 ## Notes for driver implementers
 
 Findings from reading `oracle/rust-oracledb` **`=26.0.0-beta.3`** — the version this repository pins
@@ -1932,6 +2261,14 @@ rediscover them, not as contract requirements.
   since the underlying panics themselves are not fixed.]**
 - **Warnings are a plain `String`** — `last_warning() -> Result<Option<String>, Error>`, with no code
   and no structure. *Confirmed.* See S11.
+- **Describe nullability is the server's `nulls_allowed` flag, copied verbatim.** *New; found by
+  M2.8's metadata catalog work, confirmed against a live database.* `nullable: (nulls_allowed != 0)`
+  reads the wire's own byte with no client-side computation
+  (`oracledb-26.0.0-beta.3/src/metadata.rs:120,157`) — this is Oracle's own describe/TTC protocol
+  behaviour, not a crate-level heuristic or limitation. Only a bare reference to a `NOT NULL`
+  column describes as non-null. Every expression, and every bare column that is nullable at its
+  source, describes as nullable. `WHERE` predicates never narrow it. A computed column cannot be
+  proven non-null by describe; verify declared non-null contracts against the data.
 
 ## Consequences
 
