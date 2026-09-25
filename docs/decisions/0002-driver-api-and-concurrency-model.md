@@ -2286,6 +2286,22 @@ closed or invalidated result handle" rather than succeeding on some paths.
 the cursor behaves as the server says, and D2 still requires an invalidated cursor to be reported
 as an error, never as a short result.
 
+Two failures are also out of reach, because the release follows only a *successful* execute:
+
+- **A DDL that fails still commits on Oracle.** For example, `CREATE TABLE` on an existing name
+  (ORA-00955) after an `INSERT`: the row survives a later `ROLLBACK` (M5.2 review).
+- **A `COMMIT` can fail after the transaction has ended** (ORA-02091).
+
+The worker releases nothing on a failed execute, so the results stay open. Their cursors behave
+as the server says:
+
+- an ordinary cursor keeps fetching;
+- a `FOR UPDATE` cursor fails with ORA-01002.
+
+ADR-0004 records this as Accepted limitation 13 and owner-review point (f). The owner chooses
+between accepting it and extending the driver contract so that `committed_implicitly` is also
+reported on the error path. Nothing is implemented until then.
+
 **Test.** Open a result; run a typed `COMMIT`, then a typed `ROLLBACK`. A later fetch on the
 first result fails with the invalidated-handle error, and its parked LOBs are gone, exactly as
 after `commit()`. A `TransactionControl` statement that fails releases nothing.

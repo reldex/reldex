@@ -6,7 +6,8 @@ where the code differs from the text and why. Stage B (ABI 4 in `crates/ffi`, RS
 The owner-review list is at "Owner-review points": (a) the fetch-size sign-off, re-asked with a
 corrected diagnosis, (b) whether a 1,000,000-row default cap meets `SPEC.md` §19, (c) no
 browsing past the caps in Phase 1, (d) the mobile caps (for information), (e) upstream Issue J /
-U-19 (a draft, not posted; owner review pending).
+U-19 (a draft, not posted; owner review pending). The M5.2 review added (f) failed statements
+that still end the transaction and (g) the wire array size on Oracle.
 The ADR-0003 K1/K2/K3 rulings are still open with the owner too. The decisions below do not wait
 for any of these; "Robust to the pending rulings" says what holds under each outcome.
 **Date:** 2026-09-25 (drafted and revised after review the same day)
@@ -299,6 +300,19 @@ only until the next of these, or until the next execute replaces the result in t
   ORA-01555), and a `FOR UPDATE` cursor fails with ORA-01002 and the store shows
   `Failed { after N rows }`. Either way the result never looks complete: D2 makes a driver report
   an invalidated cursor as an error, never as a short result.
+- **A statement that fails can still have ended the transaction.** The core ends the stores only
+  on a *successful* reply, because the worker releases nothing when an execute fails
+  (`finish_execute`). Oracle can commit anyway, and the core cannot see it. The review of M5.2
+  reproduced two cases:
+  - **A DDL that fails still commits.** `INSERT`, then `CREATE TABLE` on an existing name
+    (ORA-00955), then `ROLLBACK`: the inserted row survived.
+  - **A `COMMIT` that fails can still end the transaction.** For example, ORA-02091 (transaction
+    rolled back) at commit time.
+
+  In both cases the store stays `Open`, and its cursor behaves as Oracle says. An ordinary cursor
+  fetched to `Complete` in the review. A `FOR UPDATE` cursor ended `Failed { ORA-01002 }`. Both are
+  honest, but "Keep the cursor open" then outlives the transaction it was scoped to. This is
+  Accepted limitation 13 and owner-review point (f).
 
 **The honest state, and how it reaches the UI.** The store exposes a typed `ResultState`, never
 prose:
@@ -711,6 +725,23 @@ default on mobile until then.
     ADR, bounding bytes per round trip (RS2), needs a driver mechanism that does not exist yet.
     Until it lands, a 1,000-row fetch of 16 KB rows takes about 23 s. The upstream cause is U-19;
     Issue J is its draft (owner-review point (e)).
+12. **On Oracle the wire array stays at the driver's default of 100 rows, and `results.fetch_rows`
+    does not size it.** Added with M5.2 Stage A as a lead decision for Stage B. The adapter's
+    execute passes no fetch-size hint, so `oracledb`'s default of 100 rows is what each wire round
+    trip carries, fixed at execute. `results.fetch_rows` bounds only the rows the store requests
+    (RS2).
+    - Passing `results.fetch_rows` (1,000) as the hint would multiply a wide row's round-trip cost
+      by the square of the ratio (Table 3a). So it is not passed until one of two things happens:
+      M5.6 measures a budget, or upstream ships a setter for the array size after execute.
+    - The cost is more round trips for narrow rows on a real network, which M5.6 measures.
+    - Owner-review point (g).
+13. **A statement that fails but still ended the transaction does not end the stores.** A DDL that
+    fails still commits on Oracle, and a `COMMIT` can fail after the transaction was rolled back
+    (ORA-02091). The worker releases nothing on a failed execute, so the stores stay `Open` over a
+    transaction that has ended (RS2, "What the core cannot see").
+    - The cursor stays honest either way. It either keeps fetching or fails with ORA-01002; it is
+      never presented as complete.
+    - Owner-review point (f).
 
 ## Owner-review points
 
@@ -738,6 +769,19 @@ because each is either a setting's default or information.
   draft). It follows the upstream-issue etiquette: dedupe first, and the owner reviews it before
   it is posted. A setter for the fetch array size after execute (RS2) is a separate, smaller ask,
   under the same owner review. This ADR references the draft and does not write it.
+- **(f) Failed statements that still end the transaction (Accepted limitation 13), raised by the
+  M5.2 review.** Two ways forward:
+  - **Accept it as a limitation.** The cursor stays honest, and only "Keep the cursor open"
+    outlives the transaction.
+  - **Extend the driver contract** so that `committed_implicitly`, or a "transaction ended"
+    signal, is also reported on the **error** path of an execute. `db-core` would then release
+    and end the stores exactly as after a successful DDL.
+
+  Nothing is implemented until the owner chooses.
+- **(g) The wire array size on Oracle (Accepted limitation 12).** This is tied to (a) and (e).
+  Stage B keeps `oracledb`'s default of 100 rows and does not pass `results.fetch_rows` as the
+  fetch-size hint. It waits until M5.6 measures a budget or upstream ships a setter. The owner
+  may want the larger array for narrow rows on a slow network; M5.6's data is the input.
 
 Changing a default later is a registry edit and needs no redesign.
 
@@ -968,9 +1012,27 @@ additive variant) or the `Completion` of `DatabaseSession::fetch_segment`. `fetc
     figure (`phase-1-m5-2-data/`).
   - A column with no spare capacity is moved, not copied.
 - **What a segment is charged.** The segment struct, the `Arc`'s two counters, one header per
-  column and every heap capacity. A LOB cell costs its 8 B id plus 248 B nominal, 256 B in all,
-  until M5.5 measures the real cost. The store adds its own index: the segment list and each
+  column and every heap capacity. The store adds its own index: the segment list and each
   segment's first row.
+- **A LOB cell is charged 320 B, not 256 B.**
+  - The M5.2 review measured about **288 B** of client memory per parked temporary CLOB. It was
+    one rough run: 5,000 CLOBs on 19c.
+  - The 256 B nominal was about 11% under that. The charge is the measurement plus about 10% for
+    a single run's uncertainty: the 8 B id and 312 B for the parked entry and the driver's
+    locator.
+  - The declared width of a LOB column uses the same figure.
+  - M5.5 measures the real cost and replaces it.
+- **The worker gives parked-LOB storage back.**
+  - The review found about 800 KB still allocated after 5,000 temporary CLOBs, a `COMMIT` and a
+    close: about 160 B per LOB that no byte cap sees. The cause was that clearing a map keeps its
+    capacity.
+  - A transaction end now drops the parked-LOB and cursor maps and starts fresh ones. Closing one
+    result shrinks the LOB map once it is less than half full.
+  - How much client memory LOBs take, and how to bound it, is M5.5's to measure (`phase-1.md`
+    M5.5 row).
+- **A compaction that fails closes the cursor.** The store records such a result as `Failed`
+  with its cursor closed. The worker now does the same, releasing the cursor and its parked LOBs
+  exactly as after a failed fetch.
 - **`FetchedBatch::lob`'s linear search is not replaced.** The batch path stays as it is for its
   current consumer, the adapter, until Stage B moves the adapter to segments. Segments already
   hold the per-column id array Consequences asks for.
@@ -993,6 +1055,11 @@ additive variant) or the `Completion` of `DatabaseSession::fetch_segment`. `fetc
 - **"Fetch all"** is a flag that streams to the caps. **"Stop fetching"** (`stop`) clears it and
   stops submitting at once. `resume()` is added: it undoes a stop so that fetching follows the
   demand again. RS2 named no way back except "Fetch all".
+- **"Fetch all" ends with empty fetches.** A driver that does not know it has read the last row
+  answers the fetches still in flight with empty segments. With two in flight that is two extra
+  requests: the live 5,000-row test made 7 requests for 5 segments. Each costs a round trip.
+  Tuning this, for example one fetch in flight once a reply comes back short, is for Stage B or
+  M5.6.
 - **Sequence.** Each fetch carries a `FetchTicket` (result, sequence). A reply out of sequence
   panics in a debug build. In a release build it fails the result and is never appended
   (`Fetched::OutOfSequence`). A reply that arrives after the store failed, ended or was discarded
@@ -1009,6 +1076,17 @@ additive variant) or the `Completion` of `DatabaseSession::fetch_segment`. `fetc
 - **What an end does to a store that has already stopped.**
   - The session's end leaves `Complete` and `Failed` as they are, because they say more than
     "ended". Their LOB cells become unavailable (`SessionEnded`).
+  - **A fetch that loses the session** (lead decision, M5.2 review) leaves the store
+    `Failed { after, error }`, with the loss's classification (`NetworkLost`, native code) in
+    `error`.
+    - Its LOB reason is `SessionEnded`, not `ResultClosed`, whenever
+      `error.session_state()` is `Lost`: the session took every LOB, not only the cursor.
+    - The replies queued behind the failure are `Stale`. The `Terminal` that follows changes
+      neither the phase nor the reason.
+    - A fetch that fails without losing the session keeps `ResultClosed`.
+    - Tests: `a_fetch_that_loses_the_session_fails_the_result_and_its_lobs_end_with_the_session`
+      (unit) and `losing_the_session_mid_fetch_fails_the_result_and_ends_its_lobs_with_the_session`
+      (mock, through `SessionResults`).
   - At a transaction end, an `AtLimit` store whose cursor was already closed at the cap stays
     `AtLimit`, so it still says which cap stopped it. One whose cursor was open becomes
     `Ended { TransactionEnded }`.
@@ -1022,13 +1100,31 @@ additive variant) or the `Completion` of `DatabaseSession::fetch_segment`. `fetc
   flight stay within the cap. The store stops at `AtLimit { Bytes, Unknown }` when one more row
   of the current width would cross it. The first request always asks for at least one row, even
   under a cap smaller than one declared row.
+- **The overshoot bound assumes the declared widths are true.** The observed row width is capped
+  at the declared width, so the estimate for a request is never wider than the describe says.
+  Some columns declare too little:
+  - a type the driver renders as text (`Unsupported`, charged a 64 B floor);
+  - JSON;
+  - a column whose describe understates its size.
+
+  For those, a request can carry more bytes than estimated. The overshoot is then bounded by the
+  rows requested times their *actual* width, not by the budget. The row cap still bounds rows.
 - **Provenance.** Each cap is a `Sourced<Cap>`: a value and a `CapSource`. `CapSource` mirrors
   ADR-0006's `Level` (`BuiltIn`, `Application`, `Profile`, `Worksheet`) and adds `FetchMore` for
   a cap that "Fetch more" raised. `db-core` does not depend on `crates/workspace`, so the adapter
   maps each `Resolved<T>` to a `Sourced` in Stage B. RS2's table said the state carries
   `Resolved<T>` itself.
 - **"Fetch more".** `FetchMore::Step` raises each capped limit by its setting's value, and
-  `FetchMore::Unlimited` lifts both. It applies only at a cap with the cursor open.
+  `FetchMore::Unlimited` lifts both. It applies only at a row or byte cap with the cursor open. At
+  `AtLimit { RowCeiling }` no setting can raise anything, so it returns `false` and changes
+  nothing.
+- **Provenance stays in `db-core`** (lead decision, M5.2 review). `Sourced` and `CapSource` are
+  the store's own types. Stage B maps each ADR-0006 `Level` to a `CapSource`, with a test that
+  pins every level.
+- **One default, two crates.** `results.fetch_rows` and `results.fetches_in_flight` have
+  built-in defaults that `db-core` falls back on as `DEFAULT_FETCH_ROWS` and
+  `DEFAULT_FETCHES_IN_FLIGHT`. `crates/workspace/tests/result_pipeline_defaults.rs` pins each pair
+  equal.
 - **`results.close_cursor_at_limit`.** At a cap, the store makes `CloseResult` due. Once that is
   submitted, `cursor_open` is false, LOB cells read unavailable (`ResultClosed`), and `fetch_more`
   refuses.
@@ -1147,9 +1243,10 @@ stands. This is what the store bounds now, and what it still does not.
   - At 100 rows, a round trip of all-distinct 16 KB rows carries about 1.6 MB, not 16 MB.
   - The live wide-row test ran this way. Its first page, 33 rows, took 93 ms, with two of its four
     columns compressed by TTC.
-  - Stage B decides whether to pass `results.fetch_rows` as the hint. Passing it restores Table
-    3a's cost for wide rows. It also cuts round trips for narrow ones on a real network. That
-    trade-off is M5.6's to measure.
+  - Stage B does **not** pass `results.fetch_rows` as the hint (lead decision after the M5.2
+    review; Accepted limitation 12, owner-review point (g)). Passing it would restore Table 3a's
+    cost for wide rows. It would also cut round trips for narrow rows on a real network, a
+    trade-off M5.6 measures.
 - **The mechanism is not chosen.**
   - An upstream setter for the array size after execute is the recommendation. `oracledb`
     26.0.0-beta.3 has none. It goes to the owner with Issue J (owner-review point (e)).
@@ -1172,7 +1269,7 @@ revision:
 - the registry entries;
 - the lookup limitation.
 
-The owner-review points (a)–(e) are open. RS3's and RS6's defaults stand until the owner answers,
+The owner-review points (a)–(g) are open. RS3's and RS6's defaults stand until the owner answers,
 and changing one is a registry edit.
 
 ADR-0003's status is independent of this ADR. Its D4 already defers retention here, and the ABI 4
