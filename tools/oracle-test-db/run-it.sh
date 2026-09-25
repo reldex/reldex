@@ -4,6 +4,11 @@
 #   sh tools/oracle-test-db/run-it.sh                  # every spike
 #   sh tools/oracle-test-db/run-it.sh s2_fidelity      # one test file
 #   sh tools/oracle-test-db/run-it.sh s4_cancel -- --nocapture
+#   RELDEX_IT_PACKAGE=reldex-core-poc sh tools/oracle-test-db/run-it.sh m5_2_result_store_live
+#
+# `RELDEX_IT_PACKAGE` picks the crate whose `oracle-it` tests run; the default
+# is the Oracle driver's. Tests that need `db-core` as well as the driver live
+# in `reldex-core-poc` (a driver crate may not depend on `db-core`).
 #
 # It loads `tools/oracle-test-db/.env` (untracked; see `.env.example`) and turns
 # it into the environment the tests read. The passwords are never echoed, never
@@ -87,11 +92,14 @@ fi
 
 echo "database: $RELDEX_TEST_ORACLE_USER@$RELDEX_TEST_ORACLE_DSN"
 
+package="${RELDEX_IT_PACKAGE:-reldex-driver-oracle-thin}"
+echo "package:  $package"
+
 cd "$repo"
 # A leading `--` means "no test file was named; pass the rest to the harness".
 if [ "$#" -gt 0 ] && [ "$1" != "--" ]; then
     first="$1"
     shift
-    exec cargo test -p reldex-driver-oracle-thin --features oracle-it --test "$first" "$@"
+    exec cargo test -p "$package" --features oracle-it --test "$first" "$@"
 fi
-exec cargo test -p reldex-driver-oracle-thin --features oracle-it "$@"
+exec cargo test -p "$package" --features oracle-it "$@"
