@@ -1,0 +1,100 @@
+{
+    "applyBatch": {
+        "count": 1,
+        "maxNs": 25900,
+        "meanNs": 25900,
+        "minNs": 25900,
+        "over16_7ms": 0,
+        "over20ms": 0,
+        "over33ms": 0,
+        "over8ms": 0,
+        "p50Ns": 25900,
+        "p90Ns": 25900,
+        "p95Ns": 25900,
+        "p99Ns": 25900
+    },
+    "drainBoundary": {
+        "count": 4,
+        "maxNs": 1200,
+        "meanNs": 625,
+        "minNs": 100,
+        "over16_7ms": 0,
+        "over20ms": 0,
+        "over33ms": 0,
+        "over8ms": 0,
+        "p50Ns": 700,
+        "p90Ns": 1200,
+        "p95Ns": 1200,
+        "p99Ns": 1200
+    },
+    "drains": {
+        "count": 4,
+        "maxNs": 1483100,
+        "meanNs": 481375,
+        "minNs": 47500,
+        "over16_7ms": 0,
+        "over20ms": 0,
+        "over33ms": 0,
+        "over8ms": 0,
+        "p50Ns": 271500,
+        "p90Ns": 1483100,
+        "p95Ns": 1483100,
+        "p99Ns": 1483100,
+        "totalEvents": 5
+    },
+    "environment": {
+        "defaultSwapInterval": 1,
+        "devicePixelRatio": 1,
+        "fetchRows": 1000,
+        "firstBatchLatencyUs": 0,
+        "framesOnGuiThread": false,
+        "graphicsApi": "d3d11",
+        "label": "",
+        "maxFetchesInFlight": 2,
+        "mockRows": 1000,
+        "perFetchLatencyUs": 0,
+        "qsgRenderLoopEnv": "",
+        "qtScaleFactor": "",
+        "qtVersion": "6.8.3",
+        "screenDevicePixelRatio": 1,
+        "screenHeight": 1080,
+        "screenLogicalDpi": 96,
+        "screenName": "DELL U2414H",
+        "screenRefreshHz": 60,
+        "screenWidth": 1920,
+        "windowHeight": 665,
+        "windowWidth": 962
+    },
+    "initialStream": {
+    },
+    "memory": {
+    },
+    "orphanEvents": 0,
+    "phases": [
+    ],
+    "rowsStreamed": 1000,
+    "runs": [
+        {
+            "executeSubmittedNs": 134971700,
+            "firstEventNs": 134769700,
+            "firstFrameAfterInsertNs": 705900600,
+            "firstRowsInsertedNs": 327877700
+        }
+    ],
+    "streamRows": 100000,
+    "streamRuns": 5,
+    "summary": {
+        "drainCount": 4,
+        "drainTotalEvents": 5,
+        "drainTotalNs": 1925500,
+        "executeSubmittedNs": -1,
+        "firstEventNs": -1,
+        "firstFrameAfterInsertNs": -1,
+        "firstRowsInsertedNs": -1,
+        "frameIntervalCount": 1,
+        "privateBytes": 110219264,
+        "residentBytes": 133386240,
+        "resultCompleteNs": -1,
+        "rowsStreamed": 1000
+    }
+}

@@ -1,0 +1,280 @@
+{
+    "applyBatch": {
+        "count": 337,
+        "maxNs": 26300,
+        "meanNs": 2635,
+        "minNs": 1000,
+        "over16_7ms": 0,
+        "over20ms": 0,
+        "over33ms": 0,
+        "over8ms": 0,
+        "p50Ns": 1900,
+        "p90Ns": 3400,
+        "p95Ns": 4200,
+        "p99Ns": 17500
+    },
+    "drainBoundary": {
+        "count": 368,
+        "maxNs": 1600,
+        "meanNs": 307,
+        "minNs": 100,
+        "over16_7ms": 0,
+        "over20ms": 0,
+        "over33ms": 0,
+        "over8ms": 0,
+        "p50Ns": 300,
+        "p90Ns": 500,
+        "p95Ns": 600,
+        "p99Ns": 1300
+    },
+    "drains": {
+        "count": 368,
+        "maxNs": 1540500,
+        "meanNs": 72702,
+        "minNs": 2500,
+        "over16_7ms": 0,
+        "over20ms": 0,
+        "over33ms": 0,
+        "over8ms": 0,
+        "p50Ns": 42700,
+        "p90Ns": 169100,
+        "p95Ns": 267000,
+        "p99Ns": 312900,
+        "totalEvents": 459
+    },
+    "environment": {
+        "defaultSwapInterval": 1,
+        "devicePixelRatio": 1,
+        "fetchRows": 1000,
+        "firstBatchLatencyUs": 0,
+        "framesOnGuiThread": false,
+        "graphicsApi": "d3d11",
+        "label": "",
+        "maxFetchesInFlight": 2,
+        "mockRows": 1000000,
+        "perFetchLatencyUs": 0,
+        "qsgRenderLoopEnv": "",
+        "qtScaleFactor": "",
+        "qtVersion": "6.8.3",
+        "screenDevicePixelRatio": 1,
+        "screenHeight": 1080,
+        "screenLogicalDpi": 96,
+        "screenName": "DELL U2414H",
+        "screenRefreshHz": 60,
+        "screenWidth": 1920,
+        "windowHeight": 665,
+        "windowWidth": 962
+    },
+    "initialStream": {
+    },
+    "memory": {
+    },
+    "orphanEvents": 0,
+    "phases": [
+    ],
+    "rowsStreamed": 13000,
+    "runs": [
+        {
+            "executeSubmittedNs": 145985800,
+            "firstEventNs": 145774400,
+            "firstFrameAfterInsertNs": 727181400,
+            "firstRowsInsertedNs": 339969500
+        },
+        {
+            "executeSubmittedNs": 727651800,
+            "firstEventNs": 727691100,
+            "firstFrameAfterInsertNs": 743748400,
+            "firstRowsInsertedNs": 729319200
+        },
+        {
+            "executeSubmittedNs": 744331200,
+            "firstEventNs": 744536100,
+            "firstFrameAfterInsertNs": 760782400,
+            "firstRowsInsertedNs": 745755800
+        },
+        {
+            "executeSubmittedNs": 761412500,
+            "firstEventNs": 761477300,
+            "firstFrameAfterInsertNs": 777573400,
+            "firstRowsInsertedNs": 762243100
+        },
+        {
+            "executeSubmittedNs": 777798800,
+            "firstEventNs": 777869500,
+            "firstFrameAfterInsertNs": 793939200,
+            "firstRowsInsertedNs": 779036700
+        },
+        {
+            "executeSubmittedNs": 794421600,
+            "firstEventNs": 794471300,
+            "firstFrameAfterInsertNs": 809907800,
+            "firstRowsInsertedNs": 795544100
+        },
+        {
+            "executeSubmittedNs": 810139900,
+            "firstEventNs": 810188500,
+            "firstFrameAfterInsertNs": 826525500,
+            "firstRowsInsertedNs": 811284400
+        },
+        {
+            "executeSubmittedNs": 827037000,
+            "firstEventNs": 827066100,
+            "firstFrameAfterInsertNs": 843002400,
+            "firstRowsInsertedNs": 828146800
+        },
+        {
+            "executeSubmittedNs": 843176000,
+            "firstEventNs": 843618500,
+            "firstFrameAfterInsertNs": 859716200,
+            "firstRowsInsertedNs": 844734800
+        },
+        {
+            "executeSubmittedNs": 860004600,
+            "firstEventNs": 860059300,
+            "firstFrameAfterInsertNs": 876268200,
+            "firstRowsInsertedNs": 861168000
+        },
+        {
+            "executeSubmittedNs": 877071400,
+            "firstEventNs": 877099400,
+            "firstFrameAfterInsertNs": 893044300,
+            "firstRowsInsertedNs": 878019600
+        },
+        {
+            "executeSubmittedNs": 893302500,
+            "firstEventNs": 893355400,
+            "firstFrameAfterInsertNs": 909795100,
+            "firstRowsInsertedNs": 894585500
+        },
+        {
+            "executeSubmittedNs": 909968300,
+            "firstEventNs": 910254500,
+            "firstFrameAfterInsertNs": 926306700,
+            "firstRowsInsertedNs": 911443500
+        },
+        {
+            "executeSubmittedNs": 926465000,
+            "firstEventNs": 926799300,
+            "firstFrameAfterInsertNs": 943081700,
+            "firstRowsInsertedNs": 928005800
+        },
+        {
+            "executeSubmittedNs": 943338500,
+            "firstEventNs": 943454000,
+            "firstFrameAfterInsertNs": 959487100,
+            "firstRowsInsertedNs": 944570300
+        },
+        {
+            "executeSubmittedNs": 959754500,
+            "firstEventNs": 960028700,
+            "firstFrameAfterInsertNs": 976131300,
+            "firstRowsInsertedNs": 961155400
+        },
+        {
+            "executeSubmittedNs": 976485600,
+            "firstEventNs": 976529400,
+            "firstFrameAfterInsertNs": 992895700,
+            "firstRowsInsertedNs": 977518800
+        },
+        {
+            "executeSubmittedNs": 993230000,
+            "firstEventNs": 993257300,
+            "firstFrameAfterInsertNs": 1009494200,
+            "firstRowsInsertedNs": 994210300
+        },
+        {
+            "executeSubmittedNs": 1009867600,
+            "firstEventNs": 1010185100,
+            "firstFrameAfterInsertNs": 1026245600,
+            "firstRowsInsertedNs": 1011353300
+        },
+        {
+            "executeSubmittedNs": 1026537900,
+            "firstEventNs": 1026564500,
+            "firstFrameAfterInsertNs": 1042885300,
+            "firstRowsInsertedNs": 1027593500
+        },
+        {
+            "executeSubmittedNs": 1043127100,
+            "firstEventNs": 1043412600,
+            "firstFrameAfterInsertNs": 1059598800,
+            "firstRowsInsertedNs": 1044539500
+        },
+        {
+            "executeSubmittedNs": 1059765800,
+            "firstEventNs": 1059924300,
+            "firstFrameAfterInsertNs": 1076213800,
+            "firstRowsInsertedNs": 1061122000
+        },
+        {
+            "executeSubmittedNs": 1077017200,
+            "firstEventNs": 1077056100,
+            "firstFrameAfterInsertNs": 1092850300,
+            "firstRowsInsertedNs": 1078073100
+        },
+        {
+            "executeSubmittedNs": 1093184300,
+            "firstEventNs": 1093336600,
+            "firstFrameAfterInsertNs": 1109728200,
+            "firstRowsInsertedNs": 1094416200
+        },
+        {
+            "executeSubmittedNs": 1109971500,
+            "firstEventNs": 1110140500,
+            "firstFrameAfterInsertNs": 1126423700,
+            "firstRowsInsertedNs": 1111347300
+        },
+        {
+            "executeSubmittedNs": 1126939900,
+            "firstEventNs": 1127239000,
+            "firstFrameAfterInsertNs": 1142994100,
+            "firstRowsInsertedNs": 1128424100
+        },
+        {
+            "executeSubmittedNs": 1143234700,
+            "firstEventNs": 1143334100,
+            "firstFrameAfterInsertNs": 1159641000,
+            "firstRowsInsertedNs": 1144384400
+        },
+        {
+            "executeSubmittedNs": 1159839500,
+            "firstEventNs": 1160157700,
+            "firstFrameAfterInsertNs": 1176249900,
+            "firstRowsInsertedNs": 1161284400
+        },
+        {
+            "executeSubmittedNs": 1176448300,
+            "firstEventNs": 1176757800,
+            "firstFrameAfterInsertNs": 1192974900,
+            "firstRowsInsertedNs": 1177931200
+        },
+        {
+            "executeSubmittedNs": 1193242900,
+            "firstEventNs": 1193455800,
+            "firstFrameAfterInsertNs": 1209626200,
+            "firstRowsInsertedNs": 1194541400
+        },
+        {
+            "executeSubmittedNs": 1209963400,
+            "firstEventNs": 1209990700,
+            "firstFrameAfterInsertNs": 1226570400,
+            "firstRowsInsertedNs": 1210892800
+        }
+    ],
+    "streamRows": 100000,
+    "streamRuns": 5,
+    "summary": {
+        "drainCount": 368,
+        "drainTotalEvents": 459,
+        "drainTotalNs": 26754400,
+        "executeSubmittedNs": -1,
+        "firstEventNs": -1,
+        "firstFrameAfterInsertNs": -1,
+        "firstRowsInsertedNs": -1,
+        "frameIntervalCount": 32,
+        "privateBytes": 120049664,
+        "residentBytes": 143347712,
+        "resultCompleteNs": -1,
+        "rowsStreamed": 0
+    }
+}

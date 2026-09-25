@@ -720,6 +720,45 @@ window driven by a human or a harness, which is M1.8's job on the dev machine,
 not this task's. The hooks for it are in place and were exercised (the app runs
 with `RELDEX_UI_METRICS=1` and stays responsive throughout the stream).
 
+### Startup (M6.9, 2026-09-25)
+
+M1.8's K2 found the cold execute→first-frame path (`Harness.qml`'s
+`TableView`) costs ~900 ms: ~250 ms of D3D11 device creation plus one ~551 ms
+`polishItems` pass instantiating the first screenful of delegates. M6.9
+investigated the fix candidates that report named. **No code changed.** Full
+method, fresh numbers and reasoning are in
+`docs/exec-plans/active/phase-1-s15-ffi-spike.md`'s "M6.9 — cold first paint
+follow-up" section; the short version:
+
+- **A fresh, unmodified-code baseline measured 576.19 ms median (n=12), not
+  903.55 ms** — a ~36% drop with zero application change, attributed to
+  driver/OS-cache state warmed by five days of use of this machine, not to
+  anything this task or ADR-0003 did. Every candidate was judged against this
+  fresh number, not the older one.
+- **`QSG_RENDER_LOOP=basic` gave no material gain** (594.78 ms median, n=8,
+  within the baseline's own noise) — its only effect was a much tighter
+  spread (CoV 4.1% vs 23.1%), not a faster one, and switching render loops has
+  a blast radius across K1's frame-pacing numbers this task did not
+  re-verify. Not adopted.
+- **`Loader.asynchronous` and pre-warming the delegate with a throwaway query
+  were reasoned through, not implemented.** Both need `ui/app/Main.qml` (the
+  M3.1 app shell) to actually have a `TableView` — it does not yet; the
+  result pane is still a placeholder (`WorksheetArea.qml`). Pre-warming is
+  the strongest lead (the measured warm-path number, ~16 ms, is what a
+  pre-warmed execute already costs) and is written up as a concrete
+  recommendation for whoever builds the real result grid (M4.x): run one
+  small throwaway query against it at startup, before the user can type a
+  real one.
+- **DLL/plugin loading is not the cause** (confirmed again via
+  `QT_DEBUG_PLUGINS=1`): D3D11 device creation plus delegate polish already
+  account for essentially the whole number.
+- The warm path (execute 2..N in one process) is unaffected: 16.38 ms fresh
+  against S15's 15.85 ms.
+
+Net: the cold number is a real, diagnosed, one-time Qt Quick startup cost with
+a named fix that has no code to attach to yet. Nothing here changes `K7`'s
+build times, `K1`'s frame budget or the warm path.
+
 ### AddressSanitizer: not available on this machine
 
 `/fsanitize=address` was attempted in a separate build directory and **cannot**
