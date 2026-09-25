@@ -43,6 +43,21 @@ fn is_allowed(relative: &str) -> bool {
     })
 }
 
+/// Whether `text` lifts the `unsafe_code` lint anywhere: `allow(...)` or
+/// `expect(...)` (inner or outer attribute, `cfg_attr` included) whose
+/// parenthesised list names `unsafe_code`, in any position and across line
+/// breaks. A lint whose name merely contains it does not count.
+fn opts_out_of_unsafe_code(text: &str) -> bool {
+    ["allow(", "expect("].iter().any(|opener| {
+        text.match_indices(opener).any(|(start, _)| {
+            let list = &text[start + opener.len()..];
+            let list = &list[..list.find(')').unwrap_or(list.len())];
+            list.split(|c: char| c == ',' || c.is_whitespace())
+                .any(|item| item == "unsafe_code")
+        })
+    })
+}
+
 fn workspace_root() -> PathBuf {
     // `CARGO_MANIFEST_DIR` is `<root>/crates/ffi`.
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -87,7 +102,7 @@ fn only_the_ffi_boundary_the_link_probe_and_the_credential_calls_allow_unsafe_co
         let Ok(text) = fs::read_to_string(file) else {
             continue;
         };
-        if !text.contains("allow(unsafe_code") && !text.contains("allow(\n    unsafe_code") {
+        if !opts_out_of_unsafe_code(&text) {
             continue;
         }
         let relative = file
@@ -113,6 +128,28 @@ fn only_the_ffi_boundary_the_link_probe_and_the_credential_calls_allow_unsafe_co
         found_ffi,
         "reldex-ffi must carry the opt-out; without it the crate cannot be the boundary"
     );
+}
+
+#[test]
+fn every_way_of_lifting_the_lint_is_seen() {
+    for lifted in [
+        "#![allow(unsafe_code)]",
+        "#![allow(\n    unsafe_code,\n    reason = \"x\"\n)]",
+        "#[expect(unsafe_code)]",
+        "#![expect(unsafe_code, reason = \"x\")]",
+        "#[allow(dead_code, unsafe_code)]",
+        "#![cfg_attr(windows, allow(unsafe_code))]",
+    ] {
+        assert!(opts_out_of_unsafe_code(lifted), "{lifted}");
+    }
+    for not_lifted in [
+        "#![deny(unsafe_code)]",
+        "#![forbid(unsafe_code)]",
+        "#![allow(dead_code)]",
+        "#![allow(clippy::undocumented_unsafe_code_blocks)]",
+    ] {
+        assert!(!opts_out_of_unsafe_code(not_lifted), "{not_lifted}");
+    }
 }
 
 #[test]
