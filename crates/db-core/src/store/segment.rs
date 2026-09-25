@@ -76,7 +76,7 @@ pub struct SegmentColumn {
 /// ADR-0004 RS5) needs, without the storage itself being public.
 ///
 /// Values at NULL rows are unspecified placeholders; consult
-/// [`SegmentColumn::nulls`] (or read cells with [`SegmentColumn::value`],
+/// [`SegmentColumn::nulls`] (or read cells with [`ResultSegment::value`],
 /// which does). `#[non_exhaustive]`: a later encoding is an addition.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
@@ -107,7 +107,7 @@ pub enum SegmentData<'a> {
     /// A type the contract cannot represent, as the driver's text rendering.
     Unsupported(&'a TextColumn),
     /// Large objects: one id per row, `0` for NULL. An id is only meaningful
-    /// together with the segment's session ([`SegmentColumn::lob`] builds
+    /// together with the segment's session ([`ResultSegment::value`] builds
     /// the handle), and whether it can still be read is the store's to say
     /// ([`crate::ResultStore::lob`]).
     Lob(&'a [u64]),
@@ -355,7 +355,8 @@ impl ResultSegment {
 
     /// The bytes this segment holds, as the byte cap counts them
     /// (ADR-0004 RS3): the capacity of every value vector, buffer, offset
-    /// array and NULL mask, [`LOB_CELL_BYTES`] per LOB cell, and the
+    /// array and NULL mask, 256 bytes per LOB cell (ADR-0004's nominal
+    /// charge until M5.5 measures one), and the
     /// segment's own structs. Not the allocator's overhead, which is why the
     /// process's private bytes run a few percent above it (ADR-0004 Table 1).
     #[must_use]
