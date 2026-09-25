@@ -661,6 +661,9 @@ dependencies = [
 [[package]]
 name = "reldex-db-driver-api"
 version = "0.0.0"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "reldex-driver-mock"
@@ -697,6 +700,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "reldex-secrets"
+version = "0.0.0"
+dependencies = [
+ "reldex-db-driver-api",
+ "reldex-workspace",
+ "serde_json",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
 name = "reldex-sql-text"
 version = "0.0.0"
 
@@ -722,7 +736,7 @@ dependencies = [
  "getrandom 0.2.17",
  "libc",
  "untrusted",
- "windows-sys",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1132,6 +1146,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
 dependencies = [
  "windows-targets",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.61.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
+dependencies = [
+ "windows-link",
 ]
 
 [[package]]

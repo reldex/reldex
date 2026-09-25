@@ -11,3 +11,14 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# The contract's one production dependency (ADR-0007 S6, revisiting ADR-0002's
+# accepted item 4, "no `zeroize` for now; revisit in the credential-storage
+# ADR"): `Secret` wipes its buffer on drop with writes the compiler may not
+# elide, over the vector's whole capacity. A plain `fill(0)` just before the
+# buffer is freed is a dead store an optimiser is entitled to remove, which
+# made the old wipe weaker than it looked. Licence: Apache-2.0 OR MIT
+# (RustCrypto). No dependencies of its own with these features (`alloc`
+# only: no `std`, no derive macro, no `serde`), no `unsafe` exposed, and
+# already compiled into every product build through `aws-lc-rs`/`der` under
+# the Oracle driver, at this version.
+zeroize = { version = "1.9.0", default-features = false, features = ["alloc"] }

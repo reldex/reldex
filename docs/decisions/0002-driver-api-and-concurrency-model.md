@@ -53,7 +53,9 @@ mutually dependent.
 ### D1 — A blocking, object-safe trait contract; no async runtime in `db-driver-api`
 
 `db-driver-api` exposes plain blocking traits (`DatabaseDriver`, `DatabaseConnection`, `Cursor`,
-`CancelHandle`, `LobStream`) and has **zero production dependencies**. Concurrency is owned by
+`CancelHandle`, `LobStream`) and has **zero production dependencies** (since 2026-09-25 one,
+`zeroize`, private to `Secret`: see the amendment to accepted item 4 below, and ADR-0007 S6).
+Concurrency is owned by
 `db-core`: **one dedicated worker thread per session**, which owns the `Box<dyn DatabaseConnection>`
 for that session's lifetime and drains a command channel.
 
@@ -400,6 +402,9 @@ and answered "as you recommended" to all five).
    dropping the column.
 4. **`Secret` zeroing stays best-effort, no `zeroize` dependency for now (D7).** Accepted; revisit in
    the credential-storage ADR (`ARCHITECTURE.md` §13 item 9).
+   **Revisited 2026-09-25 by [ADR-0007](0007-credential-store.md) S6.** `Secret` now wipes its
+   buffer with `zeroize` on drop. That makes `zeroize` the contract's one production dependency:
+   D1's "zero production dependencies" now means "one: `zeroize`, private to `Secret`".
 5. **`SavepointName` restricted to a portable simple identifier of at most 30 ASCII characters (D4).**
    Accepted.
 
