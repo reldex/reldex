@@ -951,6 +951,33 @@ other. The cause is not established here and this is not enough evidence to pick
 a default — but it is enough to say that "bigger batches are faster" must not be
 assumed when Reldex chooses one.
 
+> *Note added 2026-09-25 (ADR-0004 / M5.1 review).* **The cause is now established.**
+> It is client-side, in `oracledb` 26.0.0-beta.3, and it depends on the server
+> version.
+>
+> - **The mechanism.** A 19c server does not announce end-of-response.
+>   - The client can only find the end of a response by failing to parse it.
+>   - On every `out_of_data`, `Response::add_packets` rebuilds its read buffer
+>     from **all** packets received so far, and deserialization restarts at
+>     byte 0 (`client/mod.rs` `receive_response`, `response/mod.rs`
+>     `add_packets`).
+>   - So one fetch costs O(packets²) in client CPU. It grows with the **bytes**
+>     one round trip carries, about 4× per doubling, not with the row count as
+>     such.
+> - **Driver-level measurements**
+>   (`docs/exec-plans/active/phase-1-m5-1-data/driver-fetch-probe.csv`):
+>   - Batch p50 for `text5date2` is 7.8 / 22.4 / 86 / 360 / 1,228 / 2,921 ms at
+>     500 / 1k / 2k / 4k / 7k / 10k rows.
+>   - One 1,000-row fetch of 16 KB rows takes 23 s.
+>   - A 2 MiB SDU changes nothing.
+> - **What follows.** The 10,000-row slowdown above is this effect. So is the
+>   long wait for the first row.
+>   - The fetch-size question (§9 "What the owner has to decide" item 12, `phase-1.md` §C.3
+>     item 10) is re-asked as a **bytes-per-round-trip** budget. ADR-0004 RS2
+>     sets it out.
+>   - Synthetic probes must make every row's values different. TTC compresses a
+>     value that repeats the previous row's, which hides the cost.
+
 ---
 
 ## 4. S4 in full — can a running statement be stopped?
@@ -3491,7 +3518,9 @@ own. Their verdicts against `SPEC.md` §8's operations list:
     within run-to-run noise of each other. This is one machine and one run: it
     is enough to forbid assuming "bigger is faster", not enough to pick a
     number. A short follow-up measurement across row shapes and a real network
-    should precede the choice.
+    should precede the choice. *(2026-09-25: the cause is now known — a
+    client-side cost quadratic in the bytes per fetch on 19c; see the note under
+    S14 and ADR-0004 RS2. The question becomes a bytes-per-round-trip budget.)*
 
     **Owner decision (2026-09-19):** no number is chosen now. The default will
     be set from a benchmark during Phase 1 UI work; until then the driver's

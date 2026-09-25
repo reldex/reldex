@@ -1,12 +1,13 @@
 # 0004 — Result Store: representation, paging and the bounded-memory policy
 
-**Status:** Proposed — drafted for M5.1 on 2026-09-25, to be accepted by the lead after review.
-Owner review is requested on the caps, the mobile caps and the P3 deferral (see "Owner-review
-points"). Three things this ADR depends on are still open with the owner: the ADR-0003 K1/K2/K3
-rulings and the fetch-size sign-off (`docs/exec-plans/active/phase-1.md` §C.3 item 10). The
-decisions below do not wait for them; "Robust to the pending rulings" says what holds under each
-outcome.
-**Date:** 2026-09-25
+**Status:** Accepted by the lead (2026-09-25), after one independent review round (PR #39).
+The owner-review list is at "Owner-review points": (a) the fetch-size sign-off, re-asked with a
+corrected diagnosis, (b) whether a 1,000,000-row default cap meets `SPEC.md` §19, (c) no
+browsing past the caps in Phase 1, (d) the mobile caps (for information), (e) an upstream issue
+being drafted.
+The ADR-0003 K1/K2/K3 rulings are still open with the owner too. The decisions below do not wait
+for any of these; "Robust to the pending rulings" says what holds under each outcome.
+**Date:** 2026-09-25 (drafted and revised after review the same day)
 **Task:** M5.1 ★ (`phase-1.md` §C.2)
 **Resolves:** `ARCHITECTURE.md` §13 item 6 (result store representation, bounded-memory policy,
 spill/eviction, Arrow). It also answers ADR-0002's open "Evidence/benchmarks" item, which said the
@@ -42,20 +43,42 @@ What exists today, and what this ADR has to replace or keep:
   memory grows with the result, which is `phase-1.md` risk R8.
 - **Settings** (ADR-0006 P2). `results.fetch_rows` defaults to 1,000 (1–100,000; application,
   profile, worksheet). `results.fetches_in_flight` defaults to 2 (1–8; application only). The
-  owner's sign-off on the number is pending, and M5.6 sets the shipped default.
+  owner's sign-off on the number is pending, and M5.6 sets the shipped default. This ADR changes
+  what that sign-off should be about (RS2, "Bytes per round trip").
 - **Evidence so far.** S14: memory tracks the batch, not the result, when batches are dropped, and
   throughput is not monotonic in batch size. S15, with the S14 shape (`NUMBER`, `VARCHAR2(40)`,
   `DATE`) and every batch retained: +114–119 B/row headless; +172.5–172.7 MB in-app for
   1,000,000 rows from an idle, drawn app; +200.3–200.8 MB from process start. The last reading is
   the K3 number that is marginal and awaiting a ruling. Scrolling while a result streams drops
-  0.33% of frames (M5.8). 1,000 rows per fetch with 2 in flight was the best of the sweep, at zero
-  network latency.
+  0.33% of frames (M5.8). 1,000 rows per fetch with 2 in flight was the best of S15's sweep, which
+  ran against the mock driver, so it never exercised the Oracle wire path.
 - **Oracle facts the store has to live with.** The cursor is forward-only; scrollable cursors are
   out of scope (ADR-0002 D8), so a row dropped from memory comes back only by running the query
   again. `oracle-thin` executes a query as a describe (`prefetch_rows(0)`), so a query's server
-  work runs in its **first** `fetch_batch`. The per-statement time limit is re-armed for **every
-  round trip** (`crates/drivers/oracle-thin/src/conn.rs`, `OracleCancelHandle`), so a result is
-  bounded per fetch, not as a whole. There is no on-demand cancel (ADR-0001; `PreArmedDeadline`).
+  work runs in its **first** `fetch_batch`. There is no on-demand cancel (ADR-0001;
+  `PreArmedDeadline`).
+- **What the time limit bounds.** `oracledb`'s call timeout is the socket's **read** timeout
+  (`Client::set_call_timeout` → `transport.set_read_timeout`). It bounds each wait for bytes from
+  the server. It does not bound the client's decoding between reads, so it bounds neither a fetch
+  nor a result. It is also a property of the connection, not of a statement: every later
+  `execute` re-arms it for every cursor still open on the connection. While any result set is
+  open, `OracleCancelHandle::remaining` therefore declines to name a stop time
+  (`crates/drivers/oracle-thin/src/conn.rs`, `OpenResultSets`).
+- **What a fetch costs on Oracle 19c.** One fetch costs roughly the square of the bytes it
+  carries, because of a behaviour of `oracledb` 26.0.0-beta.3 found by this ADR's review.
+  - A server that does not announce end-of-response does not mark where a response ends. The
+    check is TNS protocol ≥ 23 plus an accept flag; the upstream comment says "prior to Oracle
+    Database 26ai", and 19c never announces it. The client learns that more packets are needed
+    only by failing to parse (`client/mod.rs`, `receive_response`: on `out_of_data`,
+    `receive_packets` returns one more packet).
+  - Each time that happens, `Response::add_packets` rebuilds its read buffer from **all** packets
+    received so far, and deserialization starts again at byte 0 (`response/mod.rs`).
+  - So one fetch costs O(packets²) in client CPU. Measured at the driver level on the 19c container:
+    - Each doubling of rows per fetch costs about 4× per batch.
+    - One 1,000-row fetch of 16 KB rows takes **23 s**.
+    - A 2 MiB SDU changes nothing (Table 3a).
+  - This is the "throughput is not monotonic in batch size" that Phase 0's S14 could not explain
+    (`phase-0-spike-results.md` S14, note of 2026-09-25).
 
 Consumers: M5.2 (implementation and FFI lifetime rules), M5.3–M5.5 (grid, copy, LOB viewers),
 M5.6–M5.8 (fetch benchmark, perf re-run, drain budget), M4.3 (run modes that replace a result),
@@ -71,6 +94,9 @@ show. The adapter no longer owns batches. Caps, byte accounting and the fetch po
 rules, and rules do not belong in C++ or QML (`AGENTS.md`). In the product, the store lives in the
 composition root's consumer, `crates/ffi`'s hub, and is touched only from the thread that drains
 events: the Qt main thread (ADR-0003 D5 rule 3). Appending a segment there costs a pointer push.
+`crates/ffi` still runs its interim per-session pump thread (`src/lib.rs`, "What is interim here").
+The append happens when the hub **drains** a `FETCHED` event, never in that pump, so the pump
+never touches a store (RS5, "Threads").
 
 **Segments.** One fetched batch becomes one segment, and a segment is never mutated, moved or
 evicted once appended. Segments are shared as `Arc` and hold plain data only: locators are parked
@@ -81,8 +107,8 @@ on the worker before the reply leaves it (K1). They are therefore `Send + Sync`,
 goes to a store, after LOB parking and before the reply is sent. The UI thread never pays for it,
 and the event queue carries compact data. The measured cost is 31–45 µs per 1,000-row batch of the
 S14 shape, about 138 µs for 10 `NUMBER` columns and about 185 µs for 5 text + 2 date columns
-(Table 2). That is 1–2% of one real 1,000-row round trip even on loopback (Table 3), and roughly
-the size of a whole S15 drain (80–250 µs), which is why it must not run in the drain. The
+(Table 2). That is 1–2% of one real 1,000-row fetch even on loopback (Table 3b), and roughly the
+size of a whole S15 drain (80–250 µs), which is why it must not run in the drain. The
 `Completion`-path `fetch_batch` may keep returning `FetchedBatch` for tools and tests; M5.2 chooses
 the call shape.
 
@@ -105,14 +131,22 @@ the call shape.
   **118 B/row instead of 443** (Table 1). The measured column of 40-digit quotients falls back to
   44 B, and it alone is 37% of that 118. ADR-0002 foresaw "re-encode `Number` … without changing
   the exponent/digit semantics"; this is that change, made in the store, and the contract type is
-  untouched. The bulk formatter formats `i64` plus scale directly, and `reldex_batch_column_fixed`
-  builds the `ReldexNumber` mirror from either form, so a C caller sees nothing new.
+  untouched.
+- **Formatting must not show the encoding.** The bulk formatter formats `i64` plus scale directly,
+  and its output must be **byte-identical** to `Number`'s canonical `Display` (ADR-0002 S6) for
+  every value. The scale is chosen per segment column, so without that rule one value could read
+  `1.5` in one segment and `1.50` in the next. This is a stated test requirement for M5.2, and
+  M5.3 repeats it through the grid. The test is a property test over random `Number`s, formatted
+  from both encodings, with scales 0–18 and segments that mix them. Nothing is mirrored and kept
+  for a store segment: RS5 says how `NUMBER` and `TIMESTAMP` are read.
 - **Text keeps its layout and loses its slack.** The Oracle driver reserves 16 bytes per row and
   grows by doubling (`crates/drivers/oracle-thin/src/value.rs`). With 5 × `VARCHAR2(100)` that
   left about 300 B/row, close to half of each text buffer, unused: 714 B/row retained against
   416 B/row compacted. Offsets stay `usize`: switching to `u32` would save 4 B per row per text
   column (5.5% of the S14 row, 4.8% of the text5date2 row). That is not worth breaking
-  `ReldexColumnView` and ADR-0002 I2's committed layout.
+  `ReldexColumnView` and ADR-0002 I2's committed layout. The prototype copies each text buffer at
+  its exact size. M5.2 may instead `shrink_to_fit` the driver's buffer, which the allocator can
+  often do in place without a copy; the measured bytes are the same either way.
 - **Row-of-values is rejected on the numbers.** One `Box<[Value]>` per row, with a `String` per
   text cell, costs 201–695 B/row accounted and 233–813 B/row in private bytes. The allocator's
   per-allocation overhead shows as +16% on the text shapes. Appending 1,000,000 rows takes 156–561
@@ -142,6 +176,8 @@ core, and with it the last piece of fetch logic in C++.
 
 1. At `EXECUTED` with a result, the first fetch is submitted at once, whatever the demand. That
    fetch is the first page, and on `oracle-thin` it is also where the query's server work runs.
+   Its size comes from the describe's declared column widths ("Bytes per round trip" below), not
+   from a guess.
 2. After that, the store keeps **one fetch of read-ahead**. It submits while
    `retained + rows requested and not yet answered < demand + fetch_rows`, with at most
    `results.fetches_in_flight` requests outstanding **per result**, and only inside the caps (RS3).
@@ -150,8 +186,38 @@ core, and with it the last piece of fetch logic in C++.
 3. **Fetch all** (an explicit user action) sets demand to the row cap. It is the only mode that
    streams, and even then it stops at the caps.
 4. **Stop fetching** stops *submitting*. It takes effect at once: the fetches already submitted
-   (at most `fetches_in_flight`) still arrive and are kept, because their rows are already paid
-   for. It is not a cancel and is never labelled one (`SPEC.md` §10).
+   (at most `fetches_in_flight`) still run and are kept, because their rows are already paid for.
+   It is not a cancel and is never labelled one (`SPEC.md` §10). The worst case is the fetches
+   already submitted, run one after another on the worker. Today, at the defaults (1,000 rows,
+   2 in flight) on 16 KB rows, that is about **2 × 23 s** (Table 3a). The bound on bytes per round
+   trip below is what shrinks it.
+
+**Bytes per round trip.** On Oracle 19c a fetch's cost grows with the **bytes** it carries, roughly
+fourfold per doubling (Context, Table 3a). It does not grow with the row count as such, and it
+depends on the server version. So no row count is a safe default. 1,000 rows is 4.4 ms for the
+S14 shape, 22 ms for 5 texts + 2 dates, and 23 s for 4 × `VARCHAR2(4000)`.
+
+- **The rule.** The store's fetch requests, and the driver's wire array size, are bounded by
+  **bytes per round trip**, computed from the describe's declared column widths
+  (`ColumnMetadata::max_size_bytes`, which `oracle-thin` fills from the describe; a fixed width
+  for `NUMBER`, `DATE` and `TIMESTAMP`; the locator size for a LOB). Rows per round trip is
+  `clamp(budget / declared row width, 1, results.fetch_rows)`, so `results.fetch_rows` becomes
+  an upper bound, not the size. A declared width can overstate the data badly: an expression is
+  commonly described as `VARCHAR2(4000)`. So once the first segment arrives, the observed average
+  row width replaces the declared one, but never exceeds it. The first round trip is the only one
+  sized blind, and it errs small.
+- **The budget.** M5.6 measures it on this server version and on a real network, and the owner
+  signs it off (owner-review point (a)). Until then M5.2 uses a placeholder of **256 KiB**. That is
+  about 22 ms on the Table 3a curve (5 texts + 2 dates at 1,000 rows carry roughly 0.3 MB) and
+  under 70 ms for wide rows (50 rows of 16 KB). A declared width over-estimates sparse text, so the
+  bound errs toward more, smaller round trips; M5.6 weighs that against network latency.
+- **Applying it needs a driver change.** `oracle-thin` sets the array size at `execute`, before
+  the describe, and `oracledb`'s public `Cursor` has no setter. Its fetch message does read the
+  size from the statement's options on every fetch (`messages/fetch.rs`), so a setter is a small
+  upstream change. M5.2 chooses the mechanism: a setter upstream, which goes into the issue in
+  owner-review point (e), or a describe before the execute. Until one of them lands,
+  `results.fetch_rows` alone sizes the round trip, and wide rows keep Table 3a's cost (Accepted
+  limitation 11).
 
 **Back-pressure.** A result's in-flight count drops only when the consumer **drains** a reply, the
 same rule ADR-0002 E2 uses for request slots. A consumer that stops draining therefore stops its
@@ -167,30 +233,68 @@ reported as the result's failure in release, never appended silently. A failure 
 at a terminal transition (ADR-0002 E3) carries no rows and becomes the result's `Failed` or `Ended`
 state.
 
-**Cancellation, abandon and the missing Cancel.** No fetch can be interrupted on request. A running
-fetch returns when the server answers or when that round trip's time limit fires, and with
-`oracle-thin` the limit applies to each round trip, not to the result.
+**Cancellation, abandon and the missing Cancel.** No fetch can be interrupted on request. A
+running fetch ends when the client has received and decoded the whole array. The time limit fires
+only if the server is silent for longer than the limit on one socket read, because it bounds each
+read, not the fetch (Context). The client-side decode between reads, which is the O(packets²) part,
+has no bound at all.
 
 - The first fetch carries the query's work, so a long `SELECT` shows as *running* until its first
-  segment arrives. It shows the armed limit exactly as M4.6 shows it for execute, and never offers
-  Cancel.
+  segment arrives. The UI shows the limit armed at execute as a limit on waiting for the server,
+  never as a countdown or a stop time. It never offers Cancel.
 - **Discarding** a result (a new execute in the worksheet, closing its grid) marks the store
   discarded at once and submits `close_result`. In-flight replies still arrive, exactly one per
   request (E2), and are released on arrival. The close queues behind them on the worker, so the
-  session stays busy until the running fetch returns, and the UI says so ("waiting for the current
-  fetch; time limit 10 min").
-- **Abandon or loss of the session** (ADR-0002 R4/R6): the store moves to `Ended`. Its segments stay
-  readable, because they are plain data and are never cleared behind the user's back, under a
-  banner saying these N rows are all that was fetched. LOB ids die with the session (K1/K8), so
-  LOB cells read "unavailable (session ended)", never NULL.
-- **A commit or rollback while a result is open** may invalidate its cursor (ADR-0002 D2). On
-  Oracle a `SELECT … FOR UPDATE` cursor always fails after either one (ORA-01002). An ordinary
-  cursor keeps fetching across a commit but can fail later with ORA-01555 once undo is reused. That
-  is documented Oracle behaviour, not re-measured here. Either way the next fetch fails, the state
-  becomes `Failed { after N rows }` and the prefix stays. The result never looks complete: D2 makes
-  a driver report an invalidated cursor as an error, never as a short result, and has `db-core`
-  treat an open cursor and its LOB locators as transaction-scoped. A LOB cell in the prefix may
-  therefore fail to open after a commit or rollback, and M5.5 shows that error on the cell.
+  session stays busy until the running fetches finish. The UI says so without naming a time:
+  "waiting for the current fetch to finish". It shows no stop time while any result set is open
+  on the connection, following `OpenResultSets`: `OracleCancelHandle::remaining` declines to name
+  one then, because every later statement re-arms the one socket timeout for all open cursors.
+- **Abandon or loss of the session** (ADR-0002 R4/R6): the store moves to
+  `Ended { cause: SessionEnded }`. Its segments stay readable, because they are plain data and are
+  never cleared behind the user's back, under a banner saying these N rows are all that was
+  fetched. LOB ids die with the session (K1/K8), so LOB cells read "unavailable (session ended)",
+  never NULL.
+
+**A transaction end, or a rollback to a savepoint, ends every open store of the session,
+deterministically.** This is a lead decision of 2026-09-25, from the review. The events that end
+the stores are:
+
+- a successful commit, rollback or rollback-to-savepoint command;
+- a successful typed `COMMIT`, `ROLLBACK` or other `TransactionControl` statement;
+- a statement that committed implicitly (DDL).
+
+The prefix stays readable. No further fetch is submitted. The state becomes
+`Ended { retained, cause: TransactionEnded }`, and every LOB cell in the prefix **is** unavailable
+("unavailable (transaction ended)"). "Keep the cursor open" and "Fetch more" (RS3) therefore last
+only until the next of these, or until the next execute replaces the result in that worksheet
+(M4.3).
+
+- **Why not follow Oracle's cursor rules.** On Oracle an ordinary cursor survives `COMMIT` and
+  `ROLLBACK`, and a `SELECT … FOR UPDATE` cursor fails after either with ORA-01002. But `db-core`
+  already closes every cursor and clears every parked LOB after a successful commit, rollback or
+  rollback-to-savepoint command. `worker.rs` `resolve_transaction` and the
+  `RollbackToSavepoint` arm call `release_results()`. `finish_execute` does the same after an
+  implicit commit, per ADR-0002 D2, which treats cursors and locators as transaction-scoped. A
+  fetch after that fails with `DriverInternal` "unknown, closed or invalidated result handle".
+- **The gap being closed.** A typed `COMMIT` or `ROLLBACK` (`StatementKind::TransactionControl`)
+  does **not** release results today, so one transaction end would behave two ways. The ADR-0002
+  amendment of 2026-09-25 ("every transaction end releases results", X1) records the change. It is a
+  small work item that lands with M5.2 or M4.3, whichever comes first. The core must not parse
+  SQL, so it releases after every successful `TransactionControl` statement. That includes
+  `SAVEPOINT` and `SET TRANSACTION`, which end nothing: ending a result early is the safe error.
+- **How the store learns it, in order.** When the hub submits a commit, rollback or
+  rollback-to-savepoint command, every open store of that session stops submitting. Fetches
+  already submitted run first (FIFO) and their rows are kept. On the command's success reply the
+  stores end. On its failure they resume, because the worker releases nothing when the command
+  fails. For a statement, the store learns from the `EXECUTED` outcome: `committed_implicitly`,
+  or kind `TransactionControl`. Production order delivers that outcome before the reply to any
+  fetch submitted after it, so the store maps such a fetch's "invalidated result handle" error
+  to the `Ended` it has already entered, never to `Failed`.
+- **What the core cannot see.** A commit inside a PL/SQL block is invisible to the core. After one,
+  the cursor behaves as Oracle says: an ordinary cursor keeps fetching (and may later fail with
+  ORA-01555), and a `FOR UPDATE` cursor fails with ORA-01002 and the store shows
+  `Failed { after N rows }`. Either way the result never looks complete: D2 makes a driver report
+  an invalidated cursor as an error, never as a short result.
 
 **The honest state, and how it reaches the UI.** The store exposes a typed `ResultState`, never
 prose:
@@ -202,7 +306,7 @@ prose:
 | `Complete { rows }` | the cursor is exhausted; every row is in the store | "12,345 rows" |
 | `LimitReached { retained, limit: Rows \| Bytes, more: Yes \| Unknown }` | stopped at a cap | "Fetched 1,000,000 rows (row limit reached: 1,000,000, from the application default). The result has more rows." |
 | `Failed { retained, error }` | a fetch failed after `retained` rows | "Fetched 5,000 rows, then: ORA-01555 … The result is incomplete." |
-| `Ended { retained, cause }` | the session ended or the result was discarded | "Session ended — 5,000 rows were fetched before it did." |
+| `Ended { retained, cause: SessionEnded \| TransactionEnded \| Discarded }` | no further fetch will happen | "Transaction ended — 5,000 rows were fetched before it did. Run the query again for more." |
 
 Every state carries the **caps in force with their provenance**, as ADR-0006 `Resolved<T>` values
 (`value`, `source: Level`), so the grid can say where a limit came from, as M3.6 does for settings.
@@ -213,25 +317,40 @@ and enums.
 
 ### RS3 — Row and byte caps, per result, both user settings; what happens at the cap
 
-Three settings join the ADR-0006 registry (M5.2 adds them; a new setting needs no schema
-migration):
+Three settings join the ADR-0006 registry. M5.2 adds them; a new setting needs no schema
+migration. The registry rows are recorded in ADR-0006's amendment "Result caps (ADR-0004)".
 
-| Setting | Desktop default | Mobile default (RS6) | Levels | Bounds | "No limit" |
-| --- | --- | --- | --- | --- | --- |
-| `results.max_rows` | **1,000,000** | **100,000** | application, profile, worksheet | 1–2,147,483,647 | yes: the grid's own ceiling of 2,147,483,647 rows (Qt's `int`) |
-| `results.max_bytes` | **512 MiB** | **64 MiB** | application, profile, worksheet | 16 MiB up to 4 GiB − 1 B (`ByteLimit` holds a `u32`) | yes: see below |
-| `results.at_limit` | **keep the cursor open** | same | application, profile, worksheet | keep open / close | — |
+| Setting | Value kind | Desktop default | Mobile default (RS6) | Levels | Bounds | "No limit" |
+| --- | --- | --- | --- | --- | --- | --- |
+| `results.max_rows` | `EntryLimit` (existing) | **1,000,000** | **100,000** | application, profile, worksheet | 1–2,147,483,647 | yes: the grid's own ceiling of 2,147,483,647 rows (Qt's `int`) |
+| `results.max_bytes` | `ByteLimit` (existing) | **512 MiB** | **64 MiB** | application, profile, worksheet | 16 MiB up to 4 GiB − 1 B (`ByteLimit` holds a `u32`) | yes: see below |
+| `results.close_cursor_at_limit` | `bool` (existing) | **off** (keep the cursor open) | off | application, profile, worksheet | — | — |
 
-`results.max_rows` needs a `RowLimit { Rows(NonZeroU32) | NoLimit }` value kind beside ADR-0006's
-existing `ByteLimit`. All three take effect at the next statement. Raising a limit for one result
-without changing the setting is "Fetch more" below.
+- **Value kinds.** No new kind is needed.
+  - `EntryLimit { Count(NonZeroU32) | Unlimited }` already exists for query history, and it
+    already says "at most this many, or no limit".
+  - The at-limit behaviour is a `bool` named for its non-default action. There are two behaviours
+    and no third in sight. A `bool` reuses the storage encoding and the settings UI's toggle,
+    where an enum would need a new `ValueKind`, a storage tag and a widget for one binary choice.
+    If a third behaviour ("ask each time") is ever wanted, it becomes a new setting id rather than
+    a widened kind.
+- **Per-target defaults.** The built-in default is chosen by target OS at build time (a `cfg` on
+  the static descriptor). Resolution and provenance are unchanged: the UI reports "built-in"
+  either way.
+- **`results.fetches_in_flight`.** Its meaning changes from the one pipeline a process has
+  (ADR-0006 P2) to **per result** (RS2). It stays application-only.
+
+All three take effect at the next statement. Raising a limit for one result without changing the
+setting is "Fetch more" below.
 
 **Why these numbers.**
 
 - **1,000,000 rows** is `SPEC.md` §19's figure. S15 proved the grid at that size, and with the
   store the S14 shape costs 73.3 B/row, 73 MB per million rows (Table 1). For every shape up to
   about 537 B/row the row cap is the one that binds, which covers the S14 shape (73 B), 10
-  `NUMBER`s (118 B) and 5 texts + 2 dates (416 B).
+  `NUMBER`s (118 B) and 5 texts + 2 dates (416 B). §19 says "1,000,000+". S14-shape rows would
+  fit about 7.3 million times in 512 MiB, so the row cap could be raised. Whether it should be is
+  owner-review point (b).
 - **512 MiB** is the net for wide rows, not the everyday limit. It is set so that it does not bite
   before the row cap for ordinary rows. For 32 KiB rows it stops at about 16,000 rows. It is
   counted in the store's **accounted bytes**, the heap it knows it holds, not RSS. Measured, the
@@ -240,24 +359,36 @@ without changing the setting is "Fetch more" below.
   predict it.
 - **Keep the cursor open** so that "Fetch more" continues the *same* cursor and the *same*
   read-consistent snapshot. Running the query again would give a new snapshot, repeat any side
-  effects of functions in the select list, and without `ORDER BY` a different order.
+  effects of functions in the select list, and without `ORDER BY` a different order. The cursor
+  stays open only until the transaction ends or the next execute replaces the result (RS2).
 
 **What happens at the cap.**
 
-1. **Stop submitting fetches.** The row cap is exact. The fetch that would reach it asks for
-   `room + 1` rows. If `room + 1` come back, the extra row is kept as a lookahead (counted in
-   bytes, not shown) and the state is `LimitReached { more: Yes }`. If fewer come back, the result
-   is `Complete` and no limit message appears. The byte cap is checked before each submit, and
-   once the average row width is known, requests are shrunk to what fits. It can still be
-   overshot by what was already requested: at most `fetches_in_flight × fetch_rows` rows, and one
-   batch in practice. One round trip's rows sit in the driver regardless, because
-   `results.fetch_rows` is the wire array size. At the default that is 1,000 rows (32 MiB of
-   32 KiB rows), and a user who raises `fetch_rows` raises this bound. The settings UI says so. For
-   the byte cap `more` is `Unknown`, unless the batch that crossed it was short.
+1. **Stop submitting fetches.**
+   - **The row cap is exact.** The fetch that would reach it asks for `room + 1` rows. If
+     `room + 1` come back, the extra row is kept as a lookahead (counted in bytes, not shown) and
+     the state is `LimitReached { more: Yes }`. If fewer come back, the result is `Complete` and
+     no limit message appears.
+   - **The byte cap is checked before each submit**, and requests are shrunk to what fits.
+   - **The first fetch has no observed width**, so it is sized by the describe's declared widths
+     against the bytes-per-round-trip budget (RS2), and never against the cap alone. Without that,
+     a first request at high settings can by itself exceed the cap: 2 in flight × 10,000 rows ×
+     32 KiB is 640 MiB, more than the whole 512 MiB. The same bound limits the wire array size
+     once the driver change lands, which also caps the O(packets²) cost.
+   - **The residual overshoot** is what the fetches in flight carry when the cap is reached. While
+     requests are sized by declared width, that is at most `fetches_in_flight × budget` bytes: 512
+     KiB at the defaults. Once they are sized by the observed average, a round trip can exceed its
+     budget only by rows wider than the average so far, and never beyond declared width × rows.
+     Until the driver change lands, one round trip's rows sit in the driver regardless, because
+     `results.fetch_rows` is the wire array size: 1,000 rows at the default (32 MiB of 32 KiB
+     rows), and a user who raises `fetch_rows` raises this bound. The settings UI says so.
+   - For the byte cap `more` is `Unknown`, unless the batch that crossed it was short.
 2. **The cursor stays open** by default. "Fetch more" raises this result's caps by one more step
-   of the same size, or to "no limit" for this result only. With `results.at_limit = close`, the
-   cursor is closed at the cap: its server cursor, snapshot and any temporary LOBs are freed,
-   "Fetch more" is unavailable, and "Run again" re-executes, which the UI states is a new snapshot.
+   of the same size, or to "no limit" for this result only. That lasts until the transaction ends
+   or the next execute replaces the result (RS2); after that the store is `Ended` and "Run again"
+   is the only way on. With `results.close_cursor_at_limit` on, the cursor is closed at the cap.
+   Its server cursor, snapshot and any temporary LOBs are freed, "Fetch more" is unavailable, and
+   "Run again" re-executes, which the UI states is a new snapshot.
 3. **Transactions on Oracle.** Nothing in the store commits or rolls back. Auto-commit stays OFF
    and ADR-0002 K4/K7 are unchanged. An open cursor holds an `OPEN_CURSORS` slot and a
    read-consistent snapshot, and a late fetch can fail with ORA-01555 (RS2). It holds **no row
@@ -265,9 +396,11 @@ without changing the setting is "Fetch more" below.
    any fetch, and those locks belong to the transaction until commit or rollback. Closing the
    cursor at the cap does not release them, and the UI must not imply it does. Closing the session
    with a result open releases the cursor, and the existing close rules decide the transaction
-   (ADR-0002 K4).
+   (ADR-0002 K4). A commit or rollback ends the store (RS2), and that is when `db-core` closes an
+   open cursor.
 
-**"No limit", stated honestly** (ADR-0006 P2 `NoLimitConsequence`; the UI shows it when chosen):
+**"No limit", stated honestly** (ADR-0006 P2 `NoLimitConsequence`; the UI shows it when chosen;
+the two new consequences are named in ADR-0006's amendment):
 
 - **Rows, no limit:** "Fetch all" pulls the whole result, up to the byte cap and the grid's ceiling
   of 2,147,483,647 rows. On a large table that holds the cursor, the network and the server for as
@@ -301,8 +434,8 @@ and 32 KiB inline text at 100,000 rows.
 1. Resident store memory ≤ 256 MiB on desktop and ≤ 32 MiB on mobile, whatever the row count.
 2. A random 1,024-row window read from spilled segments with p99 ≤ 1 ms.
 3. K1's frame cost unchanged (p50 ≤ 8 ms) while jumping across the spilled range.
-4. Append throughput at least the fetch rate measured on the real path (Table 3: ≥ 300,000 rows/s
-   for `s14`), so spilling never slows fetching.
+4. Append throughput at least the best fetch rate measured on the real path at the time. Today
+   that is about 300,000 rows/s for `s14` (Table 3b); spilling must never slow fetching.
 
 **Arrow: deferred to P3** (`SPEC.md` §12, `ROADMAP.md` Phase 3). Reopen it when **either** holds:
 
@@ -340,34 +473,57 @@ amendment and moves the ABI major from 3 to 4, because `FETCHED` changes meaning
   - `reldex_result_state(hub, session, result, ReldexResultState* out)` returns RS2's state, the
     retained rows and bytes, `more_rows`, the limit hit, and each cap in force with its level. The
     struct starts with `struct_size`, and its enums reserve 0 for unknown (ADR-0003 D7).
-  - `reldex_result_set_demand(hub, session, result, uint64_t rows)` is RS2's input. It returns at
+  - `reldex_result_set_demand(hub, session, result, size_t rows)` is RS2's input. It returns at
     once: a submit is a channel send, and no I/O happens on the calling thread.
   - `reldex_result_fetch_more(hub, session, result, …)` raises this result's caps by a step or to
     no limit, and `reldex_result_stop(…)` stops submitting.
-  - `reldex_result_segment(hub, session, result, uint64_t row, const ReldexBatch** out,
-    uint64_t* first_row)` returns the segment that holds `row`. The existing
-    `reldex_batch_row_count`, `_column_count`, `_column_info`, `_column`, `_column_fixed` and
-    `reldex_batch_format_column` work on it unchanged.
+  - `reldex_result_segment(hub, session, result, size_t row, const ReldexBatch** out,
+    size_t* first_row)` returns the segment that holds `row`. The existing
+    `reldex_batch_row_count`, `_column_count`, `_column_info`, `_column` and
+    `reldex_batch_format_column` work on it unchanged; `_column_fixed` changes (below).
+  - Rows and row counts are `size_t`: A11's rule is that a count of things in this process is
+    `size_t`. Ids, including LOB ids, stay `uint64_t`.
+- **Threads.**
+  - `_segment`, `_state`, `_set_demand`, `_fetch_more` and `_stop` read or change a result's
+    segment list and policy. They are called from the **draining thread only**, the Qt main thread
+    (ADR-0003 D5 rule 3), and the hub checks this as it checks D5's other rules.
+  - Reading a segment returned by `_segment` is sound from **any** thread (A12). A published
+    segment is an immutable `Arc`, and compaction on the worker finishes before the segment is
+    published, so a reader and the worker never touch the same segment.
+  - Appending happens when the hub drains `FETCHED`, not in `crates/ffi`'s interim per-session
+    pump thread (RS1). Replacing the pump with `db-core`'s event queue (M2.5's design) does not
+    change this rule.
 - **Lifetime.** A segment pointer, and every pointer taken from it, stays valid until the caller
   **submits** `reldex_session_close_result` for that result, submits `reldex_session_close`, or
   calls `reldex_hub_destroy`. That is A20's rule, including "submits, not is answered". The core
-  never invalidates one on its own: not at a cap, not on a failure, not on session loss. On loss
-  the segments move to the `lost` holder, exactly as A20 does for column descriptions. No segment
-  is evicted in Phase 1.
+  never invalidates one on its own: not at a cap, not on a failure, not at a transaction end, not
+  on session loss. On loss the segments move to the `lost` holder, exactly as A20 does for column
+  descriptions. No segment is evicted in Phase 1.
 - **What is zero-copy, and what is a copy.**
   - Zero-copy, pointer arithmetic per cell: text, bytes, JSON and `Unsupported` (buffer plus
     offsets), the `bool`/`f32`/`f64` arrays, and LOB ids (a `uint64_t` array behind `fixed`, stride
     8, 0 when NULL).
   - `NUMBER`, whether scaled or decimal, and `TIMESTAMP` are never exposed raw in the plain view
     (`fixed == NULL`). They are read through the bulk formatter into a caller-owned arena, one
-    1,024-row window per column at a time, or through `reldex_batch_column_fixed`, which allocates
-    and says so (A19). A15's "no allocation per cell" is unchanged.
-- **Finding a row.** A row maps to its segment by `row / fetch_rows` when every segment before the
-  last is full. That is the normal case, and the store knows when it holds. Otherwise the lookup
-  binary-searches a start-row index, O(log segments). The adapter caches the last segment it
-  touched. Measured, a random single-cell read over a 1,000,000-row prefix is bound by memory
-  latency in every representation: medians 50–124 ns in the store, against 55–121 ns for today's
-  retained batches (Table 1 notes).
+    1,024-row window per column at a time. A15's "no allocation per cell" is unchanged.
+  - **No mirror is cached for a store segment** (lead decision, 2026-09-25). Under ABI 3,
+    `reldex_batch_column_fixed` builds a `ReldexNumber` mirror (46 B/row) and keeps it for the
+    batch's life (A19). Under the store, that would be the result's life. It would silently undo
+    the 8 B scaled `NUMBER`, and the byte cap would not see it. For a store segment, M5.2 therefore
+    replaces the cached mirror with an on-demand read. The caller passes a buffer and a row window,
+    and the call converts from the scaled `i64` (or the fallback `Number`, or the `Timestamp`) into
+    that buffer and keeps nothing. Either it fills a caller-owned buffer or it returns a borrowed
+    view valid until the next call: M5.2 chooses and the header states which. No case was found
+    that needs a cached mirror. If M5.2 finds one, the mirror is charged to the byte cap and the
+    ADR says why.
+- **Finding a row.** A row maps to its segment by division when every segment before the last
+  holds the same number of rows. The store knows whether that holds. Otherwise the lookup
+  binary-searches a start-row index, O(log segments). The store's own policy breaks uniformity:
+  the `room + 1` request at the row cap, requests shrunk for the byte cap, the observed-width
+  sizing of RS2, and each "Fetch more" can all leave a short segment that is not the last
+  (Accepted limitation 10). The adapter caches the last segment it touched. Measured, a random
+  single-cell read over a 1,000,000-row prefix is bound by memory latency in every representation:
+  medians 50–124 ns in the store, against 55–121 ns for today's retained batches (Table 1 notes).
 - **"Virtualized, never one QML object per row" at the boundary** means:
   - no per-row object, no per-row call, and no per-cell call beyond pointer reads cross the ABI;
   - a row count is a number;
@@ -376,8 +532,8 @@ amendment and moves the ABI major from 3 to 4, because `FETCHED` changes meaning
   - a drain appends rows **by count**, with one `beginInsertRows` per drain rather than per batch.
     That is an input to M5.8.
 - **Consistency with S15.** The per-cell read path is the one S15 measured (K4: 100–120 ns per warm
-  cell including Qt; the boundary under 1% of a drain). Only the segment lookup is new, and it is a
-  division. M5.7 re-measures regardless.
+  cell including Qt; the boundary under 1% of a drain). Only the segment lookup is new: a division,
+  or a binary search when segments differ in size. M5.7 re-measures regardless.
 
 ### RS6 — Mobile: the same core and store, with smaller default caps
 
@@ -404,24 +560,28 @@ default on mobile until then.
 
 ### Robust to the pending rulings
 
-- **Fetch size (§C.3 item 10, M5.6).**
-  - Segment size follows `fetch_rows`, and the store's cost barely moves with it: 76.1 / 73.3 /
-    73.1 B/row for `s14` at 100 / 1,000 / 10,000 rows per fetch, and 421.6 / 415.5 / 414.9 for
-    `text5date2`. Today's retention swings 594–721 B/row on the same data (Table 4).
-  - **If the owner signs off 1,000**, nothing changes.
-  - **If a smaller number is chosen**, the per-segment header costs about 3 B/row at 100 rows. If
-    it ever exceeds 10% of a row, M5.2 coalesces small batches into segments of at least 1,024 rows
-    on the worker.
-  - **If a larger number is chosen**, the first segment is still published the moment it arrives;
-    nothing waits to coalesce. The cost is first-row latency and the byte-cap overshoot bound
-    (RS3), both of which grow with `fetch_rows`.
-  - New evidence for that ruling, which this ADR does not decide: on the real database, 10,000
-    rows per fetch was 3× (`s14`), 5× (`numbers10`) and 11× (`text5date2`) slower than 1,000, and
-    its first batch took 112 ms to 2.6 s (Table 3).
+- **Fetch size (§C.3 item 10, M5.6).** The question is re-asked (owner-review point (a)). On
+  Oracle 19c a row count cannot be a safe default, because the cost of one fetch follows the bytes
+  it carries: 1,000 rows is 4.4 ms, 22 ms or 23 s depending on the row (Table 3a). The sign-off
+  should be on a **bytes-per-round-trip budget** (RS2) that M5.6 measures, with
+  `results.fetch_rows` kept as an upper bound. The store itself is indifferent:
+  - Segment size follows rows per round trip, and the store's cost barely moves with it: 76.1 /
+    73.3 / 73.1 B/row for `s14` at 100 / 1,000 / 10,000 rows per segment, and 421.6 / 415.5 /
+    414.9 for `text5date2`. Today's retention swings 594–721 B/row on the same data (Table 4).
+  - **If round trips get small** (a small budget, wide rows), the per-segment header costs about
+    3 B/row at 100 rows. If it ever exceeds 10% of a row, M5.2 coalesces small batches into
+    segments of at least 1,024 rows on the worker. The first segment is never delayed to coalesce.
+  - **If the owner keeps a plain row count**, the store works unchanged. Wide rows then keep Table
+    3a's cost, and "Stop fetching" keeps its worst case of `fetches_in_flight` × one fetch (RS2).
+  - **On a server that marks end-of-response** (newer than 19c, per the upstream code), the
+    quadratic term does not arise. The budget can then be larger, and M5.6 records which server
+    each number came from.
 - **K3 (ADR-0003).** The store's per-row cost does not depend on which baseline the owner picks.
-  For the S14 shape through the mock path it is 73.1 B/row accounted (Table 2), about 41–46 B/row
-  below what S15's retained batches cost headless. That puts the process-start reading, 200.3–200.8
-  MB today and over 200 × 10⁶ B, at roughly 155–160 MB. **This is an estimate**, and M5.7 measures
+  For the S14 shape through the mock path it is 73.1 B/row accounted (Table 2). Scaled by the
+  measured private-to-accounted ratio (about 1.05, Table 1), that is about 77 B/row of process
+  memory, against 114–119 B/row that S15's retained batches cost headless: a saving of about
+  37–42 B/row. That puts the process-start reading, 200.3–200.8 MB today and over 200 × 10⁶ B, at
+  roughly **158–164 MB**. **This is an estimate** from two different instruments, and M5.7 measures
   it in-app. Under either reading K3 holds with the store.
 - **K2.** The store adds nothing before the first paint. The first fetch is submitted at
   `EXECUTED`, its segment is published on arrival, and compaction costs about 45 µs per 1,000
@@ -438,9 +598,14 @@ default on mobile until then.
   - the row-cap lookahead and byte accounting.
 
   It also:
-  - adds the three settings and a `RowLimit` kind in `crates/workspace`, with mobile built-in
-    defaults;
-  - extends the bulk formatter and `_fixed` to scaled numbers;
+  - adds the three settings (existing value kinds) and per-target built-in defaults in
+    `crates/workspace` (ADR-0006 amendment "Result caps");
+  - extends the bulk formatter to scaled numbers, and replaces `_column_fixed`'s cached mirror
+    with an on-demand read for store segments (RS5);
+  - bounds bytes per round trip from the declared widths, and gets the driver mechanism that
+    applies it (RS2);
+  - makes every transaction end release results, including typed `TransactionControl`
+    statements (the ADR-0002 amendment of 2026-09-25), unless M4.3 lands that first;
   - replaces `FetchedBatch::lob`'s linear search with the per-column id array;
   - implements ABI 4 in `crates/ffi`;
   - strips the fetch logic and batch ownership out of `SessionController` and `ResultTableModel`;
@@ -448,14 +613,23 @@ default on mobile until then.
 
   Its tests:
   - accounted versus private bytes;
-  - exact row cap, lookahead, and the overshoot bound;
+  - exact row cap, lookahead, and the overshoot bound, including a first fetch sized by
+    declared widths;
   - sequence checking;
   - discard with fetches in flight;
   - session loss keeping the prefix;
-  - commit invalidation ending in `Failed`;
-  - a lossless re-encoding property test over random `Number`s.
-- **M5.3** shows NULL, `Taken`, `Unsupported` and "unavailable (session ended)" as four different
-  states, and puts RS2's state, the caps in force and their provenance in the result's status line.
+  - **a transaction end ending the store**: after a commit, rollback or rollback-to-savepoint
+    command, a typed `COMMIT`/`ROLLBACK`, and a DDL statement, the store is
+    `Ended { cause: TransactionEnded }`, the prefix is readable, no fetch is submitted, a fetch
+    already in flight is kept, and every LOB cell is unavailable. A failed commit leaves the store
+    open;
+  - a lossless re-encoding property test over random `Number`s;
+  - formatting identity: for every value, the scaled form formats byte-identically to `Number`'s
+    canonical `Display`, across segments of different scales (RS1). M5.3 repeats it through the
+    grid.
+- **M5.3** shows NULL, `Taken`, `Unsupported` and "unavailable (session ended / transaction
+  ended)" as different states. It puts RS2's state, the caps in force and their provenance in the
+  result's status line.
 - **M5.4** copies from segments. A range past the retained prefix is not copyable, and the UI says
   what was copied.
 - **M5.5** reads LOBs by id. A LOB cell is charged a nominal **256 B** against the byte cap (the
@@ -463,26 +637,35 @@ default on mobile until then.
   per-locator cost. A LOB that has been *read* keeps `oracle-thin`'s 64 KiB staging buffer
   (`lob.rs`, `STAGING_BYTES`) until it is closed, so the viewer closes what it opened and the
   store charges an open LOB that 64 KiB.
-- **M5.6** sets the shipped `fetch_rows` default. Table 3 is its first real-database input. The
-  bench here gives the store-side cost per fetch size.
+- **M5.6** does not pick a row count off Table 3b's curve. It measures and proposes a
+  **bytes-per-round-trip budget** (RS2) on this server version and on a real network, and keeps
+  `results.fetch_rows` as the upper bound. Table 3a is its first input. Its probes must make every
+  row's values different (`phase-1-m5-1-data/README.md`: TTC compresses repeated values). It
+  records the server version with every number, because a server that marks end-of-response does
+  not have the quadratic term. The bench here gives the store-side cost per segment size.
 - **M5.7** re-runs the perf gate with the store: in-app RSS against accounted bytes, and K3's
   readings.
 - **M5.8** is helped by on-demand paging, since only read-ahead arrives while the user scrolls, and
   by appending by count per drain. "Fetch all" while scrolling still needs its drain budget.
 - **M4.3.** Re-executing in a worksheet replaces its current result (submit `close_result`, discard
   the store). A script that produces several results gets one capped store each, and M4.3 decides
-  how many a run keeps.
+  how many a run keeps. A `COMMIT`, `ROLLBACK` or DDL later in the same script ends the earlier
+  results' stores (RS2).
 - **M6.3.** The state strings are composed in QML from typed state, translated, with numbers
   formatted for the locale. No text comes from the core.
 - **P2 export** streams from the open cursor after the retained prefix: the prefix first, then
   further batches written and **not retained**, so the caps limit retention and never export. If
-  the cursor was closed (at a cap with `close`, or after a failure), export offers to run the query
-  again and says it is a new snapshot.
+  the cursor was closed (at a cap with `results.close_cursor_at_limit`, after a failure, or at a
+  transaction end), export offers to run the query again and says it is a new snapshot.
 - **P2 sort and filter** is offered on the client only over a `Complete` result, as a row
   permutation (4 B/row) over the segments. Otherwise the query is re-run with `ORDER BY` / `WHERE`
   (`phase-1.md` §C.1's reason for the deferral).
-- `ARCHITECTURE.md` §13 item 6 now points here (Proposed). `SPEC.md` needs no change: the caps
-  implement §12's "bounded memory" and §19's figure.
+- `ARCHITECTURE.md` §13 item 6 is resolved by this ADR. `SPEC.md` needs no change: the caps
+  implement §12's "bounded memory", and whether §19's "1,000,000+" wants a higher default row cap
+  is owner-review point (b).
+- ADR-0006 gains the registry rows and two `NoLimitConsequence` values (its amendment "Result caps
+  (ADR-0004)"). ADR-0002 gains the amendment "every transaction end releases results".
+  `phase-0-spike-results.md` S14 gains a note naming the cause of its unexplained slowdown.
 
 ## Accepted limitations
 
@@ -491,37 +674,67 @@ default on mobile until then.
 2. **The byte cap counts accounted bytes, not RSS.** It excludes allocator overhead (3–6% for the
    store at 1,000,000 rows, 0.2% for 32 KiB rows) and replies not yet drained (at most
    `fetches_in_flight` batches).
-3. **The byte cap can be overshot** by the rows already requested when it is reached: at most
-   `fetches_in_flight × fetch_rows` rows, and one round trip's rows at minimum. The bound grows
-   with `fetch_rows`.
+3. **The byte cap can be overshot** by what is already requested when it is reached: at most
+   `fetches_in_flight` round trips. Sized by declared width, that is `fetches_in_flight × budget`.
+   Until the driver can size the wire array (limitation 11), it is `fetches_in_flight × fetch_rows`
+   rows, and the bound grows with `fetch_rows`.
 4. **There is no process-wide budget.** The worst case is the number of open results × 512 MiB.
 5. **LOB cells are charged a nominal amount.** Parked locators live on the worker thread and, for
    temporary LOBs, in the server's temporary tablespace until the result closes. Neither is
    measured here.
 6. **An open cursor holds server resources while the user reads**: a cursor slot, a snapshot, and
-   the risk of ORA-01555 on a late fetch. They are reported, not prevented, and
-   `results.at_limit = close` and closing a result free them.
-7. **A fetch cannot be cancelled on request.** "Stop fetching" only stops the next submit, and a
-   running fetch ends when the server answers or its per-round-trip limit fires (ADR-0001).
+   the risk of ORA-01555 on a late fetch. They are reported, not prevented. Turning on
+   `results.close_cursor_at_limit`, closing a result, or ending the transaction frees them.
+7. **A fetch cannot be cancelled, and the time limit does not bound it.** "Stop fetching" only
+   stops the next submit. A running fetch ends when the client has decoded the whole array. The
+   limit bounds each socket read, not the decode, so no stop time is shown while a result set is
+   open. The worst case is `fetches_in_flight` fetches: about 2 × 23 s at today's defaults on
+   16 KB rows (RS2, Table 3a; ADR-0001).
 8. **Mobile caps are unmeasured** on any device.
 9. **One value can cost a whole segment column.** A single `NUMBER` in a segment column that is
    outside `i64` or has more than 18 decimals keeps that column at 44 B per cell for that segment.
-10. **Row lookup is O(1) only while every segment but the last is full.** A driver that returns a
-    short batch mid-stream turns it into a binary search. `phase-1.md`'s M5.2 row asks for O(1),
-    and this is where that holds and where it does not.
+10. **Row lookup is O(1) only while every segment but the last holds the same number of rows.**
+    Two things break that and turn the lookup into a binary search:
+    - a driver that returns a short batch mid-stream;
+    - **the store's own policy**: the `room + 1` request at the row cap, requests shrunk to fit
+      the byte cap, observed-width sizing, and each "Fetch more" can each leave a short segment
+      that is not the last.
+
+    `phase-1.md`'s M5.2 row asks for O(1). This is where it holds, and where it degrades to
+    O(log segments): 10–17 steps for 1,000–100,000 segments.
+11. **Wide rows are slow to fetch until the byte bound can be applied.** On Oracle 19c one fetch
+    costs about the square of its bytes (`oracledb` 26.0.0-beta.3; Table 3a). The fix in this
+    ADR, bounding bytes per round trip (RS2), needs a driver mechanism that does not exist yet.
+    Until it lands, a 1,000-row fetch of 16 KB rows takes about 23 s. An upstream issue is being
+    drafted (owner-review point (e)).
 
 ## Owner-review points
 
-1. **Desktop caps: 1,000,000 rows and 512 MiB per result, keeping the cursor open at the limit**
-   (RS3). Each is a setting with "no limit" and its stated consequence.
-2. **Mobile caps: 100,000 rows and 64 MiB** (RS6), reasoned and not measured on a device.
-3. **Deferring spill and Arrow to P3, and ruling out eviction without spill** (RS4), with the
-   reopening benchmarks as written.
-4. For information: **no process-wide memory budget in Phase 1** (Accepted limitation 4).
+The lead accepted this ADR on 2026-09-25. These points go to the owner. None of them blocks M5.2,
+because each is either a setting's default or information.
 
-The proposal is that the lead accepts RS1, RS2 and RS5 on the evidence below, and RS3, RS4 and
-RS6 provisionally, with the defaults above, until the owner answers. Changing a default later is a
-registry edit and needs no redesign.
+- **(a) The fetch-size sign-off (§C.3 item 10), re-asked with the corrected diagnosis.**
+  - The Phase 0 and S15 numbers behind "1,000 rows" did not see the cause. On Oracle 19c,
+    `oracledb` 26.0.0-beta.3 costs about the square of the bytes in one fetch (Context,
+    Table 3a).
+  - The ADR asks the owner to sign off a **bytes-per-round-trip bound** (RS2) instead of a row
+    count. M5.6 measures the bound; M5.2 uses a 256 KiB placeholder. `results.fetch_rows` stays
+    as the upper bound and the setting.
+- **(b) Whether a 1,000,000-row default cap satisfies `SPEC.md` §19's "1,000,000+".** S14-shape
+  rows fit about 7.3 million times in 512 MiB, so the row cap could be raised without touching
+  the byte cap. The 512 MiB byte cap and keeping the cursor open at the limit (RS3) are part of
+  the same question.
+- **(c) Phase 1 cannot browse past the caps.** Spill is deferred to P3 and eviction without spill
+  is ruled out (RS4). Export streams past the caps (P2). There is no process-wide memory budget
+  (Accepted limitation 4).
+- **(d) Mobile caps: 100,000 rows and 64 MiB** (RS6). This is for information until the
+  physical-device gate: the numbers are reasoned, not measured.
+- **(e) An upstream issue for the O(packets²) fetch behaviour** is being drafted separately. It
+  goes through the upstream-issue etiquette: dedupe against existing issues and PRs, and the owner
+  reviews it before it is posted. It may also ask for a setter for the fetch array size after
+  execute (RS2). This ADR references it and does not write it.
+
+Changing a default later is a registry edit and needs no redesign.
 
 ## Alternatives considered
 
@@ -573,8 +786,17 @@ because it is cheap (about 3 minutes) and is what reopens RS4:
 - Machine: Ryzen 7 5700G, 63.4 GB RAM (37.4 GB free), Windows 11 build 26200, rustc 1.98.1, bench
   profile. No `cargo`/`rustc`/`cl`/`link` process was running when each run started, and CPU load
   was 4–17%. Other workers had been building earlier in the session.
-- Raw numbers are in `docs/exec-plans/active/phase-1-m5-1-data/` (`representation.csv`,
-  `mock-path.csv`, `real-db-fetch-latency.csv`, `environment.csv`).
+- **The independent review of PR #39** did two things:
+  - It re-ran the bench and got identical accounted bytes for all four shapes at 1k, 100k and 1M
+    rows (`review-reproduction.csv`).
+  - It probed the fetch path at the driver level: a release build calling `oracle-thin` directly,
+    with no `db-core` worker or event queue in the path, on the same container. It measured rows
+    per fetch from 500 to 10,000 for `s14` and `text5date2`, and one fetch of 50–1,000 wide rows
+    (4 × `VARCHAR2(4000)`, a distinct value on every row, about 16 KB per row). It also re-ran
+    with a 2 MiB SDU. There is one run per cell, and a `-warm` line precedes each series
+    (`driver-fetch-probe.csv`).
+- Raw numbers are in `docs/exec-plans/active/phase-1-m5-1-data/`. Its `README.md` says which file
+  holds what, and why generated rows must differ from each other.
 
 **Table 1 — retained bytes per row.** Accounted bytes; in brackets, private-bytes growth per row
 (min–max of 3) at the largest count. Fetch size 1,000.
@@ -597,8 +819,12 @@ because it is cheap (about 3 minutes) and is what reopens RS4:
 
 At 1,000,000 rows that is 118 MB against 443 MB (`numbers10`), 416 against 714 (`text5date2`), and
 73 against 133 (`s14`). Private-bytes growth at 1,000 rows is page-granular noise and is left out;
-it is in the CSV. The synthetic `batches` figure for `s14` (132.8) is above S15's measured 114–119
-B/row. The bench's text is longer (every 10th row Thai, every 25th an emoji) and reserved the way
+it is in the CSV. A small result shows the per-segment cost. At 50 rows of `s14` the store holds
+4,046 B in total, where today's batch holds 84,568 B, because the driver reserves 1,000 rows of
+capacity (`review-reproduction.csv`). There is no fixed per-segment cost worth counting.
+
+The synthetic `batches` figure for `s14` (132.8) is above S15's measured 114–119 B/row. The
+bench's text is longer (every 10th row Thai, every 25th an emoji) and reserved the way
 `oracle-thin` reserves it, while S15 measured RSS through the mock driver. Compare within a table,
 not across the two.
 
@@ -626,9 +852,45 @@ serially on the consumer thread:
 
 The in-process fetch itself takes 0.44–0.71 ms per batch at p50.
 
-**Table 3 — the real database.** 100,000 rows through `db-core` and `oracle-thin`; ranges over 3
-runs. Bold marks the current `results.fetch_rows` default, not the best result: for `text5date2`,
-100 rows per fetch was slightly faster.
+**Table 3a — the cost of one fetch against its size, at the driver level** (the review's probe;
+Oracle 19c on loopback; `driver-fetch-probe.csv`). The payload column is estimated from each
+statement's column values (about 52 B per `s14` row, 315 B per `text5date2` row, 16,000 B per wide
+row). It is an estimate, not a measured wire size.
+
+| Shape | Rows per fetch | ≈ Payload per fetch | Batch p50 | Client CPU / wall |
+| --- | --- | --- | --- | --- |
+| `s14` | 500 | 26 KB | 2.4 ms | 0.33 |
+| `s14` | 1,000 | 52 KB | 4.4 ms | 0.61 |
+| `s14` | 2,000 | 0.1 MB | 10.2 ms | 0.88 |
+| `s14` | 4,000 | 0.2 MB | 23.4 ms | 0.89 |
+| `s14` | 7,000 | 0.36 MB | 56.4 ms | 0.95 |
+| `s14` | 10,000 | 0.52 MB | 129.1 ms | 0.99 |
+| `text5date2` | 500 | 0.16 MB | 7.8 ms | 0.59 |
+| `text5date2` | 1,000 | 0.32 MB | 22.4 ms | 0.99 |
+| `text5date2` | 2,000 | 0.63 MB | 85.8 ms | 0.97 |
+| `text5date2` | 4,000 | 1.3 MB | 359.9 ms | 0.96 |
+| `text5date2` | 7,000 | 2.2 MB | 1,228 ms | 0.98 |
+| `text5date2` | 10,000 | 3.2 MB | 2,921 ms | 0.94 |
+| wide (4 × `VARCHAR2(4000)`) | 50 | 0.8 MB | 70 ms | 0.77 |
+| wide | 100 | 1.6 MB | 227 ms | 0.88 |
+| wide | 250 | 4 MB | 1,503 ms | 0.94 |
+| wide | 500 | 8 MB | 4,939 ms | 0.92 |
+| wide | 1,000 | 16 MB | **22,979 ms** | 0.94 |
+
+- **Rows are not the variable.** At the same row count the time differs by more than 1,000× between
+  shapes. At similar payloads it is within about 2×: 1.3 MB of `text5date2` takes 360 ms and
+  1.6 MB of wide rows takes 227 ms.
+- **The cost is quadratic in the payload.** Each doubling costs about 4×.
+- **The client is the bottleneck.** Client CPU over wall time reaches 0.9–0.99 as fetches grow.
+  The server and the loopback network are not.
+- **A 2 MiB SDU changes nothing.** With it, `s14` measured 3.8 ms at 1,000 rows and 161.9 ms at
+  10,000, and `text5date2` 24.4 ms and 3,168 ms. The O(packets²) re-parse explains this (Context).
+
+**Table 3b — the same effect through `db-core`** (the M5.1 run: 100,000 rows through `db-core`'s
+worker and `oracle-thin`, one fetch in flight; ranges over 3 runs; `real-db-fetch-latency.csv`).
+Bold marks the current `results.fetch_rows` default, not the best result. For `text5date2`, 100
+rows per fetch was slightly faster. The slowdown at 10,000 rows is Table 3a's quadratic term, not a
+property of the row count.
 
 | Shape | Rows/fetch | Batch p50 (ms) | First batch (ms) | Total (ms) | Rows/s |
 | --- | --- | --- | --- | --- | --- |
@@ -644,7 +906,8 @@ runs. Bold marks the current `results.fetch_rows` default, not the best result: 
 
 Execute, which is a describe on `oracle-thin`, took 1.4–2.6 ms once a statement text had been
 parsed. The first run of each text took 7.7–58 ms. Loopback means **zero network latency**: every
-figure here is a floor, and M5.6/M5.7 own the real-network numbers.
+figure here is a floor, and M5.6/M5.7 own the real-network numbers. Both tables come from one
+server version (19c). A server that marks end-of-response would not show the quadratic term.
 
 **Table 4 — retained bytes per row against fetch size** (100,000 rows; accounted bytes)
 
@@ -663,10 +926,27 @@ figure here is a floor, and M5.6/M5.7 own the real-network numbers.
 - Any mobile device.
 - The store in the running app: in-app RSS, and K1/K2/K4 with the store in place. That is M5.7's.
 - A spill or Arrow prototype. The Arrow figures in RS4 are arithmetic.
+- The fetch cost on a server that marks end-of-response (newer than 19c), or with the bytes
+  bound applied (RS2). The latter needs the driver change first.
+- The actual wire size of a fetch. Table 3a's payload column is an estimate.
 
 ## Status
 
-**Proposed.** The lead accepts it after review, recording the owner's answers to the review points
-above; until then RS3, RS4 and RS6 stand with their stated defaults. M5.2 does not start before
-acceptance. ADR-0003's status is independent of this ADR: its D4 already defers retention here, and
-the ABI 4 change in RS5 is recorded as an ADR-0003 amendment when M5.2 lands.
+**Accepted by the lead (2026-09-25),** after one independent review round on PR #39. That review
+reproduced Table 1 exactly and returned doc-only findings, all of which are addressed in this
+revision:
+
+- the fetch-cost diagnosis and Table 3a;
+- what the time limit bounds;
+- every transaction end ends the store;
+- RS5's thread rules and no mirror cache;
+- formatting identity;
+- a first fetch sized by declared widths;
+- the registry entries;
+- the lookup limitation.
+
+The owner-review points (a)–(e) are open. RS3's and RS6's defaults stand until the owner answers,
+and changing one is a registry edit.
+
+ADR-0003's status is independent of this ADR. Its D4 already defers retention here, and the ABI 4
+change in RS5 is recorded as an ADR-0003 amendment when M5.2 lands.

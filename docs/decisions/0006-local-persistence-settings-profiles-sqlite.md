@@ -12,7 +12,9 @@ guard in endpoints, production flag, SID builder moved into the driver, store ha
 "Amendment: query history and workspace state" below; that amendment itself revised 2026-09-25
 (same day, a second review pass on PR #38) with a schema-4 fix for the history trim's must-fix
 performance finding, a narrowed `SchemaMismatch` mapping, corrected ADR-0002 citations and
-`Debug` redaction for history/worksheet text.
+`Debug` redaction for history/worksheet text; amended 2026-09-25 by ADR-0004 with three result-cap
+settings, per-target built-in defaults and a per-result `fetches_in_flight` — see "Amendment:
+result caps (ADR-0004)" (registry only; not yet implemented, M5.2).
 **Task:** M2.9 ★ (`phase-1.md` §C.2); amendment tasks M4.10/M6.2 (`phase-1.md` §M4/§M6, store side
 only); fix round on the same tasks, PR #38 independent review
 
@@ -100,7 +102,8 @@ does not hold; the upper bound is the setting's own, a driver clamps to what its
 reports the size in force (ADR-0002 T1).
 `fetches_in_flight` is application-only because it tunes the one result pipeline a process has,
 not a connection — **accepted** as such by the review; widening a setting's levels later is a
-compatible change.
+compatible change. (ADR-0004 changes its meaning to **per result**, still application-only; see
+"Amendment: result caps (ADR-0004)".)
 
 **Resolution.** `ResolveContext::new().with_application(&a).with_profile(&p).with_worksheet(&w)`
 then `resolve(SETTING) -> Resolved<T> { value, source: Level }`, where
@@ -829,3 +832,62 @@ must-fix, two should-fix, one nit, all landed on the same branch before merge:
   (a typo in this crate's own query, say) the same way as a genuinely altered file. The mapping now
   checks SQLite's message for the specific shapes that actually prove a schema difference; see
   "Narrowed `SchemaMismatch` mapping" under the fix round below.
+
+## Amendment: result caps (ADR-0004) (2026-09-25, task M5.1)
+
+**Status:** accepted with ADR-0004. This is registry only: nothing here is implemented yet, and M5.2
+adds it. It needs no schema migration, because a setting is a row keyed by its storage key.
+
+### Registry addition
+
+| Setting (`storage key`) | Kind | Default | Levels | Bounds | "No limit" | Takes effect |
+| --- | --- | --- | --- | --- | --- | --- |
+| `results.max_rows` | `EntryLimit` | 1,000,000 rows (mobile: 100,000) | application, profile, worksheet | 1–2,147,483,647 | yes: the whole result is fetched, up to the grid's `int` ceiling | next statement |
+| `results.max_bytes` | `ByteLimit` | 512 MiB (mobile: 64 MiB) | application, profile, worksheet | 16 MiB–4 GiB − 1 B | yes: result memory grows until the process runs out and aborts | next statement |
+| `results.close_cursor_at_limit` | `bool` | off (keep the cursor open) | application, profile, worksheet | — | — | next statement |
+
+### Value kinds
+
+No new `ValueKind`.
+
+- **`results.max_rows`** reuses `EntryLimit { Count(NonZeroU32) | Unlimited }`, which query history
+  introduced for the same meaning: "at most this many, or no limit".
+- **`results.close_cursor_at_limit`** is a `bool`, named for its non-default action. There are
+  exactly two behaviours at the cap: keep the cursor open for "Fetch more", or close it and free
+  its server resources.
+  - A `bool` reuses the existing storage encoding and the settings UI's toggle (M3.6).
+  - An enum would need a new `ValueKind`, a storage tag and a widget for a single binary choice.
+  - A third behaviour ("ask each time") is not in scope. If it is ever wanted, it becomes a new
+    setting id rather than a widened kind, because widening a stored kind is a migration.
+
+### Two new `NoLimitConsequence` values
+
+Both are `#[non_exhaustive]` additions. Their wording is the UI's (M4.6's pattern).
+
+- **`WholeResultIsFetched`** (rows): "Fetch all" pulls the entire result, holding the cursor, the
+  network and the server until it ends.
+- **`ResultMemoryUnbounded`** (bytes): result memory grows until the machine runs out. On desktop
+  the process then aborts, taking every worksheet's session and its transaction with it. On mobile
+  the operating system ends the app first.
+
+### Per-target built-in defaults
+
+A descriptor's built-in default can now differ by target. It is chosen at build time by target OS
+(a `cfg` on the static descriptor: Android and iOS take the mobile value). Resolution and
+provenance do not change: the value still reports `Level::BuiltIn`. The two result caps are the
+only settings that use this so far. ADR-0004 RS6 says why the mobile numbers are smaller, and that
+they are reasoned, not measured on a device.
+
+### `results.fetches_in_flight` is per result
+
+P2 described `fetches_in_flight` as tuning "the one result pipeline a process has". Under ADR-0004
+each result has its own fetch policy, and the setting bounds the fetches outstanding **per
+result**. It stays application-only, with the same default (2) and bounds (1–8). The P2 table row
+is unchanged, apart from this meaning.
+
+### `results.fetch_rows` becomes an upper bound
+
+ADR-0004 RS2 bounds each round trip by bytes, computed from the describe's declared column widths.
+`results.fetch_rows` is then the most rows one round trip may carry, not the number it always
+carries. The default, the bounds and the levels are unchanged. The owner's sign-off (`phase-1.md`
+§C.3 item 10) is re-asked as a bytes-per-round-trip budget (ADR-0004 owner-review point (a)).
