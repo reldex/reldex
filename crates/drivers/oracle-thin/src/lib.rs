@@ -329,6 +329,7 @@ mod conn;
 mod connect_timeout;
 mod cursor;
 mod descriptor;
+mod endpoint;
 mod error;
 mod lob;
 mod metadata;
@@ -345,4 +346,5 @@ pub use conn::{
 pub use connect_timeout::{
     DEFAULT_CONNECT_TIMEOUT, EXT_CONNECT_TIMEOUT_UNBOUNDED, MAX_CONNECT_TIMEOUT,
 };
+pub use endpoint::sid_endpoint;
 pub use sql_dialect::sql_dialect;

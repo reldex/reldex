@@ -1,0 +1,59 @@
+[package]
+name = "reldex-workspace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The vendor-neutral driver contract: `ConnectionParams`, `Endpoint`,
+# `Credentials`, `Secret`, `Statement` and `ServerOutputSetting` are what a
+# profile and its resolved settings turn into (`connect` module). It has no
+# production dependencies of its own. This crate deliberately does **not**
+# depend on `reldex-db-core`: nothing here needs a session or a thread, and
+# keeping the persistence layer off `db-core` keeps `db-core` free of SQLite
+# (ADR-0006 "Crate boundary").
+reldex-db-driver-api = { path = "../db-driver-api" }
+
+# SQLite, through its de-facto standard Rust binding. Owner decision
+# 2026-09-20 (`docs/exec-plans/active/phase-1.md` §C.3 item 8): one SQLite
+# file for profiles, settings, history and workspace. Licence: MIT (rusqlite,
+# libsqlite3-sys); SQLite itself is public domain.
+#
+# `bundled` compiles the SQLite amalgamation into the binary instead of
+# linking whatever `libsqlite3` the machine has: Windows has no system
+# SQLite to link, and on Linux/macOS the system copy's version and compile
+# options (WAL, `application_id`, foreign keys) would vary per machine, so
+# the same file could behave differently on two desktops. It needs a C
+# compiler at build time, which the workspace already requires for
+# `aws-lc-rs` (oracle-thin's TLS provider).
+#
+# `default-features = false` drops only `cache` (an LRU prepared-statement
+# cache and its `hashlink` dependency); this store issues a handful of
+# statements per user action, so the cache buys nothing measurable.
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+
+# Profile ids are random (version 4) UUIDs: `SPEC.md` §17 profiles must stay
+# distinct across export/import and machines, and the M2.10 credential store is
+# keyed by the profile id, so the id must never be reused or guessable from a
+# row number. Licence: Apache-2.0 OR MIT. Already in the workspace graph (via
+# `oracledb`), at the same version; `v4` adds `getrandom`, also already present.
+uuid = { version = "1.26.1", default-features = false, features = ["std", "v4"] }
+
+[dev-dependencies]
+# Only the tests that use the reference `DriverBinding` for the Oracle thin
+# driver (`tests/support/oracle_binding.rs`): it is written against that
+# driver's own extension-key constants and SID builder, so the tests prove the
+# mapping with what the driver actually reads rather than a copy of it. A dev-dependency never reaches the compiled
+# product; the production binding belongs to the composition root (M2.11),
+# the only place allowed to name a concrete driver (ADR-0006 "Driver binding").
+reldex-driver-oracle-thin = { path = "../drivers/oracle-thin" }
+
+# Only `tests/dependency_rules.rs`, to parse `cargo metadata` JSON — the same
+# use, and the same version, as `reldex-db-core`'s own dependency-rule test.
+serde_json = "1"

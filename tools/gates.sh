@@ -40,7 +40,7 @@
 #   doc     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps, scoped to the
 #           crates that are clean today (reldex-ffi, reldex-sql-text,
 #           reldex-db-driver-api, reldex-mobile-link-check,
-#           reldex-core-poc). reldex-driver-mock, reldex-db-core and
+#           reldex-core-poc, reldex-workspace). reldex-driver-mock, reldex-db-core and
 #           reldex-driver-oracle-thin have pre-existing broken/private
 #           intra-doc links, unrelated to this script; not fixed here.
 #   ui      bash ui/build.sh --test, only when Qt 6.8 + CMake + Ninja (and,
@@ -212,6 +212,7 @@ DOC_CLEAN_CRATES=(
     reldex-db-driver-api
     reldex-mobile-link-check
     reldex-core-poc
+    reldex-workspace
 )
 
 do_doc() {
