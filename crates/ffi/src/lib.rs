@@ -129,6 +129,7 @@ mod format;
 mod hub;
 mod mock;
 mod session;
+mod splitter;
 mod status;
 mod strings;
 
@@ -173,6 +174,7 @@ pub use session::{
     reldex_session_rollback_to_savepoint, reldex_session_savepoint,
     reldex_session_set_server_output,
 };
+pub use splitter::{ReldexEndedBy, ReldexSplitKind, ReldexStatementSpan, reldex_split_statements};
 pub use status::ReldexStatus;
 pub use strings::{RELDEX_UTF16_OFFSET_INVALID, ReldexStr, reldex_utf16_offset};
 

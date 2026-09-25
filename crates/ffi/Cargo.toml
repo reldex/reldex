@@ -23,8 +23,9 @@ workspace = true
 # choice, so each one is a feature and the default is the mock: spike S15, the
 # C smoke harness (M1.4) and every test here run with no database at all, and a
 # product build will be `--no-default-features --features oracle-driver` once
-# that feature exists (M2.11). Nothing in `src/` outside `mock.rs` knows which
-# driver it is talking to.
+# that feature exists (M1.8 — session opening against a real driver; see
+# `reldex_hub_open_session`). Nothing in `src/session.rs`'s session-opening path
+# outside `mock.rs` knows which driver it is talking to.
 default = ["mock-driver"]
 mock-driver = ["dep:reldex-driver-mock"]
 
@@ -38,11 +39,21 @@ reldex-driver-mock = { path = "../drivers/mock" }
 reldex-db-core = { path = "../db-core" }
 reldex-db-driver-api = { path = "../db-driver-api" }
 reldex-driver-mock = { path = "../drivers/mock", optional = true }
+# M2.11 composition root: statement splitting (family 3) is vendor-neutral,
+# but still needs one concrete driver's SQL dialect (metadata/settings/
+# credentials in families 4-7 will need its `MetadataCatalog` and
+# `DriverBinding` too). Oracle is the only driver today (`SPEC.md` §7), so
+# this crate — the one place allowed to name a concrete driver
+# (`ARCHITECTURE.md` §2) — depends on it directly. This is independent of
+# `mock-driver` above: none of it opens a database connection, so it needs no
+# feature gate of its own and is exercised by the default
+# `cargo test --workspace` gate.
+reldex-driver-oracle-thin = { path = "../drivers/oracle-thin" }
+reldex-sql-text = { path = "../sql-text" }
 
-# No production dependency beyond the two vendor-neutral crates above and the
-# driver the build selects (`AGENTS.md`, "do not add production dependencies
-# without documenting why"). `cbindgen` generates `include/reldex.h` but is a
-# *command-line tool* run by `gen-header.sh`, not a build-dependency: making it
-# one would put a parser of our own source into every build of the most
-# correctness-critical crate for no gain, since the header is committed and
-# verified (ADR-0003 D7).
+# No production dependency beyond the vendor-neutral and driver crates above
+# (`AGENTS.md`, "do not add production dependencies without documenting why").
+# `cbindgen` generates `include/reldex.h` but is a *command-line tool* run by
+# `gen-header.sh`, not a build-dependency: making it one would put a parser of
+# our own source into every build of the most correctness-critical crate for
+# no gain, since the header is committed and verified (ADR-0003 D7).

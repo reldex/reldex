@@ -689,6 +689,8 @@ dependencies = [
  "reldex-db-core",
  "reldex-db-driver-api",
  "reldex-driver-mock",
+ "reldex-driver-oracle-thin",
+ "reldex-sql-text",
 ]
 
 [[package]]
