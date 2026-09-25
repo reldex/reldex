@@ -53,7 +53,9 @@ mutually dependent.
 ### D1 — A blocking, object-safe trait contract; no async runtime in `db-driver-api`
 
 `db-driver-api` exposes plain blocking traits (`DatabaseDriver`, `DatabaseConnection`, `Cursor`,
-`CancelHandle`, `LobStream`) and has **zero production dependencies**. Concurrency is owned by
+`CancelHandle`, `LobStream`) and has **zero production dependencies** (since 2026-09-25 one,
+`zeroize`, private to `Secret`: see the amendment to accepted item 4 below, and ADR-0007 S6).
+Concurrency is owned by
 `db-core`: **one dedicated worker thread per session**, which owns the `Box<dyn DatabaseConnection>`
 for that session's lifetime and drains a command channel.
 

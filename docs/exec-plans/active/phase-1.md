@@ -381,6 +381,7 @@ Six milestones. M1 is the de-risking gate and nothing downstream starts until it
 | M2.11 | `[ ]` todo | FFI surface for M2.5–M2.10 + regenerate and verify header | `sonnet` | M1.3 | `crates/ffi` extension | M2.5–M2.10 | `cbindgen --verify` clean; C smoke harness extended. **M2.9 hand-off:** the production Oracle `DriverBinding` (lift `crates/workspace/tests/support/oracle_binding.rs`) maps extension keys only and wires the driver's `reldex_driver_oracle_thin::sid_endpoint` for SID endpoints; settings cross the ABI by a numeric id, never the storage key; `ProfileId` as 16 bytes (ADR-0006 P4) **M2.10 hand-off:** the composition root calls `reldex_secrets::platform_default()` once and keeps it as an `Arc<dyn CredentialStore>` on the workspace service thread. `CredentialStoreKind`, `CredentialError`, `PromptReason` and `PasswordSource` cross the ABI as numeric enums. A password crosses only as bytes passed into a call, or handed out by a call that has a paired wipe-and-free function (ADR-0007 Consequences). | M |
 | M2.12 | `[x]` done 2026-09-25 — reviewed (1 must-fix landed); live 6/6 + 9/9; fuzz 120k | Server output framing over `RAW`/`LENGTHB` with per-line UTF-8 decoding in Rust, so one invalid line loses only itself | `sonnet` | M2.7 review; ADR-0002 T2 "Known limit" | `oracle-thin` `server_output.rs` change + live test | M2.7 | Today a line that is not valid UTF-8 loses every line of its read (up to 4,096 good lines) through the crate's strict `from_utf8` (`db_value.rs:164`). After this, only that line is lost and it is reported. The `LENGTH4` == Rust char count assumption is gone. Single-byte database character sets no longer exceed `max_bytes` (≈3× today, review N7). | S |
 | M2.13 | `[ ]` todo | Per-statement server-output drain bound: a total cap reported through `dropped`/`failure`, or a cancel flag checked between reads like abandon | `opus` | M2.7 review; ADR-0002 T6 | `db-core` worker change + tests | M2.7, M4.7 | Today the drain has no length bound, cannot be cancelled on Oracle, and holds `Executed` back until it finishes (10M lines ≈ 2.5k round trips). After this, a statement's reply is never held longer than the bound, and what was not read is reported, never silent. This is safe because the next `PUT` purges leftovers (measured, T6). | S |
+| M2.14 | `[ ]` todo — planned (M2.10 review follow-up) | Credential orphan sweep: delete `Reldex/profile/*` Credential Manager entries whose profile no longer exists | `sonnet` | ADR-0007 S4 "Residual" + Consequences | `crates/secrets` sweep + a call from the workspace service thread | M3.3 | Enumerates with `CredEnumerateW` filtered to `Reldex/profile/*` and deletes entries whose UUID names no profile. Runs at startup and after a profile is deleted, and reports counts. Never touches an entry outside the namespace (tested with a non-Reldex entry beside it). Cleans up both the residual lost-delete race with other applications and a failed clear | S |
 
 **Parallelism.** M2.1/M2.2 (driver), M2.4 (sql-text), M2.9/M2.10 (settings/secrets) and M2.5/M2.6 (events) are four independent tracks. M2.11 gates on all of them.
 **Mandatory review:** M2.1, M2.3, M2.5, M2.6, M2.7, M2.9, M2.10 — concurrency, contract change, and security.
@@ -418,31 +419,71 @@ server-output buffer's lower bound is 2,000 bytes; store hardening — `0700`/`0
 `ReadOnly`/`IncompleteHeader`/`SchemaMismatch`, case-insensitive ids, the four-wait open documented
 (P5); and a dependency-rule test. The C ABI is unchanged and `reldex.h` byte-identical.
 
-**M2.10 notes (as implemented; independent review pending).** The decision record is
-[ADR-0007](../../decisions/0007-credential-store.md), and `crates/secrets/README.md` is the user
-guide. The output is the new crate `crates/secrets` (`reldex-secrets`): the `CredentialStore` trait,
-`WindowsCredentialManager` (`CRED_TYPE_GENERIC`, target `Reldex/profile/<uuid>`,
-`CRED_PERSIST_LOCAL_MACHINE`, UTF-8 blob of at most 2,560 bytes), `NoCredentialStore` (every call
-fails with `Unavailable`, which is what every platform except Windows gets from
-`platform_default()`), `resolve_password(profile, store) -> PasswordSource`, and a
-`MemoryCredentialStore` behind a `test-support` feature. The "core wiring" part of the row is the
-pure `resolve_password`. The caller that joins it to `connection_params` is M3.3 through M2.11's
-service thread, and `reldex-workspace` does not depend on the new crate. Where this departs from
-the row or needs a second look: (1) `resolve_password` returns a `PasswordSource` with three
-variants (`FromStore`, `PromptRequired(reason)`, `NotNeeded`), not a `Result`, because every store
-failure becomes a prompt with a reason (ADR-0007 S3); (2) `windows-sys`, not the `windows` crate
-§C.3 item 7 named: same project and licence, raw declarations only (S7); (3) `unsafe` is allowed in
-one more place, the file `crates/secrets/src/wincred.rs`, fenced like `crates/ffi`, and
-`fences.rs` now lists files as well as crates (S5); (4) `Secret` now wipes itself with `zeroize`,
-the driver contract's first production dependency, which settles ADR-0002's deferred item 4 (S6);
-(5) **measured while testing:** the Credential Manager loses updates when different targets are
-written at the same time (deleted entries come back once the process exits; across processes a
-just-written entry reads back absent), so every call now holds a session-wide named mutex. That
-closes the loss between Reldex threads and processes. The same race with *other* applications is
-an accepted platform limitation (S4). Evidence: `cargo test -p reldex-secrets`, 15 unit tests,
-9 real Credential Manager tests (Thai/emoji, empty, 512 and 2,560 bytes, 2,561 refused, `cmdkey`
-as witness, two processes lose nothing; that test fails 5/5 without the mutex) and 3
-dependency-rule tests. The C ABI is unchanged and `reldex.h` byte-identical.
+**M2.10 notes (as implemented; independent review returned, fix round landed).** The decision
+record is [ADR-0007](../../decisions/0007-credential-store.md), and `crates/secrets/README.md` is the
+user guide.
+
+The output is the new crate `crates/secrets` (`reldex-secrets`):
+
+- the `CredentialStore` trait;
+- `WindowsCredentialManager`: `CRED_TYPE_GENERIC`, target `Reldex/profile/<uuid>`,
+  `CRED_PERSIST_LOCAL_MACHINE`, comment `Reldex credential v1`. The blob is `RLDX`, the version
+  byte `0x01`, then the UTF-8 password, at most **2,555** bytes;
+- `NoCredentialStore`: every call fails with `Unavailable`, and it is what every platform except
+  Windows gets from `platform_default()`;
+- `resolve_password(profile, store) -> PasswordSource`;
+- a `MemoryCredentialStore` behind a `test-support` feature.
+
+The "core wiring" part of the row is the pure `resolve_password`. The caller that joins it to
+`connection_params` is M3.3, through M2.11's service thread. `reldex-workspace` does not depend on
+the new crate.
+
+Where this departs from the row or needs a second look:
+
+1. `resolve_password` returns a `PasswordSource` with three variants (`FromStore`,
+   `PromptRequired(reason)`, `NotNeeded`), not a `Result`, because every store failure becomes a
+   prompt with a reason (ADR-0007 S3).
+2. `windows-sys` is used, not the `windows` crate that §C.3 item 7 named: same project and licence,
+   raw declarations only (S7).
+3. `unsafe` is allowed in one more place, the file `crates/secrets/src/wincred.rs`, fenced like
+   `crates/ffi`. `fences.rs` now lists files as well as crates, and catches `expect(unsafe_code)`
+   too (S5).
+4. `Secret` now wipes itself with `zeroize`. That is the driver contract's first production
+   dependency, and it settles ADR-0002's deferred item 4 (S6).
+
+S5–S7 are provisionally accepted by the lead, pending owner confirmation.
+
+**Review fixes (review of `7349f5a`: RETURN, narrow).**
+
+- **Must-fix: foreign entries.** An entry Reldex did not write, such as `cmdkey`'s UTF-16, used to be
+  returned as the password, which would have sent a wrong password to the database automatically
+  and pushed the account towards lockout. The stored entry is now versioned (S8). Anything else
+  under that target name is `Malformed`, which leads to a prompt. A password with a control
+  character is refused with `InvalidSecret`.
+- **Measured: concurrent writers lose updates.** This is measured while testing, and the mechanism
+  is now described correctly. With `CRED_PERSIST_LOCAL_MACHINE`, concurrent writes to *different*
+  targets lose updates. A read straight after a delete is clean, yet the entry reappears later,
+  while the process is still running. Across processes, a just-written entry can read back as
+  absent. `CRED_PERSIST_SESSION` loses nothing, but it forgets passwords at logoff, so it is kept
+  out.
+- **The lock.** Every call holds a per-user named mutex, `Local\Reldex.CredentialStore.<SID>`. It
+  is created with a descriptor granting only `SYNCHRONIZE | MUTEX_MODIFY_STATE` at medium
+  integrity, and it waits at most 2 s. A lock that cannot be taken is `Locked { code }`, never
+  `Denied`. The same race with *other* applications is an accepted platform limitation (S4), and
+  M2.14's sweep cleans up after it.
+
+Evidence: `cargo test -p reldex-secrets`, looped 10 times:
+
+- 22 unit tests;
+- 11 real Credential Manager tests:
+  - Thai/emoji, empty, 512 and 2,555 bytes, with 2,556 refused;
+  - `cmdkey` as a witness, and `cmdkey`-written "Hunter2x" and "กข" both `Malformed`, leading to a
+    prompt;
+  - two processes lose nothing; that test fails 5/5 without the lock;
+- a squatted-lock test with a real PowerShell squatter;
+- 3 dependency-rule tests.
+
+The C ABI is unchanged and `reldex.h` byte-identical.
 
 ---
 
@@ -455,8 +496,8 @@ dependency-rule tests. The C ABI is unchanged and `reldex.h` byte-identical.
 | ID | Status | Title | Owner | Inputs | Outputs | Deps | Acceptance | Size |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | M3.1 | `[x]` done 2026-09-25 — reviewed (tab-bar palette must-fix landed); 9/9 offscreen tests; DPI 1×/1.5×/2× | App shell: window, docking-free fixed layout (sidebar / worksheet tabs / output panes), light+dark theme, high-DPI | `sonnet` | SPEC §14 | `ui/app` | M1 gate | Renders at 100/150/200% DPI; theme switch has no restart | M |
-| M3.2 | `[ ]` todo | Connection manager UI: list, create/edit/delete, environment, test-connect | `sonnet` | M2.9 | QML + `ProfileModel` | M2.11 | All `SPEC.md` §17 fields present; environments Dev/Test/UAT/Staging/Production/Custom. **M2.9 hand-off:** endpoint text that looks like a credential is refused with `ProfileError::CredentialInEndpoint { field, pattern }` — show the field and the pattern, never echo the text; offer the "treat as production" choice for a Custom environment only (ADR-0006 P3/P7) **M2.10 hand-off:** offer "save password" only when `CredentialStore::kind().can_store()`, and otherwise save the profile as prompt-each-time. Delete the stored entry when a profile switches to prompt-each-time, and when the profile is deleted (`NotFound`/`Unavailable` count as done). Show `CredentialError`'s value-free `Display` (ADR-0007). | L |
-| M3.3 ★ | `[ ]` todo | Connect flow over the async path, with a bounded timeout and a cancellable "Connecting…" state | `opus` | §B3 | `SessionController` | M2.6, M2.11 | Cancelling a pending connect returns immediately and adopts nothing late; failures show kind + ORA code + cause chain **M2.10 hand-off:** get the password with `reldex_secrets::resolve_password` on the workspace service thread, never the UI thread, and handle `FromStore` / `PromptRequired(reason)` / `NotNeeded` by name. On a prompt, say why. Save a typed password only after the connect succeeds, and only if the user asked. With no store (every platform except Windows today), every connect prompts (ADR-0007 S3). | M |
+| M3.2 | `[ ]` todo | Connection manager UI: list, create/edit/delete, environment, test-connect | `sonnet` | M2.9 | QML + `ProfileModel` | M2.11 | All `SPEC.md` §17 fields present; environments Dev/Test/UAT/Staging/Production/Custom. **M2.9 hand-off:** endpoint text that looks like a credential is refused with `ProfileError::CredentialInEndpoint { field, pattern }` — show the field and the pattern, never echo the text; offer the "treat as production" choice for a Custom environment only (ADR-0006 P3/P7) **M2.10 hand-off:** offer "save password" only when `CredentialStore::kind().can_store()`, and otherwise save the profile as prompt-each-time. **Write order:** store `put` first, then the `PasswordStorage` flag. If `put` fails (`InvalidSecret`, `TooLarge`, `Locked`, `Denied`, `Backend`), the flag stays prompt-each-time and the UI says so. **Clearing:** delete the stored entry when a profile switches to prompt-each-time, and when the profile is deleted (`NotFound`/`Unavailable` count as done). If the delete fails (`Denied`, `Backend`, `Locked`), the flag still flips to prompt-each-time, the leftover entry is reported to the user, and it is left for M2.14's sweep. Show `CredentialError`'s value-free `Display` (ADR-0007 Consequences). | L |
+| M3.3 ★ | `[ ]` todo | Connect flow over the async path, with a bounded timeout and a cancellable "Connecting…" state | `opus` | §B3 | `SessionController` | M2.6, M2.11 | Cancelling a pending connect returns immediately and adopts nothing late; failures show kind + ORA code + cause chain **M2.10 hand-off:** get the password with `reldex_secrets::resolve_password` on the workspace service thread, never the UI thread, and handle `FromStore` / `PromptRequired(reason)` / `NotNeeded` by name. On a prompt, say why (e.g. `StoreFailed(Malformed)`: the saved entry is not one Reldex wrote). **Saving:** save a typed password only after the connect succeeds, only if the user asked, and follow M3.2's write order. **Refused stored password:** if the database refuses a `FromStore` password, the next connect prompts and the UI offers to update the saved password. **Never retry a stored password automatically:** each attempt counts towards the account's failed-login limit. **No store:** on every platform except Windows today, every connect prompts (ADR-0007 S3, Consequences). | M |
 | M3.4 | `[ ]` todo | Production indicator: persistent, not colour-only (icon + text + tab badge) | `sonnet` | SPEC §17 | QML | M3.2 | Visible in every place a statement can be run; passes a greyscale check. **M2.9 hand-off:** read `Profile::treat_as_production()`, not the `Environment` enum — always on for Production, the user's choice for Custom (ADR-0006 P3) | S |
 | M3.5 ★ | `[ ]` todo | TCPS UI described exactly as `SPEC.md` §8: user-supplied CA PEM, verification always on; surfaces the descriptor-guard warnings from C-6 | `opus` | SPEC §8; spike S8; PR #5 | QML + wording | M2.3 | No control implies mTLS, wallet files, OS trust store or revocation; `SSL_SERVER_CERT_DN` refusal explains the opt-out rather than failing blankly | M |
 | M3.6 | `[ ]` todo | Settings UI: application defaults, per-profile overrides, provenance shown ("inherited from profile") | `sonnet` | M2.9 | QML | M3.2 | Every default in the product is reachable here (owner rule: every default is user-configurable) | M |

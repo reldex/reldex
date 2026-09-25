@@ -347,9 +347,12 @@ Database Cursor -> Batch Fetch -> Result Store -> Virtual Table Model -> Visible
   (`Secret`) and `zeroize`, and on Windows `windows-sys`. Nothing below it depends on it, so the
   SQLite store can never reach a password. The Windows backend keeps one `CRED_TYPE_GENERIC` entry
   per profile under `Reldex/profile/<uuid>`, with `CRED_PERSIST_LOCAL_MACHINE` (this user on this
-  machine, never roamed) and the password's UTF-8 bytes (at most 2,560) as the blob. Every call
-  holds a session-wide named mutex, because concurrent Credential Manager writes of different
-  targets were measured to lose updates. Every other platform gets `NoCredentialStore` from
+  machine, never roamed). Its blob is a versioned Reldex entry: `RLDX`, the version byte `0x01`, then
+  the UTF-8 password, at most 2,555 bytes and with no control character. Anything else under that
+  name is `Malformed`, so it is never sent to a database and the user is prompted instead. Every call
+  holds a per-user named mutex, and a lock that cannot be taken is `Locked`. The mutex is there
+  because, with local-machine persistence, concurrent Credential Manager writes of different targets
+  were measured to lose updates. Every other platform gets `NoCredentialStore` from
   `platform_default()` until its own backend lands: every call fails with `Unavailable` and the
   password is asked for at every connect. The connect flow's rule is one function,
   `resolve_password(profile, store) -> PasswordSource::{FromStore, PromptRequired(reason),

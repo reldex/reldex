@@ -113,6 +113,7 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 - [ ] M2.11 FFI surface for M2.5–M2.10 + regenerate and verify header (sonnet)
 - [x] M2.12 Server output framing over `RAW`/`LENGTHB` with per-line UTF-8 decoding, so one invalid line loses only itself (sonnet; M2.7 review follow-up) —  — done 2026-09-25: RAW framing — `SYS.UTL_I18N.STRING_TO_RAW` plus a 5-digit byte-length prefix per line in `LONG RAW` OUT binds, per-frame UTF-8 decoding in Rust, invalid bytes replaced by U+FFFD and counted in `invalid_utf8_lines` on the `ServerOutput` event and the completion log (mock can script it); independently reviewed (1 must-fix landed: the count had been dropped in db-core); live 6/6 + 9/9, 32,767-byte lines byte-exact, 120k fuzz inputs, no perf regression
 - [ ] M2.13 Per-statement server-output drain bound (total cap reported, or a cancel flag checked between reads) (opus; M2.7 review follow-up)
+- [ ] M2.14 Credential orphan sweep: delete `Reldex/profile/*` Credential Manager entries whose profile no longer exists, at startup and after a profile delete; never outside the namespace (sonnet; M2.10 review follow-up; after M3.3)
 
 ### M3 — Connect: shell, connection manager, first real session
 
