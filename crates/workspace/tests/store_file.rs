@@ -8,8 +8,9 @@ use reldex_db_driver_api::SessionRole;
 use reldex_workspace::settings::{FETCH_ROWS, STATEMENT_TIME_LIMIT, TimeLimit};
 use reldex_workspace::store::{APPLICATION_ID, Migrated, SCHEMA_VERSION};
 use reldex_workspace::{
-    Authentication, DatabaseType, Environment, PasswordStorage, Profile, ProfileDetails,
-    ProfileEndpoint, Scope, ServiceTarget, Store, StoreError, TlsOptions,
+    Authentication, DatabaseType, Environment, HistoryEntry, HistoryOutcome, HistoryPage,
+    PasswordStorage, Profile, ProfileDetails, ProfileEndpoint, ProfileId, Scope, ServiceTarget,
+    Store, StoreError, TlsOptions, UnixTimeMs,
 };
 use rusqlite::Connection;
 use support::{TempDir, bytes_of};
@@ -119,6 +120,70 @@ fn a_v1_file_reopens_unchanged_with_its_data() {
 
     // Opening and reading wrote nothing: not the schema, not the header.
     assert_eq!(bytes_of(&dir.store_path()), before);
+}
+
+#[test]
+fn a_genuine_v1_file_migrates_forward_keeping_its_data_and_gains_the_new_tables() {
+    // A real schema-1 file: built with today's `Store` (which always writes
+    // the *current* schema) and then reduced to exactly what schema 1 ever
+    // had — the tables M4.10/M6.2/the fix-round history_meta added, dropped,
+    // and the header's own version pragma set back to 1 — rather than
+    // hand-written DDL, so the profile/setting rows are guaranteed the shape
+    // the real schema-1 code produced, not an approximation of it.
+    let dir = TempDir::new("v1-real");
+    let profile = populated(&dir);
+    {
+        let raw = Connection::open(dir.store_path()).expect("raw open");
+        raw.execute_batch(
+            "DROP TABLE layout; DROP TABLE worksheet_setting; DROP TABLE history; \
+             DROP TABLE worksheet; DROP TABLE history_meta;",
+        )
+        .expect("drop the v2/v3/v4 tables");
+        raw.pragma_update(None, "user_version", 1u32)
+            .expect("pragma");
+    }
+
+    let mut store = Store::open(dir.store_path()).expect("open the reduced v1 file");
+    assert_eq!(
+        store.migration(),
+        Migrated {
+            from: 1,
+            to: SCHEMA_VERSION
+        }
+    );
+    assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
+    // The v1 data survived the migration untouched.
+    assert_eq!(
+        store.profile(profile.id()).expect("read"),
+        Some(profile.clone())
+    );
+    assert_eq!(
+        store
+            .application_settings()
+            .expect("load")
+            .value
+            .get(FETCH_ROWS),
+        Some(250)
+    );
+    // And the migrated file now supports M4.10/M6.2, not just schema 1's own
+    // tables.
+    store
+        .record_history(HistoryEntry {
+            profile: profile.id(),
+            executed_at: UnixTimeMs::now(),
+            statement: "select 1 from dual".to_owned(),
+            outcome: HistoryOutcome::Succeeded,
+            elapsed_ms: 3,
+            row_count: Some(1),
+        })
+        .expect("history works on a migrated file");
+    assert_eq!(
+        store
+            .history(profile.id(), HistoryPage::first(10))
+            .expect("history")
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -264,9 +329,15 @@ fn an_identified_file_with_tables_but_no_version_is_refused_and_left_untouched()
 
 #[test]
 fn tables_that_differ_from_their_version_are_a_schema_mismatch() {
-    // Identity and version say "schema 1", the tables say otherwise: a file
-    // altered outside Reldex. Opening only reads the header; the first
-    // statement that touches the missing column fails with a typed error.
+    // Identity and version say "current schema", the tables say otherwise: a
+    // file altered outside Reldex. Opening only reads the header; the first
+    // statement that touches a missing table or column fails with a typed
+    // error. Deliberately missing every table added since schema 1
+    // (`history`, `worksheet`, `worksheet_setting`, `layout`), so every kind
+    // of store method — not only the profile/setting ones schema 1 always
+    // had — meets the same mismatch, whether the underlying SQLite error
+    // names a missing column or (for a whole missing table) a bare
+    // `SQLITE_ERROR`.
     let dir = TempDir::new("mismatch");
     {
         let raw = Connection::open(dir.store_path()).expect("raw open");
@@ -289,6 +360,20 @@ fn tables_that_differ_from_their_version_are_a_schema_mismatch() {
     }
     assert!(matches!(
         store.application_settings(),
+        Err(StoreError::SchemaMismatch { .. })
+    ));
+    match store.history(ProfileId::new_random(), HistoryPage::first(1)) {
+        Err(StoreError::SchemaMismatch { detail }) => {
+            assert!(detail.contains("no such table"), "{detail}");
+        }
+        other => panic!("expected SchemaMismatch, got {other:?}"),
+    }
+    assert!(matches!(
+        store.load_worksheets(),
+        Err(StoreError::SchemaMismatch { .. })
+    ));
+    assert!(matches!(
+        store.load_layout(),
         Err(StoreError::SchemaMismatch { .. })
     ));
 }

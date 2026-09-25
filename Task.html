@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-25T21:23:00+07:00",
+  "updatedAt": "2026-09-25T21:53:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1312,8 +1312,8 @@
               "status": "todo"
             },
             {
-              "title": "M4.10 Query history (per profile, SQLite), re-run into the current worksheet (sonnet)",
-              "status": "todo"
+              "title": "M4.10 Query history (per profile, SQLite), re-run into the current worksheet (sonnet) —  — store side done 2026-09-25: history table (per profile, FK cascade, outcome enum, bind values have no storage path, SQL text verbatim by design), bounded by history.max_entries_per_profile (default 1,000; unlimited allowed with its consequence) with an O(1) amortised trim via a per-profile counter (measured flat 22–50 µs/insert at every limit up to 1,000,000 and 50k rows); schema v1→v4 forward-only; independently reviewed (1 must-fix landed: trim cost); UI half (history pane, re-run into the worksheet) pending M2.11/M4.x",
+              "status": "in_progress"
             }
           ]
         },
@@ -1362,8 +1362,8 @@
               "status": "todo"
             },
             {
-              "title": "M6.2 Workspace persistence: open worksheets, text, layout, active profile — non-transactional state only (sonnet)",
-              "status": "todo"
+              "title": "M6.2 Workspace persistence: open worksheets, text, layout, active profile — non-transactional state only (sonnet) —  — store side done 2026-09-25: worksheet, worksheet_setting (real FK, cascade — closes the ADR-0006 keyed-alone gap) and single-row layout tables; non-transactional state only (no session, connection or transaction column exists); Debug redacts text; shell half (restore on start) pending M2.11/M3.x",
+              "status": "in_progress"
             },
             {
               "title": "M6.3 i18n baseline: qsTr everywhere, EN + TH catalogues, lrelease in the build; Thai rendering test (sonnet)",
@@ -1696,6 +1696,14 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-25",
+      "text": "M6.2 store side done: open worksheets, their text and positions, tab order and the window layout can now be saved and reloaded from the SQLite file. Nothing about a session or a transaction is stored — a restore can never imply one (verified by the reviewer against every new table). The shell half, restoring on start, follows once the FFI surface exists."
+    },
+    {
+      "date": "2026-09-25",
+      "text": "M4.10 store side done: query history now has a home in the SQLite file — per profile, bounded, with bind values never stored and the SQL text stored as typed (an accepted, documented limitation). Independent review found the size trim cost grew with the limit, up to 30 ms per statement at large limits; it is now a constant ~22 µs by keeping a per-profile counter, measured at every limit up to a million rows. The history pane and re-run come with the UI work after the FFI surface (M2.11)."
+    },
     {
       "date": "2026-09-25",
       "text": "M2.10 done: passwords now live only in the Windows Credential Manager, keyed by the profile's UUID, and a missing store means the app asks every time — there is no plaintext fallback anywhere. Independent review caught a real defect: an entry written by another tool under our name was read back as the password and would have been sent to the database, risking an account lockout; every entry now carries a versioned Reldex prefix and anything else is refused and prompts. Testing also showed that Credential Manager loses writes when two callers write at once, even to different entries, so every call takes a per-user cross-process lock (measured clean over 1,200 cycles). Three decisions are marked as provisionally accepted by the lead pending the owner: zeroize as the driver contract's first dependency, one fenced unsafe file, and windows-sys in place of the windows crate. A follow-up (M2.14) will sweep orphaned entries."

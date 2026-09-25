@@ -1,6 +1,6 @@
 //! The SQLite store: one file holding profiles and settings (owner decision
-//! 2026-09-20, `phase-1.md` §C.3 item 8), and later query history (M4.10) and
-//! workspace state (M6.2).
+//! 2026-09-20, `phase-1.md` §C.3 item 8), query history (M4.10, `store::history`)
+//! and workspace state (M6.2, `store::worksheet`).
 //!
 //! # Threading contract
 //!
@@ -42,8 +42,10 @@
 
 mod codec;
 mod error;
+mod history;
 mod paths;
 mod schema;
+mod worksheet;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -104,6 +106,8 @@ pub enum StoreTable {
     Profile,
     /// Setting values.
     Setting,
+    /// Open worksheets.
+    Worksheet,
 }
 
 /// Why a stored row was left out of what was loaded.
@@ -573,32 +577,54 @@ impl Store {
         self.load_layer(Scope::Worksheet(id))
     }
 
+    /// Both scope tables read the same four columns; `Scope::Worksheet` reads
+    /// [`worksheet_setting`] — the FK-backed table ADR-0006 moved worksheet
+    /// overrides into — everything else still reads `setting`. Collected
+    /// into a `Vec` first because the two branches prepare different
+    /// statements (different concrete `Rows<'_>` types).
     fn load_layer<S: ScopeLevel>(
         &self,
         scope: Scope,
     ) -> Result<Loaded<SettingsLayer<S>>, StoreError> {
         debug_assert_eq!(scope.level(), S::LEVEL);
-        let mut statement = self.connection.prepare(
-            "SELECT setting_key, kind, int_value, text_value FROM setting \
-             WHERE scope = ?1 AND scope_id = ?2 ORDER BY setting_key",
-        )?;
-        let rows = statement.query_map(
-            params![codec::level_word(scope.level()), scope.id_text()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
-            },
-        )?;
+        type Row = (String, String, Option<i64>, Option<String>);
+        let to_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Row> {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        };
+        let rows: Vec<Row> = match scope {
+            Scope::Worksheet(id) => {
+                let mut statement = self.connection.prepare(
+                    "SELECT setting_key, kind, int_value, text_value FROM worksheet_setting \
+                     WHERE worksheet_id = ?1 ORDER BY setting_key",
+                )?;
+                statement
+                    .query_map(params![id.to_string()], to_row)?
+                    .collect::<rusqlite::Result<_>>()?
+            }
+            Scope::Application | Scope::Profile(_) => {
+                let mut statement = self.connection.prepare(
+                    "SELECT setting_key, kind, int_value, text_value FROM setting \
+                     WHERE scope = ?1 AND scope_id = ?2 ORDER BY setting_key",
+                )?;
+                statement
+                    .query_map(
+                        params![codec::level_word(scope.level()), scope.id_text()],
+                        to_row,
+                    )?
+                    .collect::<rusqlite::Result<_>>()?
+            }
+        };
         let mut loaded = Loaded {
             value: SettingsLayer::<S>::new(),
             rejected: Vec::new(),
         };
         for row in rows {
-            let (key, kind, int, text) = row?;
+            let (key, kind, int, text) = row;
             let reject = |reason| RejectedRow {
                 table: StoreTable::Setting,
                 key: key.clone(),
@@ -650,6 +676,11 @@ impl Store {
     /// # Errors
     ///
     /// As [`Store::put_setting`], plus a kind mismatch.
+    /// [`StoreError::WorksheetNotFound`] for a worksheet scope whose
+    /// worksheet does not exist — the same rule [`StoreError::ProfileNotFound`]
+    /// already enforced for a profile scope, now possible for a worksheet
+    /// scope too because `worksheet_setting` has a real foreign key to
+    /// `worksheet(id)` (ADR-0006, resolved by M6.2).
     pub fn put_setting_value(
         &mut self,
         scope: Scope,
@@ -674,21 +705,52 @@ impl Store {
                 return Err(StoreError::ProfileNotFound(profile));
             }
         }
-        transaction.execute(
-            "INSERT INTO setting (scope, scope_id, setting_key, kind, int_value, text_value, \
-             updated_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6) \
-             ON CONFLICT (scope, scope_id, setting_key) DO UPDATE SET \
-             kind = excluded.kind, int_value = excluded.int_value, text_value = NULL, \
-             updated_at = excluded.updated_at",
-            params![
-                codec::level_word(scope.level()),
-                scope.id_text(),
-                id.storage_key(),
-                kind,
-                int,
-                UnixTimeMs::now().as_millis(),
-            ],
-        )?;
+        match scope {
+            Scope::Worksheet(worksheet) => {
+                let exists = transaction
+                    .query_row(
+                        "SELECT 1 FROM worksheet WHERE id = ?1",
+                        params![worksheet.to_string()],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !exists {
+                    return Err(StoreError::WorksheetNotFound(worksheet));
+                }
+                transaction.execute(
+                    "INSERT INTO worksheet_setting (worksheet_id, setting_key, kind, \
+                     int_value, text_value, updated_at) VALUES (?1, ?2, ?3, ?4, NULL, ?5) \
+                     ON CONFLICT (worksheet_id, setting_key) DO UPDATE SET \
+                     kind = excluded.kind, int_value = excluded.int_value, text_value = NULL, \
+                     updated_at = excluded.updated_at",
+                    params![
+                        worksheet.to_string(),
+                        id.storage_key(),
+                        kind,
+                        int,
+                        UnixTimeMs::now().as_millis(),
+                    ],
+                )?;
+            }
+            Scope::Application | Scope::Profile(_) => {
+                transaction.execute(
+                    "INSERT INTO setting (scope, scope_id, setting_key, kind, int_value, \
+                     text_value, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6) \
+                     ON CONFLICT (scope, scope_id, setting_key) DO UPDATE SET \
+                     kind = excluded.kind, int_value = excluded.int_value, text_value = NULL, \
+                     updated_at = excluded.updated_at",
+                    params![
+                        codec::level_word(scope.level()),
+                        scope.id_text(),
+                        id.storage_key(),
+                        kind,
+                        int,
+                        UnixTimeMs::now().as_millis(),
+                    ],
+                )?;
+            }
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -703,20 +765,31 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let deleted = transaction.execute(
-            "DELETE FROM setting WHERE scope = ?1 AND scope_id = ?2 AND setting_key = ?3",
-            params![
-                codec::level_word(scope.level()),
-                scope.id_text(),
-                id.storage_key()
-            ],
-        )?;
+        let deleted = match scope {
+            Scope::Worksheet(worksheet) => transaction.execute(
+                "DELETE FROM worksheet_setting WHERE worksheet_id = ?1 AND setting_key = ?2",
+                params![worksheet.to_string(), id.storage_key()],
+            )?,
+            Scope::Application | Scope::Profile(_) => transaction.execute(
+                "DELETE FROM setting WHERE scope = ?1 AND scope_id = ?2 AND setting_key = ?3",
+                params![
+                    codec::level_word(scope.level()),
+                    scope.id_text(),
+                    id.storage_key()
+                ],
+            )?,
+        };
         transaction.commit()?;
         Ok(deleted > 0)
     }
 
-    /// Removes every value a worksheet overrides — for a worksheet that is
-    /// closed for good. Returns how many were removed.
+    /// Removes every value a worksheet overrides, without deleting the
+    /// worksheet itself. Returns how many were removed.
+    ///
+    /// [`Store::delete_worksheet`] removes them too, via
+    /// `worksheet_setting`'s `ON DELETE CASCADE` — this method is for
+    /// resetting a worksheet's overrides to inherited defaults while keeping
+    /// the worksheet open.
     ///
     /// # Errors
     ///
@@ -726,7 +799,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let deleted = transaction.execute(
-            "DELETE FROM setting WHERE scope = 'worksheet' AND scope_id = ?1",
+            "DELETE FROM worksheet_setting WHERE worksheet_id = ?1",
             params![id.to_string()],
         )?;
         transaction.commit()?;
