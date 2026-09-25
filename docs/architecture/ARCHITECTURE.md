@@ -63,7 +63,7 @@ Vendor-neutral names (`SPEC.md` §6). Vendor types belong only to driver/provide
 | `TransactionManager` | Commit, rollback, savepoint, and transaction-state tracking per session. |
 | `ResultStore` | Typed, batched, bounded-memory storage of fetched rows. |
 | `MetadataProvider` | Generic metadata queries; vendor dictionary SQL stays in the vendor provider. |
-| `WorkspaceService` | Non-transactional workspace, profiles, history, settings, layout state. |
+| `WorkspaceService` | Non-transactional workspace, profiles, history, settings, layout state. Settings, profiles and the SQLite store are `crates/workspace` (M2.9, [ADR-0006](../decisions/0006-local-persistence-settings-profiles-sqlite.md), §9); the service thread that owns the store is M2.11/M3. |
 
 Per [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) D2, `DatabaseConnection` is the
 driver-contract trait (`db-driver-api`; `Send`, not `Sync`; `&mut self`), while `DatabaseSession` is a
@@ -296,6 +296,23 @@ Database Cursor -> Batch Fetch -> Result Store -> Virtual Table Model -> Visible
   above remains a separate, not-yet-built `db-core`-level consumer.
 - SQLite local persistence covers profiles (without plaintext secrets), workspace, query history,
   metadata cache, favorites, snippets, settings, UI layout, feature state (`SPEC.md` §20).
+- **Settings, profiles and the store (M2.9, [ADR-0006](../decisions/0006-local-persistence-settings-profiles-sqlite.md)).**
+  `crates/workspace` holds them, depending on `db-driver-api` only — not on `db-core`, which stays
+  free of SQLite, and on no driver. Every setting is a typed registry entry (kind, built-in default,
+  bounds, the levels it may be set at, what "no limit" costs); the effective value is
+  `worksheet ?? profile ?? application ?? built-in`, reported with the level it came from, and a level
+  a setting does not allow is refused on write and skipped on resolve. A profile's session and display
+  options are its profile-level overrides. The store is one file, `reldex.sqlite3` under the per-user
+  data directory in `com.reldex.reldex`, in WAL mode; its identity and schema version are the SQLite
+  header's `application_id`/`user_version`; migration is forward-only and a newer or foreign file is
+  refused before anything is written. The `Store` is `Send`, not `Sync`, and lives on the workspace
+  service thread — never the UI thread. The vendor-specific residue of a profile (a SID endpoint,
+  driver extension keys) goes through a `DriverBinding` the composition root supplies (M2.11), so the
+  crate names no vendor key.
+- **No secret is written to SQLite**, by construction: no stored type and no column can hold one; a
+  profile records only whether the credential store holds its password, under `CredentialKey` — the
+  profile's UUID — and the password travels from there to `ConnectionParams` as a `Secret`
+  (ADR-0006 P7, tested on the bytes of a real file).
 - Credentials use platform secure storage (Windows Credential Manager, Apple Keychain, Android
   Keystore, Linux Secret Service) behind a single core abstraction. Passwords, credentials, keys,
   and tokens are never logged.
@@ -334,6 +351,7 @@ reviewed against the Phase 0 test database — see §13 item 10 for the still-op
 crates/db-driver-api/          vendor-neutral driver contract + DbError
 crates/db-core/                sessions, transactions, query, results, metadata, workspace
 crates/sql-text/               reldex-sql-text: vendor-neutral SQL/PL-SQL lexer + statement splitter (M2.4)
+crates/workspace/              reldex-workspace: settings + resolution, connection profiles, SQLite store (M2.9, ADR-0006)
 crates/drivers/oracle-thin/    thin driver: wraps Oracle's `oracledb` crate (ADR-0001); vendor code isolated here
 crates/drivers/mock/           test-support/mock driver for core tests
 crates/ffi/                    reldex-ffi: the stable C ABI (ADR-0003); the only crate allowed `unsafe`
@@ -454,7 +472,10 @@ Until then, no code should assume an answer.
 8. **Metadata cache design.** Cache keying and per-database identity isolation, TTL and
    invalidation strategy, and behavior at 100,000+ objects.
 9. **Credential storage abstraction.** What single core abstraction spans the four platform secure
-   stores, and what is the fallback when none is available?
+   stores, and what is the fallback when none is available? *Partly settled:* the fallback is **none**
+   — prompt each time, never plaintext (owner decision 2026-09-20, `phase-1.md` §C.3 item 7) — and the
+   key is the profile's UUID (`reldex_workspace::CredentialKey`, ADR-0006 P7). The trait and the
+   Windows Credential Manager implementation are M2.10.
 10. **Crate layout.** Final workspace layout, crate boundaries, and feature flags (provisional in §11).
     Proposed resolution in part (the FFI/UI tier's crate layout — `crates/ffi`, `crates/sql-text`,
     `ui/`): [ADR-0003](../decisions/0003-qt-rust-integration.md) (**Proposed** — the `crates/ffi`

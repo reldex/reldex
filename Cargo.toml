@@ -9,6 +9,7 @@ members = [
     "crates/reldex-core-poc",
     "crates/mobile-link-check",
     "crates/sql-text",
+    "crates/workspace",
 ]
 
 # ---------------------------------------------------------------------------

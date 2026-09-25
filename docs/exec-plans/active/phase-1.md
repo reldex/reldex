@@ -399,6 +399,18 @@ decision record is ADR-0002 amendment R1–R5, and what M2.11 has to do with `Op
 **unchanged** and `reldex.h` byte-identical; `crates/ffi` still uses the blocking
 `SessionManager::open_session` and its interim pump, which M2.11 replaces.
 
+**M2.9 notes (as implemented).** The decision record is
+[ADR-0006](../../decisions/0006-local-persistence-settings-profiles-sqlite.md). Where it departs from
+the row: (1) the output is a crate of its own, `crates/workspace` (`reldex-workspace`), not a
+`db-core` module, so `db-core` stays free of SQLite and keeps its "`db-driver-api` only" dependency
+rule (ADR-0006 P1); (2) the vendor-specific residue of a profile — a SID endpoint and the Oracle
+driver's extension keys — goes through a `DriverBinding` the composition root supplies; the reference
+Oracle binding is test code (`crates/workspace/tests/support/oracle_binding.rs`) and **M2.11 lifts it
+into `crates/ffi`**, together with the workspace service thread that owns the `Store` and a 16-byte
+`ProfileId` in the ABI; (3) no `CredentialStore` trait is defined here — M2.10 owns it; the seam is
+`CredentialKey` (the profile UUID); (4) no display setting is registered yet, since none is decided
+(they come with M5). The C ABI is unchanged and `reldex.h` byte-identical.
+
 ---
 
 ### M3 — Connect: shell, connection manager, first real session
