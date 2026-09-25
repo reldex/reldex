@@ -189,15 +189,26 @@ impl From<rusqlite::Error> for StoreError {
                         Self::Corrupt { detail }
                     }
                     ErrorCode::ReadOnly => Self::ReadOnly,
+                    // A bare `SQLITE_ERROR` from a failed `prepare` — SQLite's
+                    // own generic bucket for "no such table"/"no such
+                    // column", which is how a *missing table* surfaces
+                    // (rusqlite reports "no such column" as `SqlInputError`
+                    // below, but "no such table" as a plain `SqliteFailure`
+                    // with this code). This build's SQL is fixed and tested,
+                    // so against a file whose header this build already
+                    // accepted, either message means the same thing: a table
+                    // or column the file's schema version promises is not
+                    // there — a file altered outside Reldex.
+                    ErrorCode::Unknown => Self::SchemaMismatch { detail },
                     _ => Self::Sqlite {
                         code: failure.extended_code,
                         detail,
                     },
                 }
             }
-            // A statement SQLite could not prepare. This build's SQL is fixed
-            // and tested, so against a file at a version it understands this
-            // means the file's tables are not what that version promises.
+            // A statement SQLite could not prepare, with SQLite's own
+            // diagnostic pinpointing the offending token — how "no such
+            // column" surfaces. Same reasoning as `ErrorCode::Unknown` above.
             rusqlite::Error::SqlInputError { msg, .. } => Self::SchemaMismatch {
                 detail: msg.clone(),
             },
