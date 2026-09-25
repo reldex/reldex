@@ -265,6 +265,22 @@ fn every_setting_kind_round_trips_at_every_level_it_allows() {
             SettingId::HistoryMaxEntriesPerProfile,
             SettingValue::EntryLimit(EntryLimit::Unlimited),
         ),
+        (
+            SettingId::ResultsMaxRows,
+            SettingValue::EntryLimit(EntryLimit::Count(
+                NonZeroU32::new(2_147_483_647).expect("non-zero"),
+            )),
+        ),
+        (
+            SettingId::ResultsMaxBytes,
+            SettingValue::ByteLimit(ByteLimit::Bytes(
+                NonZeroU32::new(u32::MAX).expect("non-zero"),
+            )),
+        ),
+        (
+            SettingId::ResultsCloseCursorAtLimit,
+            SettingValue::Bool(true),
+        ),
     ];
     assert_eq!(values.len(), SettingId::ALL.len(), "one value per setting");
     let scopes = [
