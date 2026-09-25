@@ -33,9 +33,10 @@ use std::thread;
 
 use reldex_db_core::{
     CloseDisposition, CloseError, CompletedOperation, ConnectionParams, DatabaseDriver,
-    DatabaseSession, DbError, DbResult, EventCaps, EventQueue, ExecuteOutcome, FetchedBatch,
-    LobHandle, RequestId, ResultId, SavepointName, ServerOutputSetting, SessionEvent, SessionId,
-    SessionLimits, SessionManager, SessionRegistry, Statement, event_channel,
+    DatabaseSession, DbError, DbResult, EventCaps, EventQueue, ExecuteOutcome, FetchRequest,
+    FetchedBatch, LobHandle, RequestId, ResultId, SavepointName, SegmentReply, ServerOutputSetting,
+    SessionEvent, SessionId, SessionLimits, SessionManager, SessionRegistry, Statement,
+    event_channel,
 };
 use reldex_db_driver_api::{Credentials, Endpoint};
 use reldex_driver_mock::{MockDriver, Scenario};
@@ -542,6 +543,27 @@ impl Session {
                         batch
                     }
                     other => panic!("expected Fetched, got {other:?}"),
+                },
+            ),
+        }
+    }
+
+    /// Fetches one segment for a result store (ADR-0004).
+    pub(crate) fn fetch_segment(&self, fetch: FetchRequest) -> Answered<SegmentReply> {
+        match self.path {
+            ReplyPath::Completion => Answered(self.inner.fetch_segment(fetch).wait()),
+            ReplyPath::Events => self.submitted(
+                |request| self.inner.submit_fetch_segment(request, fetch),
+                |event| match event {
+                    SessionEvent::FetchedSegment {
+                        fetch: named,
+                        segment,
+                        ..
+                    } => {
+                        assert_eq!(named, fetch.ticket(), "a segment reply must name its fetch");
+                        segment
+                    }
+                    other => panic!("expected FetchedSegment, got {other:?}"),
                 },
             ),
         }
