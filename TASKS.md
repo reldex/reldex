@@ -136,7 +136,7 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 - [ ] M4.7 DBMS_OUTPUT pane: per-worksheet enable, size, clear, truncation notice (sonnet)
 - [ ] M4.8 ★ Error presentation: kind, ORA code, message, cause chain; caret highlighting only for PL/SQL positions (opus, review mandatory)
 - [ ] M4.9 Multiple independent worksheets: N sessions, per-tab state, one busy tab never blocks another (sonnet)
-- [ ] M4.10 Query history (per profile, SQLite), re-run into the current worksheet (sonnet)
+- [~] M4.10 Query history (per profile, SQLite), re-run into the current worksheet (sonnet) —  — store side done 2026-09-25: `history` table (per profile, FK cascade, outcome enum, bind values have no storage path, SQL text verbatim by design), bounded by `history.max_entries_per_profile` (default 1,000; unlimited allowed with its consequence) with an O(1) amortised trim via a per-profile counter (measured flat 22–50 µs/insert at every limit up to 1,000,000 and 50k rows); schema v1→v4 forward-only; independently reviewed (1 must-fix landed: trim cost); UI half (history pane, re-run into the worksheet) pending M2.11/M4.x
 
 ### M5 — Results at scale
 
@@ -152,7 +152,7 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 ### M6 — Browse, prove, package
 
 - [ ] M6.1 Object browser: lazy tree over the 9 `SPEC.md` §16 groups, server-side filter, row cap, columns of a selected table (sonnet)
-- [ ] M6.2 Workspace persistence: open worksheets, text, layout, active profile — non-transactional state only (sonnet)
+- [~] M6.2 Workspace persistence: open worksheets, text, layout, active profile — non-transactional state only (sonnet) —  — store side done 2026-09-25: `worksheet`, `worksheet_setting` (real FK, cascade — closes the ADR-0006 keyed-alone gap) and single-row `layout` tables; non-transactional state only (no session, connection or transaction column exists); Debug redacts text; shell half (restore on start) pending M2.11/M3.x
 - [ ] M6.3 i18n baseline: `qsTr` everywhere, EN + TH catalogues, `lrelease` in the build; Thai rendering test (sonnet)
 - [ ] M6.4 Accessibility baseline: focus order, keyboard-only operation, `Accessible` properties, contrast check (sonnet)
 - [ ] M6.5 Third-party notices: `cargo about` for the Rust graph + Qt/LGPL attribution, shipped in the installer and an About dialog (sonnet)
