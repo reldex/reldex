@@ -18,7 +18,9 @@ review), 2026-09-19 (owner confirmation), 2026-09-20 (connect-time warning chann
 2026-09-20 (`LobStream: Sync` and `ExecuteOutcome` non-exhaustive, M1.3 review),
 2026-09-20 (`SqlDialect` descriptor, M2.4), 2026-09-21 (`SqlDialect` splitter-safety review, M2.4),
 2026-09-24 (server output, M2.7 — amendment T), 2026-09-24 (server-output framing moved to
-`RAW`/`LENGTHB` with per-line UTF-8 decoding, M2.12 — amendment T update)
+`RAW`/`LENGTHB` with per-line UTF-8 decoding, M2.12 — amendment T update), 2026-09-25 (every
+transaction end releases results, from ADR-0004's review — amendment X; decided, not yet
+implemented)
 
 ## Context
 
@@ -2230,6 +2232,45 @@ adapter's rules are in `phase-1-m2-5-event-queue.md` §7.5.
   30 times in parallel, with no failures.
 * A mutation check turned off the "off" guard and the abandon check. 9 tests failed, and passed
   again once the checks were restored.
+
+## Amendment: every transaction end releases results (2026-09-25, from ADR-0004's review)
+
+**Status: decided by the lead, not yet implemented.** It lands as a small work item with M5.2 or
+M4.3, whichever comes first (`phase-1.md`, the M5.2 row's follow-up). No new task id.
+
+### X1 — a typed `COMMIT` or `ROLLBACK` releases results like the commands do
+
+**What `db-core` does today.** `worker.rs` calls `release_results()`, which closes every open
+cursor and clears every parked LOB, in three places:
+
+- after a successful `commit` or `rollback` command (`resolve_transaction`);
+- after a successful `rollback_to_savepoint` command;
+- after an execute that committed implicitly (`finish_execute`, DDL).
+
+This is D2's rule that cursors and locators are transaction-scoped.
+
+**The gap.** A `COMMIT` or `ROLLBACK` typed into a worksheet reaches the driver as an ordinary
+statement of kind `StatementKind::TransactionControl`. `db-core` releases nothing after it, so one
+transaction end behaves two ways depending on how the user asked for it.
+
+**The rule.** After a successful execute whose kind is `TransactionControl`, `db-core` releases
+results exactly as after the commands, before it registers any cursor the statement returned. The
+core must not parse SQL (`shared.rs`, `note_statement`), and the kind cannot tell `COMMIT` from
+`SAVEPOINT` or `SET TRANSACTION`. So the release also follows those two, which end nothing.
+Closing a result early is the safe error. Keeping a cursor the user believes is transaction-scoped
+is not.
+
+**Why now.** ADR-0004 (RS2) ends every open result store at a transaction end, deterministically.
+It relies on the worker having released the cursors, so that a later fetch fails as "unknown,
+closed or invalidated result handle" rather than succeeding on some paths.
+
+**What stays out of reach.** A commit inside a PL/SQL block is invisible to the core. After one,
+the cursor behaves as the server says, and D2 still requires an invalidated cursor to be reported
+as an error, never as a short result.
+
+**Test.** Open a result; run a typed `COMMIT`, then a typed `ROLLBACK`. A later fetch on the
+first result fails with the invalidated-handle error, and its parked LOBs are gone, exactly as
+after `commit()`. A `TransactionControl` statement that fails releases nothing.
 
 ## Notes for driver implementers
 

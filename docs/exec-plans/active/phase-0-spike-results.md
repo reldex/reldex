@@ -951,6 +951,19 @@ other. The cause is not established here and this is not enough evidence to pick
 a default — but it is enough to say that "bigger batches are faster" must not be
 assumed when Reldex chooses one.
 
+> **Cause identified, 2026-09-25.** The independent review of ADR-0004 (M5.1)
+> traced this to upstream's O(packets²) response reassembly on a pre-23ai
+> server — see U-19 in §5 below.
+>
+> *ADR-0004 pointer, 2026-09-25.* This result is why ADR-0004 RS2 bounds each
+> fetch by **bytes per round trip** rather than by a row count. The fetch-size
+> question (§9 "What the owner has to decide" item 12; `phase-1.md` §C.3
+> item 10) is re-asked as a bytes budget. The driver-level numbers are in
+> `docs/exec-plans/active/phase-1-m5-1-data/driver-fetch-probe.csv`: the same
+> 1,000 rows take 4.4 ms, 22 ms or 23 s depending on row width. A probe must
+> make every row's values different, because TTC compresses a value that
+> repeats the previous row's and hides the cost.
+
 ---
 
 ## 4. S4 in full — can a running statement be stopped?
@@ -1993,6 +2006,90 @@ proves nothing here), the silent `INVALID` trigger the off switch leaves, and
 the literal limit. S12's own refusal test, renamed to `…_when_the_rewrite_is_off`,
 is one more independent check that the off switch changes nothing else.
 
+### U-19 — **A multi-packet response is re-parsed from byte 0 on every packet, so client CPU is O(packets²) on any pre-23ai server** (added 2026-09-25, independent review of ADR-0004/M5.1)
+
+`Client::receive_response` (`src/client/mod.rs:188-208`) calls
+`receive_packets()` once, then loops `message.deserialize(self, response)` and,
+on `e.is_out_of_data()`, calls `response.add_packets(self.receive_packets()?)`
+and retries. `Response::add_packets` (`response/mod.rs:77-88`) does not resume
+parsing where the last attempt stopped — it **extends the packet list and
+rebuilds the whole buffer from scratch**: `self.buf =
+ReadBuffer::from_packets(&self.packets)`, and `ReadBuffer::from_packets`
+(`read_buffer.rs:92-97`) always returns `pos: 0`. `add_packets` also clears
+`self.rows` (`:84`), so every row already decoded is discarded, not kept.
+`Message::deserialize`'s default loop (`messages/mod.rs:56-72`) then starts
+over at `resp.read_u8()` from that fresh position-0 buffer, re-walking and
+re-decoding every TTC sub-message — row headers, every row already read,
+everything — from the start of the response, on every packet.
+`receive_packets()` (`client/mod.rs:173-185`) only returns more than one
+packet per call when `self.supports_end_of_response()` is true, and
+`Capabilities` (`client/capabilities.rs:142-146`) only sets that once the
+negotiated `protocol_version >= constants::PROTOCOL_VERSION_23`
+(`constants.rs:149`, `= 319`) — i.e. only against an Oracle Database
+23ai-or-newer listener. Against Oracle 19c (protocol < 23, the Phase 0
+database) `receive_packets` always returns after exactly one packet, so this
+retry-and-rebuild-from-zero runs on **every** packet of **every** response,
+always. Total client work for one fetch is quadratic in the packet count the
+response spans, not linear in it.
+
+This exact mechanism was introduced deliberately, as a correctness fix: before
+commit [`5c62d4d`](https://github.com/oracle/rust-oracledb/commit/5c62d4d2e329357a16e3ffbcbc52a0b08123998c)
+(2026-08-12, closing upstream issue
+[#5](https://github.com/oracle/rust-oracledb/issues/5), "some internal
+panic"), a second `receive_packets()` call was **not** followed by any state
+reset, and mixing old and new parse state panicked partway through a
+multi-row fetch. The fix traded that panic for a full re-parse from byte 0 on
+every retry; a later refactor
+([`d3d6601`](https://github.com/oracle/rust-oracledb/commit/d3d6601139560d716ce85c514df3562a8899255e),
+2026-09-04) renamed `Response::reset` to `add_packets` and had `Response` own
+the accumulated `Vec<Packet>` itself, but kept the same rebuild-from-scratch
+shape. Nothing since has revisited the cost; confirmed unchanged on `main`
+tip `e2578c8` (2026-09-23) — none of `client/mod.rs`, `response/mod.rs`,
+`read_buffer.rs`, `messages/mod.rs` or `client/capabilities.rs` appear in the
+diff since `6785e95`.
+
+Measured directly against `oracledb` (release build, called directly with no
+Reldex wrapper in the loop; client CPU/wall ratio rises toward 0.9–0.99 as the
+batch size and elapsed time grow — the smallest, fastest samples carry more
+measurement overhead and a lower ratio, but the slow cases that matter here
+are client-bound, not network- or server-bound) on the Phase 0 Oracle 19c
+container over loopback:
+
+| Row shape | Rows in one `fetch_batch`/fetch call | p50 elapsed |
+|---|---|---|
+| 5×VARCHAR2(100) + 2×DATE | 500 / 1 000 / 2 000 / 4 000 / 7 000 / 10 000 | 7.8 / 22.4 / 85.8 / 359.9 / 1 228.4 / 2 921.0 ms |
+| S14's shape (NUMBER, VARCHAR2(40), DATE) | 1 000 / 10 000 | 4.4 / 129.1 ms |
+| 4×VARCHAR2(4000), values distinct per row (~16 KB/row) | 100 / 250 / 500 / 1 000 | 226.9 / 1 503.0 / 4 939.1 / 22 979.4 ms |
+
+The 5×VARCHAR2(100)+2×DATE shape costs roughly **×4 elapsed for every ×2
+rows** — the quadratic signature. A 2 MiB SDU changes none of it, because the
+cost is client-side parsing, not the network: it scales with **bytes per
+round trip**, not rows. **Column values have to vary per row to measure
+this** — TTC compresses a repeated column value, so a duplicate-valued probe
+sends far fewer packets for the same row count and hides the effect almost
+entirely; an early version of this probe used repeated values and measured
+nothing unusual.
+
+This is the cause S14 (§3 above) flagged as "not established": why
+`fetch_rows = 10000` was measured 3.5× slower per row than smaller batches.
+Any upstream behaviour that changes bytes-per-round-trip — batch size, row
+width, SDU-driven packet size — changes the squared term directly, which is
+why ADR-0004's batch/paging policy needs this named as a cause rather than
+left unexplained.
+
+*Evidence:* independent review of ADR-0004 (M5.1), 2026-09-25 — probe results
+kept with the M5.1 task; not yet a checked-in canary or test in this crate
+(see Issue J below — the draft has not been posted, so there is nothing
+upstream to canary against yet).
+*Can the wrapper guard it?* Not by refusing or working around a value — this
+is a cost, not a data-corrupting defect, and the fix (incremental
+deserialization that keeps parser position and decoded rows across an
+`add_packets` call, or a pre-23ai substitute for
+`supports_end_of_response`) can only happen upstream. Reldex's own lever is
+choosing a smaller default batch size against a pre-23ai server, which
+ADR-0004 addresses separately. Drafted as **Issue J**, not submitted — owner
+review pending.
+
 ---
 
 ## 6. Drafted upstream issues — **five submitted 2026-09-19; maintainer responses recorded 2026-09-20 and 2026-09-23; F and G refreshed against `main` 2026-09-23**
@@ -2885,6 +2982,186 @@ server was in a position to answer it.
 > useful — does "busy on CPU vs. suspended" match your own model of when the
 > interrupt gets serviced?
 
+### Reconciliation addendum, 2026-09-25 — O(packets²) response reassembly (U-19)
+
+Dedupe performed before drafting: `gh issue list -R oracle/rust-oracledb
+--state all --limit 200` (all 23 issues, every state, read in full where a
+title suggested any relevance), `gh pr list -R oracle/rust-oracledb --state
+all --limit 200` (all 3 PRs), `gh api repos/oracle/rust-oracledb/commits
+--paginate` (full history, 88 commits — this repository has none of the
+gaps a `--per-page 100` single call could have missed), and `gh search
+issues` for `packet`, `reassemble`, `end-of-response`, `EOR`, `quadratic`,
+`deserialize`, `ReadBuffer`, `from_packets`, `performance`, `fetch size`,
+`19c`, `23ai`, `slow`, `throughput`. Commit messages were also grep'd for
+`packet|buffer|deserial|quadrat|perf|throughput|response|reassembl` across
+the full history.
+
+| Item | Existing coverage | What was already said | Verdict |
+| --- | --- | --- | --- |
+| U-19 (O(packets²) response reassembly, pre-23ai) | none filed | Issue [#5](https://github.com/oracle/rust-oracledb/issues/5) ("some internal panic", closed) is the **origin** of this exact code path — the maintainer's fix for #5, commit `5c62d4d` (2026-08-12), is what introduced the rebuild-from-scratch `reset`/`add_packets` shape being reported here, but #5 itself is about a panic, not performance, and no comment on either thread mentions cost. Issue [#27](https://github.com/oracle/rust-oracledb/issues/27) (`prefetch_rows(n>=3)` duplicate-value parse failure, fixed on `main` 2026-09-21) and [#28](https://github.com/oracle/rust-oracledb/issues/28) (`Row::get` backtrace cost, fixed on `main` 2026-09-22) are the only other performance-flavoured issues found; neither is this — #27 was a correctness bug in the same general area (duplicate-column TTC compression) and is unrelated to packet count, #28 is per-call backtrace construction. No issue, PR or commit anywhere in the history reports client-side cost scaling with packet count. **New issue recommended.** |
+
+**New in this pass, beyond the keyword search:** commit
+[`d3d6601`](https://github.com/oracle/rust-oracledb/commit/d3d6601139560d716ce85c514df3562a8899255e)
+(2026-09-04, "Refactor internal handling of packets in preparation for
+improving the error...") is the refactor that turned #5's `Response::reset(&
+packets)` into today's `Response::add_packets(packets)` — same
+rebuild-from-scratch shape, `Response` now owns the accumulated `Vec<Packet>`
+itself instead of the caller passing it in each time. Two neighbouring
+commits,
+[`497c908`](https://github.com/oracle/rust-oracledb/commit/497c908e29870fb29e0f34dacfd1e00e4281784b)
+and
+[`9be9a50`](https://github.com/oracle/rust-oracledb/commit/9be9a50545086eea5ff4e13c98436e4e684f08af),
+touch `response/mod.rs` and `messages/mod.rs` respectively but only for error
+message quality and a `SELECT FOR UPDATE` parsing bug; neither changes the
+re-parse-from-zero behaviour. All three predate our pinned `beta.3` tag
+(`9b5aff7`, 2026-09-08), so beta.3 already contains their effect — confirmed
+by reading beta.3's own source directly (§5 U-19 above), not inferred from
+the commit log.
+
+### New draft — Issue J (U-19): `receive_response` re-parses every packet of a multi-packet response from byte 0, making client CPU O(packets²) on a pre-23ai server
+
+Confirmed present on `main` tip `e2578c8` (2026-09-23, "Preparing to release
+26.0.0-beta.4"): `git diff 6785e95..main --stat` touches `README.md`,
+`doc/bind.md`, `doc/release_notes.md`, `doc/sql_execution.md`,
+`examples/common/mod.rs`, `examples/rowid_urowid.rs`,
+`src/messages/protocol.rs` and `tests/common/mod.rs` — none of
+`client/mod.rs`, `response/mod.rs`, `read_buffer.rs`, `messages/mod.rs` or
+`client/capabilities.rs`, which is everywhere this report's evidence comes
+from.
+
+> **Title:** `Fetching a wide or multi-packet result set from a pre-23ai server costs O(packets²) client CPU: every packet re-parses the response from byte 0`
+>
+> **What I'm seeing**
+>
+> Against Oracle Database 19c (negotiated protocol < 23), elapsed time for a
+> single fetch grows much faster than the row or byte count once the response
+> spans more than a few packets — close to the square of the packet count,
+> and it is all client CPU (measured client CPU/wall ratio rising toward
+> 0.9–0.99 as elapsed time grows; smaller/faster samples carry more
+> measurement overhead, but the slow cases here are not the network or the
+> server).
+>
+> **Minimal reproducer**
+>
+> ```sql
+> -- Column values must differ per row: TTC compresses a repeated column
+> -- value, so identical-valued rows send far fewer packets for the same row
+> -- count and hide the effect almost entirely.
+> SELECT
+>     LEVEL AS id,
+>     RPAD(TO_CHAR(LEVEL), 4000, CHR(65 + MOD(LEVEL,   26))) AS c1,
+>     RPAD(TO_CHAR(LEVEL), 4000, CHR(65 + MOD(LEVEL+1, 26))) AS c2,
+>     RPAD(TO_CHAR(LEVEL), 4000, CHR(65 + MOD(LEVEL+2, 26))) AS c3,
+>     RPAD(TO_CHAR(LEVEL), 4000, CHR(65 + MOD(LEVEL+3, 26))) AS c4
+> FROM dual
+> CONNECT BY LEVEL <= :n
+> ```
+>
+> ```rust
+> let stmt = conn.statement(sql)?.fetch_array_size(n)?;
+> let start = std::time::Instant::now();
+> let _rows = stmt.query(&[&n])?.fetch_batch()?; // however many rows `n` asks for
+> println!("{n} rows: {:?}", start.elapsed());
+> ```
+>
+> Run with `:n` (and `fetch_array_size`) = 250, 1 000 and 10 000. On our
+> setup (Oracle 19c, loopback, release build, `oracledb` called directly with
+> no wrapper in the loop), the 4×VARCHAR2(4000) shape above (~16 KB/row)
+> reaches the effect at row counts this small:
+>
+> | rows in one fetch | elapsed (p50 of 3+ runs) |
+> |---|---|
+> | 100  | 0.23 s  |
+> | 250  | 1.50 s  |
+> | 500  | 4.94 s  |
+> | 1 000 | 22.98 s |
+>
+> A narrower 5×VARCHAR2(100)+2×DATE shape shows the same curve at higher row
+> counts: 500 / 1 000 / 2 000 / 4 000 / 7 000 / 10 000 rows in one fetch
+> measured at 7.8 / 22.4 / 85.8 / 359.9 / 1 228.4 / 2 921.0 ms — roughly ×4
+> elapsed for every ×2 rows. A 2 MiB SDU (`Config::set_sdu`) does not change
+> any of this: the cost tracks bytes received per round trip via packet
+> count, not the network.
+>
+> **Cause**
+>
+> `Client::receive_response` (`src/client/mod.rs`) retries `deserialize` on
+> `is_out_of_data()` by calling
+> `response.add_packets(self.receive_packets()?)` and trying again:
+>
+> ```rust
+> fn receive_response(&mut self, message: &mut impl Message, response: &mut Response) -> Result<(), Error> {
+>     response.add_packets(self.receive_packets()?);
+>     message.pre_deserialize(self, response);
+>     while let Err(e) = message.deserialize(self, response) {
+>         if e.is_out_of_data() {
+>             response.add_packets(self.receive_packets()?);
+>             continue;
+>         }
+>         return Err(e);
+>     }
+>     ...
+> }
+> ```
+>
+> `Response::add_packets` (`src/response/mod.rs`) rebuilds the parse buffer
+> from **every** packet received for this response so far, from scratch, and
+> clears the rows already decoded:
+>
+> ```rust
+> pub(crate) fn add_packets(&mut self, packets: Vec<Packet>) {
+>     self.packets.extend(packets);
+>     self.buf = ReadBuffer::from_packets(&self.packets);  // always pos: 0
+>     ...
+>     self.rows = None;
+>     ...
+> }
+> ```
+>
+> and `Message::deserialize`'s default loop (`src/messages/mod.rs`) starts
+> reading again from `resp.read_u8()` at that fresh position-0 buffer — every
+> retry re-walks and re-decodes every TTC sub-message (row headers, every row
+> already parsed, everything) from the start of the response, not just the
+> newly arrived bytes. `receive_packets` (`src/client/mod.rs`) returns more
+> than one packet per call only when `supports_end_of_response()` is true,
+> which is only set once the negotiated protocol version is
+> `>= PROTOCOL_VERSION_23` (`src/client/capabilities.rs`) — a 23ai-or-newer
+> listener. Against anything older, `receive_response`'s retry loop runs once
+> per packet, every time, and each iteration re-parses everything received so
+> far. Total client CPU for one fetch is quadratic in the packet count the
+> response spans.
+>
+> This looks like the same code path introduced by `5c62d4d` (fixing #5's
+> panic, 2026-08-12) and carried through the `d3d6601` refactor (2026-09-04):
+> the correctness fix — reset parser state before retrying — looks right on
+> its own, but resetting by rebuilding from scratch rather than resuming
+> where the previous attempt stopped is what makes it quadratic.
+>
+> **What I think might help** (asking, not prescribing — I don't know this
+> codebase's constraints on this path)
+>
+> Would it be workable to keep the parser's position and already-decoded rows
+> across an `add_packets` call and parse only the newly arrived bytes
+> (incremental deserialization), rather than rebuilding and re-walking from
+> the start each time? Failing that, is there anything server-side available
+> to a pre-23ai listener that could stand in for
+> `supports_end_of_response`, so `receive_packets` could gather the whole
+> response before the first parse attempt the way it does on 23ai+?
+>
+> **Impact**
+>
+> This makes `fetch_array_size`/prefetch tuning actively dangerous against an
+> Oracle 19c/21c server: a larger batch or wider rows can make a fetch dozens
+> of times slower in client CPU alone, with nothing in the network or on the
+> server to explain why.
+>
+> Environment: `oracledb` 26.0.0-beta.3 (confirmed the same code path present
+> on `main` at commit `e2578c8`, 2026-09-23), Rust 1.98.1 MSVC, Windows 11,
+> Oracle Database 19.0.0.0.0 Enterprise Edition, loopback.
+
+**Not posted — owner review pending**, per the dedupe/posting etiquette in §6
+above and the owner's 2026-09-19 decision on Issues F and G (`TASKS.md`).
+
 ---
 
 ## 7. Contract problems found in `reldex-db-driver-api`
@@ -3491,7 +3768,9 @@ own. Their verdicts against `SPEC.md` §8's operations list:
     within run-to-run noise of each other. This is one machine and one run: it
     is enough to forbid assuming "bigger is faster", not enough to pick a
     number. A short follow-up measurement across row shapes and a real network
-    should precede the choice.
+    should precede the choice. *(2026-09-25: the cause is now known — U-19, a
+    client-side cost quadratic in the bytes per fetch on 19c; see the notes under
+    S14 and ADR-0004 RS2. The question becomes a bytes-per-round-trip budget.)*
 
     **Owner decision (2026-09-19):** no number is chosen now. The default will
     be set from a benchmark during Phase 1 UI work; until then the driver's

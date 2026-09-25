@@ -1,0 +1,18 @@
+key,value
+date,2026-09-25 (bench 21:51-21:54 +07:00; real-DB run 21:55-21:57 +07:00)
+base_commit,432969c (origin/main) plus the bench file crates/db-core/benches/result_store_shapes.rs
+cpu,AMD Ryzen 7 5700G (8 cores / 16 threads)
+ram,63.4 GB (37.4 GB free before the runs)
+os,Windows 11 Pro build 26200
+toolchain,rustc 1.98.1 / cargo 1.98.1 (MSVC); cargo bench profile (release; thin LTO; codegen-units 1)
+database,Oracle Database 19c EE 19.3 in container reldex-oracle19c (healthy; 4 GiB memory limit; 1.5% CPU when sampled after the run); listener 127.0.0.1:1521 loopback - zero network latency
+real_db_path,db-core SessionManager + worker thread + oracle-thin driver; Statement::with_fetch_rows(n) and fetch_batch(n); one fetch in flight; Completion path
+machine_state,no cargo/rustc/cl/link/cmake/ninja process running at the launch of each run (checked with tasklist before each); CPU load 4-17% before the runs; other workers were active earlier in the session (two cargo processes were running about 15 minutes before the first run)
+os_metric,process PrivateMemorySize64 via PowerShell Get-Process; delta between a sample after warm-up and a sample after the representation is built; one fresh child process per measurement
+accounted_metric,sum of heap capacities held plus fixed struct sizes (no allocator overhead); what a store can count for its own byte cap
+repeats,3 per cell (accounted bytes are deterministic; time and OS figures vary)
+not_measured,1000000 rows of 32 KiB inline text (32 GiB); LOB locators (driver-side cost); a real network; mobile devices; in-app RSS with the store
+real_db_sql_s14,"SELECT LEVEL AS id, RPAD('row ' || LEVEL, 40, '.') AS name, DATE '2026-01-01' + MOD(LEVEL, 3650) AS created FROM dual CONNECT BY LEVEL <= 100000"
+real_db_sql_numbers10,"SELECT LEVEL AS n0, MOD(LEVEL * 7919, 100000) AS n1, MOD(LEVEL * 104729, 100000000) / 100 AS n2, MOD(LEVEL, 1000) + 1 AS n3, -MOD(LEVEL * 13, 50000) AS n4, MOD(LEVEL * 7, 10000000) / 10000 AS n5, 1000000000000 + LEVEL AS n6, MOD(LEVEL, 2) AS n7, CASE WHEN MOD(LEVEL, 20) = 0 THEN NULL ELSE MOD(LEVEL, 365) END AS n8, LEVEL / 7 AS n9 FROM dual CONNECT BY LEVEL <= 100000"
+real_db_sql_text5date2,"SELECT RPAD('r' || LEVEL || 'c0-', 20 + MOD(LEVEL * 7, 81), 'abcdefghij') AS t0, RPAD('r' || LEVEL || 'c1-', 20 + MOD(LEVEL * 7 + 13, 81), 'klmnopqrst') AS t1, RPAD('r' || LEVEL || 'c2-', 20 + MOD(LEVEL * 7 + 26, 81), 'uvwxyzABCD') AS t2, RPAD('r' || LEVEL || 'c3-', 20 + MOD(LEVEL * 7 + 39, 81), 'EFGHIJKLMN') AS t3, CASE WHEN MOD(LEVEL, 50) = 0 THEN NULL ELSE RPAD('r' || LEVEL || 'c4-', 20 + MOD(LEVEL * 7 + 52, 81), 'OPQRSTUVWX') END AS t4, DATE '2000-01-01' + MOD(LEVEL, 9000) + MOD(LEVEL, 24) / 24 AS d0, CASE WHEN MOD(LEVEL, 30) = 0 THEN NULL ELSE DATE '2020-01-01' + MOD(LEVEL, 1000) END AS d1 FROM dual CONNECT BY LEVEL <= 100000"
+real_db_probe,"a throwaway example (SessionManager + OracleThinDriver; execute with_fetch_rows(n) then fetch_batch(n) until exhausted; 3 repeats per shape and fetch size); deleted after the run, not committed"

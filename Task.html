@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-25T21:53:00+07:00",
+  "updatedAt": "2026-09-26T00:00:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -526,6 +526,11 @@
     }
   ],
   "risks": [
+    {
+      "title": "Credential Manager two-process test failed once on the Windows CI runner (2026-09-25)",
+      "detail": "On PR #39 (a docs-only change) the crates/secrets test concurrent_reldex_processes_lose_no_update failed once on windows-latest with an assertion inside a worker process; the next run passed. The test proves the per-user lock stops Credential Manager from losing concurrent writes, so a flake here can hide a real loss or a runner-specific lock/DACL problem.",
+      "mitigation": "Investigate from the failed job log (worker exit status, assertion text, whether entries were left behind); loop the test locally and on the runner; fix the test or the lock, never weaken the assertion. Until then, rerun only that job on a red result and record it here."
+    },
     {
       "title": "macOS Qt CI job flaked once on a transient copy failure (2026-09-25) — mitigated",
       "detail": "On PR #34 the qt-build (macos-latest) job failed while deploying libreldex_ffi.dylib next to a test binary: the file had been written 17 s earlier and the build ordering was correct, but the copy syscall itself hit a transient 'No such file or directory' on macOS. The M1.4 retry helper only retried the existence check and then copied once, so this gap was not covered.",
@@ -682,6 +687,13 @@
       "status": "Accepted — owner decision 2026-09-24. The reldex GitHub account's Free-plan Actions minutes (2,000/month, private-repo only) were exhausted 2026-09-21 after >=100 workflow runs; every job since has failed in ~2s on a billing error. Of five options (reduce matrix, self-hosted runner, stop using Actions, wait, go public), the owner's first choice was 'stop using Actions' but switched the same day to making the repository public once the per-run cost (~40 billable min/PR, macOS x10 multiplier) showed a public repo gets Actions minutes free with no cap. ci.yml/ui.yml/mobile-cross-compile.yml are unchanged; hosted CI stays the merge gate; tools/gates.sh is added as a local pre-push/pre-PR check, not a CI replacement. The visibility flip itself is not yet executed — gated on a history exposure scan, run 2026-09-24: no credentials/keys/certificates ever committed; no files over 5 MB; one Android device serial in phase-0-android-device.md redacted at HEAD but present in history (accepted as low risk). Same decision also settles Community/Pro licensing (open since P0): Community edition is GPL-3.0-or-later, copyright (C) 2026 Supawit Nu-iat (LICENSE, COPYRIGHT); Reldex Pro is licensed separately by the copyright holder; external contributions will require a CLA to keep dual licensing possible. PRs #22, #24 and #25 merged 2026-09-21 to 09-24 on local verification only, while CI was down — stated here honestly, not glossed over.",
       "date": "2026-09-24",
       "link": "docs/decisions/0005-public-repository-for-hosted-ci.md"
+    },
+    {
+      "id": "ADR-0004",
+      "title": "Result Store — representation, fetch-on-demand paging and bounded-memory policy (db-core ResultStore, C ABI 4 shape for M5.2)",
+      "status": "Accepted by the lead 2026-09-25 after an independent review (returned once, doc-only fixes landed). Fetched rows are kept as per-batch column segments (NUMBER as a scaled i64 when exact; measured 118 B/row for ten NUMBER columns vs 443 today); the view states its demand and the core keeps one batch ahead; row and byte caps are settings with their source shown (desktop 1,000,000 rows / 512 MiB; mobile 100,000 / 64 MiB, unmeasured); every transaction end deterministically ends an open result (rows kept, LOB cells unavailable); spill and Arrow deferred to P3 with the benchmark that would reopen them. The review found that the 'larger fetches are slower' curve is an upstream driver defect (O(packets²) response re-parse on pre-23ai servers, Issue J / U-19), so round trips must be bounded by bytes, not rows. Owner-review points: the fetch-size sign-off re-asked as a bytes-per-round-trip budget; whether a 1,000,000-row cap meets SPEC §19; no browsing past the caps in Phase 1; mobile caps for information; Issue J posting.",
+      "date": "2026-09-25",
+      "link": "docs/decisions/0004-result-store.md"
     },
     {
       "id": "ADR-0007",
@@ -1321,8 +1333,8 @@
           "title": "M5 — Results at scale",
           "tasks": [
             {
-              "title": "M5.1 ★ ADR-0004 — Result Store representation, paging and bounded-memory policy (opus, review mandatory)",
-              "status": "todo"
+              "title": "M5.1 ★ ADR-0004 — Result Store representation, paging and bounded-memory policy (opus, review mandatory) —  — done 2026-09-25: ADR-0004 Accepted by the lead after an independent review (returned once; doc-only fixes landed) — per-batch column segments (NUMBER as scaled i64 when exact; measured 118 B/row vs 443 today for ten NUMBER columns, no per-segment fixed cost), demand-driven paging one batch ahead, row/byte caps as settings with their source (desktop 1,000,000 / 512 MiB; mobile 100,000 / 64 MiB unmeasured), transaction end deterministically ends a result, spill/Arrow deferred to P3 with reopening benchmarks, C ABI 4 shape for M5.2; the review traced the 'bigger fetches are slower' curve to an upstream O(packets²) re-parse on pre-23ai servers (Issue J / U-19 draft), so round trips are bounded by bytes; owner-review points listed",
+              "status": "done"
             },
             {
               "title": "M5.2 ★ Result Store implementation in db-core + FFI batch lifetime rules (opus, review mandatory)",
@@ -1696,6 +1708,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-26",
+      "text": "M5.1 done: ADR-0004 decides how query results live in memory — fetched rows stay in the core as compact column segments (a ten-number row costs 118 bytes instead of 443), the grid asks for rows and the core keeps one batch ahead, and row and byte caps are ordinary settings whose source the UI shows. Every transaction end now ends an open result deterministically. The independent review overturned one premise: fetching 10,000 rows at a time is not slow because of the size — the upstream driver re-parses the whole response for every network packet on pre-23ai servers, so a 1,000-row fetch of wide rows already costs 23 seconds; the ADR now bounds round trips by bytes and an upstream issue is drafted (Issue J, not posted, owner review pending). Five points are marked for the owner, above all the fetch-size sign-off. Also recorded: a Credential Manager two-process test failed once on the Windows runner and passed on rerun — under investigation."
+    },
     {
       "date": "2026-09-25",
       "text": "M6.2 store side done: open worksheets, their text and positions, tab order and the window layout can now be saved and reloaded from the SQLite file. Nothing about a session or a transaction is stored — a restore can never imply one (verified by the reviewer against every new table). The shell half, restoring on start, follows once the FFI surface exists."
