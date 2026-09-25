@@ -22,10 +22,29 @@
  */
 
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
-/* Exposes nanosleep() from <time.h> under strict conformance modes
- * (e.g. -std=c11 without GNU extensions) on glibc; harmless everywhere
- * else. Must be defined before any system header is included. */
-#define _POSIX_C_SOURCE 199309L
+/* Exposes nanosleep() from <time.h>, mkdtemp() from <stdlib.h>, and (on
+ * macOS's libc specifically) snprintf() from <stdio.h> under strict
+ * conformance modes (e.g. -std=c11/-std=c++17 without GNU/Darwin
+ * extensions). 199309L (POSIX.1b) covers nanosleep() alone; mkdtemp()
+ * needs POSIX.1-2008 (200809L), and on macOS/Clang an explicit low
+ * _POSIX_C_SOURCE value also drags __DARWIN_C_LEVEL down far enough to
+ * hide snprintf(), which is otherwise ISO C99. 200809L is a superset
+ * that restores all three; harmless on glibc and other libcs. Must be
+ * defined before any system header is included. Found via CI failures
+ * on macos-latest: "call to undeclared library function 'snprintf'"
+ * and "call to undeclared function 'mkdtemp'"
+ * (-Wimplicit-function-declaration) in both the C11 and C++17 builds. */
+#define _POSIX_C_SOURCE 200809L
+#endif
+
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+/* Belt-and-suspenders alongside the _POSIX_C_SOURCE bump above: Apple's
+ * <sys/cdefs.h> derives __DARWIN_C_LEVEL from whichever feature-test
+ * macros are defined, and an explicit numeric _POSIX_C_SOURCE can still
+ * leave it below __DARWIN_C_FULL on some SDK versions. Defining this
+ * directly removes any ambiguity for mkdtemp()/snprintf() visibility.
+ * A no-op on non-Apple platforms, so always safe to define here. */
+#define _DARWIN_C_SOURCE 1
 #endif
 
 #include <reldex.h>
