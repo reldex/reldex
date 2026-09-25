@@ -93,6 +93,10 @@ automatically**, since each attempt counts towards the account's lockout limit.
   moment. That residual race is a recorded platform limitation, and the planned orphan sweep
   (M2.14) cleans up after it. So is the copy another tool's entry (such as `cmdkey`'s) can leave
   behind when Reldex saves over it and later deletes it; that copy reads as `Malformed`.
+  `tests/windows_credential_manager.rs`'s own unlocked `cmdkey` writer (the "written by another
+  tool" test) self-inflicted exactly this race once on CI by running concurrently with the
+  regression test (ADR-0007 S4 "CI incident, diagnosed"); the suite now isolates that one test from
+  the rest so it can never happen again from within this binary.
 - **Hygiene.** `put` builds the entry in one buffer of exactly the right size, wiped when dropped.
   `get` copies the blob into a buffer of exactly the right size, wipes the system's copy with
   `zeroize` before calling `CredFree`, and wipes bytes that fail decoding. The wipe reduces how many
