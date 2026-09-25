@@ -4,6 +4,27 @@ name: UI
 # the C/C++ side (M1.4, M1.5, ADR-0003), which is slower (a real C/C++
 # toolchain, and for `qt-build`, a real Qt install) and only needs to run
 # when the UI or the FFI boundary it links against actually changed.
+#
+# M6.7: this workflow already carried M6.7's full scope (three-OS Qt build,
+# offscreen QML/QTest, the C smoke harness, Qt+cargo caching) as a byproduct
+# of the M1.4/M1.5 work that built it -- ADR-0003 K7 recorded the spike's
+# cold numbers against the 25-minute `qt-build`/`qt-asan` budget below, and
+# every run since has stayed green and well under it (see phase-1.md's
+# "M6.7 as implemented" note for current job-by-job durations and cache-hit
+# evidence). M6.7 itself closed the one real gap: the CI-Actions-dependency
+# licence note below, which this workflow did not previously carry.
+#
+# CI-only Actions dependencies (installed on the runner, never shipped in a
+# Reldex binary or installer -- so they are out of scope for ui/README.md's
+# "Dependencies"/"Licence note" sections and the M6.5 NOTICES artefact,
+# which cover what ships, not what builds it):
+#   - actions/checkout (MIT)
+#   - dtolnay/rust-toolchain (MIT)
+#   - Swatinem/rust-cache (LGPL-3.0) -- itself CI tooling; nothing in this
+#     repository links against it
+#   - jurplel/install-qt-action (MIT) -- the action's own code is MIT; it
+#     installs Qt under Qt's own terms, which is the LGPLv3-dynamic-linking
+#     position ui/README.md's "Licence note" already documents
 on:
   push:
     branches: [main]
@@ -135,6 +156,10 @@ jobs:
         # all part of the base install, plus qtshadertools -- matching
         # docs/exec-plans/active/phase-1-toolchain.md's own local install).
         # No GPL-only module (qtcharts, qtwebengine, ...) is requested.
+        # M6.7: `cache: true` makes the action key its own cache on
+        # `version:`/`modules:`/host/arch (its README documents the exact
+        # key), so bumping the pinned Qt version below invalidates the
+        # cache automatically -- no separate cache-key plumbing needed here.
         uses: jurplel/install-qt-action@bcb88e3bed2e992f5f9e24c0f9e364a231d278eb # v4.4.0
         with:
           version: "6.8.3"

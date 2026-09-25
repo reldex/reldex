@@ -156,7 +156,7 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 - [ ] M6.4 Accessibility baseline: focus order, keyboard-only operation, `Accessible` properties, contrast check (sonnet)
 - [ ] M6.5 Third-party notices: `cargo about` for the Rust graph + Qt/LGPL attribution, shipped in the installer and an About dialog (sonnet)
 - [ ] M6.6 ★ Windows packaging: `windeployqt6`, unsigned installer, first-run layout (opus, review mandatory)
-- [ ] M6.7 CI: build the Qt project on all three OS; run offscreen QML/QTest and the C smoke harness; cache Qt and cargo (sonnet)
+- [x] M6.7 CI: build the Qt project on all three OS; run offscreen QML/QTest and the C smoke harness; cache Qt and cargo (sonnet) —  — done 2026-09-25: already delivered by `ui.yml` at M1.4/M1.5 (three-OS Qt 6.8.3 build + offscreen QML/QTest, `ffi-smoke` on all three OS with ASan/UBSan on Ubuntu, `qt-asan`, Qt + cargo caches pinned by SHA); this change only records the evidence (cold 1.6–3.0 min per OS vs the 25-min ADR-0003 K7 budget; warm cache hits confirmed) and documents the CI-only Actions dependencies and their licences
 - [ ] M6.8 ★ Phase 1 DoD review against `SPEC.md` §24, honest status per item; update `TASKS.md`, `phase-1.md`, `Task.html` (opus, review mandatory)
 - [ ] M6.9 Cold first paint ≈ 800–900 ms (D3D11 device creation ≈ 250 ms + first delegate-instantiation polish ≈ 551 ms) vs `SPEC.md` §19 startup target — investigate fix candidates named in the S15 report (sonnet)
 
