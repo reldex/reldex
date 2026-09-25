@@ -1045,6 +1045,150 @@ fn clear_history_removes_only_that_profiles_entries() {
     );
 }
 
+/// `history_meta.count` for `profile`, or 0 if it has no row yet — the same
+/// value [`Store::record_history`]'s upsert would start from.
+fn meta_count(store: &Store, profile: ProfileId) -> i64 {
+    store
+        .connection
+        .query_row(
+            "SELECT count FROM history_meta WHERE profile_id = ?1",
+            params![profile.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
+}
+
+/// `COUNT(*)` of `profile`'s actual rows in `history` — the ground truth
+/// `history_meta.count` must always agree with.
+fn real_count(store: &Store, profile: ProfileId) -> i64 {
+    store
+        .connection
+        .query_row(
+            "SELECT count(*) FROM history WHERE profile_id = ?1",
+            params![profile.to_string()],
+            |row| row.get(0),
+        )
+        .expect("count")
+}
+
+#[test]
+fn history_meta_count_always_matches_the_real_row_count() {
+    let mut store = store();
+    let profile = Profile::create(details("p")).expect("valid");
+    store.insert_profile(&profile).expect("insert");
+
+    // No counter row before the first insert.
+    assert_eq!(meta_count(&store, profile.id()), 0);
+    assert_eq!(real_count(&store, profile.id()), 0);
+
+    // Ordinary inserts, under the (default, 1,000) bound: the counter tracks
+    // every one of them.
+    for n in 0..10 {
+        store
+            .record_history(history_entry(profile.id(), &format!("select {n}")))
+            .expect("record");
+        assert_eq!(
+            meta_count(&store, profile.id()),
+            real_count(&store, profile.id()),
+            "after insert {n}"
+        );
+    }
+    assert_eq!(meta_count(&store, profile.id()), 10);
+
+    // A small bound: the trim inside record_history keeps the counter and
+    // the real row count in lock-step through repeated steady-state trims.
+    store
+        .put_setting(
+            Scope::Application,
+            HISTORY_MAX_ENTRIES_PER_PROFILE,
+            EntryLimit::count(3).expect("non-zero"),
+        )
+        .expect("put");
+    for n in 10..20 {
+        store
+            .record_history(history_entry(profile.id(), &format!("select {n}")))
+            .expect("record");
+        assert_eq!(
+            meta_count(&store, profile.id()),
+            real_count(&store, profile.id()),
+            "after trimmed insert {n}"
+        );
+    }
+    assert_eq!(meta_count(&store, profile.id()), 3);
+
+    // clear_history drops the counter along with the rows, not merely to 0
+    // but to "no row", the same state an unseen profile starts from.
+    store.clear_history(profile.id()).expect("clear");
+    assert_eq!(meta_count(&store, profile.id()), 0);
+    assert_eq!(real_count(&store, profile.id()), 0);
+
+    // And the very next insert recreates it correctly from that state.
+    store
+        .record_history(history_entry(profile.id(), "select 'after clear'"))
+        .expect("record");
+    assert_eq!(meta_count(&store, profile.id()), 1);
+    assert_eq!(real_count(&store, profile.id()), 1);
+}
+
+#[test]
+fn lowering_the_limit_is_caught_up_in_one_pass_on_the_next_insert() {
+    let mut store = store();
+    let profile = Profile::create(details("p")).expect("valid");
+    store.insert_profile(&profile).expect("insert");
+    for n in 0..10 {
+        store
+            .record_history(history_entry(profile.id(), &format!("select {n}")))
+            .expect("record");
+    }
+    assert_eq!(meta_count(&store, profile.id()), 10, "no bound trimmed yet");
+
+    // Lowering the limit does not retroactively trim anything by itself —
+    // only the next insert's own transaction does, in one O(k) pass.
+    store
+        .put_setting(
+            Scope::Application,
+            HISTORY_MAX_ENTRIES_PER_PROFILE,
+            EntryLimit::count(2).expect("non-zero"),
+        )
+        .expect("put");
+    assert_eq!(
+        real_count(&store, profile.id()),
+        10,
+        "lowering the setting alone writes nothing"
+    );
+
+    store
+        .record_history(history_entry(profile.id(), "select 'the catch-up insert'"))
+        .expect("record");
+    assert_eq!(
+        real_count(&store, profile.id()),
+        2,
+        "one insert's transaction caught the whole excess up to the new bound"
+    );
+    assert_eq!(meta_count(&store, profile.id()), 2);
+}
+
+#[test]
+fn deleting_a_profile_cascades_its_history_meta_row_too() {
+    let mut store = store();
+    let profile = Profile::create(details("p")).expect("valid");
+    store.insert_profile(&profile).expect("insert");
+    store
+        .record_history(history_entry(profile.id(), "select 1"))
+        .expect("record");
+    assert_eq!(meta_count(&store, profile.id()), 1);
+
+    assert!(store.delete_profile(profile.id()).expect("delete"));
+
+    // `history_meta`'s own FK (`ON DELETE CASCADE`) removed the row; a
+    // profile that no longer exists has no counter to leak.
+    let orphaned: i64 = store
+        .connection
+        .query_row("SELECT count(*) FROM history_meta", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(orphaned, 0);
+}
+
 // ---- worksheets and layout (M6.2) -----------------------------------------
 
 fn worksheet_of(profile: Option<ProfileId>, title: &str, text: &str) -> Worksheet {

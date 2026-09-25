@@ -16,6 +16,17 @@ impl Store {
     /// first) — insert and trim are the same `IMMEDIATE` transaction, so a
     /// reader never sees the bound momentarily exceeded.
     ///
+    /// **Cost: O(1) amortized**, independent of both the limit and the
+    /// table's size — not O(min(rows, limit)) per insert. `history_meta`
+    /// (schema 4) keeps a running per-profile row count maintained in this
+    /// same transaction; a steady-state insert deletes exactly one row (the
+    /// single oldest one pushed past the bound), by an index-bound
+    /// `ORDER BY id ASC LIMIT k` — never a full "keep the newest N" scan. If
+    /// the limit was just lowered, the excess is caught up in one O(k) pass
+    /// on this insert, then every later insert is O(1) again; see the
+    /// ADR-0006 amendment for the measurement table this replaces a slower
+    /// design over.
+    ///
     /// Never captures a bind value: [`HistoryEntry`] has no field for one.
     /// The statement text is stored verbatim by design — see
     /// `crate::history`'s module documentation for why the
@@ -64,12 +75,31 @@ impl Store {
         )?;
         let id = HistoryId::from_row_id(transaction.last_insert_rowid());
 
+        // One upsert, no read-then-write race: `count` becomes this
+        // profile's true post-insert total in the same statement, `RETURNING`
+        // it so trimming below never needs a second round trip to learn it.
+        let count: i64 = transaction.query_row(
+            "INSERT INTO history_meta (profile_id, count) VALUES (?1, 1) \
+             ON CONFLICT (profile_id) DO UPDATE SET count = count + 1 \
+             RETURNING count",
+            params![profile_key],
+            |row| row.get(0),
+        )?;
+
         if let Some(limit) = current_max_entries(&transaction)? {
-            transaction.execute(
-                "DELETE FROM history WHERE profile_id = ?1 AND id NOT IN ( \
-                     SELECT id FROM history WHERE profile_id = ?1 ORDER BY id DESC LIMIT ?2)",
-                params![profile_key, i64::from(limit)],
-            )?;
+            let limit = i64::from(limit);
+            if count > limit {
+                let excess = count - limit;
+                transaction.execute(
+                    "DELETE FROM history WHERE id IN ( \
+                         SELECT id FROM history WHERE profile_id = ?1 ORDER BY id ASC LIMIT ?2)",
+                    params![profile_key, excess],
+                )?;
+                transaction.execute(
+                    "UPDATE history_meta SET count = count - ?2 WHERE profile_id = ?1",
+                    params![profile_key, excess],
+                )?;
+            }
         }
         transaction.commit()?;
         Ok(id)
@@ -130,6 +160,11 @@ impl Store {
     /// Deletes every history entry for `profile`. Returns how many were
     /// removed.
     ///
+    /// Also drops `profile`'s `history_meta` row rather than zeroing it in
+    /// place: the next [`Store::record_history`] recreates it at count 1
+    /// through the same upsert an unseen profile would take, so there is one
+    /// code path for "no counter yet", not two.
+    ///
     /// # Errors
     ///
     /// An SQLite failure.
@@ -137,9 +172,14 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let profile_key = profile.to_string();
         let deleted = transaction.execute(
             "DELETE FROM history WHERE profile_id = ?1",
-            params![profile.to_string()],
+            params![profile_key],
+        )?;
+        transaction.execute(
+            "DELETE FROM history_meta WHERE profile_id = ?1",
+            params![profile_key],
         )?;
         transaction.commit()?;
         Ok(deleted)

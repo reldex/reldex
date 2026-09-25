@@ -126,19 +126,19 @@ fn a_v1_file_reopens_unchanged_with_its_data() {
 fn a_genuine_v1_file_migrates_forward_keeping_its_data_and_gains_the_new_tables() {
     // A real schema-1 file: built with today's `Store` (which always writes
     // the *current* schema) and then reduced to exactly what schema 1 ever
-    // had — the tables M4.10/M6.2 added, dropped, and the header's own
-    // version pragma set back to 1 — rather than hand-written DDL, so the
-    // profile/setting rows are guaranteed the shape the real schema-1 code
-    // produced, not an approximation of it.
+    // had — the tables M4.10/M6.2/the fix-round history_meta added, dropped,
+    // and the header's own version pragma set back to 1 — rather than
+    // hand-written DDL, so the profile/setting rows are guaranteed the shape
+    // the real schema-1 code produced, not an approximation of it.
     let dir = TempDir::new("v1-real");
     let profile = populated(&dir);
     {
         let raw = Connection::open(dir.store_path()).expect("raw open");
         raw.execute_batch(
             "DROP TABLE layout; DROP TABLE worksheet_setting; DROP TABLE history; \
-             DROP TABLE worksheet;",
+             DROP TABLE worksheet; DROP TABLE history_meta;",
         )
-        .expect("drop the v2/v3 tables");
+        .expect("drop the v2/v3/v4 tables");
         raw.pragma_update(None, "user_version", 1u32)
             .expect("pragma");
     }
