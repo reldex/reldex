@@ -19,8 +19,8 @@ review), 2026-09-19 (owner confirmation), 2026-09-20 (connect-time warning chann
 2026-09-20 (`SqlDialect` descriptor, M2.4), 2026-09-21 (`SqlDialect` splitter-safety review, M2.4),
 2026-09-24 (server output, M2.7 — amendment T), 2026-09-24 (server-output framing moved to
 `RAW`/`LENGTHB` with per-line UTF-8 decoding, M2.12 — amendment T update), 2026-09-25 (every
-transaction end releases results, from ADR-0004's review — amendment X; decided, not yet
-implemented)
+transaction end releases results, from ADR-0004's review — amendment X; implemented with M5.2
+on 2026-09-26, together with three additive batch accessors the Result Store needs)
 
 ## Context
 
@@ -2235,8 +2235,26 @@ adapter's rules are in `phase-1-m2-5-event-queue.md` §7.5.
 
 ## Amendment: every transaction end releases results (2026-09-25, from ADR-0004's review)
 
-**Status: decided by the lead, not yet implemented.** It lands as a small work item with M5.2 or
-M4.3, whichever comes first (`phase-1.md`, the M5.2 row's follow-up). No new task id.
+**Status: implemented (M5.2 Stage A, 2026-09-26).** Decided by the lead on 2026-09-25; it landed
+with M5.2, before M4.3 (`phase-1.md`, the M5.2 row). No new task id. As built:
+
+- `finish_execute` (`crates/db-core/src/worker.rs`) calls `release_results()` after a successful
+  execute of kind `TransactionControl`, in the `else` of the implicit-commit branch, before the
+  statement's own cursor (if any) is registered. A failed statement releases nothing.
+- The test is `a_typed_transaction_control_statement_releases_results_like_the_commands`
+  (`crates/db-core/tests/transactions.rs`) on both reply paths: typed `COMMIT`, `ROLLBACK`,
+  `SAVEPOINT` and `SET TRANSACTION` each invalidate the open result and its parked LOBs; a failing
+  one does not. Removing the release makes it fail. The Result Store's own tests
+  (`crates/db-core/tests/result_store.rs`) and the live test
+  `a_typed_commit_ends_an_open_result_and_its_lob_cells`
+  (`crates/reldex-core-poc/tests/m5_2_result_store_live.rs`) check the store's side on top.
+
+**Additive batch accessors (same change, no layout change).** The Result Store (ADR-0004 RS1)
+takes a fetched batch apart on the worker instead of copying it cell by cell. `db-driver-api`
+gains three consuming or read-only accessors, and I1/I2's committed layout is unchanged:
+`RowBatch::into_columns`, `Column::into_parts` (the data and its NULL mask), and
+`TextColumn::heap_bytes` / `BytesColumn::heap_bytes` (buffer plus offsets capacity, what a
+byte-capped consumer counts).
 
 ### X1 — a typed `COMMIT` or `ROLLBACK` releases results like the commands do
 

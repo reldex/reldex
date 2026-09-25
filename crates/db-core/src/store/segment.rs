@@ -382,14 +382,14 @@ impl ResultSegment {
 /// 2). Measured on `text5date2` at 1,000,000 rows, private bytes over the
 /// accounted ones (`phase-1-m5-2-data/README.md`):
 ///
-/// - `shrink_to_fit` in place: +59%. Each buffer's spare tail becomes a free
+/// - `shrink_to_fit` in place: +58%. Each buffer's spare tail becomes a free
 ///   fragment between retained segments that the next batch's growing
 ///   buffers cannot use.
 /// - Copying, freeing each column's original at once: +14–17%. The next
 ///   column's copy lands inside the block just freed and splits it.
-/// - Copying while the whole batch is alive, then freeing it: the copies sit
-///   side by side, and the batch's buffers come back as one region the next
-///   batch is built in.
+/// - Copying while the whole batch is alive, then freeing it: +3.2%, the
+///   M5.1 prototype's figure. The copies sit side by side, and the batch's
+///   buffers come back as one region the next batch is built in.
 type Spent = Vec<ColumnData>;
 
 /// A vector holding exactly its contents: moved in when it has no spare
