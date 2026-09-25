@@ -64,7 +64,7 @@ Vendor-neutral names (`SPEC.md` §6). Vendor types belong only to driver/provide
 | `TransactionManager` | Commit, rollback, savepoint, and transaction-state tracking per session. |
 | `ResultStore` | Typed, batched, bounded-memory storage of fetched rows. |
 | `MetadataProvider` | Generic metadata queries; vendor dictionary SQL stays in the vendor provider. |
-| `WorkspaceService` | Non-transactional workspace, profiles, history, settings, layout state. Settings, profiles and the SQLite store are `crates/workspace` (M2.9, [ADR-0006](../decisions/0006-local-persistence-settings-profiles-sqlite.md), §9); the service thread that owns the store is M2.11/M3. |
+| `WorkspaceService` | Non-transactional workspace, profiles, history, settings, layout state. Profiles, settings, query history and workspace state (open worksheets, layout) are all `crates/workspace`'s SQLite store, store side only (M2.9 profiles/settings + M4.10/M6.2 history/workspace, [ADR-0006](../decisions/0006-local-persistence-settings-profiles-sqlite.md), §9); the service thread that owns the store, and everything UI-facing, is M2.11/M3/M4/M6. |
 
 Per [ADR-0002](../decisions/0002-driver-api-and-concurrency-model.md) D2, `DatabaseConnection` is the
 driver-contract trait (`db-driver-api`; `Send`, not `Sync`; `&mut self`), while `DatabaseSession` is a
@@ -330,6 +330,17 @@ Database Cursor -> Batch Fetch -> Result Store -> Virtual Table Model -> Visible
   `sid_endpoint` (`crates/drivers/oracle-thin`), which the binding calls. Whether a profile shows the
   production indicator is its own `treat_as_production` flag (M3.4 reads it), fixed for the named
   environments and the user's choice for a custom one.
+- **Query history and workspace state (M4.10/M6.2, ADR-0006 amendment), store side only.** The
+  same `Store` adds `history` (one row per statement run, keyed by profile, `ON DELETE CASCADE`
+  when the profile goes; bounded per profile by a setting, FIFO-trimmed in the insert's own
+  transaction; the statement text is stored verbatim — it is user SQL, not an endpoint, so the
+  credential-pattern guard does not run on it, though no bind value is ever captured, by type) and
+  `worksheet`/`worksheet_setting`/`layout` (open worksheets, their per-worksheet setting
+  overrides — now the real foreign-key target the settings model always needed — and the
+  workspace's single-row layout: active worksheet/profile, pane sizes, window geometry). None of
+  this is a session or a transaction: a restored worksheet is text and a tab position, never an
+  implied connection or open transaction (`SPEC.md` §20/§24.16). The UI surface (re-run, restore on
+  startup, the settings/workspace screens) is M2.11/M3/M4/M6 work; this crate stops at the store.
 - **No secret is written to SQLite**, by construction: no stored type and no column can hold one; a
   profile records only whether the credential store holds its password, under `CredentialKey` — the
   profile's UUID — and the password travels from there to `ConnectionParams` as a `Secret`

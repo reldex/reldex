@@ -461,6 +461,11 @@ server-output buffer's lower bound is 2,000 bytes; store hardening — `0700`/`0
 
 **Parallelism.** M4.1–M4.4 (editor track) and M4.5–M4.8 (execution/transaction track) are independent after M2; M4.9/M4.10 follow. **Review:** M4.1 (FFI + text correctness), M4.5, M4.6, M4.8.
 
+**M4.10 as implemented, store side only (branch `phase-1/m4-10-m6-2-store`, ADR-0006 amendment).** `crates/workspace` gained `history` (bounded per profile, FIFO-trimmed, statement text verbatim, no bind value ever captured) and `record_history`/`history`/`clear_history`. Row still `[ ]` todo — what M4.10 needs beyond this:
+- [ ] "Store + QML" per the plan row's Outputs column: the QML history panel and re-run action (M4.x UI work).
+- [ ] M2.11 exposes `record_history`/`history`/`clear_history` and the `HistoryId`/`HistoryOutcome`/`HistoryPage` types over the FFI.
+- [ ] Owner sign-off on `history.max_entries_per_profile`'s default (1,000) and bound (1,000,000) — currently the implementer's numbers, unreviewed, the same status other lead defaults had before review.
+
 ---
 
 ### M5 — Results at scale
@@ -503,6 +508,11 @@ server-output buffer's lower bound is 2,000 bytes; store hardening — `0700`/`0
 | M6.9 | `[ ]` todo | Cold first paint ≈ 800–900 ms (D3D11 device creation ≈ 250 ms + first delegate-instantiation polish ≈ 551 ms) vs `SPEC.md` §19 startup target — investigate fix candidates named in the S15 report | `sonnet` | S15 K2 diagnosis (`phase-1-s15-ffi-spike.md`) | Adapter/QML startup change + re-measurement | M1 gate | Cold execute → first painted frame materially under 903.55 ms, ideally toward `SPEC.md` §19's <1 s desirable / <2 s acceptable warm-startup target; warm-path number (15.85 ms) unaffected | M |
 
 **Parallelism.** M6.1/M6.2 (features) run alongside M6.3/M6.4 (non-functional), M6.5/M6.7 (build) and M6.9 (startup). **Review:** M6.6, M6.8.
+
+**M6.2 as implemented, store side only (branch `phase-1/m4-10-m6-2-store`, ADR-0006 amendment).** `crates/workspace` gained `worksheet` (title/text/caret/scroll/tab order, `ON DELETE SET NULL` from its profile), `worksheet_setting` (the real foreign-key target `Scope::Worksheet` settings needed since M2.9, `ON DELETE CASCADE`) and the single-row `layout` (active worksheet/profile, pane sizes, window geometry, both references `ON DELETE SET NULL`) — `save_worksheet`/`load_worksheets`/`delete_worksheet`, `save_layout`/`load_layout`. Non-transactional state only: no session id, no transaction flag, restoring never implies a connection (SPEC §20/§24.16, ADR-0002 E7). Row still `[ ]` todo — what M6.2 needs beyond this:
+- [ ] "Store + shell" per the plan row's Outputs column: the shell actually saving/restoring on close/startup (M6.x UI work).
+- [ ] M2.11 exposes `save_worksheet`/`load_worksheets`/`delete_worksheet`/`save_layout`/`load_layout` and the `Worksheet`/`WorksheetState`/`Layout`/`PaneSizes`/`WindowGeometry` types over the FFI.
+- [ ] M4.1 decides whether `caret`/`scroll` are UTF-16 code-unit offsets (to match `QQuickTextDocument`); the store treats them as opaque `u32`s either way.
 
 **M6.7 as implemented (branch `phase-1/m6-7-ui-ci`).** `.github/workflows/ui.yml` already carried M6.7's full scope as a byproduct of M1.4/M1.5 — this task's real work was verifying that against the acceptance line, closing the one documentation gap (CI-Actions-dependency licences), and recording current evidence here rather than only in ADR-0003's original spike numbers.
 

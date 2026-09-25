@@ -7,8 +7,11 @@ the connect-timeout, time-limit, trigger-rewrite and fetch-size defaults) and 20
 OS credential store with no plaintext fallback, 8 one SQLite file via `rusqlite` with bundled
 SQLite, 9 no telemetry). Nothing here needed a new owner decision.
 **Date:** 2026-09-24; revised 2026-09-25 with the independent review's follow-ups (credential
-guard in endpoints, production flag, SID builder moved into the driver, store hardening).
-**Task:** M2.9 ★ (`phase-1.md` §C.2)
+guard in endpoints, production flag, SID builder moved into the driver, store hardening); amended
+2026-09-25 with the M4.10/M6.2 store-side schema (query history, workspace state) — see
+"Amendment: query history and workspace state" below.
+**Task:** M2.9 ★ (`phase-1.md` §C.2); amendment tasks M4.10/M6.2 (`phase-1.md` §M4/§M6, store side
+only)
 
 ## Context
 
@@ -378,8 +381,10 @@ the product). No `dirs`, `directories` or `tempfile`: the test temp directory is
   - A settings screen that applies several changes issues one transaction per setting; values are
     validated before any write, so only an I/O failure could apply part of a batch (a batch write
     can be added if M3.6 needs it).
-  - Worksheet overrides are keyed by worksheet id alone, with no worksheet table to reference,
-    until M6.2 adds one.
+  - ~~Worksheet overrides are keyed by worksheet id alone, with no worksheet table to reference,
+    until M6.2 adds one.~~ Resolved 2026-09-25 — see "Amendment: query history and workspace
+    state (M4.10/M6.2)" below: worksheet-scoped settings moved to `worksheet_setting`, which has
+    the real foreign key.
   - `results.fetches_in_flight` is application-only (P2).
   - An open has no overall deadline, only a per-wait one (P5).
 - `crates/workspace` is not in the mobile cross-compile workflow's package set yet: the bundled
@@ -451,3 +456,216 @@ endpoint builders, a doctest, and the live `m2_9_sid_endpoint.rs` (2 tests, pass
 - Dependency rule (`tests/dependency_rules.rs`): the crate's normal dependencies are exactly
   `reldex-db-driver-api`, `rusqlite` and `uuid`; `db-core`, the driver contract and every driver
   depend on neither this crate nor `rusqlite`.
+
+## Amendment: query history and workspace state, store side only (2026-09-25, tasks M4.10/M6.2)
+
+Store-side only, in `crates/workspace`: no QML, no FFI. M2.11 exposes this to the composition
+root; the UI halves are M3/M4/M6 work. Both plan rows are marked in-progress, not done, by this
+amendment.
+
+### Schema: bumped, not extended in place
+
+P5 said schema 1 had never shipped when M2.9 wrote it, so a field was added to schema 1 rather
+than as a step 2; that reasoning no longer applies here — schema 1 merged into `main` on
+2026-09-25 (M2.9, PR #32) before this task started. The Consequences section above already
+committed to the alternative: "M4.10 and M6.2 add tables as migration steps 2 and 3." This
+amendment does exactly that — `SCHEMA_VERSION` is now **3** — and adds the tests the plan asked
+for: `migrating_from_v1_applies_every_step_in_order_and_creates_the_new_tables` and
+`an_older_builds_migrate_refuses_a_file_newer_than_it_supports` (`store/schema.rs`, run against an
+intermediate version, not only `SCHEMA_VERSION + 1`, since the refusal rule is the same at every
+version) prove the migration path in the crate's own unit tests; `tests/store_file.rs`'s
+`a_genuine_v1_file_migrates_forward_keeping_its_data_and_gains_the_new_tables` proves it end to end
+against a real file — built with today's `Store` and then reduced to exactly what schema 1 ever
+had (its later tables dropped, `user_version` set back to 1), so the profile/setting rows are
+guaranteed the shape schema-1 code actually produced, not an approximation of it — and confirms the
+migrated file's data survives and its new `record_history`/`history` work immediately after.
+
+### P9 — Query history (M4.10)
+
+`history` (`STRICT`, an ordinary rowid table — `WITHOUT ROWID` does not fit here: the id is an
+autoincrementing cursor for paging and FIFO trimming, not a natural key):
+
+```sql
+CREATE TABLE history (
+    id          INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    profile_id  TEXT    NOT NULL COLLATE NOCASE REFERENCES profile (id) ON DELETE CASCADE,
+    executed_at INTEGER NOT NULL,
+    statement   TEXT    NOT NULL,
+    outcome     TEXT    NOT NULL
+        CHECK (outcome IN ('succeeded', 'failed', 'cancelled', 'timed_out')),
+    native_code INTEGER,
+    elapsed_ms  INTEGER NOT NULL,
+    row_count   INTEGER,
+    CHECK ((outcome = 'failed') OR (native_code IS NULL))
+) STRICT;
+```
+
+`AUTOINCREMENT` so an id handed out as a paging cursor (`HistoryPage::before`) is never reused,
+even after the row it named is trimmed away. `ON DELETE CASCADE` deletes a profile's history when
+the profile is deleted — no code in `delete_profile` had to change; the cascade is the schema's,
+enforced because `PRAGMA foreign_keys` has been on since schema 1 (P5's own note anticipated this:
+"on from the start so the first one a later migration adds ... is enforced rather than
+decorative"). `outcome`/`native_code` model `HistoryOutcome` (`Succeeded` / `Failed { native_code:
+Option<i32> }` / `Cancelled` / `TimedOut`) as a fixed word plus one nullable column, the `CHECK`
+keeping the pair consistent so a decoded row can never disagree with itself.
+
+**Statement text is stored verbatim, and the P7 guard does not apply to it.** This is the point of
+the feature ("re-run into the current worksheet", `phase-1.md` M4.10): a re-run only works if the
+captured text is exact. A statement can legitimately contain the word PASSWORD — `ALTER USER
+app_owner IDENTIFIED BY ...`, a `CREATE USER` — and P7's `CredentialPattern` guard is **not** run
+on it. Running it would both miss the actual risk (a bound value, addressed below) and refuse
+ordinary DDL. **Accepted limitation**, as the task anticipated: a statement pasted with a literal
+secret in it (rather than a bind variable) is captured exactly as typed, the same way a shell
+history or a database's own audit log would capture it. Follow-up idea, not built here: M4.x could
+offer "do not record this statement" as an execute-time choice, opt-in per statement.
+
+**Bind values are never captured, by type.** `HistoryEntry` has no field that could hold one — only
+`statement` (the text as submitted), `outcome`, `elapsed_ms`, `row_count`. There is nothing for a
+bound secret to be written to, the same "no secret by construction" argument P7 makes for a
+profile's password. `tests/no_secrets.rs` now writes a history entry (and a worksheet, below) for
+the marker-password profile, with the SQL text itself carrying a second marker in an `IDENTIFIED
+BY` clause — proving the real secret (from the stub credential store) still never reaches the file
+while the SQL-text marker does, exactly as this section says it should.
+
+**Bounded size**: `history.max_entries_per_profile` (new setting, application level only — the
+bound is one process-wide choice, not a per-connection one, the same reasoning P2 gives for
+`FETCHES_IN_FLIGHT`). Default **1,000** — the implementer's default, not an owner decision, chosen
+the same way the server-output buffer's was: bounded so an old, frequently-used profile's history
+cannot grow the file forever by accident, "no limit" one setting away with its consequence named
+(`NoLimitConsequence::HistoryFileGrowsWithoutLimit`) and stated honestly: nothing trims the table,
+so the file grows with every statement ever run. Enforced by `Store::record_history`, which trims
+the profile's oldest rows past the bound **inside the same `IMMEDIATE` transaction as the insert**
+— never a separate write a crash could leave half-done. Value kind: a new `EntryLimit` (`Count
+(NonZeroU32) | Unlimited`), the same shape as `ByteLimit` for a count of things rather than bytes;
+storage word `entry_limit`. `history_is_trimmed_fifo_to_a_small_bound_inside_the_insert_transaction`
+and, literally, `history_default_bound_trims_the_1001st_insert_keeping_the_newest_1000` (1,001
+inserts at the shipped default, oldest gone, newest 1,000 kept) and
+`history_no_limit_is_never_trimmed` (`store/tests.rs`) prove it.
+
+API: `record_history(HistoryEntry) -> Result<HistoryId, StoreError>`, `history(profile,
+HistoryPage { limit, before: Option<HistoryId> }) -> Result<Vec<HistoryRecord>, StoreError>`
+(newest first; `before` pages backward), `clear_history(profile) -> Result<usize, StoreError>`.
+
+### P10 — Workspace state (M6.2): worksheets and layout
+
+`worksheet` (`STRICT`): id, a nullable `profile_id` (`ON DELETE SET NULL` — deleting a profile
+must not delete a worksheet's text, only its association with that profile), `title`, `text`
+(verbatim, capped at 1 MiB — the same cap and the same reason as a history statement's), `caret`,
+`scroll` (opaque integers the store does not interpret), `tab_order`, `created_at`, `updated_at`.
+`Store::save_worksheet` upserts (`ON CONFLICT (id) DO UPDATE`, `created_at` left out of the `SET`
+clause so it is kept as first stored, like `update_profile`); `load_worksheets` returns every
+worksheet in tab order, tolerant of an undecodable row the way `profiles()` is; `delete_worksheet`
+removes one.
+
+**Non-transactional state only.** Neither `worksheet` nor `layout` (below) has a column for a
+session id, a connected flag or a transaction state, and cannot be given one without a schema
+change this ADR would have to approve. Restoring a worksheet is text in an editor and a place in
+the tab bar — never a session, and never an open transaction (`SPEC.md` §20/§24.16, ADR-0002 E7).
+Reopening a connection, if the UI chooses to, is entirely M6.2's UI half's decision, made after the
+workspace is restored.
+
+**`layout`** (`STRICT`, one row, `id INTEGER PRIMARY KEY CHECK (id = 1)`): `active_worksheet_id`,
+`active_profile_id` (both `ON DELETE SET NULL` — a layout naming a since-deleted worksheet or
+profile is cleared, never left dangling, and never refused: `deleting_a_profile_clears_it_from_the_layout`
+and the worksheet half of `delete_worksheet_cascades_its_settings_and_clears_it_from_the_layout`
+prove it), pane sizes (`object_browser_width`, `result_pane_height`) and window geometry
+(`window_x/y/width/height`, `window_maximized`), all nullable — "not saved yet" uses the shell's
+own default, never a guessed number. `save_layout`/`load_layout` read/write the single row; a
+second `save_layout` replaces it rather than accumulating rows
+(`layout_round_trips_and_replaces_the_single_row`).
+
+### The `setting` table's `Scope::Worksheet` rows: a new table, not a shared-column FK
+
+P5's accepted limitation said worksheet overrides were "keyed by worksheet id alone, with no
+worksheet table to reference, until M6.2 adds one." Read literally that suggests adding
+`FOREIGN KEY (scope_id) REFERENCES worksheet (id)` to the existing `setting` table. That does not
+work: SQLite enforces a foreign key over **every row** of the column it is declared on, and
+`setting.scope_id` also holds profile ids (for `scope = 'profile'`) and the empty string (for
+`scope = 'application'`) — neither of which is a row of `worksheet`. A single shared column cannot
+carry a foreign key that only applies to some of its rows.
+
+**Decision:** worksheet-scoped settings move to a table of their own, `worksheet_setting`
+(`scope`'d columns replaced by one `worksheet_id`, `STRICT, WITHOUT ROWID`,
+`PRIMARY KEY (worksheet_id, setting_key)`, `FOREIGN KEY (worksheet_id) REFERENCES worksheet (id)
+ON DELETE CASCADE`). `setting` keeps `application` and `profile` rows exactly as before — its own
+`CHECK` still names `'worksheet'` as a value the column type allows (`CHECK`s cannot be altered,
+P5), but application code never writes that scope there again. `Store::put_setting_value` /
+`load_layer` / `clear_setting` / `clear_worksheet_settings` all branch on `Scope::Worksheet` to use
+the new table; `put_setting_value` now checks the worksheet exists first, the same way it already
+checked a profile — refusing with the new `StoreError::WorksheetNotFound` — so a worksheet-scoped
+setting can no longer be written for a worksheet that was never saved
+(`worksheet_scoped_settings_require_an_existing_worksheet`; this is a real, deliberate behaviour
+change from before this amendment, where any random `WorksheetId` was accepted).
+
+**Migration note:** schema 1/2 never shipped a `worksheet` table, so any pre-existing
+`scope = 'worksheet'` row in `setting` cannot name a real worksheet — it was already an orphan the
+moment it was written, before this migration or after it. Migration step 3 deletes those rows
+(`DELETE FROM setting WHERE scope = 'worksheet'`) rather than attempt to carry them into a table
+whose foreign key they cannot satisfy. In practice this discards nothing a released Reldex ever
+wrote: M3.6 (the settings UI) has not shipped, so no worksheet-scoped override has ever reached a
+real user's file.
+
+### Registry addition
+
+| Setting (`storage key`) | Default | Levels | Bounds | "No limit" | Takes effect |
+| --- | --- | --- | --- | --- | --- |
+| `history.max_entries_per_profile` | 1,000 entries | application | 1-1,000,000 | yes - the store file grows without limit | next statement |
+
+### Consequences
+
+- M2.11 additionally lifts: `HistoryId`/`HistoryOutcome`/`HistoryPage` and `WorksheetId`'s
+  worksheet-table-backed existence check into whatever numeric/opaque form the FFI gives the UI;
+  neither type crosses the boundary as designed here.
+- M4.x (UI) decides re-run semantics (replace vs. insert at caret), pagination UX, and whether to
+  build the "do not record this statement" opt-out named above.
+- M6.2 (UI) decides restore ordering, how a restored worksheet without its profile still connected
+  reads in the UI (the store answers `profile: None`; the UI's wording is its own), and whether
+  `caret`/`scroll` are UTF-16 code-unit offsets (matching `QQuickTextDocument`, M4.1) — the store
+  treats them as opaque `u32`s either way.
+- Every enum touched here (`HistoryOutcome`, the new `StoreError`/`StoreTable` variants,
+  `NoLimitConsequence::HistoryFileGrowsWithoutLimit`) is `#[non_exhaustive]`; every addition is
+  additive to the crate's public API, no existing signature changed shape.
+- **New accepted limitations** (this amendment, one line each):
+  - A history statement's text is never scanned for credential-looking patterns; see P9 above.
+  - `history.max_entries_per_profile`'s default (1,000) and bound (1,000,000) are the
+    implementer's, not an owner-reviewed number, the same status `SERVER_OUTPUT_BUFFER`'s default
+    had before it was reviewed.
+  - A worksheet's `caret`/`scroll` are opaque integers the store does not validate against the
+    text's own length; a stale value from an edit made through another path is the UI's to clamp.
+
+### Evidence
+
+`cargo test -p reldex-workspace`: 104 unit tests (up from 86 before this amendment, 100 before
+M2.9's own final count) plus 2 doctests; `no_secrets.rs` 2 (extended, not new); `store_file.rs` 12
+(up from 10, both new tests migration/refusal-focused); `two_handles.rs` 6 (up from 5, the new one
+history-focused); `dependency_rules.rs` and `connect_oracle_binding.rs` unchanged and still green —
+no new dependency, `EntryLimit`/`history`/`worksheet`/`layout` are all built from
+`rusqlite`/`uuid`/`std` already in the graph.
+
+- History: round trip including Thai, an emoji, and a statement at the exact 1 MiB cap; paging
+  (`first`/`after`) newest-first; FIFO trim at a small explicit bound and at the literal
+  1,001st-insert/1,000-default case; "no limit" trims nothing; a deleted profile's history goes
+  with it; an unknown profile and an empty statement each write nothing.
+- Worksheet/layout: round trip including Thai, an emoji, and text at the 1 MiB cap; `save_worksheet`
+  upserts without duplicating and keeps the first-stored creation time; an unknown profile is
+  refused; a worksheet-scoped setting now requires an existing worksheet; deleting a worksheet
+  cascades its settings and clears it from the layout; deleting a profile clears it from the
+  layout; the layout round-trips and a second save replaces the single row rather than adding one.
+- Migration: a genuine reduced-to-v1 file (built by the real schema-1 code, not approximated)
+  migrates through both new steps, keeps its data, and immediately supports `record_history`; an
+  older build's `migrate` (its own `MIGRATIONS` truncated to step 1) refuses a file already at
+  version 2, generalising the existing newer-schema refusal test beyond `SCHEMA_VERSION + 1`.
+- Concurrency: `record_history` follows the exact same `Busy`/patient-wait rules as
+  `put_setting`/`insert_profile` already did.
+- No secrets: `tests/no_secrets.rs` now also writes a history entry and a worksheet (title and
+  text) for the marker-password profile, with a second marker inside a credential-looking
+  `IDENTIFIED BY` clause — the real secret is confirmed absent from the file/WAL in both encodings
+  exactly as before, and the SQL-text marker is confirmed **present**, by design.
+- Fixed along the way: a whole missing table (as opposed to a missing column) used to surface as
+  `StoreError::Sqlite`, not `SchemaMismatch`, because rusqlite reports "no such table" as a bare
+  `SqliteFailure(ErrorCode::Unknown)` while "no such column" comes through as `SqlInputError`. This
+  could not previously be exercised — schema 1 always had every table this build expected — and is
+  exactly the scenario a table added since schema 1 makes newly reachable. Both now map to
+  `SchemaMismatch`, consistent with this module's own documented reasoning that a failure against
+  this crate's fixed, tested SQL means the file's tables do not match what its schema version
+  promises. `tables_that_differ_from_their_version_are_a_schema_mismatch` covers both shapes now.
