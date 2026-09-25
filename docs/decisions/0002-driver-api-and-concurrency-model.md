@@ -400,6 +400,9 @@ and answered "as you recommended" to all five).
    dropping the column.
 4. **`Secret` zeroing stays best-effort, no `zeroize` dependency for now (D7).** Accepted; revisit in
    the credential-storage ADR (`ARCHITECTURE.md` §13 item 9).
+   **Revisited 2026-09-25 by [ADR-0007](0007-credential-store.md) S6.** `Secret` now wipes its
+   buffer with `zeroize` on drop. That makes `zeroize` the contract's one production dependency:
+   D1's "zero production dependencies" now means "one: `zeroize`, private to `Secret`".
 5. **`SavepointName` restricted to a portable simple identifier of at most 30 ASCII characters (D4).**
    Accepted.
 

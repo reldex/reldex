@@ -82,7 +82,7 @@ pub trait CredentialStore: Send + Sync {
 #[non_exhaustive]
 pub enum CredentialStoreKind {
     /// Windows Credential Manager: generic credentials, persisted for this
-    /// user on this machine ([`crate::WindowsCredentialManager`]).
+    /// user on this machine (`WindowsCredentialManager`, Windows builds only).
     WindowsCredentialManager,
     /// No credential store: this platform has no backend yet, or none is
     /// usable. Passwords are asked for at every connect

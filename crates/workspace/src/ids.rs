@@ -137,7 +137,8 @@ uuid_id!(
 /// ([`crate::PasswordStorage`]); the password itself goes from the credential
 /// store straight into [`crate::connection_params`] as a
 /// [`reldex_db_driver_api::Secret`]. How the key is spelled inside a platform
-/// store (a target-name prefix, a service name) is M2.10's decision.
+/// store is the credential store's business: `reldex-secrets` (M2.10,
+/// ADR-0007) uses the Windows Credential Manager target `Reldex/profile/<id>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CredentialKey(ProfileId);
 
