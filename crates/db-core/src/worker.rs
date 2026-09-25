@@ -66,6 +66,7 @@ use crate::session::{
     CloseDisposition, CloseError, ExecuteOutcome, FetchedBatch, OutValue, OutValues, SessionLimits,
 };
 use crate::shared::{EndedAs, SessionLifecycle, SessionShared};
+use crate::store::{FetchTicket, SegmentReply, compact_batch};
 
 /// Why the worker is being asked to shut down.
 pub(crate) enum CloseIntent {
@@ -94,6 +95,13 @@ pub(crate) enum Command {
         result: ResultId,
         max_rows: NonZeroUsize,
         reply: ReplyTo<FetchedBatch>,
+    },
+    /// Fetch the next batch of an open result for a result store, and
+    /// compact it into a segment here, on the worker (ADR-0004 RS1).
+    FetchSegment {
+        fetch: FetchTicket,
+        max_rows: NonZeroUsize,
+        reply: ReplyTo<SegmentReply>,
     },
     /// Release a result's resources.
     CloseResult {
@@ -151,6 +159,9 @@ impl Command {
                 reply.answer(Err(error));
             }
             Self::FetchBatch { reply, .. } => {
+                reply.answer(Err(error));
+            }
+            Self::FetchSegment { reply, .. } => {
                 reply.answer(Err(error));
             }
             Self::CloseResult { reply, .. }
@@ -602,6 +613,11 @@ impl Worker {
                 max_rows,
                 reply,
             } => self.fetch_batch(result, max_rows, reply),
+            Command::FetchSegment {
+                fetch,
+                max_rows,
+                reply,
+            } => self.fetch_segment(fetch, max_rows, reply),
             Command::CloseResult { result, reply } => {
                 let outcome = match self.owned_result(result) {
                     Ok(id) => self.close_result(id),
@@ -1090,6 +1106,74 @@ impl Worker {
                 // cursor is `close()` (ADR-0002 D2). Make it, here, rather than
                 // dropping the cursor and hoping.
                 let _ = self.close_result(id);
+                reply.answer(Err(err));
+            }
+        }
+        Flow::Continue
+    }
+
+    /// Fetches for a result store: the same fetch as [`Worker::fetch_batch`],
+    /// then the batch is compacted into a segment **here**, parking every LOB
+    /// locator and keeping its id in the segment, before the reply leaves the
+    /// worker (ADR-0004 RS1). Only plain data crosses the thread boundary,
+    /// exactly as on the batch path (ADR-0002 K1).
+    fn fetch_segment(
+        &mut self,
+        fetch: FetchTicket,
+        max_rows: NonZeroUsize,
+        reply: ReplyTo<SegmentReply>,
+    ) -> Flow {
+        let id = match self.owned_result(fetch.result()) {
+            Ok(id) => id,
+            Err(err) => {
+                reply.answer(Err(err));
+                return Flow::Continue;
+            }
+        };
+        let Some(cursor) = self.cursors.get_mut(&id) else {
+            reply.answer(Err(self.unknown_result_error()));
+            return Flow::Continue;
+        };
+        let torn = &self.torn;
+        let outcome = call(torn, || {
+            let batch = cursor.fetch_batch(max_rows)?;
+            Ok((batch, cursor.is_exhausted()))
+        });
+        let (batch, known_exhausted) = match outcome {
+            Ok(fetched) => fetched,
+            Err(err) => {
+                self.shared.note_error(&err);
+                // After any error from `fetch_batch`, the only legal call on a
+                // cursor is `close()` (ADR-0002 D2).
+                let _ = self.close_result(id);
+                reply.answer(Err(err));
+                return Flow::Continue;
+            }
+        };
+        let exhausted = known_exhausted || batch.is_empty();
+        let mut parked = Vec::new();
+        let session = self.session;
+        let compacted = compact_batch(session, batch, |_, locator| {
+            let handle = self.park_lob(Some(id), locator)?;
+            parked.push(handle);
+            Ok(handle.serial())
+        });
+        match compacted {
+            Ok(segment) => {
+                let answered = reply.answer(Ok(SegmentReply::new(Arc::new(segment), exhausted)));
+                if !answered {
+                    // Nobody will read these; release them on their own
+                    // thread rather than when the result closes.
+                    for lob in parked {
+                        self.lobs.remove(&lob);
+                    }
+                }
+            }
+            Err(err) => {
+                self.shared.note_error(&err);
+                for lob in parked {
+                    self.lobs.remove(&lob);
+                }
                 reply.answer(Err(err));
             }
         }
