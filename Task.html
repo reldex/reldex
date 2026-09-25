@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-25T20:46:55+07:00",
+  "updatedAt": "2026-09-25T21:23:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -682,6 +682,13 @@
       "status": "Accepted — owner decision 2026-09-24. The reldex GitHub account's Free-plan Actions minutes (2,000/month, private-repo only) were exhausted 2026-09-21 after >=100 workflow runs; every job since has failed in ~2s on a billing error. Of five options (reduce matrix, self-hosted runner, stop using Actions, wait, go public), the owner's first choice was 'stop using Actions' but switched the same day to making the repository public once the per-run cost (~40 billable min/PR, macOS x10 multiplier) showed a public repo gets Actions minutes free with no cap. ci.yml/ui.yml/mobile-cross-compile.yml are unchanged; hosted CI stays the merge gate; tools/gates.sh is added as a local pre-push/pre-PR check, not a CI replacement. The visibility flip itself is not yet executed — gated on a history exposure scan, run 2026-09-24: no credentials/keys/certificates ever committed; no files over 5 MB; one Android device serial in phase-0-android-device.md redacted at HEAD but present in history (accepted as low risk). Same decision also settles Community/Pro licensing (open since P0): Community edition is GPL-3.0-or-later, copyright (C) 2026 Supawit Nu-iat (LICENSE, COPYRIGHT); Reldex Pro is licensed separately by the copyright holder; external contributions will require a CLA to keep dual licensing possible. PRs #22, #24 and #25 merged 2026-09-21 to 09-24 on local verification only, while CI was down — stated here honestly, not glossed over.",
       "date": "2026-09-24",
       "link": "docs/decisions/0005-public-repository-for-hosted-ci.md"
+    },
+    {
+      "id": "ADR-0007",
+      "title": "Credential store — CredentialStore trait, Windows Credential Manager backend, prompt-each-time when absent (crates/secrets)",
+      "status": "Accepted 2026-09-25 (S1–S4, S8); S5–S7 provisionally accepted by the lead, pending owner confirmation: zeroize as the driver contract's first dependency, the unsafe exception fenced to wincred.rs, and windows-sys in place of the windows crate named in the Phase 1 approvals. Passwords live only in the OS store keyed by the profile UUID; absence of a store means prompt each time, never a plaintext fallback. Entries carry a versioned Reldex prefix so anything another tool wrote under our name is refused as malformed and prompts instead of being sent to the database. A per-user cross-process lock serialises every call because Credential Manager loses concurrent writes (measured); residual races with other apps are recorded and M2.14 sweeps orphans.",
+      "date": "2026-09-25",
+      "link": "docs/decisions/0007-credential-store.md"
     },
     {
       "id": "ADR-0006",
@@ -1208,8 +1215,8 @@
               "status": "done"
             },
             {
-              "title": "M2.10 ★ Credential store: CredentialStore trait + Windows Credential Manager implementation (opus, review mandatory)",
-              "status": "todo"
+              "title": "M2.10 ★ Credential store: CredentialStore trait + Windows Credential Manager implementation (opus, review mandatory) —  — done 2026-09-25: crates/secrets (reldex-secrets) — CredentialStore trait with value-free typed errors; Windows Credential Manager backend (generic credential Reldex/profile/<uuid>, LOCAL_MACHINE, versioned RLDX v1 blob ≤ 2,555 bytes, anything else → Malformed → prompt); NoCredentialStore = prompt each time; resolve_password → PasswordSource (36-row truth table); per-user named lock because Credential Manager loses concurrent writes (0/1,200 lost with the lock); Secret zeroizes; independently reviewed (1 must-fix landed: foreign entries were returned as passwords); real round-trips on Windows CI, 875 tests; ADR-0007 (S5–S7 pending owner confirmation); follow-up M2.14",
+              "status": "done"
             },
             {
               "title": "M2.11 FFI surface for M2.5–M2.10 + regenerate and verify header (sonnet)",
@@ -1224,6 +1231,11 @@
               "title": "M2.13 Per-statement server-output drain bound (total cap reported, or a cancel flag checked between reads) (opus; M2.7 review follow-up)",
               "status": "todo",
               "note": "Today the drain has no length bound, cannot be cancelled on Oracle, and holds Executed back until it finishes."
+            },
+            {
+              "title": "M2.14 Credential orphan sweep: delete Reldex/profile/* Credential Manager entries whose profile no longer exists, at startup and after a profile delete; never outside the namespace (sonnet; M2.10 review follow-up; after M3.3)",
+              "status": "todo",
+              "note": "Planned from the M2.10 review: Credential Manager can revive a deleted entry when another writer races us, and an entry written by another tool under our name is refused as malformed; the sweep removes both kinds."
             }
           ]
         },
@@ -1684,6 +1696,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-25",
+      "text": "M2.10 done: passwords now live only in the Windows Credential Manager, keyed by the profile's UUID, and a missing store means the app asks every time — there is no plaintext fallback anywhere. Independent review caught a real defect: an entry written by another tool under our name was read back as the password and would have been sent to the database, risking an account lockout; every entry now carries a versioned Reldex prefix and anything else is refused and prompts. Testing also showed that Credential Manager loses writes when two callers write at once, even to different entries, so every call takes a per-user cross-process lock (measured clean over 1,200 cycles). Three decisions are marked as provisionally accepted by the lead pending the owner: zeroize as the driver contract's first dependency, one fenced unsafe file, and windows-sys in place of the windows crate. A follow-up (M2.14) will sweep orphaned entries."
+    },
     {
       "date": "2026-09-25",
       "text": "macOS CI flake understood and mitigated: the failed copy of the FFI library was a transient filesystem error on the copy call itself, not a build-ordering bug (ordering was verified correct). The retry helper now retries the copy as well as the existence check; four reruns of the macOS job passed. The underlying transient error is still not root-caused and stays listed as a risk."
