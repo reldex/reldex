@@ -361,6 +361,20 @@ void TstCoreInfo::appShellRendersAtCurrentScaleFactor()
     // sizes/pixel dimensions; do not commit images"). Inert unless a
     // developer sets this env var by hand; ctest never does.
     if (const QByteArray grabDir = qgetenv("RELDEX_UI_DPI_GRAB_DIR"); !grabDir.isEmpty()) {
+        // RELDEX_UI_DPI_GRAB_DARK: also manual-only. QT_QUICK_CONTROLS_COLOR_SCHEME
+        // does not affect Application.styleHints.colorScheme (it is a Controls-
+        // internal styling hint, not the OS scheme Theme.qml reads), so the only
+        // reliable way to grab the dark palette by hand is the same path a user's
+        // theme picker takes: AppSettings.themeOverride.
+        if (const QByteArray forceDark = qgetenv("RELDEX_UI_DPI_GRAB_DARK");
+            !forceDark.isEmpty() && forceDark != "0") {
+            auto *settings = engine.singletonInstance<AppSettings *>("Reldex.Adapter", "AppSettings");
+            QVERIFY(settings != nullptr);
+            settings->setThemeOverride(AppSettings::Dark);
+            QCoreApplication::processEvents();
+            QCoreApplication::processEvents();
+        }
+
         QDir().mkpath(QString::fromLocal8Bit(grabDir));
         const QImage grab = window->grabWindow();
         const QString path = QDir(QString::fromLocal8Bit(grabDir))

@@ -20,11 +20,16 @@ Rectangle {
             id: outputTabBar
             objectName: "outputTabBar"
             width: parent.width
-            palette.window: Theme.tokens.surfaceAlt
-            palette.windowText: Theme.tokens.textMuted
-            palette.button: Theme.tokens.surface
-            palette.buttonText: Theme.tokens.text
-            palette.highlight: Theme.tokens.accent
+
+            // See WorksheetArea.qml's tabBar for why these four roles
+            // specifically (Basic's TabButton.qml reads them, not
+            // button/buttonText/highlight) and the computed contrast ratios
+            // (also in ui/README.md "App shell (M3.1)").
+            palette.window: Theme.tokens.accent
+            palette.windowText: Theme.tokens.accentText
+            palette.dark: Theme.tokens.surfaceAlt
+            palette.brightText: Theme.tokens.textMuted
+            palette.mid: Theme.tokens.selection
 
             TabButton { text: qsTr("Messages") }
             TabButton { text: qsTr("DBMS_OUTPUT") }

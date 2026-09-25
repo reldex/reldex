@@ -24,7 +24,16 @@ ApplicationWindow {
     minimumWidth: 900
     minimumHeight: 560
     visible: true
-    title: "Reldex"
+
+    // The brand name (AGENTS.md "Naming and branding") -- deliberately not
+    // wrapped in qsTr(): a product name is never translated, unlike every
+    // other user-visible string in this file. Named explicitly, rather than
+    // inlined into `title` below, so that not-translating it reads as a
+    // decision here rather than an oversight next to all the qsTr() calls
+    // around it.
+    readonly property string productName: "Reldex"
+
+    title: root.productName
     color: Theme.tokens.background
 
     // Session-only, per the task brief: resets to expanded on every launch.

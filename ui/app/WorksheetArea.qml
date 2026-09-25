@@ -44,11 +44,21 @@ Rectangle {
                     width: parent.width - addButton.width
                     height: parent.height
                     background: Rectangle { color: "transparent" }
-                    palette.window: Theme.tokens.surfaceAlt
-                    palette.windowText: Theme.tokens.textMuted
-                    palette.button: Theme.tokens.surface
-                    palette.buttonText: Theme.tokens.text
-                    palette.highlight: Theme.tokens.accent
+
+                    // Basic's own TabButton.qml (QtQuick/Controls/Basic/TabButton.qml)
+                    // reads exactly these four palette roles -- `button`/`buttonText`/
+                    // `highlight` (set here in an earlier revision) are not read by it
+                    // at all, which is what left the *unselected* tab on Basic's
+                    // unset-`dark` default (near-black in every theme). Contrast,
+                    // computed against `Theme`'s actual token values and stated in
+                    // `ui/README.md` "App shell (M3.1)":
+                    //   selected   window/windowText = accent/accentText   6.70:1 light, 6.55:1 dark
+                    //   unselected dark/brightText   = surfaceAlt/textMuted 5.06:1 light, 5.69:1 dark
+                    palette.window: Theme.tokens.accent
+                    palette.windowText: Theme.tokens.accentText
+                    palette.dark: Theme.tokens.surfaceAlt
+                    palette.brightText: Theme.tokens.textMuted
+                    palette.mid: Theme.tokens.selection
 
                     Repeater {
                         model: tabsModel

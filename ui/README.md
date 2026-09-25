@@ -127,6 +127,18 @@ events (offscreen window activation is not reliable enough across three CI
 platforms to make that the automated check -- it was exercised interactively
 instead, running the real app, see "Running the shell vs the harness" below).
 
+**`Theme.tokens.border` is a low-contrast divider by design, not an
+affordance.** It draws every pane seam and `SplitView` handle at rest
+(contrast against `background`: 1.29:1 light, 1.59:1 dark -- deliberately
+far under WCAG's 3:1 non-text minimum, since a divider's job here is to be
+present without competing with content). That means border colour alone must
+never be the only cue that something is interactive or draggable: the
+`SplitView` handle already gets a second, high-contrast cue on top of it
+(`Theme.tokens.accent` while `SplitHandle.pressed`), and any future control
+that leans on a border for its boundary needs the same kind of second cue.
+M6.4 (accessibility baseline) checks this project-wide; this note exists so
+that check has something written down to check against.
+
 ### Running the shell vs the harness
 
 `ui/app/main.cpp` picks which QML component to load:
@@ -175,6 +187,22 @@ not spend cycles querying a native theme engine that an offscreen CI runner
 cannot open (Fusion and the native "Windows" style both do; harmless but
 noisy `OpenThemeData() failed` warnings were observed from both before this
 was pinned down explicitly in the test binary too).
+
+**Tab bar contrast.** Basic's own `TabButton.qml` reads exactly four palette
+roles -- `window`/`windowText` for the *selected* tab, `dark`/`brightText` for
+every other one (`button`/`buttonText`/`highlight`, set in an earlier
+revision of this task, are not read by it at all, which is what left an
+unset-`dark` tab rendering near-black in every theme). `WorksheetArea.qml`
+and `OutputPanes.qml` bind all four to `Theme` tokens; contrast, computed
+against `Theme`'s actual token values (WCAG relative-luminance formula):
+
+| Tab state | Roles | Light | Dark |
+| --- | --- | --- | --- |
+| selected | `window`/`windowText` = `accent`/`accentText` | 6.70:1 | 6.55:1 |
+| unselected | `dark`/`brightText` = `surfaceAlt`/`textMuted` | 5.06:1 | 5.69:1 |
+
+Both states clear WCAG's 4.5:1 normal-text minimum in both themes with
+headroom.
 
 ### High-DPI
 
@@ -964,14 +992,3 @@ module (`Qt6Charts`, `Qt6WebEngineCore`, etc.) is present.
   screenshot taken on this dev machine (including the DPI grabs above) shows
   tofu boxes instead of real glyphs; `appShellThaiSampleTextIsNotZeroWidth`
   checks shaped width for exactly this reason, not a screenshot.
-- **The Basic style's default checked-tab chrome is not fully re-themed
-  (M3.1).** `WorksheetArea.qml`/`OutputPanes.qml`'s `TabBar`s set
-  `palette.window`/`windowText`/`button`/`buttonText`/`highlight` from
-  `Theme.tokens`, but the *selected* `TabButton`'s background comes from a
-  Basic-style palette role (`dark`) this task did not set, so it currently
-  renders with Basic's own default rather than a `Theme` token. Selection is
-  still visible (not a colour-only-meaning violation, since the tab's
-  pressed/selected state is also conveyed by which tab's content is shown),
-  just not fully on-brand yet; a full custom `TabButton` delegate (as
-  `Main.qml` already has for the `SplitView` handle) is a straightforward
-  follow-up, left for a design pass rather than this task's scope.
