@@ -183,6 +183,27 @@ impl TextColumn {
     pub fn offsets(&self) -> &[usize] {
         &self.offsets
     }
+
+    /// Gives back the capacity the column holds beyond its values.
+    ///
+    /// A driver reserves text space before it knows how long the values will
+    /// be, and grows it by doubling, so a fetched column typically holds
+    /// several hundred bytes per row that no value uses. A consumer that
+    /// *retains* the column — the result store (ADR-0004 RS1) — calls this
+    /// once, on the thread that owns it, before keeping it. The layout and
+    /// every value are unchanged; the allocator can often shrink in place.
+    pub fn shrink_to_fit(&mut self) {
+        self.buffer.shrink_to_fit();
+        self.offsets.shrink_to_fit();
+    }
+
+    /// The heap bytes this column holds: the capacity of its buffer and of
+    /// its offsets, whether used or not. What a consumer that bounds its
+    /// memory by bytes counts (ADR-0004 RS3).
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.buffer.capacity() + self.offsets.capacity() * std::mem::size_of::<usize>()
+    }
 }
 
 /// Variable-length byte values stored as one buffer plus offsets.
@@ -256,6 +277,19 @@ impl BytesColumn {
     #[must_use]
     pub fn offsets(&self) -> &[usize] {
         &self.offsets
+    }
+
+    /// Gives back the capacity the column holds beyond its values; see
+    /// [`TextColumn::shrink_to_fit`].
+    pub fn shrink_to_fit(&mut self) {
+        self.buffer.shrink_to_fit();
+        self.offsets.shrink_to_fit();
+    }
+
+    /// The heap bytes this column holds; see [`TextColumn::heap_bytes`].
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.buffer.capacity() + self.offsets.capacity() * std::mem::size_of::<usize>()
     }
 }
 
@@ -513,6 +547,19 @@ impl Column {
         };
         values.get_mut(row)?.take()
     }
+
+    /// Takes the column apart into its values and its NULL mask, without
+    /// copying either.
+    ///
+    /// For a consumer that keeps a column in a layout of its own — the result
+    /// store re-encodes `NUMBER` and drops a driver's spare capacity
+    /// (ADR-0004 RS1). A [`ColumnData::Lob`] column that still holds locators
+    /// carries the thread affinity [`RowBatch`] describes: take it apart on
+    /// the worker thread that owns the connection.
+    #[must_use]
+    pub fn into_parts(self) -> (ColumnData, NullMask) {
+        (self.data, self.nulls)
+    }
 }
 
 /// A batch of rows fetched from a cursor.
@@ -609,6 +656,16 @@ impl RowBatch {
     #[must_use]
     pub fn value(&self, row: usize, column: usize) -> Option<ValueRef<'_>> {
         self.columns.get(column)?.value(row)
+    }
+
+    /// Takes the batch apart into its columns, without copying them.
+    ///
+    /// See [`Column::into_parts`]. Every column has
+    /// [`RowBatch::row_count`] rows. A batch whose large-object locators have
+    /// not been taken keeps its thread affinity in the columns it becomes.
+    #[must_use]
+    pub fn into_columns(self) -> Vec<Column> {
+        self.columns
     }
 }
 
@@ -1272,6 +1329,55 @@ mod tests {
         }
         assert!(TextColumn::new().offsets().is_empty());
         assert!(BytesColumn::new().buffer().is_empty());
+    }
+
+    #[test]
+    fn shrinking_keeps_every_value_and_releases_the_slack() {
+        // A driver reserves before it knows the lengths (ADR-0004 RS1): the
+        // retained form keeps the same layout, only tighter.
+        let mut text = TextColumn::with_capacity(1_000, 16_000);
+        text.push("alpha");
+        text.push("");
+        text.push("ข้อมูล");
+        let before = text.heap_bytes();
+        let values: Vec<String> = (0..text.len())
+            .map(|row| text.get(row).expect("row").to_owned())
+            .collect();
+        text.shrink_to_fit();
+        assert!(
+            text.heap_bytes() < before,
+            "{} !< {before}",
+            text.heap_bytes()
+        );
+        assert!(
+            text.heap_bytes() >= text.buffer().len() + size_of_val(text.offsets()),
+            "heap bytes count at least what is used"
+        );
+        for (row, value) in values.iter().enumerate() {
+            assert_eq!(text.get(row), Some(value.as_str()));
+        }
+
+        let mut bytes = BytesColumn::with_capacity(100, 1_000);
+        bytes.push(&[1, 2, 3]);
+        let before = bytes.heap_bytes();
+        bytes.shrink_to_fit();
+        assert!(bytes.heap_bytes() < before);
+        assert_eq!(bytes.get(0), Some(&[1_u8, 2, 3][..]));
+    }
+
+    #[test]
+    fn a_batch_comes_apart_into_its_columns_and_masks() {
+        let numbers = Column::not_null(ColumnData::Number(vec![Number::from(1_i64)]));
+        let names = text_column(&[None]);
+        let batch = RowBatch::new(vec![numbers, names]).expect("equal lengths");
+        let mut columns = batch.into_columns().into_iter();
+        let (data, nulls) = columns.next().expect("first column").into_parts();
+        assert!(matches!(data, ColumnData::Number(ref values) if values.len() == 1));
+        assert!(!nulls.is_null(0));
+        let (data, nulls) = columns.next().expect("second column").into_parts();
+        assert_eq!(data.kind(), ColumnKind::Text);
+        assert!(nulls.is_null(0));
+        assert!(columns.next().is_none());
     }
 
     #[test]
