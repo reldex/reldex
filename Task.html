@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-25T09:11:00+07:00",
+  "updatedAt": "2026-09-25T20:46:55+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -527,9 +527,9 @@
   ],
   "risks": [
     {
-      "title": "macOS Qt CI job flaked once on a parallel-build race (2026-09-25)",
-      "detail": "On PR #34 the qt-build (macos-latest) job failed while copying libreldex_ffi.dylib during a parallel build; a rerun of that single job passed and no ui/ or FFI file had changed. The CI matrix is the merge gate, so a recurring flake would block merges.",
-      "mitigation": "Track recurrences; if it repeats, add an explicit CMake dependency so the copy step waits for the cdylib target (ui/CMakeLists), as a small follow-up after M6.9's ui/ changes are merged. Never merge on a red job; rerun only that job and record it."
+      "title": "macOS Qt CI job flaked once on a transient copy failure (2026-09-25) — mitigated",
+      "detail": "On PR #34 the qt-build (macos-latest) job failed while deploying libreldex_ffi.dylib next to a test binary: the file had been written 17 s earlier and the build ordering was correct, but the copy syscall itself hit a transient 'No such file or directory' on macOS. The M1.4 retry helper only retried the existence check and then copied once, so this gap was not covered.",
+      "mitigation": "PR #37 makes the helper retry the check-and-copy as one unit within the same ~10 s budget; the macOS job then passed 4/4 reruns. The root cause of the transient ENOENT (ninja/Corrosion/APFS interaction) remains un-diagnosed, as M1.4 already recorded; if it recurs despite the retry, escalate to a single copy target. Never merge on a red job; rerun only that job and record it."
     },
     {
       "title": "On-demand Cancel unavailable — accepted limitation (owner decision 2026-09-19)",
@@ -1684,6 +1684,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-25",
+      "text": "macOS CI flake understood and mitigated: the failed copy of the FFI library was a transient filesystem error on the copy call itself, not a build-ordering bug (ordering was verified correct). The retry helper now retries the copy as well as the existence check; four reruns of the macOS job passed. The underlying transient error is still not root-caused and stays listed as a risk."
+    },
     {
       "date": "2026-09-25",
       "text": "M6.9 closed with a negative result, honestly: no startup change was adopted. Measured fresh under the same instrumentation as S15, cold first paint on today's main is 576 ms median versus 903.55 ms five days ago with an identical harness, so the number moved on its own (driver and OS caches), not because of any fix. The only candidate that reached a full batch (the basic render loop) gained nothing. The cost keeps its diagnosed shape — a one-time D3D11 device sync of about 190 ms and the first delegate polish of about 370 ms at 1,000+ rows — and the warm path stays at 16 ms. The recommendation for the owner's K2 ruling is unchanged: rule on the warm path; the measured fix (pre-warming the result delegate) waits for the real result grid in M4. Also recorded as a risk: the macOS Qt CI job flaked once on a parallel-build race copying the FFI library; a rerun passed."
