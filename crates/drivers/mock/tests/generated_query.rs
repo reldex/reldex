@@ -21,6 +21,20 @@ use reldex_db_driver_api::{Cursor, DatabaseConnection, RowBatch, Statement, Valu
 use reldex_driver_mock::{Action, GeneratedQuerySpec, Scenario, ScriptValue};
 use support::{connect, one};
 
+/// Cross-clock skew tolerance for the lower-bound latency assertions below.
+///
+/// Same class of flake as `crates/drivers/mock/tests/block_for_duration.rs`
+/// (house rule from `da04004`): the mock's per-fetch/first-batch latency is a
+/// plain [`std::thread::sleep`] (`crates/drivers/mock/src/generated.rs`), and
+/// on Windows `sleep` and `Instant` (`QueryPerformanceCounter`) do not share
+/// a clock, so a measured `elapsed` can land a little short of the scripted
+/// duration even though the sleep genuinely ran that long. CI run 36168477927
+/// measured a scripted 40ms block at 39.9744ms elapsed (25.6us short); 2ms is
+/// a generous, documented margin over that, applied only to these lower
+/// bounds and nowhere near large enough to hide a fetch that skipped its
+/// latency (5ms/20ms/205ms below all stay well clear of zero after it).
+const CLOCK_SKEW_TOLERANCE: Duration = Duration::from_millis(2);
+
 fn run(sql: &str, spec: GeneratedQuerySpec) -> (Box<dyn DatabaseConnection>, Box<dyn Cursor>) {
     let scenario = Scenario::new();
     scenario.on_sql(sql, Action::GeneratedQuery(spec));
@@ -189,8 +203,9 @@ fn per_fetch_latency_occupies_the_calling_thread_on_every_fetch() {
     let after_first = started.elapsed();
     assert_eq!(first.row_count(), 10);
     assert!(
-        after_first >= per_fetch,
-        "the first fetch must pay the per-fetch latency too: took {after_first:?}"
+        after_first + CLOCK_SKEW_TOLERANCE >= per_fetch,
+        "the first fetch must pay the per-fetch latency too: took {after_first:?} \
+         (tolerance {CLOCK_SKEW_TOLERANCE:?})"
     );
 
     let started = Instant::now();
@@ -198,8 +213,9 @@ fn per_fetch_latency_occupies_the_calling_thread_on_every_fetch() {
     let after_second = started.elapsed();
     assert_eq!(second.row_count(), 10);
     assert!(
-        after_second >= per_fetch,
-        "every fetch pays the per-fetch latency: took {after_second:?}"
+        after_second + CLOCK_SKEW_TOLERANCE >= per_fetch,
+        "every fetch pays the per-fetch latency: took {after_second:?} \
+         (tolerance {CLOCK_SKEW_TOLERANCE:?})"
     );
     cursor.close().expect("close");
 }
@@ -225,8 +241,9 @@ fn first_batch_latency_applies_once_on_top_of_any_per_fetch_latency() {
     cursor.fetch_batch(one(10)).expect("first batch");
     let first_elapsed = started.elapsed();
     assert!(
-        first_elapsed >= first_batch + per_fetch,
-        "the first fetch should pay both latencies: took {first_elapsed:?}"
+        first_elapsed + CLOCK_SKEW_TOLERANCE >= first_batch + per_fetch,
+        "the first fetch should pay both latencies: took {first_elapsed:?} \
+         (tolerance {CLOCK_SKEW_TOLERANCE:?})"
     );
 
     let mut later_elapsed = Vec::with_capacity(LATER_FETCHES);
@@ -235,8 +252,9 @@ fn first_batch_latency_applies_once_on_top_of_any_per_fetch_latency() {
         cursor.fetch_batch(one(10)).expect("later batch");
         let elapsed = started.elapsed();
         assert!(
-            elapsed >= per_fetch,
-            "every fetch pays the per-fetch latency: took {elapsed:?}"
+            elapsed + CLOCK_SKEW_TOLERANCE >= per_fetch,
+            "every fetch pays the per-fetch latency: took {elapsed:?} \
+             (tolerance {CLOCK_SKEW_TOLERANCE:?})"
         );
         later_elapsed.push(elapsed);
     }
