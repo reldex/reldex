@@ -164,8 +164,18 @@ using ReldexWakeFnNoexcept = void (*)(void *user_data) noexcept;
  * An older adapter keeps working: every non-opaque struct starts with
  * `struct_size`, and every enum reserves `0` for "a value this header
  * predates".
+ *
+ * `1` because M2.11 adds the events/registry/server-output-control,
+ * statement-splitting, metadata, and settings/profiles/credentials/history/
+ * worksheets/layout families purely additively — new symbols, new opaque
+ * types, new enum values, and new *trailing* fields on existing structs
+ * (`ReldexEvent`, `ReldexLiveCounts`), each guarded by the `struct_size`
+ * prefix rule so an adapter built against `3.0` still links and runs against
+ * this build. The brief for M2.11 asked for a major bump (`3` to `4`); this
+ * is recorded as a deliberate deviation, not an oversight — see the PR
+ * description's "deviations" section and ADR-0003's M2.11 amendment.
  */
-#define RELDEX_ABI_VERSION_MINOR 0
+#define RELDEX_ABI_VERSION_MINOR 1
 
 /**
  * How many significant digits a [`ReldexNumber`] carries.
@@ -414,6 +424,47 @@ enum ReldexEventKind
    * and leave the session **open**.
    */
   RELDEX_EVENT_KIND_SESSION_CLOSED = 5,
+  /**
+   * Reply to `reldex_session_commit`, `reldex_session_rollback`,
+   * `reldex_session_savepoint`, `reldex_session_rollback_to_savepoint` or
+   * `reldex_session_ping`. Read `completed_operation` to know which one.
+   */
+  RELDEX_EVENT_KIND_COMPLETED = 6,
+  /**
+   * Reply to `reldex_session_set_server_output`. `server_output_mode` and
+   * `server_output_buffer_bytes` carry the setting **actually in force**,
+   * which a driver may have adjusted.
+   */
+  RELDEX_EVENT_KIND_SERVER_OUTPUT_CONFIGURED = 7,
+  /**
+   * Unsolicited: lines the server produced out of band (M2.7), collected
+   * after the statement that produced them and delivered before that
+   * statement's own `Executed`/`Completed`/`SessionClosed` reply. See
+   * `server_output_lines`, `server_output_dropped` and
+   * `server_output_invalid_utf8_lines`; `error` carries a failed read.
+   *
+   * M2.11 delivers this only on the **completion path**
+   * (`reldex-db-core`'s `DatabaseSession::take_server_output`, drained
+   * after every reply while output is on) — never as a fully unsolicited,
+   * mid-statement event, which needs the event-queue switch this crate has
+   * not made yet (see the crate's module documentation, "What is
+   * interim here"). A caller sees a session's output attributed to the
+   * request whose reply immediately follows it, which is correct for
+   * every case except the two rare mid-statement exceptions
+   * `docs/exec-plans/active/phase-1-m2-5-event-queue.md` §7.5 documents.
+   */
+  RELDEX_EVENT_KIND_SERVER_OUTPUT = 8,
+  /**
+   * The session ended. Delivered for a connect that failed
+   * (`RELDEX_EVENT_KIND_OPENED` with an error) and for a
+   * `reldex_session_close` that actually closed the session — **not**
+   * for the hub being destroyed while a session's statement cannot be
+   * interrupted (ADR-0003 A17: the caller has already released its hub
+   * pointer by then, so nothing could observe it). Read
+   * `transaction_possibly_lost` (`SPEC.md` §10: never hide a transaction
+   * loss).
+   */
+  RELDEX_EVENT_KIND_TERMINAL = 9,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -939,6 +990,19 @@ typedef int32_t ReldexMockStatement;
 typedef struct ReldexBatch ReldexBatch;
 
 /**
+ * The [`ConnectionParams`] `reldex_workspace::connection_params` built for a
+ * profile, summarised into plain data -- owned by the caller from the
+ * moment the reply that carries it is drained, released with
+ * [`reldex_connect_summary_release`].
+ *
+ * Not `ConnectionParams` itself: nothing downstream of M2.11 consumes it yet
+ * (session opening against a real driver is M1.8's), so this crate reports
+ * what the mapping produced rather than inventing a second FFI shape for a
+ * type with no consumer. See the PR description's "weak points" note.
+ */
+typedef struct ReldexConnectSummary ReldexConnectSummary;
+
+/**
  * One failure, owned by the caller from the moment it is handed out.
  *
  * Opaque: read it with [`reldex_error_view`], release it with
@@ -948,12 +1012,53 @@ typedef struct ReldexBatch ReldexBatch;
 typedef struct ReldexError ReldexError;
 
 /**
+ * A page of history records -- [`crate::reldex_workspace_list_history`] --
+ * owned by the caller from the moment the reply that carries it is drained.
+ */
+typedef struct ReldexHistoryList ReldexHistoryList;
+
+/**
  * The application hub: one event queue, one waker, one session registry.
  *
  * Opaque to C. Create it with [`reldex_hub_create`] and release it with
  * [`reldex_hub_destroy`], last of all.
  */
 typedef struct ReldexHub ReldexHub;
+
+/**
+ * A prepared metadata statement: its SQL text, its declared column contract,
+ * and the classifier that corrects one of its own permission-ambiguous
+ * errors.
+ *
+ * Opaque, owned by the caller from [`reldex_metadata_prepare`] until
+ * [`reldex_metadata_query_release`].
+ */
+typedef struct ReldexMetadataQuery ReldexMetadataQuery;
+
+/**
+ * A list of profiles -- [`crate::reldex_workspace_get_profile`] (0 or 1) or
+ * [`crate::reldex_workspace_list_profiles`] -- owned by the caller from the
+ * moment the reply that carries it is drained.
+ */
+typedef struct ReldexProfileList ReldexProfileList;
+
+/**
+ * An owned secret -- a password fetched from the credential store or
+ * resolved for a connect -- never a plain [`ReldexStr`] the caller could
+ * copy and keep. See this module's documentation.
+ */
+typedef struct ReldexSecret ReldexSecret;
+
+/**
+ * The lines of one `RELDEX_EVENT_KIND_SERVER_OUTPUT` event.
+ *
+ * Owned by the caller from the moment the event is drained; release with
+ * [`reldex_server_output_lines_release`]. Each line is NUL-terminated like
+ * every outbound [`ReldexStr`] (`len` is authoritative even for a line that
+ * legitimately contains an embedded NUL byte — the same rule the rest of
+ * this boundary already promises).
+ */
+typedef struct ReldexServerOutputLines ReldexServerOutputLines;
 
 /**
  * Somewhere for formatted text to land: one buffer plus offsets, reusable.
@@ -965,6 +1070,19 @@ typedef struct ReldexHub ReldexHub;
  * threads formatting at once need two arenas.
  */
 typedef struct ReldexTextArena ReldexTextArena;
+
+/**
+ * The open worksheets -- [`crate::reldex_workspace_load_worksheets`] --
+ * owned by the caller from the moment the reply that carries it is drained.
+ */
+typedef struct ReldexWorksheetList ReldexWorksheetList;
+
+/**
+ * The settings/profiles/credentials/history/worksheets/layout handle. Opaque
+ * to C. Create with [`reldex_workspace_open`], release with
+ * [`reldex_workspace_close`].
+ */
+typedef struct ReldexWorkspace ReldexWorkspace;
 
 /**
  * A borrowed UTF-8 string: pointer plus length in **bytes**.
@@ -1162,6 +1280,12 @@ typedef struct ReldexLiveCounts {
    * Text arenas created by `reldex_text_arena_create`.
    */
   size_t arenas;
+  /**
+   * Everything else M2.11 added that the caller owns and releases: server
+   * output line sets, metadata queries, profiles and profile lists,
+   * history pages, and worksheets and worksheet lists.
+   */
+  size_t misc_objects;
 } ReldexLiveCounts;
 
 /**
@@ -1442,7 +1566,95 @@ typedef struct ReldexEvent {
    * `SessionClosed`: whether the session is still open and usable.
    */
   bool session_still_open;
+  /**
+   * `Completed`: a [`ReldexCompletedOperation`].
+   */
+  int32_t completed_operation;
+  /**
+   * `ServerOutputConfigured`: a [`ReldexServerOutputMode`] — the mode
+   * **actually in force**.
+   */
+  int32_t server_output_mode;
+  /**
+   * `ServerOutputConfigured`, when `server_output_mode` is
+   * `RELDEX_SERVER_OUTPUT_MODE_ENABLED_BYTES`: the buffer size actually in
+   * force, which the server may have clamped from what was requested.
+   */
+  uint64_t server_output_buffer_bytes;
+  /**
+   * `ServerOutput`: how many lines were dropped for this session since the
+   * previous delivered `ServerOutput`, because the session's completion-path
+   * log was full (`reldex-db-core`'s `ServerOutputLog::MAX_RETAINED_LINES` /
+   * `MAX_RETAINED_BYTES`). Zero normally; non-zero means the UI must say
+   * "output truncated".
+   */
+  uint32_t server_output_dropped;
+  /**
+   * `ServerOutput`: how many of `server_output_lines` were not valid UTF-8
+   * on the wire and were delivered with U+FFFD in place of the invalid
+   * bytes rather than dropped (M2.12).
+   */
+  uint32_t server_output_invalid_utf8_lines;
+  /**
+   * `ServerOutput`: the lines, in order. The caller owns them; release with
+   * [`reldex_server_output_lines_release`]. Null when there are none (which
+   * still happens with `error` set, or `server_output_dropped` non-zero, or
+   * both — a `ServerOutput` event is never produced with nothing to say).
+   */
+  struct ReldexServerOutputLines *server_output_lines;
+  /**
+   * `Terminal`: whether this session ended while it may still have held an
+   * unresolved transaction. **This is the authoritative answer and a
+   * consumer must surface it** (`SPEC.md` §10: never silently commit or
+   * hide transaction loss).
+   */
+  bool transaction_possibly_lost;
 } ReldexEvent;
+
+/**
+ * A vendor-neutral metadata request, as input.
+ *
+ * `schema`/`table`/`name_filter` are read only while this struct is passed
+ * in — nothing here borrows past the call.
+ */
+typedef struct ReldexMetadataRequest {
+  /**
+   * `sizeof(ReldexMetadataRequest)`.
+   */
+  uint32_t struct_size;
+  /**
+   * A [`ReldexMetadataRequestKind`].
+   */
+  int32_t kind;
+  /**
+   * A [`ReldexMetadataObjectKind`]. `RELDEX_METADATA_REQUEST_KIND_OBJECTS_OF_KIND`
+   * only.
+   */
+  int32_t object_kind;
+  /**
+   * The schema to list or own the table.
+   * `RELDEX_METADATA_REQUEST_KIND_OBJECTS_OF_KIND`/`..._COLUMNS_OF` only.
+   */
+  struct ReldexStr schema;
+  /**
+   * The table (or view) to describe. `..._COLUMNS_OF` only.
+   */
+  struct ReldexStr table;
+  /**
+   * A server-side, case-insensitive "contains" filter, when
+   * `has_name_filter`. `..._SCHEMAS`/`..._OBJECTS_OF_KIND` only.
+   */
+  struct ReldexStr name_filter;
+  /**
+   * Whether `name_filter` applies.
+   */
+  bool has_name_filter;
+  /**
+   * The maximum number of rows to report; must be above zero.
+   * `..._SCHEMAS`/`..._OBJECTS_OF_KIND` only.
+   */
+  uint32_t limit;
+} ReldexMetadataRequest;
 
 /**
  * Identifies one session for this hub's lifetime. Never reused.
@@ -1523,6 +1735,632 @@ typedef uint64_t ReldexRequestId;
  * *reported* rather than being undefined behaviour (ADR-0003 D3).
  */
 typedef uint64_t ReldexResultId;
+
+/**
+ * One statement [`reldex_split_statements`] found, as byte offsets into the
+ * text the caller passed it — nothing here is owned or allocated.
+ *
+ * All positions are byte offsets, matching [`reldex_sql_text::StatementSpan`]
+ * exactly; `start_column` counts **Unicode scalar values**, not UTF-16 code
+ * units (use [`crate::reldex_utf16_offset`] to convert for a `QTextCursor`).
+ */
+typedef struct ReldexStatementSpan {
+  /**
+   * `sizeof(ReldexStatementSpan)` on the way in; how much is valid on the
+   * way out.
+   */
+  uint32_t struct_size;
+  /**
+   * A [`ReldexSplitKind`].
+   */
+  int32_t kind;
+  /**
+   * A [`ReldexEndedBy`].
+   */
+  int32_t ended_by;
+  /**
+   * Byte offset where the statement's own text begins.
+   */
+  size_t content_start;
+  /**
+   * Byte offset one past the statement's own text, excluding its
+   * terminator.
+   */
+  size_t content_end;
+  /**
+   * Byte offset one past the statement's terminator (or, for
+   * [`ReldexEndedBy::SlashLine`], past the `/` line's own trailing
+   * newline).
+   */
+  size_t full_end;
+  /**
+   * The statement's first line, counting from 1.
+   */
+  uint32_t start_line;
+  /**
+   * The statement's first character's column on that line, counting from
+   * 1 in Unicode scalar values.
+   */
+  uint32_t start_column;
+  /**
+   * Whether an explicit terminator was found; see
+   * [`reldex_sql_text::StatementSpan::terminated`].
+   */
+  bool terminated;
+} ReldexStatementSpan;
+
+/**
+ * A read-only view of one stored profile, every string borrowed from the
+ * [`ReldexProfileList`] it came from -- the same borrowed-view style as
+ * [`crate::ReldexErrorView`] and [`crate::ReldexColumnInfo`].
+ */
+typedef struct ReldexProfileView {
+  /**
+   * `sizeof(ReldexProfileView)` on the way in; how much is valid on the
+   * way out.
+   */
+  uint32_t struct_size;
+  /**
+   * The profile's id (16-byte UUID).
+   */
+  uint8_t id[16];
+  /**
+   * Created, Unix milliseconds.
+   */
+  uint64_t created_at;
+  /**
+   * Last modified, Unix milliseconds.
+   */
+  uint64_t updated_at;
+  /**
+   * Display name.
+   */
+  struct ReldexStr name;
+  /**
+   * A [`ReldexDatabaseType`].
+   */
+  int32_t database_type;
+  /**
+   * A [`ReldexEnvironmentKind`].
+   */
+  int32_t environment;
+  /**
+   * The custom environment's label.
+   */
+  struct ReldexStr environment_label;
+  /**
+   * Whether the production indicator shows for this profile.
+   */
+  bool treat_as_production;
+  /**
+   * A [`ReldexEndpointKind`].
+   */
+  int32_t endpoint_kind;
+  /**
+   * The host.
+   */
+  struct ReldexStr host;
+  /**
+   * The port.
+   */
+  uint16_t port;
+  /**
+   * A [`ReldexServiceTargetKind`].
+   */
+  int32_t service_target_kind;
+  /**
+   * The service name or SID.
+   */
+  struct ReldexStr service_name_or_sid;
+  /**
+   * The connect string.
+   */
+  struct ReldexStr connect_string;
+  /**
+   * A [`ReldexAuthKind`].
+   */
+  int32_t auth_kind;
+  /**
+   * The user name.
+   */
+  struct ReldexStr username;
+  /**
+   * A [`ReldexPasswordStorageKind`].
+   */
+  int32_t password_storage;
+  /**
+   * A [`ReldexSessionRoleKind`].
+   */
+  int32_t role;
+  /**
+   * A [`ReldexTransportKind`].
+   */
+  int32_t transport;
+  /**
+   * The CA directory, or empty.
+   */
+  struct ReldexStr ca_directory;
+  /**
+   * The C-6 guard's opt-out.
+   */
+  bool allow_unenforced_certificate_pin;
+} ReldexProfileView;
+
+/**
+ * A read-only view of a [`ReldexConnectSummary`].
+ */
+typedef struct ReldexConnectSummaryView {
+  /**
+   * `sizeof(ReldexConnectSummaryView)` on the way in; how much is valid on
+   * the way out.
+   */
+  uint32_t struct_size;
+  /**
+   * A [`ReldexEndpointKind`].
+   */
+  int32_t endpoint_kind;
+  /**
+   * The host, for [`ReldexEndpointKind::HostPort`].
+   */
+  struct ReldexStr host;
+  /**
+   * The port, for [`ReldexEndpointKind::HostPort`].
+   */
+  uint16_t port;
+  /**
+   * The service name, for [`ReldexEndpointKind::HostPort`].
+   */
+  struct ReldexStr service;
+  /**
+   * The connect string -- populated for [`ReldexEndpointKind::ConnectString`]
+   * **and** for a SID profile, since the Oracle binding maps a SID onto a
+   * connect string (there is no vendor-neutral SID endpoint shape).
+   */
+  struct ReldexStr connect_string;
+  /**
+   * A [`ReldexTransportKind`] (`Plain` or `Tls`).
+   */
+  int32_t tls_mode;
+  /**
+   * Whether a connect timeout is armed.
+   */
+  bool has_connect_timeout;
+  /**
+   * The connect timeout, in seconds, when `has_connect_timeout`.
+   */
+  uint32_t connect_timeout_seconds;
+  /**
+   * A [`ReldexSessionRoleKind`].
+   */
+  int32_t role;
+  /**
+   * Whether trigger DDL is rewritten.
+   */
+  bool rewrite_trigger_ddl;
+  /**
+   * Whether "no connect limit" was requested.
+   */
+  bool connect_without_limit;
+  /**
+   * The C-6 guard's opt-out.
+   */
+  bool allow_unenforced_certificate_pin;
+  /**
+   * The CA directory, or empty.
+   */
+  struct ReldexStr ca_directory;
+} ReldexConnectSummaryView;
+
+/**
+ * A read-only view of one history record, borrowed from the
+ * [`ReldexHistoryList`] it came from.
+ */
+typedef struct ReldexHistoryRecordView {
+  /**
+   * `sizeof(ReldexHistoryRecordView)` on the way in; how much is valid on
+   * the way out.
+   */
+  uint32_t struct_size;
+  /**
+   * The entry's id.
+   */
+  uint64_t id;
+  /**
+   * When it was submitted, Unix milliseconds.
+   */
+  uint64_t executed_at;
+  /**
+   * The statement text, verbatim.
+   */
+  struct ReldexStr statement;
+  /**
+   * A [`ReldexHistoryOutcomeKind`].
+   */
+  int32_t outcome_kind;
+  /**
+   * The native error code, when `has_native_code`.
+   */
+  int32_t native_code;
+  /**
+   * Whether `native_code` is set.
+   */
+  bool has_native_code;
+  /**
+   * How long it took, in milliseconds.
+   */
+  uint64_t elapsed_ms;
+  /**
+   * Rows affected or returned, when `has_row_count`.
+   */
+  uint64_t row_count;
+  /**
+   * Whether `row_count` is set.
+   */
+  bool has_row_count;
+} ReldexHistoryRecordView;
+
+/**
+ * A read-only view of one worksheet, borrowed from the
+ * [`ReldexWorksheetList`] it came from.
+ */
+typedef struct ReldexWorksheetView {
+  /**
+   * `sizeof(ReldexWorksheetView)` on the way in; how much is valid on the
+   * way out.
+   */
+  uint32_t struct_size;
+  /**
+   * The worksheet's id.
+   */
+  uint8_t id[16];
+  /**
+   * Whether `profile_id` is set.
+   */
+  bool has_profile;
+  /**
+   * The profile it is attached to, when `has_profile`.
+   */
+  uint8_t profile_id[16];
+  /**
+   * The tab's title.
+   */
+  struct ReldexStr title;
+  /**
+   * The editor's contents, verbatim.
+   */
+  struct ReldexStr text;
+  /**
+   * The caret position.
+   */
+  uint32_t caret;
+  /**
+   * The scroll position.
+   */
+  uint32_t scroll;
+  /**
+   * Its place in the tab bar.
+   */
+  uint32_t tab_order;
+  /**
+   * Created, Unix milliseconds.
+   */
+  uint64_t created_at;
+  /**
+   * Last saved, Unix milliseconds.
+   */
+  uint64_t updated_at;
+} ReldexWorksheetView;
+
+/**
+ * Called when the workspace's reply queue goes from empty to non-empty. Same
+ * contract as [`crate::ReldexWakeFn`] (ADR-0003 D5): must not block, must
+ * not call any `reldex_*` function, and is called from the workspace's
+ * service thread, never the caller's.
+ */
+typedef void (*ReldexWorkspaceWakeFn)(void *user_data);
+
+/**
+ * A setting's value, flattened to one shape for every
+ * [`ReldexValueKind`] (`SPEC.md` §15's typed settings, crossed as data since
+ * the FFI chooses a setting at run time -- the same reason
+ * `reldex_workspace::SettingValue` exists on the Rust side).
+ *
+ * Only the field(s) `kind` documents are meaningful; the others are zero.
+ * `struct_size` follows the ADR-0003 D7 prefix rule.
+ */
+typedef struct ReldexSettingValue {
+  /**
+   * `sizeof(ReldexSettingValue)` on the way in; how much is valid on the
+   * way out.
+   */
+  uint32_t struct_size;
+  /**
+   * A [`ReldexValueKind`].
+   */
+  int32_t kind;
+  /**
+   * Meaningful for [`ReldexValueKind::Bool`].
+   */
+  bool bool_value;
+  /**
+   * Meaningful for [`ReldexValueKind::Count`].
+   */
+  uint32_t count_value;
+  /**
+   * For [`ReldexValueKind::TimeLimit`]/[`ReldexValueKind::ByteLimit`]/
+   * [`ReldexValueKind::EntryLimit`]: `true` means "no limit"/"unlimited",
+   * and [`Self::number_value`] is then not meaningful.
+   */
+  bool no_limit;
+  /**
+   * Seconds, bytes or entries, for the three limit kinds when
+   * [`Self::no_limit`] is `false`.
+   */
+  uint32_t number_value;
+} ReldexSettingValue;
+
+/**
+ * The workspace's layout -- input to
+ * [`crate::reldex_workspace_save_layout`] and the payload of
+ * [`ReldexWorkspaceReply::layout`] for
+ * [`ReldexWorkspaceReplyKind::LayoutLoaded`].
+ */
+typedef struct ReldexLayout {
+  /**
+   * `sizeof(ReldexLayout)` on the way in.
+   */
+  uint32_t struct_size;
+  /**
+   * Whether `active_worksheet` is set.
+   */
+  bool has_active_worksheet;
+  /**
+   * The worksheet on top when last saved, when `has_active_worksheet`.
+   */
+  uint8_t active_worksheet[16];
+  /**
+   * Whether `active_profile` is set.
+   */
+  bool has_active_profile;
+  /**
+   * The profile shown as active when last saved, when `has_active_profile`.
+   */
+  uint8_t active_profile[16];
+  /**
+   * Whether `object_browser_width` is set.
+   */
+  bool has_object_browser_width;
+  /**
+   * The object browser's width, in pixels.
+   */
+  uint32_t object_browser_width;
+  /**
+   * Whether `result_pane_height` is set.
+   */
+  bool has_result_pane_height;
+  /**
+   * The result pane's height, in pixels.
+   */
+  uint32_t result_pane_height;
+  /**
+   * Whether `window_x`/`window_y` are set.
+   */
+  bool has_window_position;
+  /**
+   * The window's left edge.
+   */
+  int32_t window_x;
+  /**
+   * The window's top edge.
+   */
+  int32_t window_y;
+  /**
+   * Whether `window_width`/`window_height` are set.
+   */
+  bool has_window_size;
+  /**
+   * The window's width, in pixels.
+   */
+  uint32_t window_width;
+  /**
+   * The window's height, in pixels.
+   */
+  uint32_t window_height;
+  /**
+   * Whether the window was maximized.
+   */
+  bool window_maximized;
+} ReldexLayout;
+
+/**
+ * What one completed workspace request looks like on the way out. One flat
+ * `#[repr(C)]` struct, like [`crate::ReldexEvent`]; the adapter switches on
+ * `kind` and reads the fields that kind documents.
+ */
+typedef struct ReldexWorkspaceReply {
+  /**
+   * `sizeof(ReldexWorkspaceReply)` on the way in; how much is valid on the
+   * way out.
+   */
+  uint32_t struct_size;
+  /**
+   * A [`ReldexWorkspaceReplyKind`].
+   */
+  int32_t kind;
+  /**
+   * The caller's own correlation id, echoed back.
+   */
+  uint64_t request;
+  /**
+   * Non-null when this request failed. Owned by the caller; release with
+   * [`crate::reldex_error_free`].
+   */
+  struct ReldexError *error;
+  /**
+   * A profile or worksheet id, for the kinds that carry exactly one.
+   */
+  uint8_t id[16];
+  /**
+   * A found/existed flag, reused across several kinds -- see
+   * [`ReldexWorkspaceReplyKind`].
+   */
+  bool found;
+  /**
+   * Created, Unix milliseconds, for `ProfileSaved`/`WorksheetSaved`.
+   */
+  uint64_t created_at;
+  /**
+   * Modified/updated, Unix milliseconds, for
+   * `ProfileSaved`/`WorksheetSaved`.
+   */
+  uint64_t updated_at;
+  /**
+   * A count, for `HistoryCleared`.
+   */
+  uint64_t count;
+  /**
+   * A [`ReldexSettingId`], for `SettingResolved`.
+   */
+  int32_t setting_id;
+  /**
+   * The resolved value, for `SettingResolved`.
+   */
+  struct ReldexSettingValue setting_value;
+  /**
+   * A [`ReldexSettingLevel`], for `SettingResolved`.
+   */
+  int32_t setting_source;
+  /**
+   * 0 or 1 profile (`ProfileFetched`) or every matching profile
+   * (`ProfilesListed`). Owned by the caller; release with
+   * [`reldex_profile_list_release`].
+   */
+  struct ReldexProfileList *profile_list;
+  /**
+   * The mapped connection parameters, for `ConnectParamsBuilt`. Owned by
+   * the caller; release with [`reldex_connect_summary_release`].
+   */
+  struct ReldexConnectSummary *connect;
+  /**
+   * A password, for `CredentialGot` (when `found`) and `PasswordResolved`
+   * (when `password_source_kind` is `FromStore`). Owned by the caller;
+   * release with [`reldex_secret_release`].
+   */
+  struct ReldexSecret *secret;
+  /**
+   * A [`ReldexPasswordSourceKind`], for `PasswordResolved`.
+   */
+  int32_t password_source_kind;
+  /**
+   * A [`ReldexPromptReasonKind`], for `PasswordResolved` when
+   * `password_source_kind` is `PromptRequired`.
+   */
+  int32_t prompt_reason;
+  /**
+   * The new entry's id, for `HistoryRecorded`.
+   */
+  uint64_t history_id;
+  /**
+   * A page of history, for `HistoryListed`. Owned by the caller; release
+   * with [`reldex_history_list_release`].
+   */
+  struct ReldexHistoryList *history_list;
+  /**
+   * Every open worksheet, for `WorksheetsLoaded`. Owned by the caller;
+   * release with [`reldex_worksheet_list_release`].
+   */
+  struct ReldexWorksheetList *worksheet_list;
+  /**
+   * The saved layout, for `LayoutLoaded` when `found`.
+   */
+  struct ReldexLayout layout;
+} ReldexWorkspaceReply;
+
+/**
+ * Everything about a profile the caller edits (`SPEC.md` §17), as one flat
+ * input struct -- the FFI shape of `reldex_workspace::ProfileDetails`.
+ *
+ * Every [`ReldexStr`] field is read only for the duration of the call that
+ * takes this struct (the "into Reldex" rule -- see [`ReldexStr`]).
+ */
+typedef struct ReldexProfileDetails {
+  /**
+   * `sizeof(ReldexProfileDetails)` on the way in.
+   */
+  uint32_t struct_size;
+  /**
+   * Display name.
+   */
+  struct ReldexStr name;
+  /**
+   * A [`ReldexDatabaseType`].
+   */
+  int32_t database_type;
+  /**
+   * A [`ReldexEnvironmentKind`].
+   */
+  int32_t environment;
+  /**
+   * The custom environment's label, for [`ReldexEnvironmentKind::Custom`].
+   */
+  struct ReldexStr environment_label;
+  /**
+   * Whether the production indicator shows for this profile.
+   */
+  bool treat_as_production;
+  /**
+   * A [`ReldexEndpointKind`].
+   */
+  int32_t endpoint_kind;
+  /**
+   * The host, for [`ReldexEndpointKind::HostPort`].
+   */
+  struct ReldexStr host;
+  /**
+   * The port, for [`ReldexEndpointKind::HostPort`].
+   */
+  uint16_t port;
+  /**
+   * A [`ReldexServiceTargetKind`], for [`ReldexEndpointKind::HostPort`].
+   */
+  int32_t service_target_kind;
+  /**
+   * The service name or SID, for [`ReldexEndpointKind::HostPort`].
+   */
+  struct ReldexStr service_name_or_sid;
+  /**
+   * The connect string, for [`ReldexEndpointKind::ConnectString`].
+   */
+  struct ReldexStr connect_string;
+  /**
+   * A [`ReldexAuthKind`].
+   */
+  int32_t auth_kind;
+  /**
+   * The user name, for [`ReldexAuthKind::Password`].
+   */
+  struct ReldexStr username;
+  /**
+   * A [`ReldexPasswordStorageKind`], for [`ReldexAuthKind::Password`].
+   */
+  int32_t password_storage;
+  /**
+   * A [`ReldexSessionRoleKind`].
+   */
+  int32_t role;
+  /**
+   * A [`ReldexTransportKind`].
+   */
+  int32_t transport;
+  /**
+   * A directory of certificate authorities to trust, or empty for none.
+   */
+  struct ReldexStr ca_directory;
+  /**
+   * The C-6 guard's opt-out.
+   */
+  bool allow_unenforced_certificate_pin;
+} ReldexProfileDetails;
 
 /**
  * An exact decimal, mirroring `db-driver-api`'s `Number` field for field.
@@ -1815,6 +2653,37 @@ ReldexStatus reldex_error_view(const struct ReldexError *error, struct ReldexErr
 void reldex_error_free(struct ReldexError *error);
 
 /**
+ * How many lines `lines` holds.
+ *
+ * # Safety
+ *
+ * `lines` must be null (reported as 0) or a live
+ * [`ReldexServerOutputLines`].
+ */
+size_t reldex_server_output_lines_count(const struct ReldexServerOutputLines *lines);
+
+/**
+ * Line `index`, or the empty string when `index` is out of range.
+ *
+ * # Safety
+ *
+ * `lines` must be null (reported as empty) or a live
+ * [`ReldexServerOutputLines`].
+ */
+struct ReldexStr reldex_server_output_lines_get(const struct ReldexServerOutputLines *lines,
+                                                size_t index);
+
+/**
+ * Releases the lines of a drained `RELDEX_EVENT_KIND_SERVER_OUTPUT` event.
+ *
+ * # Safety
+ *
+ * `lines` must be null (a no-op) or a pointer this library handed out that
+ * has not already been released.
+ */
+void reldex_server_output_lines_release(struct ReldexServerOutputLines *lines);
+
+/**
  * Creates an arena. Returns `NULL` only if allocation failed.
  */
 struct ReldexTextArena *reldex_text_arena_create(void);
@@ -2035,6 +2904,133 @@ size_t reldex_hub_pending_events(const struct ReldexHub *hub);
  * [`ReldexEvent`] whose `struct_size` the caller has initialized.
  */
 bool reldex_hub_next_event(struct ReldexHub *hub, struct ReldexEvent *out);
+
+/**
+ * How many sessions this hub currently holds an entry for.
+ *
+ * Every session from the moment `reldex_hub_open_session` returns a
+ * [`crate::ReldexSessionId`] until its `RELDEX_EVENT_KIND_TERMINAL` event has
+ * been drained **and** the caller has stopped calling into it — this
+ * library's own bookkeeping releases the entry when the pump exits, which for
+ * a normally closed session is promptly, and for a session whose statement
+ * cannot be interrupted (ADR-0003 A17) is not until that statement returns.
+ * Diagnostic, like [`crate::reldex_live_counts`]'s `sessions` field, which
+ * this agrees with; that one is process-wide across every hub, this one is
+ * scoped to `hub`.
+ *
+ * # Safety
+ *
+ * `hub` must be null (reported as 0) or a live hub.
+ */
+size_t reldex_hub_session_count(const struct ReldexHub *hub);
+
+/**
+ * Fills `out` with up to `capacity` of this hub's session ids and returns
+ * how many sessions there are in total (which may be more than `capacity`,
+ * exactly like `snprintf`'s return value: compare it against `capacity` to
+ * know whether `out` holds all of them).
+ *
+ * The order is unspecified — a caller after a stable ordering sorts `out`
+ * itself. This is a point-in-time snapshot: a session may open or reach its
+ * `RELDEX_EVENT_KIND_TERMINAL` between this call returning and the caller
+ * reading `out`.
+ *
+ * # Safety
+ *
+ * `hub` must be null (reported as 0) or a live hub. `out` must be null (to
+ * ask only for the count) or point at `capacity` writable
+ * [`crate::ReldexSessionId`]s.
+ */
+size_t reldex_hub_list_sessions(const struct ReldexHub *hub, uint64_t *out, size_t capacity);
+
+/**
+ * Prepares `request` as a statement plus its column contract.
+ *
+ * Allocates the query this returns through `out`; release it with
+ * [`reldex_metadata_query_release`]. `request` is read only for the
+ * duration of this call.
+ *
+ * # Safety
+ *
+ * `request` must be null, or aligned with `struct_size` set and every
+ * `ReldexStr` field pointing at readable bytes. `out` must be null (to
+ * validate without keeping the result) or point at a writable pointer.
+ */
+ReldexStatus reldex_metadata_prepare(const struct ReldexMetadataRequest *request,
+                                     struct ReldexMetadataQuery **out);
+
+/**
+ * The prepared statement's SQL text.
+ *
+ * # Safety
+ *
+ * `query` must be a live [`ReldexMetadataQuery`].
+ */
+struct ReldexStr reldex_metadata_query_sql(const struct ReldexMetadataQuery *query);
+
+/**
+ * How many bind placeholders the prepared statement has. Every metadata
+ * statement has at least one (`crates/drivers/oracle-thin/src/metadata.rs`'s
+ * module documentation: schema, table, the name filter and the limit are
+ * always bind values, never interpolated) — see the module documentation for
+ * why this crate cannot yet execute one through
+ * [`crate::reldex_session_execute`].
+ *
+ * # Safety
+ *
+ * `query` must be a live [`ReldexMetadataQuery`].
+ */
+size_t reldex_metadata_query_bind_count(const struct ReldexMetadataQuery *query);
+
+/**
+ * How many columns the prepared statement's result is declared to have.
+ *
+ * # Safety
+ *
+ * `query` must be a live [`ReldexMetadataQuery`].
+ */
+size_t reldex_metadata_query_column_count(const struct ReldexMetadataQuery *query);
+
+/**
+ * Describes declared column `index` of the prepared statement's contract.
+ *
+ * # Safety
+ *
+ * `query` must be a live [`ReldexMetadataQuery`]; `out` must be null or point
+ * at a writable [`ReldexColumnInfo`] with `struct_size` set.
+ */
+ReldexStatus reldex_metadata_query_column(const struct ReldexMetadataQuery *query,
+                                          size_t index,
+                                          struct ReldexColumnInfo *out);
+
+/**
+ * Builds an error of `kind_in`/`native_code_in`/`message_in` and runs it
+ * through this query's classifier — [`reldex_db_driver_api::PreparedMetadataQuery::reclassify_error`]
+ * — returning the (possibly corrected) result as a new, owned
+ * [`ReldexError`]. `kind_in` is a [`crate::ReldexErrorKind`]; passing
+ * `RELDEX_ERROR_KIND_UNKNOWN` is refused, because a caller building an error
+ * has no "unknown to this header" case to name.
+ *
+ * # Safety
+ *
+ * `query` must be a live [`ReldexMetadataQuery`]. `message_in` must point at
+ * `message_in.len` readable bytes of UTF-8 text.
+ */
+struct ReldexError *reldex_metadata_query_reclassify_error(const struct ReldexMetadataQuery *query,
+                                                           int32_t kind_in,
+                                                           int32_t native_code_in,
+                                                           bool has_native_code_in,
+                                                           struct ReldexStr message_in);
+
+/**
+ * Releases a prepared metadata query.
+ *
+ * # Safety
+ *
+ * `query` must be null (a no-op) or a pointer [`reldex_metadata_prepare`]
+ * handed out that has not already been released.
+ */
+void reldex_metadata_query_release(struct ReldexMetadataQuery *query);
 
 /**
  * The SQL text for one of the scenario's statements, as a borrowed `'static`
@@ -2301,6 +3297,106 @@ ReldexStatus reldex_session_close(struct ReldexHub *hub,
                                   int32_t disposition);
 
 /**
+ * Commits the session's current transaction. The reply is a
+ * `RELDEX_EVENT_KIND_COMPLETED` event carrying `request`, with
+ * `completed_operation` set to `RELDEX_COMPLETED_OPERATION_COMMIT`.
+ *
+ * # Safety
+ *
+ * `hub` must be a live hub.
+ */
+ReldexStatus reldex_session_commit(struct ReldexHub *hub,
+                                   ReldexSessionId session,
+                                   ReldexRequestId request);
+
+/**
+ * Rolls back the session's current transaction. The reply is a
+ * `RELDEX_EVENT_KIND_COMPLETED` event, `completed_operation`
+ * `RELDEX_COMPLETED_OPERATION_ROLLBACK`.
+ *
+ * # Safety
+ *
+ * `hub` must be a live hub.
+ */
+ReldexStatus reldex_session_rollback(struct ReldexHub *hub,
+                                     ReldexSessionId session,
+                                     ReldexRequestId request);
+
+/**
+ * Marks a savepoint named `name` in the session's current transaction. The
+ * reply is a `RELDEX_EVENT_KIND_COMPLETED` event, `completed_operation`
+ * `RELDEX_COMPLETED_OPERATION_SAVEPOINT`.
+ *
+ * # Safety
+ *
+ * `hub` must be a live hub, and `name` must point at `name.len` readable
+ * bytes of UTF-8 text.
+ */
+ReldexStatus reldex_session_savepoint(struct ReldexHub *hub,
+                                      ReldexSessionId session,
+                                      ReldexRequestId request,
+                                      struct ReldexStr name);
+
+/**
+ * Rolls the session's current transaction back to a savepoint named `name`.
+ * The reply is a `RELDEX_EVENT_KIND_COMPLETED` event, `completed_operation`
+ * `RELDEX_COMPLETED_OPERATION_ROLLBACK_TO_SAVEPOINT`.
+ *
+ * # Safety
+ *
+ * As [`reldex_session_savepoint`].
+ */
+ReldexStatus reldex_session_rollback_to_savepoint(struct ReldexHub *hub,
+                                                  ReldexSessionId session,
+                                                  ReldexRequestId request,
+                                                  struct ReldexStr name);
+
+/**
+ * Pings the session: a round trip with no statement, used to validate a
+ * connection the driver flagged as needing revalidation. The reply is a
+ * `RELDEX_EVENT_KIND_COMPLETED` event, `completed_operation`
+ * `RELDEX_COMPLETED_OPERATION_PING`.
+ *
+ * # Safety
+ *
+ * `hub` must be a live hub.
+ */
+ReldexStatus reldex_session_ping(struct ReldexHub *hub,
+                                 ReldexSessionId session,
+                                 ReldexRequestId request);
+
+/**
+ * Turns this session's server output collection on or off (M2.7; ADR-0002
+ * amendment T). The reply is a `RELDEX_EVENT_KIND_SERVER_OUTPUT_CONFIGURED`
+ * event carrying `request`; read `server_output_mode` and
+ * `server_output_buffer_bytes` there for the setting **actually in force** —
+ * a driver may clamp a requested buffer size into the range its server
+ * accepts.
+ *
+ * **Off by default, and only the user turns it on.** While on, every
+ * statement this session runs pays at least one extra round trip
+ * (`docs/exec-plans/active/phase-1-m2-5-event-queue.md` §7.5). A reconnect
+ * is a new session, and a new session starts with output off: this library
+ * never carries the setting over one.
+ *
+ * `mode` is a [`crate::ReldexServerOutputMode`]:
+ * `RELDEX_SERVER_OUTPUT_MODE_DISABLED` turns output off;
+ * `RELDEX_SERVER_OUTPUT_MODE_ENABLED_UNLIMITED` turns it on with no buffer
+ * limit; `RELDEX_SERVER_OUTPUT_MODE_ENABLED_BYTES` turns it on with
+ * `buffer_bytes` as the requested limit (`buffer_bytes` is ignored for the
+ * other two modes).
+ *
+ * # Safety
+ *
+ * `hub` must be a live hub.
+ */
+ReldexStatus reldex_session_set_server_output(struct ReldexHub *hub,
+                                              ReldexSessionId session,
+                                              ReldexRequestId request,
+                                              int32_t mode,
+                                              uint64_t buffer_bytes);
+
+/**
  * Asks the session's driver to stop whatever it is running.
  *
  * Deliberately callable from **any** thread, unlike every other function
@@ -2368,6 +3464,32 @@ ReldexStatus reldex_session_connect_warnings(struct ReldexHub *hub,
                                              struct ReldexTextArena *arena);
 
 /**
+ * Splits `text` into statements using the Oracle dialect (the only one this
+ * build knows — `reldex_driver_oracle_thin::sql_dialect()`), writing up to
+ * `capacity` spans into `out` and returning the **total** number of
+ * statements found, exactly like `snprintf`: compare the return value
+ * against `capacity` to know whether `out` holds all of them, and call again
+ * with a bigger buffer (or `out = NULL`, `capacity = 0`) to size it first.
+ *
+ * Every byte of `text` belongs to exactly one span's `[content_start,
+ * full_end)` range or to the gap before/after/between spans (leading and
+ * trailing whitespace and comments, which belong to no statement); this
+ * function does not report the gaps, only the statements.
+ *
+ * Allocates nothing beyond the `Vec` this crate builds internally and frees
+ * before returning; `out` is the caller's own memory throughout.
+ *
+ * # Safety
+ *
+ * `text` must point at `text.len` readable UTF-8 bytes. `out` must be null
+ * (to ask only for the count) or point at `capacity` writable
+ * [`ReldexStatementSpan`]s.
+ */
+size_t reldex_split_statements(struct ReldexStr text,
+                               struct ReldexStatementSpan *out,
+                               size_t capacity);
+
+/**
  * Converts a Unicode **scalar** offset into a UTF-16 code-unit offset.
  *
  * `SqlPosition` counts scalars (ADR-0002 S3); `QString` counts UTF-16 units.
@@ -2385,6 +3507,543 @@ ReldexStatus reldex_session_connect_warnings(struct ReldexHub *hub,
  * readable initialized bytes.
  */
 size_t reldex_utf16_offset(struct ReldexStr text, size_t char_offset);
+
+/**
+ * How many profiles `list` holds.
+ *
+ * # Safety
+ *
+ * `list` must be null (reported as 0) or a live [`ReldexProfileList`].
+ */
+size_t reldex_profile_list_count(const struct ReldexProfileList *list);
+
+/**
+ * Reads profile `index` into `out`.
+ *
+ * # Safety
+ *
+ * `list` must be null (reported as `false`) or a live [`ReldexProfileList`].
+ * `out` must be null or point at a writable [`ReldexProfileView`] with
+ * `struct_size` set.
+ */
+bool reldex_profile_list_get(const struct ReldexProfileList *list,
+                             size_t index,
+                             struct ReldexProfileView *out);
+
+/**
+ * Releases a profile list.
+ *
+ * # Safety
+ *
+ * `list` must be null (a no-op) or a pointer this library handed out that
+ * has not already been released.
+ */
+void reldex_profile_list_release(struct ReldexProfileList *list);
+
+/**
+ * Reads a connect summary into `out`.
+ *
+ * # Safety
+ *
+ * `summary` must be null (reported as `false`) or a live
+ * [`ReldexConnectSummary`]. `out` must be null or point at a writable
+ * [`ReldexConnectSummaryView`] with `struct_size` set.
+ */
+bool reldex_connect_summary_view(const struct ReldexConnectSummary *summary,
+                                 struct ReldexConnectSummaryView *out);
+
+/**
+ * Releases a connect summary.
+ *
+ * # Safety
+ *
+ * `summary` must be null (a no-op) or a pointer this library handed out that
+ * has not already been released.
+ */
+void reldex_connect_summary_release(struct ReldexConnectSummary *summary);
+
+/**
+ * Borrows the secret's text. The borrow is valid only until
+ * [`reldex_secret_release`]; do not copy it into a longer-lived buffer.
+ *
+ * # Safety
+ *
+ * `secret` must be null (reported as empty) or a live [`ReldexSecret`].
+ */
+struct ReldexStr reldex_secret_expose(const struct ReldexSecret *secret);
+
+/**
+ * Releases a secret, wiping its bytes (`reldex-secrets`'s `Secret::drop`,
+ * ADR-0007 S6).
+ *
+ * # Safety
+ *
+ * `secret` must be null (a no-op) or a pointer this library handed out that
+ * has not already been released.
+ */
+void reldex_secret_release(struct ReldexSecret *secret);
+
+/**
+ * How many records `list` holds.
+ *
+ * # Safety
+ *
+ * `list` must be null (reported as 0) or a live [`ReldexHistoryList`].
+ */
+size_t reldex_history_list_count(const struct ReldexHistoryList *list);
+
+/**
+ * Reads record `index` into `out`.
+ *
+ * # Safety
+ *
+ * `list` must be null (reported as `false`) or a live [`ReldexHistoryList`].
+ * `out` must be null or point at a writable [`ReldexHistoryRecordView`] with
+ * `struct_size` set.
+ */
+bool reldex_history_list_get(const struct ReldexHistoryList *list,
+                             size_t index,
+                             struct ReldexHistoryRecordView *out);
+
+/**
+ * Releases a history list.
+ *
+ * # Safety
+ *
+ * `list` must be null (a no-op) or a pointer this library handed out that
+ * has not already been released.
+ */
+void reldex_history_list_release(struct ReldexHistoryList *list);
+
+/**
+ * How many worksheets `list` holds.
+ *
+ * # Safety
+ *
+ * `list` must be null (reported as 0) or a live [`ReldexWorksheetList`].
+ */
+size_t reldex_worksheet_list_count(const struct ReldexWorksheetList *list);
+
+/**
+ * Reads worksheet `index` into `out`.
+ *
+ * # Safety
+ *
+ * `list` must be null (reported as `false`) or a live [`ReldexWorksheetList`].
+ * `out` must be null or point at a writable [`ReldexWorksheetView`] with
+ * `struct_size` set.
+ */
+bool reldex_worksheet_list_get(const struct ReldexWorksheetList *list,
+                               size_t index,
+                               struct ReldexWorksheetView *out);
+
+/**
+ * Releases a worksheet list.
+ *
+ * # Safety
+ *
+ * `list` must be null (a no-op) or a pointer this library handed out that
+ * has not already been released.
+ */
+void reldex_worksheet_list_release(struct ReldexWorksheetList *list);
+
+/**
+ * A new, random worksheet id, for [`crate::reldex_workspace_save_worksheet`].
+ *
+ * Pure and synchronous -- generating a UUID needs no I/O, so this does not
+ * go through the service thread.
+ *
+ * # Safety
+ *
+ * `out` must point at 16 writable bytes.
+ */
+void reldex_workspace_new_worksheet_id(uint8_t *out);
+
+/**
+ * Opens (or creates) the settings/profiles/credentials/history/worksheets/
+ * layout store on a new service thread this library owns, and returns a
+ * handle immediately.
+ *
+ * This **never blocks**: the store is opened on the new thread, and the
+ * caller learns the outcome from the first reply, `RELDEX_WORKSPACE_REPLY_
+ * KIND_OPENED`, carrying `request`. Nothing else may be submitted
+ * meaningfully until that reply arrives without an error, but submitting
+ * earlier is not undefined behaviour -- the command simply waits behind the
+ * open in the same queue and is answered afterwards.
+ *
+ * `in_memory` opens a private, in-memory store (`path` is then ignored) --
+ * for tests and for a caller that must not touch disk. `path` is copied
+ * before this call returns; the caller's buffer need not outlive it.
+ *
+ * `use_memory_credential_store`, **honoured only in a build with the
+ * `mock-driver` feature** (the default; what the C smoke harness links), asks
+ * for an in-process credential store instead of the platform's, so the
+ * harness runs the same on every CI OS with no OS credential store at all.
+ * Ignored in a build without that feature, which always uses
+ * `reldex_secrets::platform_default()`.
+ *
+ * # Safety
+ *
+ * `path` must point at `path.len` readable UTF-8 bytes, unless `in_memory`.
+ * `out` must be null or point at a writable pointer.
+ */
+ReldexStatus reldex_workspace_open(struct ReldexStr path,
+                                   bool in_memory,
+                                   bool use_memory_credential_store,
+                                   uint64_t request,
+                                   struct ReldexWorkspace **out);
+
+/**
+ * Closes the workspace: the service thread finishes whatever is already
+ * queued, then exits on its own. This **never blocks** the caller -- it does
+ * not join the thread, the same "promptly, not necessarily finished" shape
+ * as [`crate::reldex_hub_destroy`] (whose doc comment explains the trade-off
+ * in full). Any reply already queued, and any the thread pushes while
+ * draining the rest of the channel, must still be drained and released or it
+ * leaks.
+ *
+ * # Safety
+ *
+ * `workspace` must be null, or a pointer [`reldex_workspace_open`] returned
+ * that has not already been closed.
+ */
+void reldex_workspace_close(struct ReldexWorkspace *workspace);
+
+/**
+ * Registers (or, with a null `func`, unregisters) the workspace's wake
+ * callback. Same contract as [`crate::reldex_hub_set_waker`].
+ *
+ * # Safety
+ *
+ * `workspace` must be a live workspace. `user_data` must stay valid until
+ * this is called again with a different (or null) `func` and returns.
+ */
+ReldexStatus reldex_workspace_set_waker(struct ReldexWorkspace *workspace,
+                                        ReldexWorkspaceWakeFn func,
+                                        void *user_data);
+
+/**
+ * How many replies are waiting. Never blocks.
+ *
+ * # Safety
+ *
+ * `workspace` must be null (reported as 0) or a live workspace.
+ */
+size_t reldex_workspace_pending_replies(const struct ReldexWorkspace *workspace);
+
+/**
+ * Takes the next reply, or reports that there is none. Never blocks. Same
+ * draining contract as [`crate::reldex_hub_next_event`]: `false` means
+ * `*out` was not touched.
+ *
+ * # Safety
+ *
+ * `workspace` must be a live workspace, and `out` must point at a writable
+ * [`ReldexWorkspaceReply`] whose `struct_size` the caller has initialized.
+ */
+bool reldex_workspace_next_reply(struct ReldexWorkspace *workspace,
+                                 struct ReldexWorkspaceReply *out);
+
+/**
+ * Resolves one setting's effective value: `worksheet ?? profile ?? \
+ * application ?? built-in`, with the level it came from
+ * ([`ReldexSettingValue`]/[`ReldexWorkspaceReply::setting_source`]).
+ *
+ * `profile`/`worksheet` are 16-byte ids; pass null for a context with no
+ * such layer (a connection that is not yet a worksheet has none, a fresh
+ * install has no profile).
+ *
+ * # Safety
+ *
+ * `workspace` must be a live workspace. `profile`/`worksheet` must each be
+ * null or point at 16 readable bytes.
+ */
+ReldexStatus reldex_workspace_resolve_setting(struct ReldexWorkspace *workspace,
+                                              uint64_t request,
+                                              int32_t setting_id,
+                                              const uint8_t *profile,
+                                              const uint8_t *worksheet);
+
+/**
+ * Writes one setting value at `level` (`Application`, `Profile` or
+ * `Worksheet` -- never `BuiltIn`), replacing any value already there.
+ *
+ * # Safety
+ *
+ * `workspace` must be a live workspace. `scope_id` must be null (for
+ * `Application`) or point at 16 readable bytes (for `Profile`/`Worksheet`).
+ * `value` must be null or point at a [`ReldexSettingValue`] with
+ * `struct_size` set.
+ */
+ReldexStatus reldex_workspace_set_setting(struct ReldexWorkspace *workspace,
+                                          uint64_t request,
+                                          int32_t setting_id,
+                                          int32_t level,
+                                          const uint8_t *scope_id,
+                                          const struct ReldexSettingValue *value);
+
+/**
+ * Removes the value at `level`/`scope_id`, so the setting is inherited
+ * again.
+ *
+ * # Safety
+ *
+ * As [`reldex_workspace_set_setting`], minus `value`.
+ */
+ReldexStatus reldex_workspace_clear_setting(struct ReldexWorkspace *workspace,
+                                            uint64_t request,
+                                            int32_t setting_id,
+                                            int32_t level,
+                                            const uint8_t *scope_id);
+
+/**
+ * Creates a profile.
+ *
+ * # Safety
+ *
+ * `workspace` must be a live workspace. `details` must be null or point at
+ * a [`ReldexProfileDetails`] with `struct_size` set and every string field
+ * readable for the length it declares.
+ */
+ReldexStatus reldex_workspace_create_profile(struct ReldexWorkspace *workspace,
+                                             uint64_t request,
+                                             const struct ReldexProfileDetails *details);
+
+/**
+ * Replaces a profile's details.
+ *
+ * # Safety
+ *
+ * `workspace` must be a live workspace. `id` must point at 16 readable
+ * bytes. `details` as [`reldex_workspace_create_profile`].
+ */
+ReldexStatus reldex_workspace_update_profile(struct ReldexWorkspace *workspace,
+                                             uint64_t request,
+                                             const uint8_t *id,
+                                             const struct ReldexProfileDetails *details);
+
+/**
+ * Deletes a profile (and, in the same transaction, every setting it
+ * overrides). Its credential-store entry, if any, is **not** removed here --
+ * remove it with [`reldex_workspace_credential_delete`] first if wanted.
+ *
+ * # Safety
+ *
+ * `workspace` must be a live workspace. `id` must point at 16 readable
+ * bytes.
+ */
+ReldexStatus reldex_workspace_delete_profile(struct ReldexWorkspace *workspace,
+                                             uint64_t request,
+                                             const uint8_t *id);
+
+/**
+ * Fetches one profile.
+ *
+ * # Safety
+ *
+ * As [`reldex_workspace_delete_profile`].
+ */
+ReldexStatus reldex_workspace_get_profile(struct ReldexWorkspace *workspace,
+                                          uint64_t request,
+                                          const uint8_t *id);
+
+/**
+ * Lists every profile, by name.
+ *
+ * # Safety
+ *
+ * `workspace` must be a live workspace.
+ */
+ReldexStatus reldex_workspace_list_profiles(struct ReldexWorkspace *workspace, uint64_t request);
+
+/**
+ * Builds the connection parameters for `profile`, resolving its settings and
+ * composing them with the real Oracle driver binding
+ * ([`OracleDriverBinding`]).
+ *
+ * `password`, when non-null, must be a live [`ReldexSecret`] -- typically
+ * what [`reldex_workspace_resolve_password`] or
+ * [`reldex_workspace_credential_get`] handed back, or what the user typed
+ * wrapped with... there is deliberately no "wrap a plain string" entry
+ * point here: building a [`ReldexSecret`] from caller text is
+ * [`reldex_workspace_credential_put`]'s job today. Passing null answers as
+ * if no password is available, which is correct for `External`
+ * authentication and reported as [`reldex_workspace::ConnectError::
+ * PasswordRequired`] (via the reply's `error`) otherwise.
+ *
+ * # Safety
+ *
+ * `workspace` must be a live workspace. `profile` must point at 16 readable
+ * bytes. `password` must be null or a live [`ReldexSecret`]; it is **not**
+ * consumed -- the caller still owns it and must release it separately.
+ */
+ReldexStatus reldex_workspace_build_connect_params(struct ReldexWorkspace *workspace,
+                                                   uint64_t request,
+                                                   const uint8_t *profile,
+                                                   const struct ReldexSecret *password);
+
+/**
+ * Fetches the password the credential store holds for `profile`, if any.
+ *
+ * # Safety
+ *
+ * `workspace` must be a live workspace. `profile` must point at 16 readable
+ * bytes.
+ */
+ReldexStatus reldex_workspace_credential_get(struct ReldexWorkspace *workspace,
+                                             uint64_t request,
+                                             const uint8_t *profile);
+
+/**
+ * Stores `password` for `profile`, replacing whatever was there.
+ *
+ * # Safety
+ *
+ * `workspace` must be a live workspace. `profile` must point at 16 readable
+ * bytes. `password` must point at `password.len` readable UTF-8 bytes (read
+ * only for the duration of this call).
+ */
+ReldexStatus reldex_workspace_credential_put(struct ReldexWorkspace *workspace,
+                                             uint64_t request,
+                                             const uint8_t *profile,
+                                             struct ReldexStr password);
+
+/**
+ * Removes the stored password for `profile`.
+ *
+ * # Safety
+ *
+ * As [`reldex_workspace_credential_get`].
+ */
+ReldexStatus reldex_workspace_credential_delete(struct ReldexWorkspace *workspace,
+                                                uint64_t request,
+                                                const uint8_t *profile);
+
+/**
+ * Decides where the password for connecting to `profile` comes from
+ * (`reldex_secrets::resolve_password`): the credential store, a prompt (with
+ * its reason), or "not needed".
+ *
+ * # Safety
+ *
+ * As [`reldex_workspace_credential_get`].
+ */
+ReldexStatus reldex_workspace_resolve_password(struct ReldexWorkspace *workspace,
+                                               uint64_t request,
+                                               const uint8_t *profile);
+
+/**
+ * Records one statement's outcome, then trims the profile's history back to
+ * its configured bound.
+ *
+ * # Safety
+ *
+ * `workspace` must be a live workspace. `profile` must point at 16 readable
+ * bytes. `statement` must point at `statement.len` readable UTF-8 bytes
+ * (read only for the duration of this call).
+ */
+ReldexStatus reldex_workspace_record_history(struct ReldexWorkspace *workspace,
+                                             uint64_t request,
+                                             const uint8_t *profile,
+                                             uint64_t executed_at_ms,
+                                             struct ReldexStr statement,
+                                             int32_t outcome_kind,
+                                             int32_t native_code,
+                                             bool has_native_code,
+                                             uint64_t elapsed_ms,
+                                             uint64_t row_count,
+                                             bool has_row_count);
+
+/**
+ * Lists one page of a profile's history, newest first.
+ *
+ * # Safety
+ *
+ * `workspace` must be a live workspace. `profile` must point at 16 readable
+ * bytes.
+ */
+ReldexStatus reldex_workspace_list_history(struct ReldexWorkspace *workspace,
+                                           uint64_t request,
+                                           const uint8_t *profile,
+                                           uint32_t limit,
+                                           uint64_t before_id,
+                                           bool has_before);
+
+/**
+ * Clears a profile's history.
+ *
+ * # Safety
+ *
+ * As [`reldex_workspace_list_history`], minus `limit`/`before_id`.
+ */
+ReldexStatus reldex_workspace_clear_history(struct ReldexWorkspace *workspace,
+                                            uint64_t request,
+                                            const uint8_t *profile);
+
+/**
+ * Saves a worksheet: inserts it if `id` is new, otherwise replaces its
+ * state, profile and tab order in place (its creation time is kept as first
+ * stored). Get `id` from [`reldex_workspace_new_worksheet_id`] the first
+ * time a worksheet is created.
+ *
+ * # Safety
+ *
+ * `workspace` must be a live workspace. `id` must point at 16 readable
+ * bytes. `profile_id` must be null (no profile attached) or point at 16
+ * readable bytes. `title`/`text` must point at their declared lengths of
+ * readable UTF-8 bytes (read only for the duration of this call).
+ */
+ReldexStatus reldex_workspace_save_worksheet(struct ReldexWorkspace *workspace,
+                                             uint64_t request,
+                                             const uint8_t *id,
+                                             const uint8_t *profile_id,
+                                             struct ReldexStr title,
+                                             struct ReldexStr text,
+                                             uint32_t caret,
+                                             uint32_t scroll,
+                                             uint32_t tab_order);
+
+/**
+ * Loads every open worksheet, in tab order.
+ *
+ * # Safety
+ *
+ * `workspace` must be a live workspace.
+ */
+ReldexStatus reldex_workspace_load_worksheets(struct ReldexWorkspace *workspace, uint64_t request);
+
+/**
+ * Deletes a worksheet.
+ *
+ * # Safety
+ *
+ * `workspace` must be a live workspace. `id` must point at 16 readable
+ * bytes.
+ */
+ReldexStatus reldex_workspace_delete_worksheet(struct ReldexWorkspace *workspace,
+                                               uint64_t request,
+                                               const uint8_t *id);
+
+/**
+ * Saves the workspace's layout, replacing whatever was saved before.
+ *
+ * # Safety
+ *
+ * `workspace` must be a live workspace. `layout` must be null or point at a
+ * [`ReldexLayout`] with `struct_size` set.
+ */
+ReldexStatus reldex_workspace_save_layout(struct ReldexWorkspace *workspace,
+                                          uint64_t request,
+                                          const struct ReldexLayout *layout);
+
+/**
+ * Loads the workspace's layout, if one has ever been saved.
+ *
+ * # Safety
+ *
+ * `workspace` must be a live workspace.
+ */
+ReldexStatus reldex_workspace_load_layout(struct ReldexWorkspace *workspace, uint64_t request);
 
 #ifdef __cplusplus
 }  // extern "C"

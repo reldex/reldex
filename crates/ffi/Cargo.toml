@@ -26,8 +26,14 @@ workspace = true
 # that feature exists (M1.8 — session opening against a real driver; see
 # `reldex_hub_open_session`). Nothing in `src/session.rs`'s session-opening path
 # outside `mock.rs` knows which driver it is talking to.
+#
+# `mock-driver` also turns on `reldex-secrets`'s `test-support` feature
+# (`MemoryCredentialStore`), the same way it already turns on the mock database
+# driver: both exist so the boundary — and the C smoke harness, on every CI OS
+# — can be driven end to end with no real backend (database or OS credential
+# store) at all. Neither is compiled into a `--no-default-features` build.
 default = ["mock-driver"]
-mock-driver = ["dep:reldex-driver-mock"]
+mock-driver = ["dep:reldex-driver-mock", "reldex-secrets/test-support"]
 
 [dev-dependencies]
 # The tests check fetched cells against the mock's own
@@ -40,16 +46,22 @@ reldex-db-core = { path = "../db-core" }
 reldex-db-driver-api = { path = "../db-driver-api" }
 reldex-driver-mock = { path = "../drivers/mock", optional = true }
 # M2.11 composition root: statement splitting (family 3) is vendor-neutral,
-# but still needs one concrete driver's SQL dialect (metadata/settings/
-# credentials in families 4-7 will need its `MetadataCatalog` and
-# `DriverBinding` too). Oracle is the only driver today (`SPEC.md` §7), so
-# this crate — the one place allowed to name a concrete driver
-# (`ARCHITECTURE.md` §2) — depends on it directly. This is independent of
-# `mock-driver` above: none of it opens a database connection, so it needs no
-# feature gate of its own and is exercised by the default
-# `cargo test --workspace` gate.
+# but metadata (family 4) and settings/profiles/credentials (families 5-7)
+# need one concrete driver's binding. Oracle is the only driver today
+# (`SPEC.md` §7), so this crate — the one place allowed to name a concrete
+# driver (`ARCHITECTURE.md` §2) — depends on it directly for `sid_endpoint`,
+# its extension-key constants, its SQL dialect and its `MetadataCatalog`.
+# This is independent of `mock-driver` above: none of it opens a database
+# connection, so it needs no feature gate of its own and is exercised by the
+# default `cargo test --workspace` gate.
 reldex-driver-oracle-thin = { path = "../drivers/oracle-thin" }
 reldex-sql-text = { path = "../sql-text" }
+# The local store (settings, profiles, history, worksheets, layout) and the
+# credential store it never touches directly (`reldex-workspace`'s own "no
+# secret is ever written to SQLite" rule) — both owned, on their own service
+# thread, by the composition root (`workspace.rs`).
+reldex-workspace = { path = "../workspace" }
+reldex-secrets = { path = "../secrets" }
 
 # No production dependency beyond the vendor-neutral and driver crates above
 # (`AGENTS.md`, "do not add production dependencies without documenting why").

@@ -133,6 +133,7 @@ mod session;
 mod splitter;
 mod status;
 mod strings;
+mod workspace;
 
 pub use batch::{
     RELDEX_NUMBER_MAX_DIGITS, ReldexBatch, ReldexColumnInfo, ReldexColumnKind, ReldexColumnView,
@@ -185,6 +186,31 @@ pub use session::{
 pub use splitter::{ReldexEndedBy, ReldexSplitKind, ReldexStatementSpan, reldex_split_statements};
 pub use status::ReldexStatus;
 pub use strings::{RELDEX_UTF16_OFFSET_INVALID, ReldexStr, reldex_utf16_offset};
+pub use workspace::{
+    ReldexAuthKind, ReldexConnectSummary, ReldexConnectSummaryView, ReldexDatabaseType,
+    ReldexEndpointKind, ReldexEnvironmentKind, ReldexHistoryList, ReldexHistoryOutcomeKind,
+    ReldexHistoryRecordView, ReldexLayout, ReldexPasswordSourceKind, ReldexPasswordStorageKind,
+    ReldexProfileDetails, ReldexProfileList, ReldexProfileView, ReldexPromptReasonKind,
+    ReldexSecret, ReldexServiceTargetKind, ReldexSessionRoleKind, ReldexSettingId,
+    ReldexSettingLevel, ReldexSettingValue, ReldexTransportKind, ReldexValueKind,
+    ReldexWorksheetList, ReldexWorksheetView, ReldexWorkspace, ReldexWorkspaceReply,
+    ReldexWorkspaceReplyKind, ReldexWorkspaceWakeFn, reldex_connect_summary_release,
+    reldex_connect_summary_view, reldex_history_list_count, reldex_history_list_get,
+    reldex_history_list_release, reldex_profile_list_count, reldex_profile_list_get,
+    reldex_profile_list_release, reldex_secret_expose, reldex_secret_release,
+    reldex_worksheet_list_count, reldex_worksheet_list_get, reldex_worksheet_list_release,
+    reldex_workspace_build_connect_params, reldex_workspace_clear_history,
+    reldex_workspace_clear_setting, reldex_workspace_close, reldex_workspace_create_profile,
+    reldex_workspace_credential_delete, reldex_workspace_credential_get,
+    reldex_workspace_credential_put, reldex_workspace_delete_profile,
+    reldex_workspace_delete_worksheet, reldex_workspace_get_profile, reldex_workspace_list_history,
+    reldex_workspace_list_profiles, reldex_workspace_load_layout, reldex_workspace_load_worksheets,
+    reldex_workspace_new_worksheet_id, reldex_workspace_next_reply, reldex_workspace_open,
+    reldex_workspace_pending_replies, reldex_workspace_record_history,
+    reldex_workspace_resolve_password, reldex_workspace_resolve_setting,
+    reldex_workspace_save_layout, reldex_workspace_save_worksheet, reldex_workspace_set_setting,
+    reldex_workspace_set_waker, reldex_workspace_update_profile,
+};
 
 /// Major part of the ABI version reported by [`reldex_abi_version`].
 ///
@@ -209,7 +235,17 @@ pub const RELDEX_ABI_VERSION_MAJOR: u32 = 3;
 /// An older adapter keeps working: every non-opaque struct starts with
 /// `struct_size`, and every enum reserves `0` for "a value this header
 /// predates".
-pub const RELDEX_ABI_VERSION_MINOR: u32 = 0;
+///
+/// `1` because M2.11 adds the events/registry/server-output-control,
+/// statement-splitting, metadata, and settings/profiles/credentials/history/
+/// worksheets/layout families purely additively — new symbols, new opaque
+/// types, new enum values, and new *trailing* fields on existing structs
+/// (`ReldexEvent`, `ReldexLiveCounts`), each guarded by the `struct_size`
+/// prefix rule so an adapter built against `3.0` still links and runs against
+/// this build. The brief for M2.11 asked for a major bump (`3` to `4`); this
+/// is recorded as a deliberate deviation, not an oversight — see the PR
+/// description's "deviations" section and ADR-0003's M2.11 amendment.
+pub const RELDEX_ABI_VERSION_MINOR: u32 = 1;
 
 /// The ABI version this library implements: `(major << 16) | minor`.
 ///
