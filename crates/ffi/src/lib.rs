@@ -16,6 +16,14 @@
 //! | Fetched batch | `ReldexBatch*` (opaque) | **caller**, from the moment [`reldex_hub_next_event`] hands it out | [`reldex_batch_release`] |
 //! | Error | `ReldexError*` (opaque) + [`ReldexErrorView`] | **caller**, likewise | [`reldex_error_free`] |
 //! | Text arena | `ReldexTextArena*` (opaque) | caller | [`reldex_text_arena_release`] |
+//! | Metadata query (M2.11) | `ReldexMetadataQuery*` (opaque) | caller | [`reldex_metadata_query_release`] |
+//! | Server output lines (M2.11) | `ReldexServerOutputLines*` (opaque) | caller | [`reldex_server_output_lines_release`] |
+//! | Workspace handle (M2.11) | `ReldexWorkspace*` (opaque) | Rust, own service thread | [`reldex_workspace_close`] |
+//! | Profile list (M2.11) | `ReldexProfileList*` (opaque) | caller | [`reldex_profile_list_release`] |
+//! | Connect params summary (M2.11) | `ReldexConnectSummary*` (opaque) | caller | [`reldex_connect_summary_release`] |
+//! | Resolved/fetched password (M2.11) | `ReldexSecret*` (opaque) | caller | [`reldex_secret_release`] |
+//! | History page (M2.11) | `ReldexHistoryList*` (opaque) | caller | [`reldex_history_list_release`] |
+//! | Worksheet list (M2.11) | `ReldexWorksheetList*` (opaque) | caller | [`reldex_worksheet_list_release`] |
 //!
 //! Integer ids, not pointers, wherever the core already has a scoped id: a
 //! stale or foreign id is *reported* (`RELDEX_STATUS_NOT_FOUND`), whereas a
@@ -76,9 +84,35 @@
 //! The interim pump blocks; it never polls, so no polling interval can
 //! distort the S15 measurements.
 //!
-//! Not yet exported, and out of scope for M1.3: binds, LOB reads, commit /
-//! rollback / savepoint / ping, server output, metadata, and the `Terminal`
-//! session event. Each is a small, deliberate addition (M2.11).
+//! Not yet exported, and out of scope for M1.3: binds and LOB reads. Commit /
+//! rollback / savepoint / ping, server output control, statement splitting,
+//! metadata, the `Terminal` session event, and settings/profiles/
+//! credentials/history/worksheets/layout landed in M2.11 (see below) — each
+//! a small, deliberate addition, purely additive to the ABI major version
+//! (`RELDEX_ABI_VERSION_MINOR` moved `0` → `1`, not a major bump; see
+//! [`RELDEX_ABI_VERSION_MINOR`]'s doc comment for why that is a deliberate
+//! deviation from the M2.11 brief's request for a major bump).
+//!
+//! # M2.11: settings, profiles, credentials, history, worksheets and layout
+//!
+//! [`reldex_workspace_open`] opens `reldex-workspace`'s local SQLite-backed
+//! `Store` and a `reldex-secrets` credential store together, on **one
+//! service thread this crate spawns and owns** — `Store` is `Send`, not
+//! `Sync`, and must live on exactly one thread for its whole life, so
+//! settings, profiles, credentials, history, worksheets and layout all share
+//! it rather than opening three competing threads against the same SQLite
+//! file. [`ReldexWorkspace`] is submit-now/reply-later, exactly like a
+//! session: a request function sends a command and returns immediately, and
+//! the answer arrives as a [`ReldexWorkspaceReply`] drained with
+//! [`reldex_workspace_next_reply`] after its own, independent waker fires —
+//! it does not share the hub's event queue or waker. `crates/ffi/src/
+//! workspace.rs` is also this crate's second composition root (alongside
+//! `metadata.rs`/`splitter.rs`): it is the one place that names
+//! `reldex-driver-oracle-thin` concretely, to map a profile's settings into
+//! real connection parameters. A resolved or fetched password never crosses
+//! as a plain string the adapter could copy and keep — see
+//! [`ReldexSecret`]/[`reldex_secret_expose`]'s doc comment for the one,
+//! deliberate exception to this crate's outbound-NUL-termination promise.
 //!
 //! # The header
 //!

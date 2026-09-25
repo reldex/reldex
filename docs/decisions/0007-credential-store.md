@@ -319,7 +319,14 @@ dependency line; S7 is the import paths in one file.
   `CredentialStoreKind`, `CredentialError` (including `InvalidSecret`, `Malformed` and `Locked`),
   `PromptReason` and `PasswordSource` as numeric enums. A password crosses only as bytes passed
   into a call, or handed out by a call that also offers a function to wipe and free them.
-  `reldex.h` is unchanged by this ADR (ABI 3).
+  `reldex.h` is unchanged by this ADR (ABI 3). **Delivered:** `reldex_workspace_credential_get`/
+  `_put`/`_delete` and `reldex_workspace_resolve_password` on `ReldexWorkspace`;
+  `ReldexPasswordSourceKind`/`ReldexPromptReasonKind` as the numeric enums; a resolved or fetched
+  password crosses as the opaque, wipe-on-release `ReldexSecret` (`reldex_secret_expose`/
+  `reldex_secret_release`), never a `ReldexStr` the caller could copy and keep — see ADR-0003's
+  M2.11 amendment (A30) for why its exposed text is the one exception to this crate's outbound
+  NUL-termination promise. `reldex.h`'s major version is unchanged by M2.11 (`RELDEX_ABI_VERSION_
+  MAJOR` stays 3); the minor version moved 0 → 1 (ADR-0003 A26).
 - **Rules for saving, clearing and using a stored password.** These bind M3.2 and M3.3.
   - **Write order.** Store `put` first, then the profile's `PasswordStorage` flag. If `put` fails
     (`InvalidSecret`, `TooLarge`, `Locked`, `Denied`, `Backend`), the flag stays "prompt each
