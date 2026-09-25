@@ -204,6 +204,40 @@ include = [
   "ReldexDriverKind",
   "ReldexMockScenario",
   "ReldexMockStatement",
+  # M2.11 families 2-4 (`crates/ffi/src/event.rs`, `splitter.rs`,
+  # `metadata.rs`): the same "crosses only as an `int32_t` field" reason as
+  # the block above. Missing from this list since those families first
+  # landed -- caught only once the C smoke harness was extended to exercise
+  # them, which is why `reldex_split_statements`'s `kind`/`ended_by` and
+  # `reldex_metadata_prepare`'s `object_kind`/`kind` compiled and ran fine in
+  # Rust the whole time but had no C name to compare against.
+  "ReldexCompletedOperation",
+  "ReldexServerOutputMode",
+  "ReldexSplitKind",
+  "ReldexEndedBy",
+  "ReldexMetadataRequestKind",
+  "ReldexMetadataObjectKind",
+  # M2.11 families 5-7 (`crates/ffi/src/workspace.rs`): every one of these
+  # crosses only as an `int32_t` field or parameter (`setting_id`, `level`,
+  # `ReldexSettingValue::kind`, `ReldexProfileDetails`'s several `_kind`
+  # fields, `ReldexHistoryRecordView::outcome_kind`,
+  # `ReldexWorkspaceReply::kind`), never by value in a signature cbindgen
+  # would otherwise walk to on its own.
+  "ReldexSettingId",
+  "ReldexSettingLevel",
+  "ReldexValueKind",
+  "ReldexDatabaseType",
+  "ReldexEnvironmentKind",
+  "ReldexEndpointKind",
+  "ReldexServiceTargetKind",
+  "ReldexAuthKind",
+  "ReldexPasswordStorageKind",
+  "ReldexTransportKind",
+  "ReldexSessionRoleKind",
+  "ReldexPasswordSourceKind",
+  "ReldexPromptReasonKind",
+  "ReldexHistoryOutcomeKind",
+  "ReldexWorkspaceReplyKind",
 ]
 # Defined by hand in `after_includes`, with C language linkage; see the note
 # there. Generating it as well would define it twice.

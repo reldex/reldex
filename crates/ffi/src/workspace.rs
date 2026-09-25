@@ -441,7 +441,7 @@ pub enum ReldexEnvironmentKind {
     Custom = 6,
 }
 
-/// How [`ReldexProfileDetails::endpoint`] is shaped.
+/// How [`ReldexProfileDetails::endpoint_kind`] is shaped.
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReldexEndpointKind {
@@ -3423,7 +3423,7 @@ pub unsafe extern "C" fn reldex_workspace_list_profiles(
 
 /// Builds the connection parameters for `profile`, resolving its settings and
 /// composing them with the real Oracle driver binding
-/// ([`OracleDriverBinding`]).
+/// (`OracleDriverBinding`, private to this crate).
 ///
 /// `password`, when non-null, must be a live [`ReldexSecret`] -- typically
 /// what [`reldex_workspace_resolve_password`] or

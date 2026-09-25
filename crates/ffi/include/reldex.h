@@ -982,6 +982,878 @@ typedef int32_t ReldexMockStatement;
 #endif // __cplusplus
 
 /**
+ * Which operation a `RELDEX_EVENT_KIND_COMPLETED` event answers.
+ *
+ * `0` is reserved for an operation this header predates.
+ */
+enum ReldexCompletedOperation
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * An operation this header does not know.
+   */
+  RELDEX_COMPLETED_OPERATION_UNKNOWN = 0,
+  /**
+   * `reldex_session_commit`.
+   */
+  RELDEX_COMPLETED_OPERATION_COMMIT = 1,
+  /**
+   * `reldex_session_rollback`.
+   */
+  RELDEX_COMPLETED_OPERATION_ROLLBACK = 2,
+  /**
+   * `reldex_session_savepoint`.
+   */
+  RELDEX_COMPLETED_OPERATION_SAVEPOINT = 3,
+  /**
+   * `reldex_session_rollback_to_savepoint`.
+   */
+  RELDEX_COMPLETED_OPERATION_ROLLBACK_TO_SAVEPOINT = 4,
+  /**
+   * `reldex_session_ping`.
+   */
+  RELDEX_COMPLETED_OPERATION_PING = 5,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexCompletedOperation ReldexCompletedOperation;
+#else
+typedef int32_t ReldexCompletedOperation;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Whether server output is on for a session, and with what buffer — the
+ * setting `RELDEX_EVENT_KIND_SERVER_OUTPUT_CONFIGURED` reports **in force**.
+ *
+ * `0` is reserved for a mode this header predates.
+ */
+enum ReldexServerOutputMode
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A mode this header does not know.
+   */
+  RELDEX_SERVER_OUTPUT_MODE_UNKNOWN = 0,
+  /**
+   * The server does not buffer output for this session.
+   */
+  RELDEX_SERVER_OUTPUT_MODE_DISABLED = 1,
+  /**
+   * The server buffers output with no limit other than its own memory.
+   */
+  RELDEX_SERVER_OUTPUT_MODE_ENABLED_UNLIMITED = 2,
+  /**
+   * The server buffers output up to `server_output_buffer_bytes`.
+   */
+  RELDEX_SERVER_OUTPUT_MODE_ENABLED_BYTES = 3,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexServerOutputMode ReldexServerOutputMode;
+#else
+typedef int32_t ReldexServerOutputMode;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Whether a statement is plain or a block (`SPEC.md` §15).
+ *
+ * `0` is reserved for a kind this header predates. Named `ReldexSplitKind`,
+ * not `ReldexStatementKind`, because that name is already
+ * [`crate::ReldexStatementKind`] — the driver's classification of an
+ * *executed* statement (`Query`/`Dml`/`Ddl`/…), a different axis entirely: a
+ * block can be DDL or PL/SQL, and a plain statement can be DML or a query.
+ */
+enum ReldexSplitKind
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A kind this header does not know.
+   */
+  RELDEX_SPLIT_KIND_UNKNOWN = 0,
+  /**
+   * An ordinary statement, ending at the dialect's terminator or a lone
+   * `/` line.
+   */
+  RELDEX_SPLIT_KIND_PLAIN = 1,
+  /**
+   * A block statement (an anonymous block, or DDL that creates a stored
+   * PL/SQL unit, trigger, type, or opaque source).
+   */
+  RELDEX_SPLIT_KIND_BLOCK = 2,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexSplitKind ReldexSplitKind;
+#else
+typedef int32_t ReldexSplitKind;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Why a [`ReldexStatementSpan`] ended where it did.
+ *
+ * `0` is reserved for a value this header predates.
+ */
+enum ReldexEndedBy
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A value this header does not know.
+   */
+  RELDEX_ENDED_BY_UNKNOWN = 0,
+  /**
+   * The dialect's own statement terminator.
+   */
+  RELDEX_ENDED_BY_TERMINATOR = 1,
+  /**
+   * An authoritative lone `/` line (safety principle S1).
+   */
+  RELDEX_ENDED_BY_SLASH_LINE = 2,
+  /**
+   * A block's own structural close, with no `/` line following. See
+   * [`ReldexStatementSpan::terminated`].
+   */
+  RELDEX_ENDED_BY_INFERRED_BLOCK_END = 3,
+  /**
+   * End of input was reached with nothing above having closed the
+   * statement — a truncated script.
+   */
+  RELDEX_ENDED_BY_END_OF_INPUT = 4,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexEndedBy ReldexEndedBy;
+#else
+typedef int32_t ReldexEndedBy;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Which shape of [`MetadataRequest`] a [`ReldexMetadataRequest`] describes.
+ *
+ * `0` is reserved for a value this header predates.
+ */
+enum ReldexMetadataRequestKind
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A value this header does not know.
+   */
+  RELDEX_METADATA_REQUEST_KIND_UNKNOWN = 0,
+  /**
+   * [`MetadataRequest::Schemas`].
+   */
+  RELDEX_METADATA_REQUEST_KIND_SCHEMAS = 1,
+  /**
+   * [`MetadataRequest::ObjectsOfKind`].
+   */
+  RELDEX_METADATA_REQUEST_KIND_OBJECTS_OF_KIND = 2,
+  /**
+   * [`MetadataRequest::ColumnsOf`].
+   */
+  RELDEX_METADATA_REQUEST_KIND_COLUMNS_OF = 3,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexMetadataRequestKind ReldexMetadataRequestKind;
+#else
+typedef int32_t ReldexMetadataRequestKind;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * One of the nine object groups `SPEC.md` §16 lists besides schemas.
+ *
+ * `0` is reserved for a value this header predates.
+ */
+enum ReldexMetadataObjectKind
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A value this header does not know.
+   */
+  RELDEX_METADATA_OBJECT_KIND_UNKNOWN = 0,
+  /**
+   * Tables.
+   */
+  RELDEX_METADATA_OBJECT_KIND_TABLES = 1,
+  /**
+   * Views.
+   */
+  RELDEX_METADATA_OBJECT_KIND_VIEWS = 2,
+  /**
+   * PL/SQL package specifications.
+   */
+  RELDEX_METADATA_OBJECT_KIND_PACKAGES = 3,
+  /**
+   * PL/SQL package bodies.
+   */
+  RELDEX_METADATA_OBJECT_KIND_PACKAGE_BODIES = 4,
+  /**
+   * Stored procedures.
+   */
+  RELDEX_METADATA_OBJECT_KIND_PROCEDURES = 5,
+  /**
+   * Stored functions.
+   */
+  RELDEX_METADATA_OBJECT_KIND_FUNCTIONS = 6,
+  /**
+   * Triggers.
+   */
+  RELDEX_METADATA_OBJECT_KIND_TRIGGERS = 7,
+  /**
+   * Sequences.
+   */
+  RELDEX_METADATA_OBJECT_KIND_SEQUENCES = 8,
+  /**
+   * Synonyms.
+   */
+  RELDEX_METADATA_OBJECT_KIND_SYNONYMS = 9,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexMetadataObjectKind ReldexMetadataObjectKind;
+#else
+typedef int32_t ReldexMetadataObjectKind;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * A setting, by the numeric id this ABI assigns -- never the crate-private
+ * storage key.
+ *
+ * `0` is reserved for an id this header predates (ADR-0003 D7); the order
+ * otherwise matches `reldex_workspace::settings::SettingId::ALL`.
+ */
+enum ReldexSettingId
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * An id this header does not know.
+   */
+  RELDEX_SETTING_ID_UNKNOWN = 0,
+  /**
+   * `CONNECT_TIMEOUT`.
+   */
+  RELDEX_SETTING_ID_CONNECT_TIMEOUT = 1,
+  /**
+   * `REWRITE_TRIGGER_DDL`.
+   */
+  RELDEX_SETTING_ID_REWRITE_TRIGGER_DDL = 2,
+  /**
+   * `STATEMENT_TIME_LIMIT`.
+   */
+  RELDEX_SETTING_ID_STATEMENT_TIME_LIMIT = 3,
+  /**
+   * `FETCH_ROWS`.
+   */
+  RELDEX_SETTING_ID_FETCH_ROWS = 4,
+  /**
+   * `FETCHES_IN_FLIGHT`.
+   */
+  RELDEX_SETTING_ID_FETCHES_IN_FLIGHT = 5,
+  /**
+   * `SERVER_OUTPUT_ENABLED`.
+   */
+  RELDEX_SETTING_ID_SERVER_OUTPUT_ENABLED = 6,
+  /**
+   * `SERVER_OUTPUT_BUFFER`.
+   */
+  RELDEX_SETTING_ID_SERVER_OUTPUT_BUFFER = 7,
+  /**
+   * `HISTORY_MAX_ENTRIES_PER_PROFILE`.
+   */
+  RELDEX_SETTING_ID_HISTORY_MAX_ENTRIES_PER_PROFILE = 8,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexSettingId ReldexSettingId;
+#else
+typedef int32_t ReldexSettingId;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * A level a setting resolves at or is set at.
+ *
+ * `0` is reserved for a level this header predates. [`Self::BuiltIn`] is a
+ * valid *resolution source* but never a valid *scope* to set or clear at --
+ * [`reldex_workspace_set_setting`] and [`reldex_workspace_clear_setting`]
+ * refuse it.
+ */
+enum ReldexSettingLevel
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A level this header does not know.
+   */
+  RELDEX_SETTING_LEVEL_UNKNOWN = 0,
+  /**
+   * The built-in default. Resolution source only.
+   */
+  RELDEX_SETTING_LEVEL_BUILT_IN = 1,
+  /**
+   * The application-wide default.
+   */
+  RELDEX_SETTING_LEVEL_APPLICATION = 2,
+  /**
+   * One connection profile's override.
+   */
+  RELDEX_SETTING_LEVEL_PROFILE = 3,
+  /**
+   * One worksheet's override.
+   */
+  RELDEX_SETTING_LEVEL_WORKSHEET = 4,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexSettingLevel ReldexSettingLevel;
+#else
+typedef int32_t ReldexSettingLevel;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Which of [`ReldexSettingValue`]'s value fields is meaningful.
+ *
+ * `0` is reserved for a kind this header predates; the values otherwise
+ * match `reldex_workspace::settings::ValueKind`.
+ */
+enum ReldexValueKind
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A kind this header does not know.
+   */
+  RELDEX_VALUE_KIND_UNKNOWN = 0,
+  /**
+   * [`ReldexSettingValue::bool_value`].
+   */
+  RELDEX_VALUE_KIND_BOOL = 1,
+  /**
+   * A time limit: [`ReldexSettingValue::no_limit`] or
+   * [`ReldexSettingValue::number_value`] seconds.
+   */
+  RELDEX_VALUE_KIND_TIME_LIMIT = 2,
+  /**
+   * [`ReldexSettingValue::count_value`].
+   */
+  RELDEX_VALUE_KIND_COUNT = 3,
+  /**
+   * A byte limit: [`ReldexSettingValue::no_limit`] or
+   * [`ReldexSettingValue::number_value`] bytes.
+   */
+  RELDEX_VALUE_KIND_BYTE_LIMIT = 4,
+  /**
+   * An entry limit: [`ReldexSettingValue::no_limit`] or
+   * [`ReldexSettingValue::number_value`] entries.
+   */
+  RELDEX_VALUE_KIND_ENTRY_LIMIT = 5,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexValueKind ReldexValueKind;
+#else
+typedef int32_t ReldexValueKind;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Which database a profile connects to.
+ */
+enum ReldexDatabaseType
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A type this header does not know.
+   */
+  RELDEX_DATABASE_TYPE_UNKNOWN = 0,
+  /**
+   * Oracle Database, through the thin driver.
+   */
+  RELDEX_DATABASE_TYPE_ORACLE = 1,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexDatabaseType ReldexDatabaseType;
+#else
+typedef int32_t ReldexDatabaseType;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * A profile's environment (`SPEC.md` §17).
+ */
+enum ReldexEnvironmentKind
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A kind this header does not know.
+   */
+  RELDEX_ENVIRONMENT_KIND_UNKNOWN = 0,
+  /**
+   * Development.
+   */
+  RELDEX_ENVIRONMENT_KIND_DEVELOPMENT = 1,
+  /**
+   * Test.
+   */
+  RELDEX_ENVIRONMENT_KIND_TEST = 2,
+  /**
+   * User acceptance testing.
+   */
+  RELDEX_ENVIRONMENT_KIND_UAT = 3,
+  /**
+   * Staging.
+   */
+  RELDEX_ENVIRONMENT_KIND_STAGING = 4,
+  /**
+   * Production.
+   */
+  RELDEX_ENVIRONMENT_KIND_PRODUCTION = 5,
+  /**
+   * A user-named environment; the label is
+   * [`ReldexProfileDetails::environment_label`].
+   */
+  RELDEX_ENVIRONMENT_KIND_CUSTOM = 6,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexEnvironmentKind ReldexEnvironmentKind;
+#else
+typedef int32_t ReldexEnvironmentKind;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * How [`ReldexProfileDetails::endpoint_kind`] is shaped.
+ */
+enum ReldexEndpointKind
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A kind this header does not know.
+   */
+  RELDEX_ENDPOINT_KIND_UNKNOWN = 0,
+  /**
+   * Host, port, and a service name or SID.
+   */
+  RELDEX_ENDPOINT_KIND_HOST_PORT = 1,
+  /**
+   * A complete connect string or descriptor.
+   */
+  RELDEX_ENDPOINT_KIND_CONNECT_STRING = 2,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexEndpointKind ReldexEndpointKind;
+#else
+typedef int32_t ReldexEndpointKind;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Whether [`ReldexProfileDetails::service_name_or_sid`] is a service name or
+ * a SID, for [`ReldexEndpointKind::HostPort`].
+ */
+enum ReldexServiceTargetKind
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A kind this header does not know.
+   */
+  RELDEX_SERVICE_TARGET_KIND_UNKNOWN = 0,
+  /**
+   * A service name.
+   */
+  RELDEX_SERVICE_TARGET_KIND_SERVICE_NAME = 1,
+  /**
+   * A system identifier.
+   */
+  RELDEX_SERVICE_TARGET_KIND_SID = 2,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexServiceTargetKind ReldexServiceTargetKind;
+#else
+typedef int32_t ReldexServiceTargetKind;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * How a session authenticates.
+ */
+enum ReldexAuthKind
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A kind this header does not know.
+   */
+  RELDEX_AUTH_KIND_UNKNOWN = 0,
+  /**
+   * A user name and a password (never carried here -- see
+   * [`ReldexProfileDetails::password_storage`]).
+   */
+  RELDEX_AUTH_KIND_PASSWORD = 1,
+  /**
+   * Authentication by the operating system or another external mechanism.
+   */
+  RELDEX_AUTH_KIND_EXTERNAL = 2,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexAuthKind ReldexAuthKind;
+#else
+typedef int32_t ReldexAuthKind;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Where a profile's password is kept.
+ */
+enum ReldexPasswordStorageKind
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A kind this header does not know.
+   */
+  RELDEX_PASSWORD_STORAGE_KIND_UNKNOWN = 0,
+  /**
+   * The credential store holds it.
+   */
+  RELDEX_PASSWORD_STORAGE_KIND_CREDENTIAL_STORE = 1,
+  /**
+   * The user is asked at every connect.
+   */
+  RELDEX_PASSWORD_STORAGE_KIND_PROMPT_EACH_TIME = 2,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexPasswordStorageKind ReldexPasswordStorageKind;
+#else
+typedef int32_t ReldexPasswordStorageKind;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Whether the transport is encrypted.
+ */
+enum ReldexTransportKind
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A kind this header does not know.
+   */
+  RELDEX_TRANSPORT_KIND_UNKNOWN = 0,
+  /**
+   * Plain TCP.
+   */
+  RELDEX_TRANSPORT_KIND_PLAIN = 1,
+  /**
+   * TLS required.
+   */
+  RELDEX_TRANSPORT_KIND_TLS = 2,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexTransportKind ReldexTransportKind;
+#else
+typedef int32_t ReldexTransportKind;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * The administrative role a session opens with.
+ */
+enum ReldexSessionRoleKind
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A role this header does not know.
+   */
+  RELDEX_SESSION_ROLE_KIND_UNKNOWN = 0,
+  /**
+   * An ordinary session.
+   */
+  RELDEX_SESSION_ROLE_KIND_NORMAL = 1,
+  /**
+   * The highest administrative role.
+   */
+  RELDEX_SESSION_ROLE_KIND_SYS_DBA = 2,
+  /**
+   * The restricted operator role.
+   */
+  RELDEX_SESSION_ROLE_KIND_SYS_OPER = 3,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexSessionRoleKind ReldexSessionRoleKind;
+#else
+typedef int32_t ReldexSessionRoleKind;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Where a resolved password came from -- the FFI shape of
+ * `reldex_secrets::PasswordSource`.
+ */
+enum ReldexPasswordSourceKind
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A kind this header does not know.
+   */
+  RELDEX_PASSWORD_SOURCE_KIND_UNKNOWN = 0,
+  /**
+   * The credential store held it; see the reply's `secret`.
+   */
+  RELDEX_PASSWORD_SOURCE_KIND_FROM_STORE = 1,
+  /**
+   * The user must be asked; see the reply's `prompt_reason`.
+   */
+  RELDEX_PASSWORD_SOURCE_KIND_PROMPT_REQUIRED = 2,
+  /**
+   * The profile authenticates without a password.
+   */
+  RELDEX_PASSWORD_SOURCE_KIND_NOT_NEEDED = 3,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexPasswordSourceKind ReldexPasswordSourceKind;
+#else
+typedef int32_t ReldexPasswordSourceKind;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Why the user must be asked for the password -- the FFI shape of
+ * `reldex_secrets::PromptReason`.
+ */
+enum ReldexPromptReasonKind
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A reason this header does not know, or not applicable.
+   */
+  RELDEX_PROMPT_REASON_KIND_UNKNOWN = 0,
+  /**
+   * The profile is set to "prompt each time".
+   */
+  RELDEX_PROMPT_REASON_KIND_PROMPT_EACH_TIME = 1,
+  /**
+   * No usable credential store.
+   */
+  RELDEX_PROMPT_REASON_KIND_STORE_UNAVAILABLE = 2,
+  /**
+   * The store holds nothing for this profile.
+   */
+  RELDEX_PROMPT_REASON_KIND_NOT_STORED = 3,
+  /**
+   * The store failed; see the reply's `error`.
+   */
+  RELDEX_PROMPT_REASON_KIND_STORE_FAILED = 4,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexPromptReasonKind ReldexPromptReasonKind;
+#else
+typedef int32_t ReldexPromptReasonKind;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * How a recorded statement ended.
+ */
+enum ReldexHistoryOutcomeKind
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A kind this header does not know.
+   */
+  RELDEX_HISTORY_OUTCOME_KIND_UNKNOWN = 0,
+  /**
+   * Ran to completion without error.
+   */
+  RELDEX_HISTORY_OUTCOME_KIND_SUCCEEDED = 1,
+  /**
+   * The database or driver reported an error.
+   */
+  RELDEX_HISTORY_OUTCOME_KIND_FAILED = 2,
+  /**
+   * Cancelled.
+   */
+  RELDEX_HISTORY_OUTCOME_KIND_CANCELLED = 3,
+  /**
+   * The per-statement time limit fired.
+   */
+  RELDEX_HISTORY_OUTCOME_KIND_TIMED_OUT = 4,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexHistoryOutcomeKind ReldexHistoryOutcomeKind;
+#else
+typedef int32_t ReldexHistoryOutcomeKind;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Which request a [`ReldexWorkspaceReply`] answers.
+ *
+ * `0` is reserved for a kind this header predates (ADR-0003 D7). A reply
+ * whose `error` is non-null is that request's *failure*, still delivered
+ * under its own kind.
+ */
+enum ReldexWorkspaceReplyKind
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A kind this header does not know.
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_UNKNOWN = 0,
+  /**
+   * Reply to [`crate::reldex_workspace_open`]: the store finished opening
+   * (or failed to).
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_OPENED = 1,
+  /**
+   * Reply to [`crate::reldex_workspace_resolve_setting`].
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_SETTING_RESOLVED = 2,
+  /**
+   * Reply to [`crate::reldex_workspace_clear_setting`]. `found` is
+   * whether a value existed at that scope.
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_SETTING_CLEARED = 3,
+  /**
+   * Reply to [`crate::reldex_workspace_create_profile`] or
+   * [`crate::reldex_workspace_update_profile`].
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_PROFILE_SAVED = 4,
+  /**
+   * Reply to [`crate::reldex_workspace_delete_profile`]. `found` is
+   * whether it existed.
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_PROFILE_DELETED = 5,
+  /**
+   * Reply to [`crate::reldex_workspace_get_profile`]. `found` is whether
+   * it exists; `profile_list` holds 0 or 1 entries either way.
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_PROFILE_FETCHED = 6,
+  /**
+   * Reply to [`crate::reldex_workspace_list_profiles`].
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_PROFILES_LISTED = 7,
+  /**
+   * Reply to [`crate::reldex_workspace_build_connect_params`].
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_CONNECT_PARAMS_BUILT = 8,
+  /**
+   * Reply to [`crate::reldex_workspace_credential_get`]. `found` is
+   * whether the store held one.
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_CREDENTIAL_GOT = 9,
+  /**
+   * Reply to [`crate::reldex_workspace_credential_put`].
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_CREDENTIAL_PUT = 10,
+  /**
+   * Reply to [`crate::reldex_workspace_credential_delete`]. `found` is
+   * whether it existed.
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_CREDENTIAL_DELETED = 11,
+  /**
+   * Reply to [`crate::reldex_workspace_resolve_password`].
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_PASSWORD_RESOLVED = 12,
+  /**
+   * Reply to [`crate::reldex_workspace_record_history`].
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_HISTORY_RECORDED = 13,
+  /**
+   * Reply to [`crate::reldex_workspace_list_history`].
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_HISTORY_LISTED = 14,
+  /**
+   * Reply to [`crate::reldex_workspace_clear_history`]. `count` is how
+   * many were removed.
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_HISTORY_CLEARED = 15,
+  /**
+   * Reply to [`crate::reldex_workspace_save_worksheet`].
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_WORKSHEET_SAVED = 16,
+  /**
+   * Reply to [`crate::reldex_workspace_load_worksheets`].
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_WORKSHEETS_LOADED = 17,
+  /**
+   * Reply to [`crate::reldex_workspace_delete_worksheet`]. `found` is
+   * whether it existed.
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_WORKSHEET_DELETED = 18,
+  /**
+   * Reply to [`crate::reldex_workspace_save_layout`].
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_LAYOUT_SAVED = 19,
+  /**
+   * Reply to [`crate::reldex_workspace_load_layout`]. `found` is whether
+   * a layout had ever been saved.
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_LAYOUT_LOADED = 20,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexWorkspaceReplyKind ReldexWorkspaceReplyKind;
+#else
+typedef int32_t ReldexWorkspaceReplyKind;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
  * One fetched batch, owned by the caller from the moment its event is handed
  * out until [`reldex_batch_release`].
  *
@@ -3859,7 +4731,7 @@ ReldexStatus reldex_workspace_list_profiles(struct ReldexWorkspace *workspace, u
 /**
  * Builds the connection parameters for `profile`, resolving its settings and
  * composing them with the real Oracle driver binding
- * ([`OracleDriverBinding`]).
+ * (`OracleDriverBinding`, private to this crate).
  *
  * `password`, when non-null, must be a live [`ReldexSecret`] -- typically
  * what [`reldex_workspace_resolve_password`] or
