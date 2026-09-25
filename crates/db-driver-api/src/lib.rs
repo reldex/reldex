@@ -4,7 +4,8 @@
 //! vendor (`docs/architecture/ARCHITECTURE.md` §2, §4). It defines the traits a
 //! driver implements, the normalized [`DbError`], the value and type model, and
 //! the shape of batched results. It contains no vendor code, no I/O, no threads,
-//! no async runtime and **no production dependencies**.
+//! no async runtime, and one production dependency: `zeroize`, which [`Secret`]
+//! wipes itself with (ADR-0007 S6).
 //!
 //! The decisions behind every type here are recorded in
 //! `docs/decisions/0002-driver-api-and-concurrency-model.md`.

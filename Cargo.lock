@@ -661,6 +661,9 @@ dependencies = [
 [[package]]
 name = "reldex-db-driver-api"
 version = "0.0.0"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "reldex-driver-mock"
