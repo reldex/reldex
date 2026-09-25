@@ -485,6 +485,21 @@ decision record is ADR-0002 amendment R1–R5, and what M2.11 has to do with `Op
 
 **Parallelism.** M6.1/M6.2 (features) run alongside M6.3/M6.4 (non-functional), M6.5/M6.7 (build) and M6.9 (startup). **Review:** M6.6, M6.8.
 
+**M6.7 as implemented (branch `phase-1/m6-7-ui-ci`).** `.github/workflows/ui.yml` already carried M6.7's full scope as a byproduct of M1.4/M1.5 — this task's real work was verifying that against the acceptance line, closing the one documentation gap (CI-Actions-dependency licences), and recording current evidence here rather than only in ADR-0003's original spike numbers.
+
+Jobs (all three matrixed `windows-latest`/`ubuntu-latest`/`macos-latest` except `qt-asan`):
+- `ffi-smoke` — no Qt install; builds `ui/tests/ffi_smoke` (the C11/C++17 smoke harness) against `reldex-ffi`'s cdylib and runs it via CTest; ASan/UBSan on the ubuntu leg. `timeout-minutes: 25`.
+- `qt-build` — real Qt 6.8.3 (LGPL, dynamic) install, then `bash ui/build.sh --test` with `QT_QPA_PLATFORM=offscreen` (the full QML/QTest suite, `ADR-0003 K7`'s job). `timeout-minutes: 25`.
+- `qt-asan` (`ubuntu-latest` only) — same as `qt-build` but `bash ui/build.sh --sanitize --test` (ADR-0003 K5's ASan half). `timeout-minutes: 25`.
+
+Cold (ADR-0003 K7's original spike, before `ffi-smoke`/`qt-asan` existed, `qt-build` only): windows 3.0 min, ubuntu 2.1 min, macos 1.6 min (macos **FAILED** once on a build-script race, fixed in M1.4; every run since has been green on all three). Budget: **25 minutes cold**, per ADR-0003 K7 — the only time budget written in this plan/ADR set; `timeout-minutes: 25` on `qt-build`/`qt-asan` enforces it, `ffi-smoke` (no Qt install) gets `timeout-minutes: 15`.
+
+Warm, from two consecutive real `push`-to-`main` runs today (2026-09-25, runs `36079299866` and `36080240322`, both cache hits on cargo and Qt — see below): `qt-build` windows 3m9s/3m11s, ubuntu 2m0s/1m36s, macos 1m58s/2m18s; `ffi-smoke` windows 1m29s/1m25s, ubuntu 26s/59s, macos 36s/39s; `qt-asan` ubuntu 2m2s/1m56s. Worst warm job seen: 3m11s — consistent with ADR-0003's own "worst warm job 4.0 min" and nowhere near the 25-minute budget.
+
+Cache-hit evidence (run `36080240322`, `qt-build`): cargo (`Swatinem/rust-cache`) — `Cache hit for: v0-rust-qt-build-<os>-...` / `Cache restored successfully` on all three OS; Qt (`jurplel/install-qt-action`, `cache: true`) — `Cache hit for: install-qt-action-<os>-...-6.8.3-...-qtshadertools` / `Cache restored successfully` on all three OS. The Qt cache key embeds the pinned version (`6.8.3`) and module list, so bumping either invalidates the cache automatically — no separate cache-key plumbing was needed.
+
+Gaps closed by this task: `jurplel/install-qt-action`'s own licence (MIT) and the other three CI-only Actions' licences were not previously documented anywhere; now in `ui.yml`'s header comment and `ui/README.md`'s new "CI-only dependencies (M6.7)" subsection. No workflow behavior changed — `ffi-smoke`, `qt-build` and `qt-asan` were already green on all three OS (`qt-asan` is ubuntu-only by design, matching `ffi-smoke`'s own ASan/UBSan leg, for the reasons already in `ui.yml`'s comments) and `ci.yml`'s fast hermetic Rust job was not touched.
+
 ## C.3 — Owner decisions required (numbered; recommendation for each; current status per the 2026-09-20 facts)
 
 1. **Install Qt and the build tools per §C.0?** — *Recommend yes*, Qt 6.8 LTS `msvc2022_64`, modules `qtbase`/`qtdeclarative`/`qtshadertools`/`qtsvg`/`qttools` only, **without Qt Creator**, plus CMake and Ninja. ~2 GB download, ~5 GB on disk. Nothing starts without this.
