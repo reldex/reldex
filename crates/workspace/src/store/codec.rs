@@ -10,12 +10,13 @@ use std::path::PathBuf;
 
 use reldex_db_driver_api::SessionRole;
 
+use crate::history::HistoryOutcome;
 use crate::ids::ProfileId;
 use crate::profile::{
     Authentication, DatabaseType, Environment, PasswordStorage, Profile, ProfileDetails,
     ProfileEndpoint, ServiceTarget, TlsOptions, Transport,
 };
-use crate::settings::{ByteLimit, Level, SettingValue, TimeLimit, ValueKind};
+use crate::settings::{ByteLimit, EntryLimit, Level, SettingValue, TimeLimit, ValueKind};
 use crate::time::UnixTimeMs;
 
 pub(crate) const fn level_word(level: Level) -> &'static str {
@@ -33,6 +34,7 @@ pub(crate) const fn kind_word(kind: ValueKind) -> &'static str {
         ValueKind::TimeLimit => "time_limit",
         ValueKind::Count => "count",
         ValueKind::ByteLimit => "byte_limit",
+        ValueKind::EntryLimit => "entry_limit",
     }
 }
 
@@ -42,6 +44,7 @@ fn kind_from_word(word: &str) -> Option<ValueKind> {
         "time_limit" => ValueKind::TimeLimit,
         "count" => ValueKind::Count,
         "byte_limit" => ValueKind::ByteLimit,
+        "entry_limit" => ValueKind::EntryLimit,
         _ => return None,
     })
 }
@@ -54,8 +57,10 @@ pub(crate) fn encode_value(value: SettingValue) -> (&'static str, Option<i64>) {
         SettingValue::Count(count) => Some(i64::from(count)),
         SettingValue::TimeLimit(TimeLimit::Seconds(seconds)) => Some(i64::from(seconds.get())),
         SettingValue::ByteLimit(ByteLimit::Bytes(bytes)) => Some(i64::from(bytes.get())),
+        SettingValue::EntryLimit(EntryLimit::Count(count)) => Some(i64::from(count.get())),
         SettingValue::TimeLimit(TimeLimit::NoLimit)
-        | SettingValue::ByteLimit(ByteLimit::Unlimited) => None,
+        | SettingValue::ByteLimit(ByteLimit::Unlimited)
+        | SettingValue::EntryLimit(EntryLimit::Unlimited) => None,
     };
     (kind_word(value.kind()), int)
 }
@@ -93,7 +98,41 @@ pub(crate) fn decode_value(
         (ValueKind::ByteLimit, Some(bytes)) => SettingValue::ByteLimit(ByteLimit::Bytes(
             non_zero(bytes).ok_or(DecodeValueError::Malformed)?,
         )),
+        (ValueKind::EntryLimit, None) => SettingValue::EntryLimit(EntryLimit::Unlimited),
+        (ValueKind::EntryLimit, Some(count)) => SettingValue::EntryLimit(EntryLimit::Count(
+            non_zero(count).ok_or(DecodeValueError::Malformed)?,
+        )),
         _ => return Err(DecodeValueError::Malformed),
+    })
+}
+
+/// A history entry's outcome as stored: its word and, for
+/// [`HistoryOutcome::Failed`], the native error code column.
+pub(crate) fn encode_history_outcome(outcome: &HistoryOutcome) -> (&'static str, Option<i64>) {
+    match outcome {
+        HistoryOutcome::Succeeded => ("succeeded", None),
+        HistoryOutcome::Failed { native_code } => ("failed", native_code.map(i64::from)),
+        HistoryOutcome::Cancelled => ("cancelled", None),
+        HistoryOutcome::TimedOut => ("timed_out", None),
+    }
+}
+
+/// Decodes a stored history outcome. The schema's own `CHECK` keeps
+/// `native_code` `NULL` for every outcome but `'failed'`, so this only
+/// rejects a word this build does not know — a file written by a newer
+/// Reldex.
+pub(crate) fn decode_history_outcome(
+    word: &str,
+    native_code: Option<i64>,
+) -> Result<HistoryOutcome, String> {
+    Ok(match word {
+        "succeeded" => HistoryOutcome::Succeeded,
+        "failed" => HistoryOutcome::Failed {
+            native_code: native_code.map(|code| i32::try_from(code).unwrap_or(i32::MAX)),
+        },
+        "cancelled" => HistoryOutcome::Cancelled,
+        "timed_out" => HistoryOutcome::TimedOut,
+        _ => return Err(format!("outcome '{word}' is not one this build knows")),
     })
 }
 
@@ -393,6 +432,8 @@ mod tests {
             SettingValue::TimeLimit(TimeLimit::Seconds(NonZeroU32::MAX)),
             SettingValue::ByteLimit(ByteLimit::Unlimited),
             SettingValue::ByteLimit(ByteLimit::Bytes(NonZeroU32::MAX)),
+            SettingValue::EntryLimit(EntryLimit::Unlimited),
+            SettingValue::EntryLimit(EntryLimit::Count(NonZeroU32::MAX)),
         ];
         for value in values {
             let (kind, int) = encode_value(value);
@@ -421,6 +462,7 @@ mod tests {
             ("time_limit", Some(0)),
             ("time_limit", Some(-5)),
             ("byte_limit", Some(0)),
+            ("entry_limit", Some(0)),
         ] {
             assert_eq!(
                 decode_value(kind, int, None),
@@ -431,6 +473,30 @@ mod tests {
         assert_eq!(
             decode_value("bool", Some(1), Some("x")),
             Err(DecodeValueError::Malformed)
+        );
+    }
+
+    #[test]
+    fn every_history_outcome_round_trips() {
+        for outcome in [
+            HistoryOutcome::Succeeded,
+            HistoryOutcome::Failed { native_code: None },
+            HistoryOutcome::Failed {
+                native_code: Some(1017),
+            },
+            HistoryOutcome::Cancelled,
+            HistoryOutcome::TimedOut,
+        ] {
+            let (word, native_code) = encode_history_outcome(&outcome);
+            assert_eq!(decode_history_outcome(word, native_code), Ok(outcome));
+        }
+    }
+
+    #[test]
+    fn an_unknown_outcome_word_is_an_error() {
+        assert_eq!(
+            decode_history_outcome("retried", None),
+            Err("outcome 'retried' is not one this build knows".to_owned())
         );
     }
 }

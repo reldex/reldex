@@ -18,7 +18,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
 
-use super::value::{ByteLimit, SettingType, SettingValue, TimeLimit, ValueKind};
+use super::value::{ByteLimit, EntryLimit, SettingType, SettingValue, TimeLimit, ValueKind};
 
 /// A level a setting's value can come from, in increasing precedence.
 ///
@@ -101,6 +101,8 @@ pub enum SettingGroup {
     Results,
     /// The server output (`DBMS_OUTPUT`) pane.
     ServerOutput,
+    /// Query history (M4.10).
+    History,
 }
 
 /// When a changed value is first used.
@@ -134,6 +136,9 @@ pub enum NoLimitConsequence {
     /// The server buffers output without a limit, in the session's own
     /// memory on the server.
     ServerBuffersWithoutLimit,
+    /// Query history is never trimmed: the store file grows without bound
+    /// (M4.10).
+    HistoryFileGrowsWithoutLimit,
 }
 
 /// Whether a limit-valued setting accepts "no limit".
@@ -180,11 +185,13 @@ pub enum SettingId {
     ServerOutputEnabled,
     /// See [`SERVER_OUTPUT_BUFFER`].
     ServerOutputBuffer,
+    /// See [`HISTORY_MAX_ENTRIES_PER_PROFILE`].
+    HistoryMaxEntriesPerProfile,
 }
 
 impl SettingId {
     /// Every setting, in registry order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::ConnectTimeout,
         Self::RewriteTriggerDdl,
         Self::StatementTimeLimit,
@@ -192,6 +199,7 @@ impl SettingId {
         Self::FetchesInFlight,
         Self::ServerOutputEnabled,
         Self::ServerOutputBuffer,
+        Self::HistoryMaxEntriesPerProfile,
     ];
 
     /// This setting's descriptor.
@@ -205,6 +213,7 @@ impl SettingId {
             Self::FetchesInFlight => &DESCRIPTORS[4],
             Self::ServerOutputEnabled => &DESCRIPTORS[5],
             Self::ServerOutputBuffer => &DESCRIPTORS[6],
+            Self::HistoryMaxEntriesPerProfile => &DESCRIPTORS[7],
         }
     }
 
@@ -405,8 +414,10 @@ impl SettingDescriptor {
             SettingValue::Count(count) => Some(count),
             SettingValue::TimeLimit(TimeLimit::Seconds(seconds)) => Some(seconds.get()),
             SettingValue::ByteLimit(ByteLimit::Bytes(bytes)) => Some(bytes.get()),
+            SettingValue::EntryLimit(EntryLimit::Count(count)) => Some(count.get()),
             SettingValue::TimeLimit(TimeLimit::NoLimit)
-            | SettingValue::ByteLimit(ByteLimit::Unlimited) => {
+            | SettingValue::ByteLimit(ByteLimit::Unlimited)
+            | SettingValue::EntryLimit(EntryLimit::Unlimited) => {
                 return match self.unlimited {
                     Unlimited::Allowed(_) => Ok(()),
                     Unlimited::NotAllowed => {
@@ -557,7 +568,22 @@ pub const SERVER_OUTPUT_ENABLED: Setting<bool> = Setting::new(SettingId::ServerO
 /// and reports the size actually in force (ADR-0002 T1).
 pub const SERVER_OUTPUT_BUFFER: Setting<ByteLimit> = Setting::new(SettingId::ServerOutputBuffer);
 
-const DESCRIPTORS: [SettingDescriptor; 7] = [
+/// How many query-history entries are kept per connection profile before the
+/// oldest are trimmed (M4.10). Default **1,000** — the implementer's default,
+/// unreviewed by the owner, chosen the same way the server-output buffer's
+/// was (P2): bounded so a long-lived profile's history cannot grow the store
+/// file without bound, "unlimited" one setting away.
+///
+/// Application level only: history is bounded per profile, but how many
+/// entries that bound allows is one process-wide choice, not a
+/// per-connection one — the same reasoning as [`FETCHES_IN_FLIGHT`].
+/// "No limit" is accepted, honestly: nothing trims the table, so the file
+/// grows with every statement ever run (`NoLimitConsequence::
+/// HistoryFileGrowsWithoutLimit`).
+pub const HISTORY_MAX_ENTRIES_PER_PROFILE: Setting<EntryLimit> =
+    Setting::new(SettingId::HistoryMaxEntriesPerProfile);
+
+const DESCRIPTORS: [SettingDescriptor; 8] = [
     SettingDescriptor {
         id: SettingId::ConnectTimeout,
         storage_key: "connection.connect_timeout",
@@ -655,6 +681,21 @@ const DESCRIPTORS: [SettingDescriptor; 7] = [
         unlimited: Unlimited::Allowed(NoLimitConsequence::ServerBuffersWithoutLimit),
         takes_effect: TakesEffect::NextStatement,
         summary: "Bytes of server output the server may buffer per session, or unlimited.",
+    },
+    SettingDescriptor {
+        id: SettingId::HistoryMaxEntriesPerProfile,
+        storage_key: "history.max_entries_per_profile",
+        group: SettingGroup::History,
+        kind: ValueKind::EntryLimit,
+        default: SettingValue::EntryLimit(EntryLimit::Count(nz(1_000))),
+        levels: LevelSet::APPLICATION,
+        bounds: Some(Bounds {
+            min: 1,
+            max: 1_000_000,
+        }),
+        unlimited: Unlimited::Allowed(NoLimitConsequence::HistoryFileGrowsWithoutLimit),
+        takes_effect: TakesEffect::NextStatement,
+        summary: "History entries kept per profile before the oldest are trimmed, or no limit.",
     },
 ];
 
@@ -771,6 +812,19 @@ mod tests {
             FETCHES_IN_FLIGHT.descriptor().levels(),
             LevelSet::APPLICATION
         );
+
+        assert_eq!(
+            HISTORY_MAX_ENTRIES_PER_PROFILE.default_value(),
+            EntryLimit::Count(nz(1_000))
+        );
+        assert_eq!(
+            HISTORY_MAX_ENTRIES_PER_PROFILE.descriptor().levels(),
+            LevelSet::APPLICATION
+        );
+        assert!(matches!(
+            HISTORY_MAX_ENTRIES_PER_PROFILE.descriptor().unlimited(),
+            Unlimited::Allowed(NoLimitConsequence::HistoryFileGrowsWithoutLimit)
+        ));
     }
 
     #[test]

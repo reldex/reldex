@@ -60,22 +60,32 @@
 //! its only other dependencies are `rusqlite` and `uuid`
 //! (`tests/dependency_rules.rs` checks all of it).
 //!
-//! Query history (M4.10), workspace layout (M6.2), the metadata cache and
-//! the credential store itself (M2.10) are not built here; the schema's
-//! migration path is where the first two will be added.
+//! Query history ([`history`], M4.10) and workspace state ([`worksheet`],
+//! [`layout`], M6.2) are store-side only here: schema, validation, bounded
+//! trimming and no-secrets guarantees. Re-running a history entry, restoring
+//! a workspace on startup and everything FFI/UI is M2.11/M3/M4/M6 work. The
+//! metadata cache and the credential store itself (M2.10) are not built here.
 
 mod connect;
+mod history;
 mod ids;
+mod layout;
 mod profile;
 pub mod settings;
 pub mod store;
 mod time;
+mod worksheet;
 
 pub use connect::{
     ConnectError, ConnectSettings, DriverBinding, DriverOptions, ServerOutputSettings,
     StatementSettings, connection_params,
 };
+pub use history::{
+    HistoryEntry, HistoryError, HistoryId, HistoryOutcome, HistoryPage, HistoryRecord,
+    MAX_STATEMENT_BYTES,
+};
 pub use ids::{CredentialKey, IdError, ProfileId, WorksheetId};
+pub use layout::{Layout, PaneSizes, WindowGeometry};
 pub use profile::{
     Authentication, CredentialPattern, DatabaseType, Environment, MAX_FIELD_BYTES, MAX_NAME_CHARS,
     PasswordStorage, Profile, ProfileDetails, ProfileEndpoint, ProfileError, ProfileField,
@@ -86,3 +96,6 @@ pub use store::{
     Loaded, RejectReason, RejectedRow, Scope, Store, StoreError, StoreOptions, StoreTable,
 };
 pub use time::UnixTimeMs;
+pub use worksheet::{
+    MAX_TITLE_CHARS, MAX_WORKSHEET_TEXT_BYTES, Worksheet, WorksheetError, WorksheetState,
+};

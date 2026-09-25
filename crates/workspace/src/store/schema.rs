@@ -31,8 +31,9 @@
 //! refuses a newer file ([`super::StoreError::NewerSchema`]) rather than
 //! guess. Adding a **setting** never needs a migration — settings are rows,
 //! and a key this build does not know is reported and kept, not deleted.
-//! Adding a table (query history M4.10, workspace M6.2) or a column is a new
-//! step appended to [`MIGRATIONS`].
+//! Adding a table or a column is a new step appended to [`MIGRATIONS`]: step
+//! 2 (query history, M4.10) and step 3 (workspace state, M6.2) are exactly
+//! that.
 
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
@@ -42,7 +43,7 @@ use super::error::StoreError;
 pub const APPLICATION_ID: i32 = 0x524C_4458;
 
 /// The schema version this build writes and understands.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// One forward step: the version it produces and the DDL that produces it.
 pub(crate) struct Migration {
@@ -51,7 +52,11 @@ pub(crate) struct Migration {
 }
 
 /// Every step, in order. `steps_are_contiguous` checks `to` runs 1, 2, 3, ….
-pub(crate) const MIGRATIONS: &[Migration] = &[Migration { to: 1, apply: v1 }];
+pub(crate) const MIGRATIONS: &[Migration] = &[
+    Migration { to: 1, apply: v1 },
+    Migration { to: 2, apply: v2 },
+    Migration { to: 3, apply: v3 },
+];
 
 /// Version 1: profiles and settings.
 ///
@@ -111,6 +116,105 @@ CREATE TABLE setting (
 
 fn v1(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
     transaction.execute_batch(V1)
+}
+
+/// Version 2: query history (M4.10), one row per statement run.
+///
+/// `id` is the SQLite rowid (`INTEGER PRIMARY KEY`), `AUTOINCREMENT` so an id
+/// handed out as a paging cursor ([`crate::HistoryPage::before`]) is never
+/// reused, even after the row it named is trimmed. `profile_id` cascades: a
+/// deleted profile's history goes with it. `statement` has no length
+/// constraint in the schema — [`crate::history::MAX_STATEMENT_BYTES`] is
+/// enforced in code, where the message can say why, not by a `CHECK` SQLite
+/// would reject with no context.
+///
+/// `outcome` is one of a fixed set of words, like every other enumeration in
+/// this schema; `native_code` is meaningful only for `'failed'`, which the
+/// `CHECK` enforces so a decoded row can never disagree with itself.
+const V2: &str = "
+CREATE TABLE history (
+    id          INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    profile_id  TEXT    NOT NULL COLLATE NOCASE REFERENCES profile (id) ON DELETE CASCADE,
+    executed_at INTEGER NOT NULL,
+    statement   TEXT    NOT NULL,
+    outcome     TEXT    NOT NULL CHECK (outcome IN ('succeeded', 'failed', 'cancelled', 'timed_out')),
+    native_code INTEGER,
+    elapsed_ms  INTEGER NOT NULL,
+    row_count   INTEGER,
+    CHECK ((outcome = 'failed') OR (native_code IS NULL))
+) STRICT;
+
+CREATE INDEX history_profile_id_idx ON history (profile_id, id);
+";
+
+fn v2(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+    transaction.execute_batch(V2)
+}
+
+/// Version 3: workspace state (M6.2) — open worksheets, worksheet-scoped
+/// settings, and the workspace's own layout. Non-transactional state only:
+/// no column here names a session or a transaction (`crate::worksheet`'s
+/// module documentation).
+///
+/// **`setting`'s `scope = 'worksheet'` rows move to a table of their own**,
+/// `worksheet_setting`, with a real foreign key to `worksheet(id)` and
+/// `ON DELETE CASCADE` — the "real FK target" ADR-0006 deferred to this
+/// migration. A single shared `scope_id` column cannot carry that FK: SQLite
+/// enforces a foreign key over every row of the column it is declared on,
+/// and `setting.scope_id` also holds profile ids and the empty string for
+/// the application scope, neither of which names a row in `worksheet`. The
+/// existing `setting` table keeps `application` and `profile` rows exactly
+/// as schema 1 and 2 left them (its own `CHECK` still names `'worksheet'` as
+/// a value the column *type* allows — `CHECK`s cannot be altered — but the
+/// application code never writes that scope there again).
+///
+/// Schema 1/2 never shipped a `worksheet` table, so any pre-existing
+/// `scope = 'worksheet'` row in `setting` cannot name a real worksheet — it
+/// is already an orphan by construction — and is dropped rather than carried
+/// forward into a table whose foreign key it cannot satisfy.
+const V3: &str = "
+DELETE FROM setting WHERE scope = 'worksheet';
+
+CREATE TABLE worksheet (
+    id         TEXT    NOT NULL COLLATE NOCASE PRIMARY KEY CHECK (length(id) = 36),
+    profile_id TEXT    COLLATE NOCASE REFERENCES profile (id) ON DELETE SET NULL,
+    title      TEXT    NOT NULL,
+    text       TEXT    NOT NULL,
+    caret      INTEGER NOT NULL,
+    scroll     INTEGER NOT NULL,
+    tab_order  INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE worksheet_setting (
+    worksheet_id TEXT    NOT NULL COLLATE NOCASE REFERENCES worksheet (id) ON DELETE CASCADE,
+    setting_key  TEXT    NOT NULL,
+    kind         TEXT    NOT NULL,
+    int_value    INTEGER,
+    text_value   TEXT,
+    updated_at   INTEGER NOT NULL,
+    PRIMARY KEY (worksheet_id, setting_key),
+    CHECK (int_value IS NULL OR text_value IS NULL)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE layout (
+    id                    INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+    active_worksheet_id   TEXT    COLLATE NOCASE REFERENCES worksheet (id) ON DELETE SET NULL,
+    active_profile_id     TEXT    COLLATE NOCASE REFERENCES profile (id) ON DELETE SET NULL,
+    object_browser_width  INTEGER,
+    result_pane_height    INTEGER,
+    window_x              INTEGER,
+    window_y              INTEGER,
+    window_width          INTEGER,
+    window_height         INTEGER,
+    window_maximized      INTEGER NOT NULL CHECK (window_maximized IN (0, 1)),
+    updated_at            INTEGER NOT NULL
+) STRICT;
+";
+
+fn v3(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+    transaction.execute_batch(V3)
 }
 
 /// What an open found in the header.
@@ -242,16 +346,94 @@ mod tests {
         assert_eq!(inspect(&connection).expect("inspect"), Header::Empty);
         assert_eq!(
             migrate(&mut connection).expect("migrate"),
-            Migrated { from: 0, to: 1 }
+            Migrated {
+                from: 0,
+                to: SCHEMA_VERSION
+            }
         );
+        assert_eq!(
+            inspect(&connection).expect("inspect"),
+            Header::Reldex {
+                version: SCHEMA_VERSION
+            }
+        );
+        assert_eq!(
+            migrate(&mut connection).expect("migrate"),
+            Migrated {
+                from: SCHEMA_VERSION,
+                to: SCHEMA_VERSION
+            }
+        );
+    }
+
+    #[test]
+    fn migrating_from_v1_applies_every_step_in_order_and_creates_the_new_tables() {
+        // A genuine schema-1 file (the literal historical DDL), migrated by
+        // today's code straight through steps 2 and 3.
+        let mut connection = Connection::open_in_memory().expect("memory");
+        {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("begin");
+            v1(&transaction).expect("v1 DDL");
+            transaction
+                .pragma_update(None, "application_id", APPLICATION_ID)
+                .expect("pragma");
+            transaction
+                .pragma_update(None, "user_version", 1u32)
+                .expect("pragma");
+            transaction.commit().expect("commit");
+        }
         assert_eq!(
             inspect(&connection).expect("inspect"),
             Header::Reldex { version: 1 }
         );
         assert_eq!(
             migrate(&mut connection).expect("migrate"),
-            Migrated { from: 1, to: 1 }
+            Migrated {
+                from: 1,
+                to: SCHEMA_VERSION
+            }
         );
+        for table in ["profile", "setting", "history", "worksheet", "worksheet_setting", "layout"] {
+            let exists: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("query");
+            assert_eq!(exists, 1, "table {table} missing after migration");
+        }
+    }
+
+    #[test]
+    fn an_older_builds_migrate_refuses_a_file_newer_than_it_supports() {
+        // Simulates "v1 code": a build whose own `MIGRATIONS` stops at 1,
+        // opening a file a later build already brought to version 2. The
+        // mechanism is exactly `a_newer_version_is_refused_by_inspect_and_by_migrate`,
+        // checked here against an intermediate version rather than only
+        // against `SCHEMA_VERSION + 1`, since it is the same rule at every
+        // version, not a special case of the current one.
+        let mut connection = Connection::open_in_memory().expect("memory");
+        let v1_only = [Migration { to: 1, apply: v1 }];
+        assert_eq!(
+            migrate_with(&mut connection, &v1_only, 1).expect("migrate to 1"),
+            Migrated { from: 0, to: 1 }
+        );
+        let v1_and_v2 = [Migration { to: 1, apply: v1 }, Migration { to: 2, apply: v2 }];
+        assert_eq!(
+            migrate_with(&mut connection, &v1_and_v2, 2).expect("migrate to 2"),
+            Migrated { from: 1, to: 2 }
+        );
+        // "v1 code" reopening that same file now refuses it.
+        assert!(matches!(
+            migrate_with(&mut connection, &v1_only, 1),
+            Err(StoreError::NewerSchema {
+                found: 2,
+                supported: 1
+            })
+        ));
     }
 
     #[test]
