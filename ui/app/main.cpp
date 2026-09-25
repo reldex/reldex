@@ -3,8 +3,11 @@
 #include <QGuiApplication>
 #include <QMutex>
 #include <QQmlApplicationEngine>
+#include <QQuickStyle>
 #include <QSurfaceFormat>
 #include <QTextStream>
+
+#include <cstring>
 
 namespace {
 
@@ -71,12 +74,48 @@ int main(int argc, char *argv[])
 
     QGuiApplication app(argc, argv);
 
+    // M3.1: Basic is the style, chosen because this app's whole theming
+    // approach (ui/app/Theme.qml) works by setting each control's `palette`
+    // property from live-bound colour tokens, and Basic is the style Qt
+    // documents as built for exactly that -- no native platform chrome to
+    // override, no extra dependency (QtQuickControls2Basic ships inside the
+    // qtdeclarative module already installed per
+    // docs/exec-plans/active/phase-1-toolchain.md). Must run before the
+    // first QML file importing QtQuick.Controls loads, which is why it is
+    // set here, before QQmlApplicationEngine (and therefore every
+    // `engine.loadFromModule` call below) is even constructed.
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
+
+    // M3.1: the S15 measurement harness (Harness.qml, formerly this file's
+    // only window) stays reachable behind its own existing env gate --
+    // every documented ui/README.md repro command already sets
+    // RELDEX_S15_AUTORUN, and RELDEX_S15_SCROLL/RELDEX_S15_RUNS cover the
+    // rest -- or an explicit `--harness` argument. Anything else loads the
+    // real app shell (Main.qml). See ui/README.md "Running the shell vs the
+    // harness".
+    bool harness = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--harness") == 0) {
+            harness = true;
+            break;
+        }
+    }
+    const auto envRequestsHarness = [](const char *name) {
+        const QByteArray value = qgetenv(name);
+        return !value.isEmpty() && value != "0";
+    };
+    if (!harness
+        && (envRequestsHarness("RELDEX_S15_AUTORUN") || envRequestsHarness("RELDEX_S15_SCROLL")
+            || envRequestsHarness("RELDEX_S15_RUNS") || envRequestsHarness("RELDEX_UI_HARNESS"))) {
+        harness = true;
+    }
+
     QQmlApplicationEngine engine;
     QObject::connect(
         &engine, &QQmlApplicationEngine::objectCreationFailed, &app,
         []() { QCoreApplication::exit(-1); }, Qt::QueuedConnection);
 
-    engine.loadFromModule("Reldex.App", "Main");
+    engine.loadFromModule("Reldex.App", harness ? "Harness" : "Main");
 
     const int status = app.exec();
 

@@ -8,24 +8,40 @@ set_target_properties(tst_coreinfo PROPERTIES
     MACOSX_BUNDLE FALSE
 )
 
-# Re-attaches the *same* ../app/Main.qml file (not a copy) under the same
-# "Reldex.App" URI, for the same reason ui/app/CMakeLists.txt attaches it
+# Re-attaches the *same* ../app/*.qml files (not copies) under the same
+# "Reldex.App" URI, for the same reason ui/app/CMakeLists.txt attaches them
 # directly to the `Reldex` executable rather than to a shared library: a
 # statically linked QML entry-point module only self-registers reliably when
 # compiled straight into the binary that loads it. Each executable's default
 # qt_add_qml_module() OUTPUT_DIRECTORY is <its own CMAKE_CURRENT_BINARY_DIR>
 # plus the target path, so Reldex and tst_coreinfo do not collide even
-# though they share both the URI and the source file.
-set(RELDEX_APP_MAIN_QML "${CMAKE_SOURCE_DIR}/app/Main.qml")
-# QT_RESOURCE_ALIAS is required because the file is referenced by an
-# absolute path from outside this directory; without it, qt_add_qml_module()
-# refuses ("used in a Qt resource... set QT_RESOURCE_ALIAS").
-set_source_files_properties(${RELDEX_APP_MAIN_QML} PROPERTIES
-    QT_RESOURCE_ALIAS "Main.qml"
+# though they share both the URI and every source file. RELDEX_APP_QML_FILES
+# is the single list ui/CMakeLists.txt defines for exactly this reuse (M3.1).
+#
+# RELDEX_APP_QML_FILES (ui/CMakeLists.txt) holds bare filenames, relative to
+# ui/app/ -- resolved to absolute paths here since this directory is not
+# ui/app. QT_RESOURCE_ALIAS is required per file because each is then
+# referenced by an absolute path from outside this directory; without it,
+# qt_add_qml_module() refuses ("used in a Qt resource... set
+# QT_RESOURCE_ALIAS").
+set(RELDEX_APP_QML_ABSOLUTE_FILES "")
+foreach(reldexAppQmlFileName IN LISTS RELDEX_APP_QML_FILES)
+    set(reldexAppQmlFile "${CMAKE_SOURCE_DIR}/app/${reldexAppQmlFileName}")
+    set_source_files_properties(${reldexAppQmlFile} PROPERTIES
+        QT_RESOURCE_ALIAS "${reldexAppQmlFileName}"
+    )
+    list(APPEND RELDEX_APP_QML_ABSOLUTE_FILES "${reldexAppQmlFile}")
+endforeach()
+
+# See ui/app/CMakeLists.txt for why this is required (not auto-detected from
+# Theme.qml's own `pragma Singleton`): this module is compiled separately
+# into tst_coreinfo, so it needs the same source property set again here.
+set_source_files_properties("${CMAKE_SOURCE_DIR}/app/Theme.qml" PROPERTIES
+    QT_QML_SINGLETON_TYPE TRUE
 )
 
 # NO_CACHEGEN: the AOT qmlcache compiler derives its intermediate file names
-# from the QML_FILES path relative to this directory (`../app/Main.qml`),
+# from each QML_FILES path relative to this directory (`../app/Main.qml`),
 # which it cannot turn into a valid output path when the source lives
 # outside this target's own source tree. Not needed for a test binary --
 # it only affects load-time compilation, not what is being tested here.
@@ -40,7 +56,7 @@ qt_add_qml_module(tst_coreinfo
     NO_CACHEGEN
     OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/qml-tests/Reldex/App"
     QML_FILES
-        ${RELDEX_APP_MAIN_QML}
+        ${RELDEX_APP_QML_ABSOLUTE_FILES}
 )
 
 target_link_libraries(tst_coreinfo
@@ -49,6 +65,10 @@ target_link_libraries(tst_coreinfo
         Qt6::Gui
         Qt6::Qml
         Qt6::Quick
+        # QQuickStyle (M3.1): tst_coreinfo.cpp sets the Basic style itself in
+        # initTestCase(), for the same reason and with the same "before the
+        # first QML load" ordering as ui/app/main.cpp.
+        Qt6::QuickControls2
         Qt6::Test
         reldex_adapter
 )
@@ -60,6 +80,27 @@ add_test(NAME tst_coreinfo COMMAND tst_coreinfo)
 set_tests_properties(tst_coreinfo PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
 )
+
+# M3.1 acceptance (docs/exec-plans/active/phase-1.md row M3.1): "Renders at
+# 100/150/200% DPI." QT_SCALE_FACTOR is read once at QPA platform start-up
+# (see appShellRendersAtCurrentScaleFactor() in tst_coreinfo.cpp), so it
+# cannot be varied within one already-running process -- these are three
+# separate ctest processes, each running only that one test function, rather
+# than three assertions inside a single run.
+foreach(reldexDpiPercent IN ITEMS 100 150 200)
+    if(reldexDpiPercent STREQUAL "100")
+        set(reldexScaleFactor "1")
+    elseif(reldexDpiPercent STREQUAL "150")
+        set(reldexScaleFactor "1.5")
+    else()
+        set(reldexScaleFactor "2")
+    endif()
+    add_test(NAME tst_appshell_dpi${reldexDpiPercent}
+             COMMAND tst_coreinfo appShellRendersAtCurrentScaleFactor)
+    set_tests_properties(tst_appshell_dpi${reldexDpiPercent} PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_SCALE_FACTOR=${reldexScaleFactor}"
+    )
+endforeach()
 
 # M1.4: the Qt-free C/C++ smoke harness (ADR-0003 D10 item 2). Reuses the
 # reldex_ffi-shared target and RELDEX_FFI_INCLUDE_DIR that ui/CMakeLists.txt

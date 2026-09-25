@@ -14,6 +14,8 @@ qt_add_qml_module(reldex_adapter
     SOURCES
         CoreInfo.h
         CoreInfo.cpp
+        AppSettings.h
+        AppSettings.cpp
         ReldexHandles.h
         Metrics.h
         Metrics.cpp

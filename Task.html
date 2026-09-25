@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-24T22:36:00+07:00",
+  "updatedAt": "2026-09-25T07:44:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1219,8 +1219,8 @@
           "title": "M3 — Connect: shell, connection manager, first real session",
           "tasks": [
             {
-              "title": "M3.1 App shell: window, docking-free fixed layout (sidebar / worksheet tabs / output panes), light+dark theme, high-DPI (sonnet)",
-              "status": "todo"
+              "title": "M3.1 App shell: window, docking-free fixed layout (sidebar / worksheet tabs / output panes), light+dark theme, high-DPI (sonnet) —  — done 2026-09-25: app shell (ui/app/{Main,Sidebar,WorksheetArea,OutputPanes,StatusBar,Theme}.qml) — fixed three-region layout, light/dark tokens driven by the system colour scheme with an in-memory override (AppSettings, persisted at M3.6), Basic style palette bound to the tokens, high-DPI verified offscreen at 1×/1.5×/2×; independently reviewed (tab-bar palette must-fix landed); 9/9 offscreen tests; old S15 harness kept behind --harness",
+              "status": "done"
             },
             {
               "title": "M3.2 Connection manager UI: list, create/edit/delete, environment, test-connect (sonnet)",
@@ -1672,6 +1672,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-25",
+      "text": "M3.1 done: the app shell exists. Main window with a fixed sidebar / worksheet-tab / output-pane layout, light and dark themes driven by the system colour scheme (with an in-memory override until M3.6 persists it), and high-DPI verified offscreen at 1x, 1.5x and 2x. Independent review caught a real defect — Qt's Basic style reads different palette roles for tab buttons than the ones first bound, leaving unselected tabs near-black — fixed and confirmed in light and dark grabs with WCAG contrast measured. The old S15 harness stays reachable behind a flag. No business logic in QML."
+    },
     {
       "date": "2026-09-24",
       "text": "M2.7 done: DBMS_OUTPUT reaches the core. The driver drains the server buffer in bounded chunks (10,000 lines in 5 round trips; Thai, emoji and 32,767-byte lines byte-exact), the core reads after every statement — success or failure — and delivers the lines before the statement's reply, and a session with the pane off costs no extra round trip (proven with call counters and on the real database). Independent review found no must-fix; it corrected the completion log to keep a strict prefix, documented a second attribution exception (output of a timed-out statement arrives with the next one), and fixed a wrong rationale. Two follow-ups recorded: RAW-based framing so one invalid line cannot lose a read (M2.12) and a per-statement drain bound (M2.13)."
