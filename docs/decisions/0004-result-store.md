@@ -3,8 +3,8 @@
 **Status:** Accepted by the lead (2026-09-25), after one independent review round (PR #39).
 The owner-review list is at "Owner-review points": (a) the fetch-size sign-off, re-asked with a
 corrected diagnosis, (b) whether a 1,000,000-row default cap meets `SPEC.md` §19, (c) no
-browsing past the caps in Phase 1, (d) the mobile caps (for information), (e) an upstream issue
-being drafted.
+browsing past the caps in Phase 1, (d) the mobile caps (for information), (e) upstream Issue J /
+U-19 (a draft, not posted; owner review pending).
 The ADR-0003 K1/K2/K3 rulings are still open with the owner too. The decisions below do not wait
 for any of these; "Robust to the pending rulings" says what holds under each outcome.
 **Date:** 2026-09-25 (drafted and revised after review the same day)
@@ -67,9 +67,9 @@ What exists today, and what this ADR has to replace or keep:
 - **What a fetch costs on Oracle 19c.** One fetch costs roughly the square of the bytes it
   carries, because of a behaviour of `oracledb` 26.0.0-beta.3 found by this ADR's review.
   - A server that does not announce end-of-response does not mark where a response ends. The
-    check is TNS protocol ≥ 23 plus an accept flag; the upstream comment says "prior to Oracle
-    Database 26ai", and 19c never announces it. The client learns that more packets are needed
-    only by failing to parse (`client/mod.rs`, `receive_response`: on `out_of_data`,
+    client enables it only when the negotiated TNS protocol is ≥ 23 (23ai or newer, per U-19 in
+    `phase-0-spike-results.md` §5), and 19c never qualifies. The client learns that more packets
+    are needed only by failing to parse (`client/mod.rs`, `receive_response`: on `out_of_data`,
     `receive_packets` returns one more packet).
   - Each time that happens, `Response::add_packets` rebuilds its read buffer from **all** packets
     received so far, and deserialization starts again at byte 0 (`response/mod.rs`).
@@ -78,7 +78,8 @@ What exists today, and what this ADR has to replace or keep:
     - One 1,000-row fetch of 16 KB rows takes **23 s**.
     - A 2 MiB SDU changes nothing (Table 3a).
   - This is the "throughput is not monotonic in batch size" that Phase 0's S14 could not explain
-    (`phase-0-spike-results.md` S14, note of 2026-09-25).
+    (`phase-0-spike-results.md` S14, and U-19 in §5, which holds the upstream analysis and the
+    draft Issue J).
 
 Consumers: M5.2 (implementation and FFI lifetime rules), M5.3–M5.5 (grid, copy, LOB viewers),
 M5.6–M5.8 (fetch benchmark, perf re-run, drain budget), M4.3 (run modes that replace a result),
@@ -214,8 +215,9 @@ S14 shape, 22 ms for 5 texts + 2 dates, and 23 s for 4 × `VARCHAR2(4000)`.
 - **Applying it needs a driver change.** `oracle-thin` sets the array size at `execute`, before
   the describe, and `oracledb`'s public `Cursor` has no setter. Its fetch message does read the
   size from the statement's options on every fetch (`messages/fetch.rs`), so a setter is a small
-  upstream change. M5.2 chooses the mechanism: a setter upstream, which goes into the issue in
-  owner-review point (e), or a describe before the execute. Until one of them lands,
+  upstream change. M5.2 chooses the mechanism: a setter upstream (asked alongside Issue J, or
+  separately, under the same owner review as point (e)), or a describe before the execute. Until
+  one of them lands,
   `results.fetch_rows` alone sizes the round trip, and wide rows keep Table 3a's cost (Accepted
   limitation 11).
 
@@ -573,7 +575,7 @@ default on mobile until then.
     segments of at least 1,024 rows on the worker. The first segment is never delayed to coalesce.
   - **If the owner keeps a plain row count**, the store works unchanged. Wide rows then keep Table
     3a's cost, and "Stop fetching" keeps its worst case of `fetches_in_flight` × one fetch (RS2).
-  - **On a server that marks end-of-response** (newer than 19c, per the upstream code), the
+  - **On a server that marks end-of-response** (23ai or newer, per U-19), the
     quadratic term does not arise. The budget can then be larger, and M5.6 records which server
     each number came from.
 - **K3 (ADR-0003).** The store's per-row cost does not depend on which baseline the owner picks.
@@ -705,8 +707,8 @@ default on mobile until then.
 11. **Wide rows are slow to fetch until the byte bound can be applied.** On Oracle 19c one fetch
     costs about the square of its bytes (`oracledb` 26.0.0-beta.3; Table 3a). The fix in this
     ADR, bounding bytes per round trip (RS2), needs a driver mechanism that does not exist yet.
-    Until it lands, a 1,000-row fetch of 16 KB rows takes about 23 s. An upstream issue is being
-    drafted (owner-review point (e)).
+    Until it lands, a 1,000-row fetch of 16 KB rows takes about 23 s. The upstream cause is U-19;
+    Issue J is its draft (owner-review point (e)).
 
 ## Owner-review points
 
@@ -729,10 +731,11 @@ because each is either a setting's default or information.
   (Accepted limitation 4).
 - **(d) Mobile caps: 100,000 rows and 64 MiB** (RS6). This is for information until the
   physical-device gate: the numbers are reasoned, not measured.
-- **(e) An upstream issue for the O(packets²) fetch behaviour** is being drafted separately. It
-  goes through the upstream-issue etiquette: dedupe against existing issues and PRs, and the owner
-  reviews it before it is posted. It may also ask for a setter for the fetch array size after
-  execute (RS2). This ADR references it and does not write it.
+- **(e) Issue J / U-19 (a draft, not posted; owner review pending).** This is the upstream issue
+  for the O(packets²) fetch behaviour, in `phase-0-spike-results.md` §5 (U-19) and §6 (the
+  draft). It follows the upstream-issue etiquette: dedupe first, and the owner reviews it before
+  it is posted. A setter for the fetch array size after execute (RS2) is a separate, smaller ask,
+  under the same owner review. This ADR references the draft and does not write it.
 
 Changing a default later is a registry edit and needs no redesign.
 
@@ -907,7 +910,8 @@ property of the row count.
 Execute, which is a describe on `oracle-thin`, took 1.4–2.6 ms once a statement text had been
 parsed. The first run of each text took 7.7–58 ms. Loopback means **zero network latency**: every
 figure here is a floor, and M5.6/M5.7 own the real-network numbers. Both tables come from one
-server version (19c). A server that marks end-of-response would not show the quadratic term.
+server version (19c). A server that marks end-of-response (23ai or newer) would not show the
+quadratic term.
 
 **Table 4 — retained bytes per row against fetch size** (100,000 rows; accounted bytes)
 
@@ -926,7 +930,7 @@ server version (19c). A server that marks end-of-response would not show the qua
 - Any mobile device.
 - The store in the running app: in-app RSS, and K1/K2/K4 with the store in place. That is M5.7's.
 - A spill or Arrow prototype. The Arrow figures in RS4 are arithmetic.
-- The fetch cost on a server that marks end-of-response (newer than 19c), or with the bytes
+- The fetch cost on a server that marks end-of-response (23ai or newer), or with the bytes
   bound applied (RS2). The latter needs the driver change first.
 - The actual wire size of a fetch. Table 3a's payload column is an estimate.
 
