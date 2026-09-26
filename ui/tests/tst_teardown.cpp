@@ -34,9 +34,9 @@ using adapter_test::spinUntilLiveCounts;
 // started from. The RSS check stays as a gross guard for anything that leaks
 // on OUR side of the boundary, where those counters cannot see.
 //
-// The assertion is always a *wait*: A17 says `reldex_hub_destroy` does not join
-// the session pump threads, so a session stays counted until its thread has
-// actually finished. The deadline is a hang guard; no latency is asserted.
+// The assertion is always a *wait*, although since M2.15 everything counted is
+// released before `reldex_hub_destroy` returns. The deadline is a hang guard;
+// no latency is asserted.
 //
 // Iteration count: `RELDEX_UI_TEARDOWN_ITERATIONS` overrides the default of
 // 10,000 (CI may want fewer; a sanitizer build certainly does).
@@ -92,9 +92,8 @@ void TstTeardown::destroyingTheBridgeUnderAFloodOfCompletions()
     // THE leak assertion (ABI 3). 10,000 iterations each holding a hub, a
     // session, a stream of batches and the arenas the formatter made: if any
     // of them survived its Bridge, this never comes back to the baseline.
-    // A deliberately generous hang guard, not a latency bound: this waits for
-    // up to `iterations` session pump threads to have finished (A17), and a
-    // two-core CI runner is a long way from this machine.
+    // A deliberately generous hang guard, not a latency bound: a two-core CI
+    // runner is a long way from this machine.
     const bool settled = spinUntilLiveCounts(baseline, 300000);
     QVERIFY2(settled, qPrintable(QStringLiteral("live counts did not return to the baseline: "
                                                 "%1 (baseline %2)")
@@ -121,7 +120,7 @@ void TstTeardown::destroyingTheBridgeUnderAFloodOfCompletions()
 void TstTeardown::destroyingTheBridgeWhileTheSessionIsStillConnecting()
 {
     // The other teardown window: the OPENED event has not been drained yet,
-    // so the pump is mid-connect when the waker is unregistered.
+    // so the session may be mid-connect when the waker is unregistered.
     const auto iterations = static_cast<int>(
             qBound<qint64>(1LL, envNumber("RELDEX_UI_TEARDOWN_CONNECT_ITERATIONS", 2000), 1000000LL));
     const auto baseline = settledBaseline();
@@ -136,8 +135,9 @@ void TstTeardown::destroyingTheBridgeWhileTheSessionIsStillConnecting()
     }
 
     // The window this test exists for is also the one where a session is most
-    // likely to outlive its hub: the pump is mid-connect when the waker comes
-    // off, and A17 says nothing joins it. Same generous hang guard as above.
+    // likely to outlive its hub: it may be mid-connect when the waker comes
+    // off, and the registry abandons the connect rather than joining it. Same
+    // generous hang guard as above.
     QVERIFY2(spinUntilLiveCounts(baseline, 300000),
              qPrintable(QStringLiteral("live counts did not return to the baseline: %1 "
                                        "(baseline %2)")

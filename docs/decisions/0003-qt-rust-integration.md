@@ -2,7 +2,8 @@
 
 **Status:** Proposed — spike S15 complete 2026-09-20; owner ruling requested
 **Date:** 2026-09-20
-**Amended:** 2026-09-20 (pre-acceptance, from building `crates/ffi` in M1.3 — see "Amendment (pre-acceptance): what building the boundary changed", items A1–A9; extended the same day with A10–A18 from the independent review of that work. A19–A25 followed the same day from the first consumers' findings (ABI 3). The status is unchanged and S15 is still the gate.) **Amended again, 2026-09-20:** spike S15 was run and reported (`docs/exec-plans/active/phase-1-s15-ffi-spike.md`) — see "S15 result (2026-09-20)" under Evidence. Status moved from "acceptance conditional on spike S15" to "spike S15 complete; owner ruling requested". The lead does not accept ADR-0003 unilaterally on this evidence; three specific rulings are requested from the owner (see below). Status is still not Accepted.
+**Amended:** 2026-09-20 (pre-acceptance, from building `crates/ffi` in M1.3 — see "Amendment (pre-acceptance): what building the boundary changed", items A1–A9; extended the same day with A10–A18 from the independent review of that work. A19–A25 followed the same day from the first consumers' findings (ABI 3). The status is unchanged and S15 is still the gate.) **Amended again, 2026-09-20:** spike S15 was run and reported (`docs/exec-plans/active/phase-1-s15-ffi-spike.md`) — see "S15 result (2026-09-20)" under Evidence. Status moved from "acceptance conditional on spike S15" to "spike S15 complete; owner ruling requested". The lead does not accept ADR-0003 unilaterally on this evidence; three specific rulings are requested from the owner (see below). Status is still not Accepted. **Amended 2026-09-26:** M2.11 (A26–A31) and M2.15 (A32–A37, the
+switch onto `db-core`'s event queue; ABI 3.2). The status is unchanged.
 **Supersedes/resolves:** `ARCHITECTURE.md` §13 item 2 (FFI mechanism), item 3's remaining FFI half (completion marshalling, thread affinity, reentrancy), and item 10 in part (crate layout for the FFI/UI tier).
 
 ## Context
@@ -264,6 +265,9 @@ documented as diagnostic, and S15's K6 instrumentation may use it.
 
 ### A5 — the per-session pump is interim, and M2.5 still owns the real queue
 
+> **Superseded by A32 (M2.15, 2026-09-26).** The pump described here is gone; the hub drains
+> `db-core`'s `EventQueue`. Kept as the record of why it existed.
+
 ADR-0002 explicitly deferred "a per-session outbound completion/event queue for the FFI adapter"
 (its §B2) to the work that is now M2.5. M1.3 needed completions to become events *now*, and had two
 options: build the §B2 subset in `db-core`, or pump `Completion<T>` inside `crates/ffi` and leave
@@ -446,6 +450,10 @@ pointer into the middle of a larger buffer.
 
 ### A14 — the pump contains its own panics (D2)
 
+> **Superseded by A32 (M2.15).** There is no pump thread to contain. A driver panic is now contained
+> by `db-core`'s worker, which answers every accepted request and ends the session with a `TERMINAL`
+> (`transaction_possibly_lost` true); `crates/ffi/tests/ordering.rs` tests that path.
+
 D2 wraps every `extern "C"` body in `catch_unwind`, which cannot reach the session pump: that
 thread is ours, and an unwind out of it would leave every outstanding request unanswered. Nothing
 would report it — the adapter's spinner would simply never stop, which is the failure mode
@@ -481,6 +489,9 @@ digit grouping both on.
 
 ### A16 — the event queue is unbounded, and what bounds it
 
+> **Superseded by A34 (M2.15).** The queue is now bounded per session by `db-core`. What still holds:
+> a `FETCHED` batch is the caller's memory until released, and the waker is edge-triggered.
+
 Stated because the review asked where back-pressure lives: nowhere in this ABI. Every accepted
 request eventually queues exactly one event, and a `FETCHED` event holds a `ReldexBatch` whose rows
 become the caller's memory. A caller that keeps fetching without draining, or drains without
@@ -494,6 +505,10 @@ caller that stops draining while `reldex_hub_next_event` is still returning `tru
 wake and must re-post its own drain.
 
 ### A17 — `reldex_hub_destroy` is prompt, and what that leaks
+
+> **Amended by A33 (M2.15).** Destroy is still prompt and the stuck-statement leak is still real, but
+> the hub, its queue and every counted object are now freed before destroy returns; what can outlive
+> it is a `db-core` worker and its connection, bounded by the registry's teardown.
 
 D5 and this ADR both said destroy "returns promptly". Measured: 12.7 µs with a pump parked in an
 uninterruptible statement. What was not said is what it costs, which the header now states: until
@@ -832,28 +847,30 @@ run.sh`) actually ran, which nothing had done since `Terminal` was added — the
 nothing had caught it yet, are both recorded here for the reviewer's benefit, not left implicit in a
 diff.
 
-### A29 — the interim pump is unchanged; the switch is split out as M2.15, not attempted here
+### A29 — the pump switch was split out as M2.15, not attempted in M2.11 (done: A32)
 
-A5 records that the per-session pump in `crates/ffi/src/session.rs` is deliberately interim, to be
+> **Resolved by M2.15 (2026-09-26), A32–A37.** Everything listed below as undeliverable is now
+> delivered. The rest of this entry is the M2.11 record, kept as written apart from this note.
+
+A5 records that the per-session pump in `crates/ffi/src/session.rs` was a stand-in, to be
 replaced when `db-core`'s `SessionRegistry`/`EventQueue`/`Waker` (`docs/exec-plans/active/
 phase-1.md` §B2/§B3, tasks M2.5/M2.6) land. **Correction (M2.11 review round 2):** an earlier
 version of this entry said those tasks "have not landed as of M2.11" — false, and caught by an
 independent reviewer. M2.5 and M2.6 landed 2026-09-21, well before this task. What is still true,
 and is the actual reason the pump is unchanged, is that *this crate has not switched onto them* —
-`Terminal` and `ServerOutput` are both produced by the same interim per-session-thread pump, not by
-a real event-queue switch, and the module documentation for `ServerOutput` (and `crate::lib`'s "What
-is interim here") says so plainly: it is delivered only on the completion path (drained after every
-reply while output is on), not as a genuinely unsolicited, mid-statement event.
+`Terminal` and `ServerOutput` were both produced by the same per-session-thread pump, not by a real
+event-queue switch, and the module documentation for `ServerOutput` said so plainly: it was
+delivered only on the completion path (drained after every reply while output was on), not as a
+genuinely unsolicited, mid-statement event.
 
 That switch is real concurrency work — replacing a thread-per-session pump with a shared event queue
 and waker while every existing ordering guarantee (D5) keeps holding — and does not belong riding
 along with M2.11's already-large review-round fix pass. It is split out as its own task, **M2.15**
 ("FFI pump switch to the M2.5 event queue"), `opus`, review mandatory, listed in `phase-1.md` after
-M2.14 and in `TASKS.md`. Until M2.15 lands, the interim pump cannot deliver: a genuinely unsolicited,
-mid-statement `Terminal` (today's only fires on close, failed open, or a contained panic); `abandon`
+M2.14 and in `TASKS.md`. Before M2.15 the pump could not deliver: a genuinely unsolicited,
+mid-statement `Terminal` (it fired only on close, failed open, or a contained panic); `abandon`
 relayed through the real `SessionRegistry`; `EXECUTING`/`TRANSACTION_STATE` events; or server output
-ahead of the reply that follows it. `crates/ffi/src/lib.rs`'s module documentation lists the same
-four gaps next to the code, and `crates/ffi/README.md`'s limitations section points here.
+ahead of the reply that follows it.
 
 ### A30 — `ReldexSecret`'s exposed text is the one exception to A13's NUL-termination promise
 
@@ -879,3 +896,208 @@ shape may still change before M1.8 needs it. When M1.8 lands and something needs
 with these parameters (not just inspect them), that is the point to decide whether `ReldexConnectSummary`
 grows into the real crossing shape or a second, session-opening-specific one is added beside it —
 recorded here as a known, deliberate gap rather than a decision made by omission.
+
+## Amendment: M2.15 — the hub drains `db-core`'s event queue (2026-09-26)
+
+M2.15 removes the per-session pump (A5) and puts the hub on `db-core`'s `EventQueue` and
+`SessionRegistry` (`phase-1.md` §B2/§B3, `phase-1-m2-5-event-queue.md` §3.1/§7). The ABI moves
+**3.1 → 3.2**, additively (A26's rule). Status is unchanged: this ADR is still not Accepted.
+
+### A32 — one queue, one registry, translation on the draining thread
+
+The hub owns one `EventQueue` and the `SessionRegistry` that opens every session bound to it. Each
+session's worker pushes its `SessionEvent`s straight into that queue, and `reldex_hub_next_event`
+pops and translates one on the caller's thread. There is no thread of this crate's per session or
+per request, and nothing polls.
+
+- **Request ids.** The hub allocates the `RequestId`s `db-core` sees, and keeps a small table from
+  each to what the reply owes the caller: the caller's own request id, and for a fetch or a result
+  close, the result key and its shared column descriptions. The entry is taken out when the reply is
+  translated. Replies that arrive after their session's `TERMINAL` are therefore still answered with
+  the caller's id.
+- **Ordering.** D5's guarantees are now `db-core`'s (ADR-0002 E1–E6): per-session production order,
+  exactly one reply per accepted request, exactly one `Terminal` per session, `Executing` before its
+  `Executed`. The FFI adds nothing that could reorder them.
+- **The waker** is the queue's own (`EventQueue::set_waker`): edge-triggered on empty → non-empty,
+  so one wake covers a burst, called with no `db-core` lock and no lock of this crate's held. This
+  crate wraps the adapter's callback in the re-entrancy guard (D5 rule 1). The guard now restores
+  the value it found, so a wake raised inside a `reldex_*` call on the caller's own thread (a request
+  answered on the spot) cannot clear the guard of the call around it.
+- **Panics.** D2's `catch_unwind` still wraps every exported function. A driver panic is contained
+  by `db-core`'s worker and becomes a lost session (`TERMINAL`, `transaction_possibly_lost`), with
+  every accepted request still answered (A14 superseded).
+
+### A33 — a session ends when its `TERMINAL` is drained, and destroy abandons
+
+- Taking a session's `TERMINAL` **retires** it: the hub drops its entry, `db-core` releases the
+  session (`SessionRegistry::retire`), and every later call naming the id reports
+  `RELDEX_STATUS_NOT_FOUND`. Before M2.15, a normally closed session stayed in the hub's table:
+  `reldex_hub_session_count()` and `reldex_live_counts().sessions` never came back down after a
+  close. Both are now exact, and tested for a clean close, a lost session and a failed open.
+- A lost session's column descriptions can still be named by a batch the caller holds, so they are
+  kept (orphaned) past `TERMINAL` rather than freed there — bounded by A39. A closed session's are
+  freed at `TERMINAL`: the close was the caller's promise that nothing names them any more (A20).
+- `reldex_hub_destroy` unregisters the waker, abandons every open session through the registry
+  (never commits, never waits), drops the queue with whatever it holds, and frees the hub before it
+  returns. If any session is still finishing, the registry's teardown (at most `db-core`'s 500 ms
+  `DROP_SHUTDOWN_TIMEOUT`, shared by all sessions) runs on a short-lived `reldex-ffi-teardown`
+  thread instead of the caller's. When every session was already retired, nothing is spawned.
+  A17's leak is now narrower: only a `db-core` worker stuck in an uninterruptible statement, and its
+  connection, can outlive destroy. Nothing counted by `reldex_live_counts` does.
+- `reldex_session_abandon` relays to `SessionRegistry::abandon`. It never blocks, reports what it
+  found (`ReldexAbandonOutcome`: `CONNECTING`, `OPEN`, `ALREADY_ENDED`) and whether a transaction may
+  have been lost. The session's `TERMINAL` then carries `abandoned`.
+
+### A34 — the bound is `db-core`'s, and it replaces A16's "unbounded"
+
+A request holds one of 1,024 per-session slots from the moment it is accepted until its reply is
+taken out of the queue. Past that, a submit is refused with `RELDEX_ERROR_KIND_RESOURCE`; no
+producer ever blocks. Progress events share that bound. Unsolicited events are capped at 256 per
+session: server output past the cap is dropped and counted (`server_output_dropped`, reported on the
+next output event or on `TERMINAL`), and a transaction-state change is coalesced, never dropped.
+A `FETCHED` batch is still the caller's memory once handed out; that part of A16 stands.
+
+### A35 — what ABI 3.2 adds
+
+All additive (a symbol, a trailing field, or an enum value; A26's rule):
+
+- Event kinds `EXECUTING` (10: `request` is `0`; the statement it announces is named in the new
+  `executing_request` field, with its deadline if one is set), `TRANSACTION_STATE` (11,
+  `transaction_possibly_active`) and `FETCHED_SEGMENT` (12, opaque: result key and row count only;
+  nothing in 3.2 submits one). A `db-core` event this build does not translate arrives as
+  `RELDEX_EVENT_KIND_UNKNOWN`, carrying the caller's request id only if it is a reply.
+- **Behaviourally additive, not just structurally.** The 3.1 contract — exactly one event per
+  accepted request carries that request's id, its reply — still holds, and every new kind carries
+  `request == 0`. A 3.1 adapter therefore sees each new kind as one more unsolicited kind it does
+  not know and ignores it (D7); no new rule is imposed on an old caller. **Correction (M2.15
+  review):** the first version of this change delivered `EXECUTING` with the live request id of the
+  statement in `request` and asked adapters to "route only reply kinds through bookkeeping" — a new
+  rule on old callers, contrary to A26. The 3.1 `smoke.c`, built against the 3.1 header and run
+  against the 3.2 library, failed at its first execute. `exactly_one_event_carries_each_request_id`
+  (`crates/ffi/tests/events.rs`) now pins the contract.
+- **A caller is never given a kind its header predates.** Moving the id out of `request` was not
+  enough on its own: a 3.1 caller that submits, waits for the wake and takes "the" reply — as the
+  3.1 smoke harness does, one request at a time — would take `EXECUTING` instead. The caller's
+  `struct_size` says which header it was built against (3.1's `ReldexEvent` is 152 bytes, 3.2's
+  168), so below 3.2's size `reldex_hub_next_event` discards the three 3.2 kinds instead of
+  delivering them. The waker is not called for a wake whose only news is one of them when it can
+  tell without waiting: it `try_lock`s the hub's queue, discards them, and parks the first visible
+  event in front of the queue, so the next push still raises its edge. It never waits for the
+  lock, and lets the wake through when it cannot take it. So a wake with nothing to take reaches
+  such a caller **at most rarely**, not never — exactly as one can reach any caller when a push
+  races its drain or the lock is contended (the re-review counted 36 empty drains of 3,327 at
+  3.1's `struct_size`, 13 of 3,222 at 3.2's). A caller drains until empty and never assumes a wake
+  means an event (D5). Result: origin/main's 3.1 `smoke.c` passes **457/458** against
+  this library. The one failure asserts `returned struct_size == sizeof(ReldexEvent)` for a
+  caller that declared *more* than its header's size — equality with the older header's size,
+  which any minor that appends a field breaks (3.0 → 3.1 did, 112 → 152). The library reports
+  `min(declared, 168)`, which is D7's contract, and the 3.2 harness checks `>=`.
+  `a_caller_built_against_3_1_is_never_given_a_3_2_kind_nor_woken_for_one` pins the behaviour.
+- Trailing `ReldexEvent` fields `has_deadline`, `transaction_possibly_active`, `abandoned`,
+  `deadline_ms`, `executing_request`. `TERMINAL` now carries the cause in `error` (caller-owned), and `SERVER_OUTPUT`
+  carries its lines, `server_output_dropped`, `server_output_invalid_utf8_lines` and a read failure.
+- `reldex_session_abandon` and `ReldexAbandonOutcome`.
+- Mock only (`mock-driver` feature): `ReldexMockStatement` `SERVER_OUTPUT` (8) and `LOSE_SESSION` (9),
+  and `ReldexMockScenarioConfig` fields for a scripted open or ping failure (`ReldexMockFailure`), so
+  an adapter can test a failed connect without a database. `PUMP_PANIC` (6) keeps its value and is
+  now a second driver panic.
+
+### A36 — two meanings that changed without changing shape
+
+- **`session_state` on a successful reply is `USABLE`.** The request succeeded, so the session was
+  usable when it answered. A loss while that reply waited in the queue is reported by the `TERMINAL`
+  behind it, not by rewriting the reply. Failed replies, progress events and notifications report
+  the state when the event is taken. This also keeps `FETCHED` off the session's state lock.
+- **An event's objects are created when it is handed out.** The `ReldexBatch`, `ReldexError` and
+  `ReldexServerOutputLines` an event carries are built by `reldex_hub_next_event`, not when the event
+  is queued. So `reldex_live_counts` no longer counts an undrained event's batch: that memory is
+  `db-core`'s until drained, and destroying the hub frees it.
+
+### A37 — the drain now pays for translation, and that is measured, not assumed
+
+Moving translation onto the draining thread moves its cost there. The pump used to translate and
+allocate each `ReldexBatch` on its own thread. S15's K6 instrumentation (`RELDEX_UI_METRICS`, the
+`drainBoundary` series: time inside `reldex_hub_next_event` per drain) was re-run as an interleaved
+A/B against the pre-M2.15 `main` (5434f5c), on a Release build, 1,000,000 mock rows, 3 runs each.
+The machine was an AMD Ryzen 7 5700G (8C/16T), 64 GB, Windows 11, Qt 6.8.3/d3d11, 1920×1080 at 60 Hz,
+with a game running in the background (CPU load 48–93 % across the runs, recorded per run):
+
+| p50 per drain | before (pump) | M2.15 as first written | M2.15 as landed |
+| --- | --- | --- | --- |
+| boundary share, initial 1M-row stream | 0.5–0.6 µs | 2.3–3.1 µs | 1.7–1.9 µs |
+| boundary share, `streamscroll` | 2.1–3.0 µs | 8.3–8.9 µs | 6.6–9.1 µs |
+| whole drain, initial stream | 66–95 µs | 67–86 µs | 72–78 µs |
+| whole drain, `streamscroll` | 225–327 µs | 225–232 µs | 242–306 µs |
+
+**Independent review's A/B (M2.15 review, HEAD c6b2cc2, p50 of 3 runs, busy machine):**
+
+| p50 per drain | before (pump) | after |
+| --- | --- | --- |
+| boundary share, initial 1M-row stream | 0.6 µs | 1.8 µs |
+| boundary share, `streamscroll` | 2.2 µs | 7.0 µs |
+| whole drain, initial stream | 75.6 µs | 69.7 µs |
+| whole drain, `streamscroll` | 232.2 µs | 235.6 µs |
+
+**The boundary's own share went up.** Per event that is about **1.1 µs** during the initial stream
+and about **2.4 µs** under `streamscroll` (where a drain carries fewer, colder events). The brief's
+criterion that the boundary share must not rise is **not met**. The whole-drain criterion **is**:
+the whole drain did not move beyond run-to-run noise, because it is dominated by the model's own
+work. The review accepted the performance line on that basis. Per event, in-process (release, worker idle), the pop is ≈0.2 µs, the
+pending-table lookup ≈0.1 µs, and the one `ReldexBatch` allocation ≈0.3 µs. Before this was measured,
+M2.15 also allocated a per-column mirror table per batch, hashed with SipHash, and took the session's
+state lock on every `FETCHED`. All three were removed (A36; mirror table built on first use). What is
+left is the translation itself, which has to run somewhere and, with no thread of this crate's, runs
+here. If it ever matters, the next step is a budgeted `drain_into`: take up to a budget of events
+under one queue lock, saving about 0.2 µs per event. A recycled `ReldexBatch` allocation would come
+after that. Neither is worth its complexity at 1–2.4 µs per event against a ~70–240 µs drain. The
+raw JSON is not committed. Both sets of numbers were taken on loaded machines and should be re-taken
+on a quiet one before anyone quotes them as more than a direction.
+
+**Allocations per event taken** (`reldex_hub_next_event`, counting allocator; the review's counts,
+pinned for the hot path by `allocations.rs`'s
+`taking_an_event_allocates_what_it_hands_over_and_nothing_else`):
+
+| event | allocations | |
+| --- | --- | --- |
+| `FETCHED` | 1 | the `ReldexBatch` box the caller owns — hot path, pinned |
+| `EXECUTING`, `TRANSACTION_STATE`, `COMPLETED`, `SERVER_OUTPUT_CONFIGURED`, a DML's `EXECUTED` | 0 | pinned |
+| a query's `EXECUTED` | 9 | its column descriptions, once per result |
+| `SERVER_OUTPUT` (three lines) | 5 | the lines' NUL-terminated copies |
+| `TERMINAL` | 1 (clean close) – 10 (a loss, with its error) | once per session |
+
+### A38 — field presence is decided by the ABI minor, not by `struct_size` (M2.15 review)
+
+`struct_size` tells the library which header a caller was built against, and the library uses it:
+it writes `min(declared, its own size)` and, since M2.15, never hands a caller a kind that header
+predates (A35). The other direction does not work. A field appended in a minor can land inside the
+previous minor's tail padding, where the size the library reports back is identical with or without
+it. 3.1's `completed_operation` (offset 108) already sat inside 3.0's 112-byte `ReldexEvent`, and
+3.2's `has_deadline`, `transaction_possibly_active` and `abandoned` (offsets 145–147) sit inside
+3.1's 152 bytes. A 3.2 adapter loaded against a stale 3.1 library would read `abandoned` from bytes
+that library never wrote.
+
+So an adapter refuses to start against a library whose **minor is below its header's**, and says
+why: `Bridge::checkAbiVersion` returns `Bridge::StartError::AbiMinorTooOld` (major mismatch stays
+`AbiMajorMismatch`), tested with synthetic versions in `tst_bridge`. A newer minor is accepted: it
+only adds. This keeps D7's promise in the direction it can be kept — an old adapter on a new library
+— and refuses the direction that cannot.
+
+### A39 — a lost session's column descriptions are bounded by the caller's next close (M2.15 review)
+
+A20 lets the caller keep reading a result's column names until it submits a close, and a session
+lost mid-statement is not the caller's doing — so A33 kept those descriptions past the session's
+`TERMINAL`. As first written they then lived until the hub was destroyed: a few KB per lost session
+with open results, growing for as long as the application ran.
+
+They are now kept per session and freed the next time the caller names that retired session in
+`reldex_session_close`, `reldex_session_close_result` or `reldex_session_abandon` — the calls that
+say "I am done with it". Each still reports `RELDEX_STATUS_NOT_FOUND`, because the session is gone;
+the call is simply also the point at which nothing can be holding the names any more by the caller's
+own account. Hub destroy still frees whatever is left. `reldex_live_counts` gained a `column_sets`
+field (additive, 3.2) so a leak check sees them, and
+`a_lost_sessions_column_descriptions_go_when_the_caller_names_it_again` (`live_counts.rs`) proves
+the count returns to baseline for each of the three calls.
+
+**ABI 4.0 (M5.2 Stage B) will shorten this:** a lost session's descriptions will be valid only until
+its `TERMINAL` is drained, the same point at which its id stops being found. That is a change to
+A20's documented lifetime, so it waits for the major version that ADR-0004 already reserves.

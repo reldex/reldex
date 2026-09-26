@@ -156,11 +156,10 @@ inline LiveCounts liveCounts()
 
 /// Waits for the live counts to come back to `baseline`.
 ///
-/// A wait rather than an immediate compare, and deliberately so: A17 says
-/// `reldex_hub_destroy` does **not** join the session pump threads, so a
-/// session stays counted until its thread actually finishes. Asserting the
-/// instant the destructor returns would be testing the scheduler. The deadline
-/// is a hang guard, never a latency bound.
+/// A wait rather than an immediate compare. Since M2.15 the library releases
+/// everything it counts before `reldex_hub_destroy` returns, so the wait is a
+/// guard rather than a necessity; it costs nothing when the counts are
+/// already right. The deadline is a hang guard, never a latency bound.
 inline bool spinUntilLiveCounts(const LiveCounts &baseline, int timeoutMs = 60000)
 {
     return spinUntil([&baseline] { return liveCounts() == baseline; }, timeoutMs);
@@ -169,11 +168,11 @@ inline bool spinUntilLiveCounts(const LiveCounts &baseline, int timeoutMs = 6000
 /// Waits for the library to go quiescent, and returns that as a baseline.
 ///
 /// Take a baseline with this rather than with `liveCounts()` directly. The
-/// counts are **process-wide**, and by A17 a previous test's session pump
-/// thread can still be finishing when the next one starts -- a baseline read
-/// in that window records a hub and a session that are on their way out, and
-/// the test then fails at the end for having *fewer* live objects than it
-/// started with. Found exactly that way, not by reasoning.
+/// counts are **process-wide**, and a previous test's objects can still be
+/// on their way out when the next one starts -- a baseline read in that
+/// window records a hub and a session that are about to go, and the test then
+/// fails at the end for having *fewer* live objects than it started with.
+/// Found exactly that way, not by reasoning.
 ///
 /// The calling thread's last-error slot is emptied first. An error sitting
 /// there counts as live exactly like one the caller holds, so a baseline taken

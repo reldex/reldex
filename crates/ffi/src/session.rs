@@ -1,48 +1,45 @@
-//! Sessions, and the **interim** completion pump that turns `db-core`'s
-//! `Completion<T>` into events (ADR-0003 D3/D5).
+//! Sessions: the calls that submit work to one, and the translation of what
+//! `db-core` reports back into the events the adapter drains (ADR-0003 D3/D5).
 //!
-//! # Why the pump is here and not in `db-core`
+//! # How a request travels
 //!
-//! `phase-1.md` §B2/§B3 design an `EventQueue`/`EventSink`/`SessionRegistry`
-//! inside `db-core`, delivered by tasks M2.5/M2.6. Building even a subset of
-//! that now would mean doing M2.5's central decision — turning the worker's
-//! `Reply<T>` into `enum ReplyTo<T>` — before the task that owns it, against
-//! the suite that has to be parameterised over both paths. So this crate keeps
-//! its own pump, which is deletable in one commit:
+//! A submitting call runs on the caller's thread and never blocks. It records
+//! what the reply will need that `db-core`'s event does not carry — the
+//! caller's own request id and, for a fetch, the result's key and column
+//! description ([`crate::hub::Pending`]) — allocates a `db-core` request id,
+//! and hands the request to the session's worker with one
+//! `DatabaseSession::submit_*` call. The worker pushes its events straight
+//! into the hub's `db-core` event queue, and [`crate::reldex_hub_next_event`]
+//! takes them out, again on the caller's thread, and [`translate`]s each one.
+//! No thread of this crate's sits in between
+//! (`docs/exec-plans/active/phase-1-m2-5-event-queue.md` §3.1, §6, §7.2).
 //!
-//! * **One thread per session.** It performs the blocking `open_session`, then
-//!   loops: take the next submitted request, **block** in `Completion::wait`
-//!   for its reply, push exactly one event. Nothing polls and nothing sleeps,
-//!   so no interval sits between a reply and the UI hearing about it.
-//! * **Order is the channel's.** Submitting takes the session's lock, sends
-//!   the request to `db-core` and hands the pump its `Completion` — in that
-//!   order, atomically. `db-core` replies to one session's requests strictly
-//!   in order (its own FIFO worker queue), so waiting on the oldest
-//!   outstanding completion is both correct and exact: per-session ordering
-//!   holds without a sequence number anywhere.
-//! * **Submitting still happens on the caller's thread**, because
-//!   `DatabaseSession::execute` only enqueues. Doing it on the pump would
-//!   serialise submission behind the previous reply and destroy the
-//!   adapter's ability to have the next fetch already in flight.
-//! * **Exactly one reply per accepted request.** A request that is rejected
-//!   (any non-`Ok` status) was never accepted and produces no event. Once a
-//!   close succeeds the pump drains everything still queued, so requests that
-//!   raced the close get their one failure reply too.
+//! Every ordering guarantee ADR-0003 D5 makes is therefore `db-core`'s own:
+//! one session's events in the order it produced them; exactly one reply per
+//! accepted request, even when a driver call panics (the worker contains the
+//! panic, and a reply channel dropped unanswered still answers); exactly one
+//! `Terminal` per session, after the replies of every request queued ahead of
+//! it. A submit `db-core` refuses — the session's reply slots are all taken —
+//! was never accepted and produces no event.
 //!
-//! When M2.5/M2.6 land, this module keeps its exported functions and its
-//! registry and loses the threads: it will forward a `db-core` `SessionEvent`
-//! instead of waiting on a `Completion`.
+//! # Per-session state ends on `TERMINAL`, and only there
+//!
+//! A session's entry here lives from `reldex_hub_open_session` until its
+//! `TERMINAL` event is drained, whatever ended it: a close, a loss, an
+//! abandon, or a connect that never succeeded. Draining that event removes
+//! the entry and retires the session from `db-core`'s registry — the one
+//! retirement rule `db-core` documents, and what keeps
+//! `reldex_hub_session_count` and `reldex_live_counts` exact.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use reldex_db_core::{
-    CancelKind, CancelOutcome, CloseDisposition, CloseError, Completion, DatabaseSession, DbError,
-    ErrorKind, ExecuteOutcome, FetchedBatch, ResultId, Statement,
+    CancelKind, CancelOutcome, CloseDisposition, CloseError, CompletedOperation, DatabaseSession,
+    DbError, DbResult, ErrorKind, RequestId, ResultId, SessionEvent, SessionId, SessionRegistry,
+    Statement,
 };
 use reldex_db_driver_api::{SavepointName, ServerOutputBuffer, ServerOutputSetting};
 
@@ -52,12 +49,12 @@ use crate::event::{
     QueuedEvent, ReldexCompletedOperation, ReldexEventKind, ReldexServerOutputMode,
 };
 use crate::format::ReldexTextArena;
-use crate::hub::{ReldexHub, with_hub};
+use crate::hub::{Pending, ReldexHub, lock, with_hub};
 use crate::mock::{BlockControl, ReldexMockScenarioConfig, build_driver, release_block};
 use crate::status::{ReldexStatus, entry, entry_value};
 use crate::strings::{CStruct, ReldexStr, read_in_struct, write_out_struct};
 
-/// Identifies one session for this hub's lifetime. Never reused.
+/// Identifies one session. Never reused, in this process.
 pub type ReldexSessionId = u64;
 
 /// Identifies one open result set, scoped to the session that produced it.
@@ -117,6 +114,29 @@ pub enum ReldexCancelOutcome {
     NotInterruptible = 2,
 }
 
+/// What [`reldex_session_abandon`] found (ABI 3.2).
+///
+/// `0` is reserved for an outcome this header predates.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReldexAbandonOutcome {
+    /// An outcome this header does not know.
+    Unknown = 0,
+    /// The connect had not finished. Its `OPENED` event arrives with a
+    /// `RELDEX_ERROR_KIND_CANCELLED` error, then its `TERMINAL`; a connection
+    /// that arrives late is closed, never adopted.
+    Connecting = 1,
+    /// An open session was released **without committing**: the server rolls
+    /// back whatever transaction it held. `*out_transaction_possibly_lost` is
+    /// a lower bound available now; the authoritative answer is the
+    /// `TERMINAL` event's `transaction_possibly_lost`, which the UI must
+    /// surface either way (`SPEC.md` §10).
+    Open = 2,
+    /// The session had already ended — closed, lost, or abandoned before.
+    /// Nothing happened; its `TERMINAL` is, or was, delivered as usual.
+    AlreadyEnded = 3,
+}
+
 /// What to do with a possibly-open transaction when closing a session.
 ///
 /// `RELDEX_CLOSE_DISPOSITION_NONE` is the honest default: if a transaction may
@@ -169,7 +189,8 @@ impl Default for ReldexOpenOptions {
 /// Where a session is in its life, from this crate's point of view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    /// The pump is still inside `open_session`; nothing may be submitted yet.
+    /// Connecting; nothing may be submitted until `db-core` hands out the
+    /// session, which it does from the moment the connect succeeds.
     Opening,
     /// Open for business.
     Open,
@@ -186,163 +207,28 @@ struct ResultEntry {
 
 struct SessionSlot {
     phase: Phase,
+    /// This crate's handle, cached from the registry once the session opens
+    /// and released before the registry's own, so that the registry's is the
+    /// last one and its release — which joins the worker — happens at a known
+    /// point: the retirement on `TERMINAL`.
     session: Option<Arc<DatabaseSession>>,
-    commands: Option<mpsc::Sender<PumpCommand>>,
     results: HashMap<u64, ResultEntry>,
     next_result_id: u64,
-    /// Column descriptions the pump took out of `results` **because the caller
-    /// asked it to** — it processed a `close_result`, or a `close`.
-    ///
-    /// The caller's pointers into these died when it submitted that close
-    /// ([`reldex_session_result_column`]), so this is not about extending
-    /// their life. It is about *where* the last claim is dropped: without it,
-    /// a `reldex_session_result_column` call that raced the close could hold
-    /// the only remaining clone and free the strings by returning, handing the
-    /// caller an `out` full of freed pointers. Drained on the caller's own
-    /// thread, by [`SessionEntry::take_released_columns`].
-    released: Vec<Arc<ResultColumns>>,
-    /// Column descriptions of results that were still open when the session
-    /// was **lost** — the pump panicked and its containment tore the session
-    /// down (ADR-0003 A14).
-    ///
-    /// The caller submitted nothing, so none of the three documented
-    /// invalidators happened and the strings must stay readable. They are
-    /// freed only by a caller-initiated teardown: a submitted
-    /// `reldex_session_close`, or `reldex_hub_destroy`.
-    lost: Vec<Arc<ResultColumns>>,
+    /// The caller submitted a close or called abandon, which ends the
+    /// documented lifetime of every column description this session handed
+    /// out; see [`reldex_session_result_column`].
+    caller_ended: bool,
+    /// [`reldex_session_abandon`] ended the session.
+    abandoned: bool,
 }
 
-impl SessionSlot {
-    /// Moves every open result's shared column description out of `results`
-    /// and into `where_to`, instead of dropping it here.
-    ///
-    /// Every caller of this is on the **pump** thread, which is the whole
-    /// point: the pump must never drop the last claim on strings the caller
-    /// may still be reading.
-    fn retire_results(&mut self, where_to: Retired) {
-        let columns = self.results.drain().map(|(_, open)| open.columns);
-        match where_to {
-            Retired::Released => self.released.extend(columns),
-            Retired::Lost => self.lost.extend(columns),
-        }
-    }
-}
-
-/// Which holder a retired result's columns belong in; see [`SessionSlot`].
-#[derive(Clone, Copy)]
-enum Retired {
-    /// The caller submitted the close that removed it.
-    Released,
-    /// Nothing the caller submitted removed it.
-    Lost,
-}
-
-/// A request handed to the pump thread, with the completion it must wait on.
-enum PumpCommand {
-    Execute {
-        request: u64,
-        completion: Completion<ExecuteOutcome>,
-    },
-    Fetch {
-        request: u64,
-        completion: Completion<FetchedBatch>,
-        columns: Arc<ResultColumns>,
-        /// The caller-facing result id, echoed on the reply.
-        key: u64,
-    },
-    CloseResult {
-        request: u64,
-        completion: Completion<()>,
-        key: u64,
-    },
-    Close {
-        request: u64,
-        disposition: Option<CloseDisposition>,
-    },
-    /// `reldex_session_commit`.
-    Commit {
-        request: u64,
-        completion: Completion<()>,
-    },
-    /// `reldex_session_rollback`.
-    Rollback {
-        request: u64,
-        completion: Completion<()>,
-    },
-    /// `reldex_session_savepoint`.
-    Savepoint {
-        request: u64,
-        completion: Completion<()>,
-    },
-    /// `reldex_session_rollback_to_savepoint`.
-    RollbackToSavepoint {
-        request: u64,
-        completion: Completion<()>,
-    },
-    /// `reldex_session_ping`.
-    Ping {
-        request: u64,
-        completion: Completion<()>,
-    },
-    /// `reldex_session_set_server_output`.
-    SetServerOutput {
-        request: u64,
-        completion: Completion<ServerOutputSetting>,
-    },
-    /// Panics inside the pump, to prove the containment below actually answers
-    /// the requests behind it. Reachable only through the mock driver's
-    /// reserved statement text; see [`crate::mock::statements::PUMP_PANIC`].
-    #[cfg(feature = "mock-driver")]
-    PanicForTest { request: u64 },
-}
-
-impl PumpCommand {
-    /// The one event this request will be answered with, whatever happens.
-    ///
-    /// Used both on the normal path and by the panic handler, so a contained
-    /// panic cannot answer with a different kind than a success would have.
-    /// The result id that reply must carry, per the header's per-kind table:
-    /// `FETCHED` and `RESULT_CLOSED` always name their result, `EXECUTED`
-    /// learns one only if the statement opens it, and no other kind has one.
-    ///
-    /// Returned alongside the kind so the panic path cannot answer with a
-    /// *differently shaped* event than a success would have — an adapter that
-    /// routes on `event.result` must not have to special-case failures.
-    fn reply_shape(&self) -> ReplyShape {
-        match self {
-            Self::Execute { request, .. } => (ReldexEventKind::Executed, *request, None),
-            Self::Fetch { request, key, .. } => (ReldexEventKind::Fetched, *request, Some(*key)),
-            Self::CloseResult { request, key, .. } => {
-                (ReldexEventKind::ResultClosed, *request, Some(*key))
-            }
-            Self::Close { request, .. } => (ReldexEventKind::SessionClosed, *request, None),
-            Self::Commit { request, .. }
-            | Self::Rollback { request, .. }
-            | Self::Savepoint { request, .. }
-            | Self::RollbackToSavepoint { request, .. }
-            | Self::Ping { request, .. } => (ReldexEventKind::Completed, *request, None),
-            Self::SetServerOutput { request, .. } => {
-                (ReldexEventKind::ServerOutputConfigured, *request, None)
-            }
-            #[cfg(feature = "mock-driver")]
-            Self::PanicForTest { request } => (ReldexEventKind::Executed, *request, None),
-        }
-    }
-}
-
-/// What one accepted request will be answered with: the event kind, the
-/// request id, and the result id that kind carries (if any).
-type ReplyShape = (ReldexEventKind, u64, Option<u64>);
-
-/// One session's registry entry: everything the caller's thread and the pump
-/// thread share.
+/// One session's entry in its hub.
 pub(crate) struct SessionEntry {
-    id: u64,
-    /// Guards submission *and* ordering: a submit sends to `db-core` and hands
-    /// the pump its completion while holding this, so the pump can never see
-    /// two requests in the wrong order.
+    id: SessionId,
     slot: Mutex<SessionSlot>,
+    /// The mock's statement gate and connect gate, when the mock is linked.
     block: Option<BlockControl>,
+    connect_block: Option<BlockControl>,
 }
 
 impl Drop for SessionEntry {
@@ -351,132 +237,234 @@ impl Drop for SessionEntry {
     }
 }
 
+/// What retiring an entry leaves behind.
+struct Ended {
+    abandoned: bool,
+    caller_ended: bool,
+    columns: Vec<Arc<ResultColumns>>,
+}
+
 impl SessionEntry {
-    fn lock(&self) -> std::sync::MutexGuard<'_, SessionSlot> {
-        self.slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn new(
+        id: SessionId,
+        block: Option<BlockControl>,
+        connect_block: Option<BlockControl>,
+    ) -> Self {
+        crate::counters::created(crate::counters::Kind::Session);
+        Self {
+            id,
+            slot: Mutex::new(SessionSlot {
+                phase: Phase::Opening,
+                session: None,
+                results: HashMap::new(),
+                next_result_id: 1,
+                caller_ended: false,
+                abandoned: false,
+            }),
+            block,
+            connect_block,
+        }
     }
 
-    /// Closes the session without committing and lets the pump finish on its
-    /// own, so hub teardown never blocks on a statement that cannot be
-    /// interrupted.
+    fn lock(&self) -> MutexGuard<'_, SessionSlot> {
+        lock(&self.slot)
+    }
+
+    /// The handle to submit on, or `None` when nothing may be submitted.
     ///
-    /// Reached from two places: `reldex_hub_destroy`, on the caller's thread,
-    /// and the pump's own panic containment, on the pump thread. Open results'
-    /// column descriptions are therefore **retired, not dropped** — the pump
-    /// path has no caller-initiated invalidation behind it, and freeing there
-    /// would break the lifetime `reldex_session_result_column` promises.
-    /// `reldex_hub_destroy` takes them back with
-    /// [`Self::take_lost_columns`] and drops them on its own thread.
-    pub(crate) fn shut_down(&self) {
+    /// A session is usable from the moment it connects, not from the moment
+    /// the caller drains its `OPENED`: `db-core`'s registry hands the handle
+    /// out once the connect has succeeded, and it is cached here then.
+    fn handle(&self, registry: &SessionRegistry) -> Option<Arc<DatabaseSession>> {
+        {
+            let slot = self.lock();
+            match slot.phase {
+                Phase::Open => return slot.session.clone(),
+                Phase::Closed => return None,
+                Phase::Opening => {}
+            }
+        }
+        let session = registry.get(self.id)?;
+        let mut slot = self.lock();
+        if slot.phase != Phase::Opening {
+            return slot.session.clone();
+        }
+        slot.phase = Phase::Open;
+        slot.session = Some(Arc::clone(&session));
+        Some(session)
+    }
+
+    /// The lifecycle state reported on an event that carries no error.
+    fn state(&self) -> ReldexSessionState {
+        let slot = self.lock();
+        match (&slot.session, slot.phase) {
+            (Some(session), _) => session.session_state().into(),
+            (None, Phase::Closed) => ReldexSessionState::Closed,
+            (None, _) => ReldexSessionState::Unknown,
+        }
+    }
+
+    /// Submits one request, recording what its reply will need first.
+    fn submit(
+        &self,
+        hub: &ReldexHub,
+        what: &str,
+        pending: Pending,
+        send: impl FnOnce(&DatabaseSession, RequestId) -> DbResult<()>,
+    ) -> ReldexStatus {
+        let Some(session) = self.handle(&hub.registry) else {
+            return refused(what);
+        };
+        let request = hub.begin_request(pending);
+        match send(&session, request) {
+            Ok(()) => ReldexStatus::Ok,
+            Err(error) => {
+                // Refused: nothing was accepted, so no reply will come.
+                hub.abandon_request(request);
+                set_last_error(error);
+                ReldexStatus::Error
+            }
+        }
+    }
+
+    /// The `db-core` id and shared columns of the open result `key`.
+    fn result(&self, key: u64) -> Option<(ResultId, Arc<ResultColumns>)> {
+        self.lock()
+            .results
+            .get(&key)
+            .map(|open| (open.id, Arc::clone(&open.columns)))
+    }
+
+    /// Records a result the session just opened and returns its key.
+    fn register_result(&self, id: ResultId, columns: Arc<ResultColumns>) -> u64 {
+        let mut slot = self.lock();
+        let key = slot.next_result_id;
+        slot.next_result_id += 1;
+        slot.results.insert(key, ResultEntry { id, columns });
+        key
+    }
+
+    /// The key this crate gave the `db-core` result `id`, if it is open.
+    fn result_key(&self, id: ResultId) -> Option<u64> {
+        self.lock()
+            .results
+            .iter()
+            .find_map(|(key, open)| (open.id == id).then_some(*key))
+    }
+
+    /// Forgets a result the caller closed. The columns are returned so they
+    /// are dropped outside the lock.
+    fn forget_result(&self, key: u64) -> Option<Arc<ResultColumns>> {
+        self.lock().results.remove(&key).map(|open| open.columns)
+    }
+
+    /// The session closed at the caller's request: nothing more is accepted,
+    /// and the caller's close ended every column description's lifetime.
+    fn close(&self) -> Vec<Arc<ResultColumns>> {
+        let (session, columns) = {
+            let mut slot = self.lock();
+            slot.phase = Phase::Closed;
+            slot.caller_ended = true;
+            let columns = slot.results.drain().map(|(_, open)| open.columns);
+            let columns: Vec<_> = columns.collect();
+            (slot.session.take(), columns)
+        };
+        drop(session);
+        columns
+    }
+
+    /// Takes everything the entry still holds, on its `TERMINAL`.
+    fn end(&self) -> Ended {
+        let (session, ended) = {
+            let mut slot = self.lock();
+            slot.phase = Phase::Closed;
+            let columns = slot.results.drain().map(|(_, open)| open.columns);
+            let columns: Vec<_> = columns.collect();
+            let ended = Ended {
+                abandoned: slot.abandoned,
+                caller_ended: slot.caller_ended,
+                columns,
+            };
+            (slot.session.take(), ended)
+        };
+        drop(session);
+        self.release_gates();
+        ended
+    }
+
+    /// [`reldex_session_abandon`]: never blocks, never commits.
+    fn abandon(&self, registry: &SessionRegistry) -> (ReldexAbandonOutcome, bool) {
         let session = {
             let mut slot = self.lock();
             slot.phase = Phase::Closed;
-            // Dropping the sender ends the pump's loop once it is idle.
-            slot.commands = None;
-            slot.retire_results(Retired::Lost);
+            slot.caller_ended = true;
             slot.session.take()
         };
-        if let Some(block) = &self.block {
-            release_block(block);
+        // Before the registry's abandon, so the registry's handle is the last.
+        drop(session);
+        let (outcome, lost) = match registry.abandon(self.id) {
+            reldex_db_core::Abandoned::Connecting => (ReldexAbandonOutcome::Connecting, false),
+            reldex_db_core::Abandoned::Open {
+                transaction_possibly_lost,
+            } => (ReldexAbandonOutcome::Open, transaction_possibly_lost),
+            // `Unknown` cannot happen while this entry exists (the registry
+            // retires a session only when this crate asks, on `TERMINAL`), and
+            // `Abandoned` is `#[non_exhaustive]`.
+            _ => (ReldexAbandonOutcome::AlreadyEnded, false),
+        };
+        if outcome != ReldexAbandonOutcome::AlreadyEnded {
+            self.lock().abandoned = true;
         }
-        if let Some(session) = session {
-            // Best effort, and honest about it: on a driver that cannot
-            // interrupt a running call this does nothing, which is why nothing
-            // here waits for it.
-            let _ = session.cancel();
+        (outcome, lost)
+    }
+
+    /// Hub teardown: abandon, never commit, never wait.
+    pub(crate) fn tear_down(&self, registry: &SessionRegistry) {
+        let columns = self.close();
+        let _ = registry.abandon(self.id);
+        // After the abandon, so a parked connect that is released now finds it
+        // abandoned and closes its connection instead of adopting it.
+        self.release_gates();
+        drop(columns);
+    }
+
+    fn release_gates(&self) {
+        for gate in [&self.block, &self.connect_block].into_iter().flatten() {
+            release_block(gate);
         }
     }
 
-    /// Takes the column descriptions the pump retired after a caller-submitted
-    /// close, so the **caller's** thread drops them.
-    ///
-    /// Called at the top of every session entry point the caller can reach.
-    /// The caller is inside a call when this runs, which is exactly when it is
-    /// not reading a `ReldexColumnInfo` it was handed, and those strings were
-    /// out of contract from the moment it submitted the close.
-    fn take_released_columns(&self) -> Vec<Arc<ResultColumns>> {
-        let mut slot = self.lock();
-        if slot.released.is_empty() {
-            return Vec::new();
-        }
-        std::mem::take(&mut slot.released)
-    }
-
-    /// Takes the column descriptions of results that were open when the
-    /// session was lost. Only `reldex_hub_destroy` and a caller-submitted
-    /// session close may call this; see [`SessionSlot::lost`].
-    pub(crate) fn take_lost_columns(&self) -> Vec<Arc<ResultColumns>> {
-        let mut slot = self.lock();
-        let mut taken = std::mem::take(&mut slot.lost);
-        taken.append(&mut slot.released);
-        taken
-    }
-
-    /// Releases a parked mock statement; see
+    /// Releases a parked mock statement or connect; see
     /// [`crate::reldex_mock_release_block`].
     pub(crate) fn release_block(&self) -> ReldexStatus {
-        match &self.block {
-            Some(block) => {
-                release_block(block);
-                ReldexStatus::Ok
-            }
-            None => ReldexStatus::InvalidState,
+        if self.block.is_none() && self.connect_block.is_none() {
+            return ReldexStatus::InvalidState;
         }
-    }
-
-    /// The shared column descriptions of one open result set.
-    ///
-    /// Cloning the `Arc` under the lock and reading it afterwards is what keeps
-    /// the descriptions alive for the duration of the read even if the pump
-    /// closes the result meanwhile — the caller's *pointers*, however, live
-    /// only as long as its own claim on the result; see
-    /// [`reldex_session_result_column`].
-    fn result_columns(&self, result: u64) -> Option<Arc<ResultColumns>> {
-        self.lock()
-            .results
-            .get(&result)
-            .map(|open| Arc::clone(&open.columns))
-    }
-
-    /// Takes the session and the pump's sender for a submission, refusing if
-    /// the session is not open.
-    fn submit<T>(
-        &self,
-        make: impl FnOnce(
-            &Arc<DatabaseSession>,
-            &mut SessionSlot,
-        ) -> Result<(PumpCommand, T), ReldexStatus>,
-    ) -> Result<T, ReldexStatus> {
-        let mut slot = self.lock();
-        match slot.phase {
-            Phase::Opening => return Err(ReldexStatus::InvalidState),
-            Phase::Closed => return Err(ReldexStatus::InvalidState),
-            Phase::Open => {}
-        }
-        let Some(session) = slot.session.clone() else {
-            return Err(ReldexStatus::InvalidState);
-        };
-        let (command, value) = make(&session, &mut slot)?;
-        let Some(sender) = slot.commands.as_ref() else {
-            return Err(ReldexStatus::InvalidState);
-        };
-        // The send cannot block: the channel is unbounded. If the pump has
-        // gone, the session is finished and nothing was accepted.
-        sender
-            .send(command)
-            .map_err(|_| ReldexStatus::InvalidState)?;
-        Ok(value)
+        self.release_gates();
+        ReldexStatus::Ok
     }
 }
 
-/// Runs `body` with the entry for `session`, reporting a stale or unknown id
-/// rather than dereferencing anything.
-///
-/// Also frees whatever the pump retired after a caller-submitted close — here,
-/// on the caller's **own** thread, while it is inside a call and therefore not
-/// reading a `ReldexColumnInfo` it was handed. See [`SessionSlot::released`].
+/// Records why a submit was refused before reaching `db-core`.
+fn refused(what: &str) -> ReldexStatus {
+    set_last_error(DbError::internal(format!(
+        "reldex-ffi: {what} was refused because the session is not open: it is still \
+         connecting, its connect failed, or it was closed or abandoned"
+    )));
+    ReldexStatus::InvalidState
+}
+
+/// Records that a call named a result the session does not have open.
+fn unknown_result(what: &str) -> ReldexStatus {
+    set_last_error(DbError::internal(format!(
+        "reldex-ffi: {what} names a result that this session does not have open; it was \
+         closed, or it belongs to another session"
+    )));
+    ReldexStatus::NotFound
+}
+
+/// Runs `body` with the hub and the entry for `session`, reporting a stale or
+/// unknown id rather than dereferencing anything.
 ///
 /// # Safety
 ///
@@ -484,82 +472,312 @@ impl SessionEntry {
 pub(crate) unsafe fn with_session(
     hub: *mut ReldexHub,
     session: ReldexSessionId,
-    body: impl FnOnce(&Arc<SessionEntry>) -> ReldexStatus,
-) -> ReldexStatus {
-    // SAFETY: delegated to this function's contract.
-    unsafe {
-        with_session_inner(hub, session, |entry| {
-            let released = entry.take_released_columns();
-            let status = body(entry);
-            // After `body`, so the drop is never inside the slot lock.
-            drop(released);
-            status
-        })
-    }
-}
-
-/// [`with_session`], for a call that may arrive on **any** thread.
-///
-/// Identical except that it frees nothing: a cancel (ADR-0003 A10) can come
-/// from a thread that is not the one reading column descriptions, and a free
-/// racing that read is exactly what retirement exists to prevent.
-///
-/// # Safety
-///
-/// As [`with_session`].
-pub(crate) unsafe fn with_session_from_any_thread(
-    hub: *mut ReldexHub,
-    session: ReldexSessionId,
-    body: impl FnOnce(&Arc<SessionEntry>) -> ReldexStatus,
-) -> ReldexStatus {
-    // SAFETY: delegated to this function's contract.
-    unsafe { with_session_inner(hub, session, body) }
-}
-
-/// The session lookup both of the above share.
-///
-/// # Safety
-///
-/// As [`with_session`].
-unsafe fn with_session_inner(
-    hub: *mut ReldexHub,
-    session: ReldexSessionId,
-    body: impl FnOnce(&Arc<SessionEntry>) -> ReldexStatus,
+    body: impl FnOnce(&ReldexHub, &Arc<SessionEntry>) -> ReldexStatus,
 ) -> ReldexStatus {
     // SAFETY: delegated to this function's contract.
     let found = unsafe {
         with_hub(hub.cast_const(), |hub| {
-            hub.sessions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&session)
-                .map(Arc::clone)
+            hub.session_entry(session).map(|entry| body(hub, &entry))
         })
     };
     match found {
         None => set_last_argument_error("the hub pointer is null or unaligned"),
         Some(None) => {
             set_last_error(DbError::internal(format!(
-                "reldex-ffi: session {session} is not open on this hub; it was closed, or it \
-                 belongs to another hub"
+                "reldex-ffi: session {session} is not on this hub; its TERMINAL event has been \
+                 drained, or it belongs to another hub"
             )));
             ReldexStatus::NotFound
         }
-        Some(Some(entry)) => body(&entry),
+        Some(Some(status)) => status,
     }
 }
 
-/// Opens a session and reports its id immediately; the connection itself is
-/// made on the session's own thread.
+/// [`with_session`], for the three calls that end what a session's column
+/// descriptions are for: `reldex_session_close`, `reldex_session_close_result`
+/// and `reldex_session_abandon`.
 ///
-/// This **never blocks**: `db-core`'s `open_session` waits for the connect to
-/// finish, so the wait happens on the session's pump thread and the answer
-/// arrives as a `RELDEX_EVENT_KIND_OPENED` event carrying `request`. On
-/// failure that same request id comes back as an `OPENED` event with a
-/// non-null `error` — exactly one reply either way.
+/// Naming a session whose `TERMINAL` has been drained is still
+/// `RELDEX_STATUS_NOT_FOUND`. It is also the caller saying it is done with
+/// that session, so the descriptions a **loss** kept past the `TERMINAL`
+/// (see [`crate::reldex_session_result_column`]) are freed then, on this
+/// thread — bounded by the caller's next close rather than by the hub's
+/// lifetime.
+///
+/// # Safety
+///
+/// As [`with_session`].
+unsafe fn with_session_ending(
+    hub: *mut ReldexHub,
+    session: ReldexSessionId,
+    body: impl FnOnce(&ReldexHub, &Arc<SessionEntry>) -> ReldexStatus,
+) -> ReldexStatus {
+    // SAFETY: delegated to this function's contract.
+    let status = unsafe { with_session(hub, session, body) };
+    if status == ReldexStatus::NotFound {
+        // SAFETY: as above; a null or unaligned hub was already refused, and
+        // `with_hub` refuses it again rather than dereferencing it.
+        let _: Option<()> =
+            unsafe { with_hub(hub.cast_const(), |hub| hub.release_orphans(session)) };
+    }
+    status
+}
+
+/// Turns one `db-core` event into the event the caller drains.
+///
+/// Runs on the caller's thread, inside `reldex_hub_next_event`, with no lock
+/// of the queue's held. Everything that changes this crate's per-session
+/// state in response to what a session did happens here, in the order the
+/// session did it.
+pub(crate) fn translate(hub: &ReldexHub, event: SessionEvent) -> QueuedEvent {
+    let pending = hub.pending_for(&event);
+    let caller = pending.as_ref().map_or(0, |pending| pending.caller);
+    // Only a reply carries the caller's id in `request` — exactly one event per
+    // accepted request does (D5 rule 5, and the 3.1 contract a 3.1 adapter
+    // still relies on). Progress names its request elsewhere.
+    let answered = if event.is_reply() { caller } else { 0 };
+    let id = event.session();
+    let key = id.get();
+    // Only the kinds that change this crate's per-session state look the
+    // entry up; a FETCHED — the one kind a result stream is made of — does not.
+    let entry = if matches!(event, SessionEvent::Fetched { .. }) {
+        None
+    } else {
+        hub.session_entry(key)
+    };
+    let entry = entry.as_deref();
+    // A successful reply reports the state as of that reply: a request that
+    // succeeded left the session usable. Progress and notifications report
+    // the session's state now.
+    let usable = ReldexSessionState::Usable;
+    let state = || entry.map_or(ReldexSessionState::Unknown, SessionEntry::state);
+    let reply = |kind| QueuedEvent::new(kind, key, answered);
+    let failed =
+        |event: QueuedEvent, error: &DbError| event.with_error(ReldexError::from_db_error(error));
+    match event {
+        SessionEvent::Opened {
+            connection,
+            cancel_kind,
+            warnings,
+            ..
+        } => {
+            if let Some(entry) = entry {
+                let _ = entry.handle(&hub.registry);
+            }
+            let mut opened = reply(ReldexEventKind::Opened);
+            opened.connection_id = connection.get();
+            opened.cancel_kind = cancel_kind.into();
+            opened.warning_count = warnings.len();
+            opened.with_session_state(usable)
+        }
+        SessionEvent::OpenFailed { error, .. } => {
+            if let Some(entry) = entry {
+                entry.lock().phase = Phase::Closed;
+            }
+            // Mirrors the `TERMINAL` that follows: an abandoned connect ended
+            // deliberately, a failed one was lost.
+            let ended = if error.kind() == ErrorKind::Cancelled {
+                ReldexSessionState::Closed
+            } else {
+                ReldexSessionState::Lost
+            };
+            failed(reply(ReldexEventKind::Opened), &error).with_session_state(ended)
+        }
+        SessionEvent::Executed { outcome, .. } => match outcome {
+            Ok(mut outcome) => {
+                let column_count = outcome.columns.len();
+                let result = match (outcome.result, entry) {
+                    // Moved, not cloned: the names are copied into their
+                    // NUL-terminated form exactly once per result set and
+                    // shared by every batch of it.
+                    (Some(result), Some(entry)) => Some(entry.register_result(
+                        result,
+                        ResultColumns::new(std::mem::take(&mut outcome.columns)),
+                    )),
+                    _ => None,
+                };
+                reply(ReldexEventKind::Executed)
+                    .with_execute_outcome(&outcome, result, column_count)
+                    .with_session_state(usable)
+            }
+            Err(error) => failed(reply(ReldexEventKind::Executed), &error),
+        },
+        SessionEvent::Fetched { batch, .. } => {
+            let (result, columns) =
+                pending.map_or((None, None), |pending| (pending.result, pending.columns));
+            let event = match batch {
+                Ok(batch) => {
+                    let rows = batch.row_count();
+                    // Every fetch records its result's columns when it is
+                    // submitted; the fallback only keeps an impossible case
+                    // from being undefined.
+                    let columns = columns.unwrap_or_else(|| ResultColumns::new(Vec::new()));
+                    reply(ReldexEventKind::Fetched)
+                        .with_batch(Box::new(ReldexBatch::new(batch, columns)), rows)
+                        .with_session_state(usable)
+                }
+                Err(error) => failed(reply(ReldexEventKind::Fetched), &error),
+            };
+            with_optional_result(event, result)
+        }
+        SessionEvent::FetchedSegment { fetch, segment, .. } => {
+            let event = with_optional_result(
+                reply(ReldexEventKind::FetchedSegment),
+                entry.and_then(|entry| entry.result_key(fetch.result())),
+            );
+            match segment {
+                Ok(segment) => {
+                    let mut event = event.with_session_state(usable);
+                    event.row_count = segment.segment.row_count();
+                    event
+                }
+                Err(error) => failed(event, &error),
+            }
+        }
+        SessionEvent::Completed {
+            operation, result, ..
+        } => {
+            let event = if let CompletedOperation::CloseResult(_) = operation {
+                let closed = pending.and_then(|pending| pending.result);
+                // The caller submitted this close, which ended the strings'
+                // documented lifetime; dropped here, on the caller's own
+                // thread, whatever the outcome.
+                drop(closed.and_then(|closed| entry?.forget_result(closed)));
+                with_optional_result(reply(ReldexEventKind::ResultClosed), closed)
+            } else {
+                reply(ReldexEventKind::Completed)
+                    .with_completed_operation(completed_operation(operation))
+            };
+            match result {
+                Ok(()) => event.with_session_state(usable),
+                Err(error) => failed(event, &error),
+            }
+        }
+        SessionEvent::SessionClosed { result, .. } => {
+            let still_open = result
+                .as_ref()
+                .err()
+                .is_some_and(CloseError::session_is_still_open);
+            let mut event = reply(ReldexEventKind::SessionClosed).with_close_outcome(&result);
+            if let Err(error) = &result {
+                event = event.with_error(close_error_to_reldex(error));
+            }
+            if still_open {
+                event.with_session_state(state())
+            } else {
+                drop(entry.map(SessionEntry::close));
+                event.with_session_state(ReldexSessionState::Closed)
+            }
+        }
+        SessionEvent::ServerOutputConfigured { result, .. } => match result {
+            Ok(setting) => reply(ReldexEventKind::ServerOutputConfigured)
+                .with_server_output_setting(setting)
+                .with_session_state(usable),
+            Err(error) => failed(reply(ReldexEventKind::ServerOutputConfigured), &error),
+        },
+        SessionEvent::Executing { deadline, .. } => {
+            QueuedEvent::new(ReldexEventKind::Executing, key, 0)
+                .with_executing(caller, deadline)
+                .with_session_state(state())
+        }
+        SessionEvent::ServerOutput {
+            lines,
+            dropped,
+            failure,
+            invalid_utf8_lines,
+            ..
+        } => QueuedEvent::new(ReldexEventKind::ServerOutput, key, 0)
+            .with_server_output(lines, dropped, invalid_utf8_lines, failure.as_ref())
+            .with_session_state(state()),
+        SessionEvent::TransactionStateChanged {
+            possibly_active, ..
+        } => QueuedEvent::new(ReldexEventKind::TransactionState, key, 0)
+            .with_transaction_possibly_active(possibly_active)
+            .with_session_state(state()),
+        SessionEvent::Terminal {
+            lifecycle,
+            cause,
+            transaction_possibly_lost,
+            ..
+        } => {
+            let mut event = QueuedEvent::new(ReldexEventKind::Terminal, key, 0);
+            if let Some(cause) = &cause {
+                event = event.with_error(ReldexError::from_db_error(cause));
+            }
+            event.server_output_dropped = hub.pending_dropped_lines(id);
+            let abandoned = retire(hub, id);
+            event
+                .with_session_state(lifecycle.into())
+                .with_terminal(transaction_possibly_lost, abandoned)
+        }
+        // `LobChunk` (nothing in this ABI reads a LOB yet) and every variant
+        // a later `db-core` adds: delivered as `RELDEX_EVENT_KIND_UNKNOWN`,
+        // which an adapter already ignores (ADR-0003 D7), rather than dropped
+        // — its reply slot is released either way. `request` is the caller's
+        // id only if the variant is a reply; a future progress kind carries 0.
+        _ => reply(ReldexEventKind::Unknown),
+    }
+}
+
+fn with_optional_result(event: QueuedEvent, result: Option<u64>) -> QueuedEvent {
+    match result {
+        Some(result) => event.with_result(result),
+        None => event,
+    }
+}
+
+fn completed_operation(operation: CompletedOperation) -> ReldexCompletedOperation {
+    match operation {
+        CompletedOperation::Commit => ReldexCompletedOperation::Commit,
+        CompletedOperation::Rollback => ReldexCompletedOperation::Rollback,
+        CompletedOperation::Savepoint => ReldexCompletedOperation::Savepoint,
+        CompletedOperation::RollbackToSavepoint => ReldexCompletedOperation::RollbackToSavepoint,
+        CompletedOperation::Ping => ReldexCompletedOperation::Ping,
+        // `CloseLob` (not exported yet) and later additions:
+        // `CompletedOperation` is `#[non_exhaustive]`.
+        _ => ReldexCompletedOperation::Unknown,
+    }
+}
+
+/// Retires a session on its `TERMINAL`: removes its entry, and releases
+/// `db-core`'s registry entry. Returns whether the caller abandoned it.
+///
+/// Nothing here waits on a statement: `TERMINAL` is emitted after the worker's
+/// last driver call has returned (or, for an abandoned connect, by the
+/// abandon itself, with the connect's thread detached), so releasing the
+/// registry's handle joins a worker that is finishing or already gone.
+fn retire(hub: &ReldexHub, id: SessionId) -> bool {
+    let entry = lock(&hub.sessions).remove(&id.get());
+    // This crate's handle goes first (inside `end`), so the registry's is the
+    // last one and the worker is joined here, not by whichever thread happens
+    // to drop a clone later.
+    let ended = entry.as_deref().map(SessionEntry::end);
+    hub.registry.retire(id);
+    let Some(ended) = ended else {
+        return false;
+    };
+    if ended.caller_ended {
+        drop(ended.columns);
+    } else {
+        // Nothing the caller did ended these descriptions' documented
+        // lifetime, so they stay readable until the caller next names this
+        // session to end them (`with_session_ending`) or destroys the hub.
+        hub.orphan_columns(id.get(), ended.columns);
+    }
+    ended.abandoned
+}
+
+/// Opens a session and reports its id immediately; the connection itself is
+/// made on the session's own worker thread.
+///
+/// This **never blocks**. The answer arrives as a `RELDEX_EVENT_KIND_OPENED`
+/// event carrying `request`; on failure that same request id comes back as an
+/// `OPENED` event with a non-null `error`, followed by the session's
+/// `TERMINAL` — exactly one reply either way.
 ///
 /// The session id is valid as soon as this returns, but nothing may be
-/// submitted on it until its `OPENED` event arrives without an error.
+/// submitted on it until the connect has succeeded (see
+/// [`reldex_session_execute`] for exactly when that is).
 ///
 /// # Safety
 ///
@@ -604,52 +822,16 @@ pub unsafe extern "C" fn reldex_hub_open_session(
         };
 
         let start = |hub: &Arc<ReldexHub>| {
-            let id = hub
-                .next_session_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let (tx, rx) = mpsc::channel();
-            crate::counters::created(crate::counters::Kind::Session);
-            let entry = Arc::new(SessionEntry {
-                id,
-                slot: Mutex::new(SessionSlot {
-                    phase: Phase::Opening,
-                    session: None,
-                    commands: Some(tx),
-                    results: HashMap::new(),
-                    next_result_id: 1,
-                    released: Vec::new(),
-                    lost: Vec::new(),
-                }),
-                block: choice.block,
-            });
-            hub.sessions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(id, Arc::clone(&entry));
-
-            let pump_hub = Arc::clone(hub);
-            let pump_entry = Arc::clone(&entry);
-            let driver = choice.driver;
-            let params = choice.params;
-            let spawned = std::thread::Builder::new()
-                .name(format!("reldex-ffi-session-{id}"))
-                .spawn(move || {
-                    pump_main(&pump_hub, &pump_entry, &rx, driver, params, request);
-                });
-            if spawned.is_err() {
-                hub.sessions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&id);
-                set_last_error(DbError::internal(
-                    "reldex-ffi: could not spawn the session's thread",
-                ));
-                return ReldexStatus::Error;
-            }
+            let core = hub.begin_request(Pending::caller(request));
+            // Never blocks, never fails: anything that goes wrong — even the
+            // worker thread not spawning — arrives as the open's one reply.
+            let id = hub.registry.open(choice.driver, choice.params, core);
+            let entry = SessionEntry::new(id, choice.block, choice.connect_block);
+            lock(&hub.sessions).insert(id.get(), Arc::new(entry));
             if !out_session.is_null() {
                 // SAFETY: checked non-null and aligned above; the caller
                 // promises it points at a writable `uint64_t`.
-                unsafe { out_session.write(id) };
+                unsafe { out_session.write(id.get()) };
             }
             ReldexStatus::Ok
         };
@@ -661,7 +843,9 @@ pub unsafe extern "C" fn reldex_hub_open_session(
 }
 
 /// Submits one statement. The reply is a `RELDEX_EVENT_KIND_EXECUTED` event
-/// carrying `request`.
+/// carrying `request`, preceded by a `RELDEX_EVENT_KIND_EXECUTING` event with
+/// the same `request` when the worker starts it, and by any
+/// `RELDEX_EVENT_KIND_SERVER_OUTPUT` the statement wrote.
 ///
 /// `deadline_ms` arms a per-statement time limit; `0` means none, with the
 /// consequence `SPEC.md` §10 requires the UI to state — on a driver that
@@ -683,11 +867,22 @@ pub unsafe extern "C" fn reldex_hub_open_session(
 ///   caller notices.
 ///
 /// The simple rule for an adapter is still "wait for `OPENED`", because that
-/// is the first moment it can be sure; the rule for this library is the three
-/// cases above, and `exactly one reply per accepted request` holds in all of
-/// them.
+/// is the first moment it can be sure.
 ///
-/// Binds are not exported yet (M2.11).
+/// # When the session is already gone
+///
+/// A request submitted after the session was lost, but before its `TERMINAL`
+/// was drained, is still **accepted** and answered with a failure reply — which
+/// may arrive after the `TERMINAL`. Once `TERMINAL` has been drained the id is
+/// retired and this reports `RELDEX_STATUS_NOT_FOUND`.
+///
+/// # When the caller does not drain
+///
+/// A session holds at most 1,024 undrained replies. Past that, this returns
+/// `RELDEX_STATUS_ERROR` with a `RELDEX_ERROR_KIND_RESOURCE` last error and
+/// accepts nothing: drain the queue, then submit again.
+///
+/// Binds are not exported yet.
 ///
 /// # Safety
 ///
@@ -708,41 +903,16 @@ pub unsafe extern "C" fn reldex_session_execute(
                 "reldex_session_execute: `sql` is null or is not valid UTF-8",
             );
         };
-        // The mock driver's reserved statement for proving the pump's panic
-        // containment. Compiled only with the mock, so no production build can
-        // be made to panic by statement text.
-        #[cfg(feature = "mock-driver")]
-        if text == crate::mock::statements::text(crate::mock::statements::PUMP_PANIC) {
-            // SAFETY: delegated to this function's contract for `hub`.
-            return unsafe {
-                with_session(hub, session, |entry| {
-                    report(
-                        entry.submit(|_session, _slot| {
-                            Ok((PumpCommand::PanicForTest { request }, ()))
-                        }),
-                        "execute",
-                    )
-                })
-            };
-        }
         let mut statement = Statement::new(text);
         if deadline_ms > 0 {
             statement = statement.with_deadline(Duration::from_millis(deadline_ms));
         }
         // SAFETY: delegated to this function's contract for `hub`.
         unsafe {
-            with_session(hub, session, move |entry| {
-                let outcome = entry.submit(move |session, _slot| {
-                    let completion = session.execute(statement);
-                    Ok((
-                        PumpCommand::Execute {
-                            request,
-                            completion,
-                        },
-                        (),
-                    ))
-                });
-                report(outcome, "execute")
+            with_session(hub, session, move |hub, entry| {
+                entry.submit(hub, "execute", Pending::caller(request), |session, core| {
+                    session.submit_execute(core, statement)
+                })
             })
         }
     })
@@ -780,24 +950,21 @@ pub unsafe extern "C" fn reldex_session_fetch(
         };
         // SAFETY: delegated to this function's contract for `hub`.
         unsafe {
-            with_session(hub, session, |entry| {
-                let outcome = entry.submit(|session, slot| {
-                    let Some(open) = slot.results.get(&result) else {
-                        return Err(ReldexStatus::NotFound);
-                    };
-                    let columns = Arc::clone(&open.columns);
-                    let completion = session.fetch_batch(open.id, max_rows);
-                    Ok((
-                        PumpCommand::Fetch {
-                            request,
-                            completion,
-                            columns,
-                            key: result,
-                        },
-                        (),
-                    ))
-                });
-                report(outcome, "fetch")
+            with_session(hub, session, |hub, entry| {
+                if entry.handle(&hub.registry).is_none() {
+                    return refused("fetch");
+                }
+                let Some((id, columns)) = entry.result(result) else {
+                    return unknown_result("fetch");
+                };
+                let pending = Pending {
+                    caller: request,
+                    result: Some(result),
+                    columns: Some(columns),
+                };
+                entry.submit(hub, "fetch", pending, |session, core| {
+                    session.submit_fetch(core, id, max_rows)
+                })
             })
         }
     })
@@ -814,7 +981,7 @@ pub unsafe extern "C" fn reldex_session_fetch(
 /// with `reldex_last_error_take()` — this call has no status of its own to
 /// report them with:
 ///
-/// * `hub` is null or unaligned, or `session` is not open on it;
+/// * `hub` is null or unaligned, or `session` is not on it;
 /// * `result` is not an open result of that session — it was never opened, it
 ///   belongs to another session, or it has been closed;
 /// * the call came from inside a waker callback, which the ADR-0003 D5
@@ -838,8 +1005,8 @@ pub unsafe extern "C" fn reldex_session_result_column_count(
         let mut count = 0;
         // SAFETY: delegated to this function's contract for `hub`.
         let _ = unsafe {
-            with_session(hub, session, |entry| match entry.result_columns(result) {
-                Some(columns) => {
+            with_session(hub, session, |_hub, entry| match entry.result(result) {
+                Some((_, columns)) => {
                     count = columns.len();
                     ReldexStatus::Ok
                 }
@@ -871,8 +1038,8 @@ pub unsafe extern "C" fn reldex_session_result_column_count(
 /// `result` is drained, which is when a UI wants to put its header row up.
 ///
 /// The description is the one the whole result shares: built once, when the
-/// statement was executed, and reported identically by every batch of it.
-/// Calling this allocates nothing.
+/// statement's `EXECUTED` was drained, and reported identically by every batch
+/// of it. Calling this allocates nothing.
 ///
 /// # The one difference from the batch version
 ///
@@ -890,33 +1057,39 @@ pub unsafe extern "C" fn reldex_session_result_column_count(
 /// NUL-terminated, until the first of:
 ///
 /// * the caller submits `reldex_session_close_result` for this `result`;
-/// * the caller submits `reldex_session_close` for this session;
+/// * the caller submits `reldex_session_close` for this session, or calls
+///   `reldex_session_abandon` on it;
 /// * the caller calls `reldex_hub_destroy`.
 ///
-/// **Only those three.** Nothing Reldex does on its own ends the lifetime: a
-/// statement that fails, a fetch that fails, a cancel, and a session *lost* to
-/// an internal panic all leave the strings readable, because the caller — who
-/// may still be holding the pointers — did nothing to say otherwise. That is a
-/// guarantee, not an accident of timing: a result the caller never closed has
-/// its description retired rather than freed.
+/// **Only those.** Nothing Reldex does on its own ends the lifetime: a
+/// statement that fails, a fetch that fails, a cancel, and a session *lost*
+/// mid-statement all leave the strings readable, because the caller — who may
+/// still be holding the pointers — did nothing to say otherwise. A lost
+/// session's descriptions are kept even after its `TERMINAL` has been
+/// drained: until the caller next names that session in
+/// `reldex_session_close`, `reldex_session_close_result` or
+/// `reldex_session_abandon` (each then reports `RELDEX_STATUS_NOT_FOUND`, and
+/// frees them), or destroys the hub. ABI 4.0 (M5.2 Stage B) will shorten
+/// this: a lost session's descriptions valid only until its `TERMINAL` is
+/// drained (ADR-0003 A39).
 ///
 /// Note what that does **not** promise. On a lost session the result itself is
-/// gone — nothing can be fetched from it — so this call reports
-/// `RELDEX_STATUS_NOT_FOUND` for it. The two are separate on purpose: what was
-/// already handed out stays readable, and what was not is not invented.
+/// gone — nothing can be fetched from it — and once its `TERMINAL` has been
+/// drained this call reports `RELDEX_STATUS_NOT_FOUND` for it. The two are
+/// separate on purpose: what was already handed out stays readable, and what
+/// was not is not invented.
 ///
-/// A caller that wants the names past those three points must copy them, which
-/// is what a Qt model does anyway, building its header `QString`s once with
+/// A caller that wants the names past those points must copy them, which is
+/// what a Qt model does anyway, building its header `QString`s once with
 /// `QString::fromUtf8(info.name.ptr, info.name.len)`.
 ///
 /// Two consequences worth stating, because both are easy to get wrong:
 ///
 /// * The rule is "valid **at least** until you submit", not "invalid from the
 ///   moment you submit". Right after `reldex_session_close_result` this call
-///   may still succeed for a while; that is not a signal that the close has
-///   not landed, and the `RESULT_CLOSED` event remains the only such signal.
-///   Do not read the strings after submitting — but do not treat a successful
-///   read as meaning anything either.
+///   may still succeed for a while (the description is freed when its
+///   `RESULT_CLOSED` is drained); that is not a signal that the close has not
+///   landed, and the `RESULT_CLOSED` event remains the only such signal.
 /// * `reldex_hub_destroy` frees them **synchronously, on the thread that
 ///   called it**, before it returns. There is no window after it during which
 ///   a stale pointer still happens to work.
@@ -949,8 +1122,8 @@ pub unsafe extern "C" fn reldex_session_result_column(
     entry(|| {
         // SAFETY: delegated to this function's contract for `hub`.
         unsafe {
-            with_session(hub, session, |entry| {
-                let Some(columns) = entry.result_columns(result) else {
+            with_session(hub, session, |_hub, entry| {
+                let Some((_, columns)) = entry.result(result) else {
                     set_last_error(DbError::internal(format!(
                         "reldex-ffi: reldex_session_result_column: session {session} has no open result {result}"
                     )));
@@ -992,22 +1165,21 @@ pub unsafe extern "C" fn reldex_session_close_result(
     entry(|| {
         // SAFETY: delegated to this function's contract for `hub`.
         unsafe {
-            with_session(hub, session, |entry| {
-                let outcome = entry.submit(|session, slot| {
-                    let Some(open) = slot.results.get(&result) else {
-                        return Err(ReldexStatus::NotFound);
-                    };
-                    let completion = session.close_result(open.id);
-                    Ok((
-                        PumpCommand::CloseResult {
-                            request,
-                            completion,
-                            key: result,
-                        },
-                        (),
-                    ))
-                });
-                report(outcome, "close_result")
+            with_session_ending(hub, session, |hub, entry| {
+                if entry.handle(&hub.registry).is_none() {
+                    return refused("close_result");
+                }
+                let Some((id, _)) = entry.result(result) else {
+                    return unknown_result("close_result");
+                };
+                let pending = Pending {
+                    caller: request,
+                    result: Some(result),
+                    columns: None,
+                };
+                entry.submit(hub, "close_result", pending, |session, core| {
+                    session.submit_close_result(core, id)
+                })
             })
         }
     })
@@ -1018,8 +1190,9 @@ pub unsafe extern "C" fn reldex_session_close_result(
 /// The reply is a `RELDEX_EVENT_KIND_SESSION_CLOSED` event carrying `request`.
 /// Read its `close_outcome`: `DECISION_REQUIRED`, `COMMIT_FAILED` and
 /// `ROLLBACK_FAILED` all leave the session **open and usable**, so the caller
-/// can ask the user and close again. This is the only path that can commit;
-/// destroying the hub never does.
+/// can ask the user and close again. A close that closed is followed by the
+/// session's `TERMINAL`. This is the only path that can commit; abandoning a
+/// session or destroying the hub never does.
 ///
 /// # Safety
 ///
@@ -1045,20 +1218,93 @@ pub unsafe extern "C" fn reldex_session_close(
         };
         // SAFETY: delegated to this function's contract for `hub`.
         unsafe {
-            with_session(hub, session, |entry| {
-                let outcome = entry.submit(|_session, _slot| {
-                    Ok((
-                        PumpCommand::Close {
-                            request,
-                            disposition,
-                        },
-                        (),
-                    ))
-                });
-                report(outcome, "close")
+            with_session_ending(hub, session, |hub, entry| {
+                let status =
+                    entry.submit(hub, "close", Pending::caller(request), |session, core| {
+                        session.submit_close(core, disposition)
+                    });
+                if status == ReldexStatus::Ok {
+                    entry.lock().caller_ended = true;
+                }
+                status
             })
         }
     })
+}
+
+/// Abandons a session: releases it **without committing** and without
+/// waiting, whatever it is doing (ABI 3.2).
+///
+/// This is how a worksheet is disconnected when a close cannot be waited for —
+/// a statement that cannot be interrupted, or a connect that has not
+/// returned. It never blocks and is never refused for lack of room. The
+/// session's `TERMINAL` follows once its worker reaches the abandon —
+/// immediately when it is idle or still connecting, when the current driver
+/// call returns when it is not — carrying `abandoned = true` and the
+/// authoritative `transaction_possibly_lost`. Every request already accepted
+/// still gets its one reply.
+///
+/// `*out_outcome` receives a [`ReldexAbandonOutcome`]; with
+/// `RELDEX_ABANDON_OUTCOME_OPEN`, `*out_transaction_possibly_lost` is a
+/// conservative early answer the UI may show at once. Nothing may be submitted
+/// on the session afterwards (`RELDEX_STATUS_INVALID_STATE`); a second abandon
+/// reports `ALREADY_ENDED` and does nothing.
+///
+/// # Safety
+///
+/// `hub` must be a live hub; each out pointer must be null or point at a
+/// writable value of its type.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reldex_session_abandon(
+    hub: *mut ReldexHub,
+    session: ReldexSessionId,
+    out_outcome: *mut i32,
+    out_transaction_possibly_lost: *mut bool,
+) -> ReldexStatus {
+    entry(|| {
+        if (!out_outcome.is_null() && !out_outcome.is_aligned())
+            || (!out_transaction_possibly_lost.is_null()
+                && !out_transaction_possibly_lost.is_aligned())
+        {
+            return set_last_argument_error("reldex_session_abandon: an out pointer is unaligned");
+        }
+        // SAFETY: delegated to this function's contract for `hub`.
+        unsafe {
+            with_session_ending(hub, session, |hub, entry| {
+                let (outcome, lost) = entry.abandon(&hub.registry);
+                if !out_outcome.is_null() {
+                    // SAFETY: checked non-null and aligned above.
+                    out_outcome.write(outcome as i32);
+                }
+                if !out_transaction_possibly_lost.is_null() {
+                    // SAFETY: checked non-null and aligned above.
+                    out_transaction_possibly_lost.write(lost);
+                }
+                ReldexStatus::Ok
+            })
+        }
+    })
+}
+
+/// Submits a request that is answered by a `RELDEX_EVENT_KIND_COMPLETED`
+/// event.
+///
+/// # Safety
+///
+/// `hub` must be null, or a live hub.
+unsafe fn submit_simple(
+    hub: *mut ReldexHub,
+    session: ReldexSessionId,
+    request: ReldexRequestId,
+    what: &str,
+    send: impl FnOnce(&DatabaseSession, RequestId) -> DbResult<()>,
+) -> ReldexStatus {
+    // SAFETY: delegated to this function's contract.
+    unsafe {
+        with_session(hub, session, |hub, entry| {
+            entry.submit(hub, what, Pending::caller(request), send)
+        })
+    }
 }
 
 /// Commits the session's current transaction. The reply is a
@@ -1077,18 +1323,8 @@ pub unsafe extern "C" fn reldex_session_commit(
     entry(|| {
         // SAFETY: delegated to this function's contract for `hub`.
         unsafe {
-            with_session(hub, session, |entry| {
-                let outcome = entry.submit(|session, _slot| {
-                    let completion = session.commit();
-                    Ok((
-                        PumpCommand::Commit {
-                            request,
-                            completion,
-                        },
-                        (),
-                    ))
-                });
-                report(outcome, "commit")
+            submit_simple(hub, session, request, "commit", |session, core| {
+                session.submit_commit(core)
             })
         }
     })
@@ -1110,20 +1346,28 @@ pub unsafe extern "C" fn reldex_session_rollback(
     entry(|| {
         // SAFETY: delegated to this function's contract for `hub`.
         unsafe {
-            with_session(hub, session, |entry| {
-                let outcome = entry.submit(|session, _slot| {
-                    let completion = session.rollback();
-                    Ok((
-                        PumpCommand::Rollback {
-                            request,
-                            completion,
-                        },
-                        (),
-                    ))
-                });
-                report(outcome, "rollback")
+            submit_simple(hub, session, request, "rollback", |session, core| {
+                session.submit_rollback(core)
             })
         }
+    })
+}
+
+/// Reads a savepoint name for the two savepoint calls.
+///
+/// # Safety
+///
+/// `name` must point at `name.len` readable bytes.
+unsafe fn savepoint_name(name: ReldexStr, what: &str) -> Result<SavepointName, ReldexStatus> {
+    // SAFETY: delegated to this function's contract.
+    let Some(text) = (unsafe { name.as_str() }) else {
+        return Err(set_last_argument_error(format!(
+            "{what}: `name` is null or is not valid UTF-8"
+        )));
+    };
+    SavepointName::new(text).map_err(|error| {
+        set_last_error(DbError::new(ErrorKind::Configuration, error.to_string()));
+        ReldexStatus::InvalidArgument
     })
 }
 
@@ -1144,32 +1388,14 @@ pub unsafe extern "C" fn reldex_session_savepoint(
 ) -> ReldexStatus {
     entry(|| {
         // SAFETY: delegated to this function's contract for `name`.
-        let Some(text) = (unsafe { name.as_str() }) else {
-            return set_last_argument_error(
-                "reldex_session_savepoint: `name` is null or is not valid UTF-8",
-            );
-        };
-        let name = match SavepointName::new(text) {
+        let name = match unsafe { savepoint_name(name, "reldex_session_savepoint") } {
             Ok(name) => name,
-            Err(error) => {
-                set_last_error(DbError::new(ErrorKind::Configuration, error.to_string()));
-                return ReldexStatus::InvalidArgument;
-            }
+            Err(status) => return status,
         };
         // SAFETY: delegated to this function's contract for `hub`.
         unsafe {
-            with_session(hub, session, move |entry| {
-                let outcome = entry.submit(move |session, _slot| {
-                    let completion = session.savepoint(name);
-                    Ok((
-                        PumpCommand::Savepoint {
-                            request,
-                            completion,
-                        },
-                        (),
-                    ))
-                });
-                report(outcome, "savepoint")
+            submit_simple(hub, session, request, "savepoint", move |session, core| {
+                session.submit_savepoint(core, name)
             })
         }
     })
@@ -1191,33 +1417,19 @@ pub unsafe extern "C" fn reldex_session_rollback_to_savepoint(
 ) -> ReldexStatus {
     entry(|| {
         // SAFETY: delegated to this function's contract for `name`.
-        let Some(text) = (unsafe { name.as_str() }) else {
-            return set_last_argument_error(
-                "reldex_session_rollback_to_savepoint: `name` is null or is not valid UTF-8",
-            );
-        };
-        let name = match SavepointName::new(text) {
+        let name = match unsafe { savepoint_name(name, "reldex_session_rollback_to_savepoint") } {
             Ok(name) => name,
-            Err(error) => {
-                set_last_error(DbError::new(ErrorKind::Configuration, error.to_string()));
-                return ReldexStatus::InvalidArgument;
-            }
+            Err(status) => return status,
         };
         // SAFETY: delegated to this function's contract for `hub`.
         unsafe {
-            with_session(hub, session, move |entry| {
-                let outcome = entry.submit(move |session, _slot| {
-                    let completion = session.rollback_to_savepoint(name);
-                    Ok((
-                        PumpCommand::RollbackToSavepoint {
-                            request,
-                            completion,
-                        },
-                        (),
-                    ))
-                });
-                report(outcome, "rollback_to_savepoint")
-            })
+            submit_simple(
+                hub,
+                session,
+                request,
+                "rollback_to_savepoint",
+                move |session, core| session.submit_rollback_to_savepoint(core, name),
+            )
         }
     })
 }
@@ -1239,18 +1451,8 @@ pub unsafe extern "C" fn reldex_session_ping(
     entry(|| {
         // SAFETY: delegated to this function's contract for `hub`.
         unsafe {
-            with_session(hub, session, |entry| {
-                let outcome = entry.submit(|session, _slot| {
-                    let completion = session.ping();
-                    Ok((
-                        PumpCommand::Ping {
-                            request,
-                            completion,
-                        },
-                        (),
-                    ))
-                });
-                report(outcome, "ping")
+            submit_simple(hub, session, request, "ping", |session, core| {
+                session.submit_ping(core)
             })
         }
     })
@@ -1313,19 +1515,13 @@ pub unsafe extern "C" fn reldex_session_set_server_output(
         };
         // SAFETY: delegated to this function's contract for `hub`.
         unsafe {
-            with_session(hub, session, move |entry| {
-                let outcome = entry.submit(move |session, _slot| {
-                    let completion = session.set_server_output(setting);
-                    Ok((
-                        PumpCommand::SetServerOutput {
-                            request,
-                            completion,
-                        },
-                        (),
-                    ))
-                });
-                report(outcome, "set_server_output")
-            })
+            submit_simple(
+                hub,
+                session,
+                request,
+                "set_server_output",
+                move |session, core| session.submit_set_server_output(core, setting),
+            )
         }
     })
 }
@@ -1354,7 +1550,7 @@ pub unsafe extern "C" fn reldex_session_set_server_output(
 /// > before `reldex_hub_destroy` is called.
 ///
 /// A stale *session id* is safe: ids are never reused, so a cancel naming a
-/// session that has since been closed reports `RELDEX_STATUS_NOT_FOUND`
+/// session that has since been retired reports `RELDEX_STATUS_NOT_FOUND`
 /// against a live hub. It is only the **hub pointer** that must be sequenced.
 /// In a Qt adapter this falls out naturally — the worker that offers Cancel is
 /// stopped before the bridge is torn down — but it must be done on purpose.
@@ -1381,13 +1577,11 @@ pub unsafe extern "C" fn reldex_session_request_cancel(
                 "reldex_session_request_cancel: `out_outcome` is unaligned",
             );
         }
-        let cancel = |entry: &Arc<SessionEntry>| {
-            // The lock is held only long enough to clone the handle: a
-            // cancel must not wait behind a submission.
-            let session = entry.lock().session.clone();
-            let Some(session) = session else {
+        let cancel = |hub: &ReldexHub, entry: &Arc<SessionEntry>| {
+            let Some(session) = entry.handle(&hub.registry) else {
                 set_last_error(DbError::internal(
-                    "reldex-ffi: reldex_session_request_cancel: the session is still opening or                      already closed; there is nothing to cancel",
+                    "reldex-ffi: reldex_session_request_cancel: the session is still opening or \
+                     already closed; there is nothing to cancel",
                 ));
                 return ReldexStatus::InvalidState;
             };
@@ -1414,7 +1608,7 @@ pub unsafe extern "C" fn reldex_session_request_cancel(
             }
         };
         // SAFETY: delegated to this function's contract for `hub`.
-        unsafe { with_session_from_any_thread(hub, session, cancel) }
+        unsafe { with_session(hub, session, cancel) }
     })
 }
 
@@ -1446,11 +1640,11 @@ pub unsafe extern "C" fn reldex_session_connect_warnings(
                 "reldex_session_connect_warnings: `arena` is null or unaligned",
             );
         }
-        let collect = |entry: &Arc<SessionEntry>| {
-            let session = entry.lock().session.clone();
-            let Some(session) = session else {
+        let collect = |hub: &ReldexHub, entry: &Arc<SessionEntry>| {
+            let Some(session) = entry.handle(&hub.registry) else {
                 set_last_error(DbError::internal(
-                    "reldex-ffi: reldex_session_connect_warnings: the session is still opening or                      already closed",
+                    "reldex-ffi: reldex_session_connect_warnings: the session is still opening or \
+                     already closed",
                 ));
                 return ReldexStatus::InvalidState;
             };
@@ -1467,472 +1661,6 @@ pub unsafe extern "C" fn reldex_session_connect_warnings(
     })
 }
 
-/// Turns a submission outcome into a status, recording why when it failed.
-fn report(outcome: Result<(), ReldexStatus>, what: &str) -> ReldexStatus {
-    match outcome {
-        Ok(()) => ReldexStatus::Ok,
-        Err(ReldexStatus::NotFound) => {
-            set_last_error(DbError::internal(format!(
-                "reldex-ffi: {what} names a result that this session does not have open; it was \
-                 closed, or it belongs to another session"
-            )));
-            ReldexStatus::NotFound
-        }
-        Err(status) => {
-            set_last_error(DbError::internal(format!(
-                "reldex-ffi: {what} was refused because the session is not open"
-            )));
-            status
-        }
-    }
-}
-
-/// The reply the pump currently owes, so a panic can still answer it.
-///
-/// Set before every blocking wait, cleared when that request's event is
-/// pushed. Without it, a panic between the two would silently eat a reply and
-/// break rule 5 — and the adapter would wait forever for an event that is
-/// never coming.
-type OwedReply = Mutex<Option<ReplyShape>>;
-
-/// One session's thread, with the panic containment ADR-0003 D2 requires of
-/// every path that can reach a driver.
-///
-/// `catch_unwind` on every `extern "C"` body cannot help here: this thread is
-/// *ours*, and an unwind out of it would leave every outstanding request
-/// unanswered — the UI's spinner would simply never stop. So a panic is caught
-/// here, the session is marked lost, and **every** accepted request still owed
-/// a reply gets one failure event: the one in flight, then everything still
-/// queued behind it.
-fn pump_main(
-    hub: &Arc<ReldexHub>,
-    entry: &Arc<SessionEntry>,
-    rx: &mpsc::Receiver<PumpCommand>,
-    driver: Arc<dyn reldex_db_core::DatabaseDriver>,
-    params: reldex_db_core::ConnectionParams,
-    open_request: u64,
-) {
-    let owed: OwedReply = Mutex::new(Some((ReldexEventKind::Opened, open_request, None)));
-    // `AssertUnwindSafe`: everything reachable here is either behind a mutex
-    // (which this crate always recovers from poisoning, since a panicked
-    // session is exactly the case being handled) or owned by this thread.
-    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        pump_body(hub, entry, rx, driver, params, open_request, &owed);
-    }));
-    if let Err(payload) = panicked {
-        answer_after_panic(hub, entry, rx, &owed, &payload);
-    }
-}
-
-/// Reads a panic payload's message, for the error the caller is handed.
-fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
-    let detail = payload
-        .downcast_ref::<&'static str>()
-        .map(|text| (*text).to_owned())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "no message".to_owned());
-    format!("reldex-ffi: the session's event pump panicked ({detail}); the session is lost")
-}
-
-/// Answers every request the pump still owed when it panicked, exactly once
-/// each, and closes the session.
-fn answer_after_panic(
-    hub: &Arc<ReldexHub>,
-    entry: &Arc<SessionEntry>,
-    rx: &mpsc::Receiver<PumpCommand>,
-    owed: &OwedReply,
-    payload: &Box<dyn std::any::Any + Send>,
-) {
-    let message = panic_message(payload);
-    // Closes the phase and drops the sender, so nothing further is accepted
-    // and the loop below sees the whole remaining queue and then the end of it.
-    entry.shut_down();
-    let id = entry.id;
-    // The reply keeps the *shape* a success would have had, result id
-    // included: an adapter that routes a `FETCHED` by `event.result` must not
-    // have to special-case the failure path (ADR-0003 A21).
-    let answer = |(kind, request, result): ReplyShape| {
-        let error = ReldexError::from_db_error(
-            &DbError::new(ErrorKind::DriverInternal, message.clone())
-                .with_session_state(reldex_db_core::SessionState::Lost),
-        );
-        let mut event = QueuedEvent::new(kind, id, request)
-            .with_error(error)
-            .with_session_state(ReldexSessionState::Lost);
-        if let Some(result) = result {
-            event = event.with_result(result);
-        }
-        hub.push_event(event);
-    };
-    let in_flight = owed
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-    if let Some(shape) = in_flight {
-        answer(shape);
-    }
-    while let Ok(command) = rx.try_recv() {
-        answer(command.reply_shape());
-    }
-    // Exactly one `Terminal`, after every reply this panic owed, same as a
-    // clean close — a panicked pump is still one session ending, and a
-    // consumer that retires per-session state on `Terminal` must see one.
-    // Conservative (`true`): nothing here resolved anything the session may
-    // have held, so a transaction cannot be ruled out.
-    hub.push_event(
-        QueuedEvent::new(ReldexEventKind::Terminal, id, 0)
-            .with_session_state(ReldexSessionState::Lost)
-            .with_transaction_possibly_lost(true),
-    );
-}
-
-/// Opens the connection, then turns completions into events until there is
-/// nothing left to answer.
-fn pump_body(
-    hub: &Arc<ReldexHub>,
-    entry: &Arc<SessionEntry>,
-    rx: &mpsc::Receiver<PumpCommand>,
-    driver: Arc<dyn reldex_db_core::DatabaseDriver>,
-    params: reldex_db_core::ConnectionParams,
-    open_request: u64,
-    owed: &OwedReply,
-) {
-    let id = entry.id;
-    let session = match hub.manager.open_session(driver, params) {
-        Ok(session) => Arc::new(session),
-        Err(error) => {
-            {
-                let mut slot = entry.lock();
-                slot.phase = Phase::Closed;
-                slot.commands = None;
-            }
-            hub.push_event(
-                QueuedEvent::new(ReldexEventKind::Opened, id, open_request)
-                    .with_error(ReldexError::from_db_error(&error)),
-            );
-            // A connect that never opened a connection never held a
-            // transaction, and `Terminal` still follows `OpenFailed` exactly
-            // once, same as every other session this registry-less pump ever
-            // names (`docs/exec-plans/active/phase-1-m2-5-event-queue.md` §7.1).
-            hub.push_event(
-                QueuedEvent::new(ReldexEventKind::Terminal, id, 0)
-                    .with_session_state(ReldexSessionState::Lost)
-                    .with_transaction_possibly_lost(false),
-            );
-            return;
-        }
-    };
-    {
-        let mut slot = entry.lock();
-        slot.phase = Phase::Open;
-        slot.session = Some(Arc::clone(&session));
-    }
-    let mut opened = QueuedEvent::new(ReldexEventKind::Opened, id, open_request);
-    opened.connection_id = session.connection_id().get();
-    opened.cancel_kind = session.cancel_kind().into();
-    opened.warning_count = session.connect_warnings().len();
-    opened.session_state = session.session_state().into();
-    clear_owed(owed);
-    hub.push_event(opened);
-
-    while let Ok(command) = rx.recv() {
-        let finished = run_command(hub, entry, &session, command, owed);
-        if finished {
-            // The session is gone. Everything still queued was accepted before
-            // it went, so each one still gets its single reply — `db-core`
-            // answers them with the session's terminal error — and only then
-            // does the pump stop.
-            while let Ok(pending) = rx.try_recv() {
-                run_command(hub, entry, &session, pending, owed);
-            }
-            break;
-        }
-    }
-}
-
-fn set_owed(owed: &OwedReply, shape: ReplyShape) {
-    *owed
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(shape);
-}
-
-fn clear_owed(owed: &OwedReply) {
-    *owed
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-}
-
-/// Runs one submitted request and pushes its single reply. Returns whether the
-/// session ended.
-fn run_command(
-    hub: &Arc<ReldexHub>,
-    entry: &Arc<SessionEntry>,
-    session: &Arc<DatabaseSession>,
-    command: PumpCommand,
-    owed: &OwedReply,
-) -> bool {
-    set_owed(owed, command.reply_shape());
-    let finished = run_command_inner(hub, entry, session, command);
-    clear_owed(owed);
-    finished
-}
-
-fn run_command_inner(
-    hub: &Arc<ReldexHub>,
-    entry: &Arc<SessionEntry>,
-    session: &Arc<DatabaseSession>,
-    command: PumpCommand,
-) -> bool {
-    let id = entry.id;
-    match command {
-        PumpCommand::Execute {
-            request,
-            completion,
-        } => {
-            let event = match completion.wait() {
-                Ok(mut outcome) => {
-                    // Read before the columns are moved out below.
-                    let column_count = outcome.columns.len();
-                    let result = outcome.result.map(|result| {
-                        let mut slot = entry.lock();
-                        let key = slot.next_result_id;
-                        slot.next_result_id += 1;
-                        slot.results.insert(
-                            key,
-                            ResultEntry {
-                                id: result,
-                                // Moved, not cloned: the names are copied into
-                                // their NUL-terminated form exactly once per
-                                // result set and shared by every batch of it.
-                                columns: ResultColumns::new(std::mem::take(&mut outcome.columns)),
-                            },
-                        );
-                        key
-                    });
-                    QueuedEvent::new(ReldexEventKind::Executed, id, request).with_execute_outcome(
-                        &outcome,
-                        result,
-                        column_count,
-                    )
-                }
-                Err(error) => QueuedEvent::new(ReldexEventKind::Executed, id, request)
-                    .with_error(ReldexError::from_db_error(&error)),
-            };
-            // Before the statement's own reply, per `phase-1-m2-5-event-queue.md`
-            // §7.5: server output a statement wrote is delivered ahead of that
-            // statement's own reply, never after.
-            drain_server_output(hub, session, id);
-            hub.push_event(event.with_session_state(session.session_state().into()));
-            false
-        }
-        PumpCommand::Fetch {
-            request,
-            completion,
-            columns,
-            key,
-        } => {
-            let event = match completion.wait() {
-                Ok(batch) => {
-                    let rows = batch.row_count();
-                    QueuedEvent::new(ReldexEventKind::Fetched, id, request)
-                        .with_batch(Box::new(ReldexBatch::new(batch, columns)), rows)
-                }
-                Err(error) => QueuedEvent::new(ReldexEventKind::Fetched, id, request)
-                    .with_error(ReldexError::from_db_error(&error)),
-            }
-            .with_result(key);
-            hub.push_event(event.with_session_state(session.session_state().into()));
-            false
-        }
-        PumpCommand::CloseResult {
-            request,
-            completion,
-            key,
-        } => {
-            let outcome = completion.wait();
-            {
-                // Retired, not dropped: a `reldex_session_result_column` call
-                // that raced this close could otherwise hold the last clone
-                // and free the strings by returning. The caller's thread frees
-                // them on its next call (`SessionSlot::released`).
-                let mut slot = entry.lock();
-                if let Some(open) = slot.results.remove(&key) {
-                    slot.released.push(open.columns);
-                }
-            }
-            let event = match outcome {
-                Ok(()) => QueuedEvent::new(ReldexEventKind::ResultClosed, id, request),
-                Err(error) => QueuedEvent::new(ReldexEventKind::ResultClosed, id, request)
-                    .with_error(ReldexError::from_db_error(&error)),
-            }
-            .with_result(key);
-            hub.push_event(event.with_session_state(session.session_state().into()));
-            false
-        }
-        PumpCommand::Close {
-            request,
-            disposition,
-        } => {
-            let outcome = session.close(disposition);
-            let still_open = outcome
-                .as_ref()
-                .err()
-                .is_some_and(CloseError::session_is_still_open);
-            let mut event = QueuedEvent::new(ReldexEventKind::SessionClosed, id, request)
-                .with_close_outcome(&outcome);
-            if let Err(error) = &outcome {
-                event = event.with_error(close_error_to_reldex(error));
-            }
-            if !still_open {
-                let mut slot = entry.lock();
-                slot.phase = Phase::Closed;
-                slot.commands = None;
-                // A caller-submitted close ends the documented lifetime of
-                // every description this session handed out, including any
-                // retired earlier because the session was lost.
-                slot.retire_results(Retired::Released);
-                let lost = std::mem::take(&mut slot.lost);
-                slot.released.extend(lost);
-            }
-            let state = if still_open {
-                session.session_state().into()
-            } else {
-                ReldexSessionState::Closed
-            };
-            hub.push_event(event.with_session_state(state));
-            if !still_open {
-                // Exactly one `Terminal` for this session (`SPEC.md` §10):
-                // `false` for `Ok(())` — the disposition resolved the
-                // transaction, nothing was left unresolved; `true` for
-                // `Failed` — the close itself lost the session, so whatever
-                // it held is the server's decision, not ours.
-                let transaction_possibly_lost = outcome.is_err();
-                hub.push_event(
-                    QueuedEvent::new(ReldexEventKind::Terminal, id, 0)
-                        .with_session_state(ReldexSessionState::Closed)
-                        .with_transaction_possibly_lost(transaction_possibly_lost),
-                );
-            }
-            !still_open
-        }
-        PumpCommand::Commit {
-            request,
-            completion,
-        } => run_completed(
-            hub,
-            session,
-            id,
-            request,
-            completion,
-            ReldexCompletedOperation::Commit,
-        ),
-        PumpCommand::Rollback {
-            request,
-            completion,
-        } => run_completed(
-            hub,
-            session,
-            id,
-            request,
-            completion,
-            ReldexCompletedOperation::Rollback,
-        ),
-        PumpCommand::Savepoint {
-            request,
-            completion,
-        } => run_completed(
-            hub,
-            session,
-            id,
-            request,
-            completion,
-            ReldexCompletedOperation::Savepoint,
-        ),
-        PumpCommand::RollbackToSavepoint {
-            request,
-            completion,
-        } => run_completed(
-            hub,
-            session,
-            id,
-            request,
-            completion,
-            ReldexCompletedOperation::RollbackToSavepoint,
-        ),
-        PumpCommand::Ping {
-            request,
-            completion,
-        } => run_completed(
-            hub,
-            session,
-            id,
-            request,
-            completion,
-            ReldexCompletedOperation::Ping,
-        ),
-        PumpCommand::SetServerOutput {
-            request,
-            completion,
-        } => {
-            let event = match completion.wait() {
-                Ok(setting) => {
-                    QueuedEvent::new(ReldexEventKind::ServerOutputConfigured, id, request)
-                        .with_server_output_setting(setting)
-                }
-                Err(error) => {
-                    QueuedEvent::new(ReldexEventKind::ServerOutputConfigured, id, request)
-                        .with_error(ReldexError::from_db_error(&error))
-                }
-            };
-            hub.push_event(event.with_session_state(session.session_state().into()));
-            false
-        }
-        #[cfg(feature = "mock-driver")]
-        PumpCommand::PanicForTest { request } => {
-            panic!("reldex-ffi: deliberate pump panic for request {request}");
-        }
-    }
-}
-
-/// The shared body of `Commit`/`Rollback`/`Savepoint`/`RollbackToSavepoint`/
-/// `Ping`: wait, drain server output ahead of the reply (§7.5), push
-/// `Completed`.
-fn run_completed(
-    hub: &Arc<ReldexHub>,
-    session: &Arc<DatabaseSession>,
-    id: u64,
-    request: u64,
-    completion: Completion<()>,
-    operation: ReldexCompletedOperation,
-) -> bool {
-    let event = match completion.wait() {
-        Ok(()) => QueuedEvent::new(ReldexEventKind::Completed, id, request)
-            .with_completed_operation(operation),
-        Err(error) => QueuedEvent::new(ReldexEventKind::Completed, id, request)
-            .with_completed_operation(operation)
-            .with_error(ReldexError::from_db_error(&error)),
-    };
-    drain_server_output(hub, session, id);
-    hub.push_event(event.with_session_state(session.session_state().into()));
-    false
-}
-
-/// Drains this session's completion-path server output log and, if it holds
-/// anything, pushes it as a `RELDEX_EVENT_KIND_SERVER_OUTPUT` event ahead of
-/// the reply that follows. A no-op — no allocation, no event — when the log
-/// is empty, which is the overwhelmingly common case (output is off by
-/// default, and even with it on, most statements print nothing).
-fn drain_server_output(hub: &Arc<ReldexHub>, session: &Arc<DatabaseSession>, id: u64) {
-    let log = session.take_server_output();
-    if log.is_empty() {
-        return;
-    }
-    let event = QueuedEvent::new(ReldexEventKind::ServerOutput, id, 0)
-        .with_server_output_log(log)
-        .with_session_state(session.session_state().into());
-    hub.push_event(event);
-}
-
 /// Renders a close failure as the error the adapter shows.
 ///
 /// `DecisionRequired` has no underlying `DbError` — nothing failed, a decision
@@ -1947,5 +1675,144 @@ fn close_error_to_reldex(error: &CloseError) -> ReldexError {
         CloseError::CommitFailed(inner)
         | CloseError::RollbackFailed(inner)
         | CloseError::Failed(inner) => ReldexError::from_db_error(inner),
+    }
+}
+
+#[cfg(all(test, feature = "mock-driver"))]
+mod tests {
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use reldex_db_core::{
+        Cap, CapSource, ConnectionParams, OutValue, ResultCaps, ResultPolicy, ResultStore,
+        SessionEvent, Sourced, Statement,
+    };
+    use reldex_db_driver_api::{Credentials, Endpoint, LobKind};
+    use reldex_driver_mock::{Action, MockDriver, Scenario};
+
+    use super::{Pending, ReldexHub, ResultColumns, translate, with_session};
+    use crate::event::ReldexEventKind;
+    use crate::mock::statements;
+
+    /// The next raw event matching `wanted`, discarding the others.
+    fn next_raw(hub: &ReldexHub, wanted: impl Fn(&SessionEvent) -> bool) -> SessionEvent {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(event) = hub.take_raw().filter(|event| wanted(event)) {
+                return event;
+            }
+            assert!(Instant::now() < deadline, "no event within the hang guard");
+            std::thread::yield_now();
+        }
+    }
+
+    /// Nothing in ABI 3.2 submits a segment fetch or reads a LOB, so these
+    /// two replies are driven straight through `db-core` and only their
+    /// translation is under test: `FetchedSegment` crosses as an opaque
+    /// notification naming the caller's request and result, and `LobChunk` —
+    /// standing in for every variant this build does not know — as
+    /// `RELDEX_EVENT_KIND_UNKNOWN`, not as nothing.
+    #[test]
+    fn a_segment_reply_and_an_unknown_reply_cross_as_notifications() {
+        let raw = crate::reldex_hub_create();
+        let mut id = 0_u64;
+        // SAFETY: `raw` is the live hub just created; `id` is a real local.
+        let status =
+            unsafe { crate::reldex_hub_open_session(raw, std::ptr::null(), 1, &raw mut id) };
+        assert_eq!(status, crate::ReldexStatus::Ok);
+        let check = |hub: &ReldexHub, entry: &Arc<super::SessionEntry>| {
+            let opened = next_raw(hub, |event| matches!(event, SessionEvent::Opened { .. }));
+            assert_eq!(translate(hub, opened).kind, ReldexEventKind::Opened);
+            let session = entry.handle(&hub.registry).expect("the session is open");
+
+            let query = statements::text(statements::GENERATED_QUERY);
+            let request = hub.begin_request(Pending::caller(2));
+            session
+                .submit_execute(request, Statement::new(query))
+                .expect("accepted");
+            let SessionEvent::Executed { outcome, .. } =
+                next_raw(hub, |event| matches!(event, SessionEvent::Executed { .. }))
+            else {
+                unreachable!("filtered on Executed");
+            };
+            let outcome = outcome.expect("the query runs");
+            let result = outcome.result.expect("the query opens a result");
+            let policy = ResultPolicy::new(ResultCaps::new(
+                Sourced::new(Cap::Unlimited, CapSource::Application),
+                Sourced::new(Cap::Unlimited, CapSource::BuiltIn),
+            ));
+            let mut store = ResultStore::new(result, &outcome.columns, policy);
+            let key = entry.register_result(result, ResultColumns::new(outcome.columns));
+            let fetches = store
+                .submit_events(&session, || hub.begin_request(Pending::caller(3)))
+                .expect("the store asks for its first segment");
+            assert!(fetches >= 1);
+            let segment = next_raw(hub, |event| {
+                matches!(event, SessionEvent::FetchedSegment { .. })
+            });
+            let segment = translate(hub, segment);
+            assert_eq!(segment.kind, ReldexEventKind::FetchedSegment);
+            assert_eq!(segment.request, 3);
+            assert_eq!(segment.result, Some(key));
+            assert!(segment.row_count > 0);
+            assert!(segment.error.is_none());
+            crate::ReldexStatus::Ok
+        };
+        // SAFETY: `raw` is live until destroyed below.
+        let checked = unsafe { with_session(raw, id, check) };
+        assert_eq!(checked, crate::ReldexStatus::Ok);
+
+        // A world that can hand out a large object, opened on the same hub.
+        let scenario = Scenario::new();
+        scenario.on_sql(
+            "lob",
+            Action::LobOut {
+                name: "doc".to_owned(),
+                kind: LobKind::Character,
+                bytes: b"text".to_vec(),
+            },
+        );
+        let params = ConnectionParams::new(
+            Endpoint::ConnectString("mock".to_owned()),
+            Credentials::External,
+        );
+        // SAFETY: as above.
+        let unknown = unsafe {
+            crate::hub::with_hub(raw, |hub| {
+                let request = hub.begin_request(Pending::caller(4));
+                let lob_session =
+                    hub.registry
+                        .open(Arc::new(MockDriver::new(scenario)), params, request);
+                next_raw(hub, |event| matches!(event, SessionEvent::Opened { .. }));
+                let session = hub.registry.get(lob_session).expect("open");
+                let request = hub.begin_request(Pending::caller(5));
+                session
+                    .submit_execute(request, Statement::new("lob"))
+                    .expect("accepted");
+                let SessionEvent::Executed { outcome, .. } =
+                    next_raw(hub, |event| matches!(event, SessionEvent::Executed { .. }))
+                else {
+                    unreachable!("filtered on Executed");
+                };
+                let outcome = outcome.expect("the block runs");
+                let Some(OutValue::Lob(lob)) = outcome.out_values.named("doc") else {
+                    panic!("expected a large object");
+                };
+                let chunk = NonZeroUsize::new(16).expect("non-zero");
+                let request = hub.begin_request(Pending::caller(6));
+                session
+                    .submit_read_lob_chunk(request, *lob, chunk)
+                    .expect("accepted");
+                let read = next_raw(hub, |event| matches!(event, SessionEvent::LobChunk { .. }));
+                (translate(hub, read), lob_session.get())
+            })
+        };
+        let (unknown, lob_session) = unknown.expect("the hub is live");
+        assert_eq!(unknown.kind, ReldexEventKind::Unknown);
+        assert_eq!(unknown.request, 6);
+        assert_eq!(unknown.session, lob_session);
+        // SAFETY: `raw` is live and destroyed once.
+        unsafe { crate::reldex_hub_destroy(raw) };
     }
 }

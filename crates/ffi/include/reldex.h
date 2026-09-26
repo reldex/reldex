@@ -201,8 +201,17 @@ using ReldexWorkspaceWakeFnNoexcept = void (*)(void *user_data) noexcept;
  * this build. The brief for M2.11 asked for a major bump (`3` to `4`); this
  * is recorded as a deliberate deviation, not an oversight — see the PR
  * description's "deviations" section and ADR-0003's M2.11 amendment.
+ *
+ * `2` because M2.15 moves the event path onto `db-core`'s event queue and
+ * session registry, again purely additively: new event kinds (`EXECUTING`,
+ * `TRANSACTION_STATE`, `FETCHED_SEGMENT`), new *trailing* `ReldexEvent` and
+ * `ReldexMockScenarioConfig` fields, `reldex_session_abandon` and two new
+ * enums. What an existing symbol can now *deliver* changed — a `TERMINAL` on
+ * a loss mid-statement, a session id that is retired once its `TERMINAL` is
+ * drained — without changing its shape; ADR-0003's M2.15 amendment lists
+ * each change.
  */
-#define RELDEX_ABI_VERSION_MINOR 1
+#define RELDEX_ABI_VERSION_MINOR 2
 
 /**
  * How many significant digits a [`ReldexNumber`] carries.
@@ -464,34 +473,73 @@ enum ReldexEventKind
    */
   RELDEX_EVENT_KIND_SERVER_OUTPUT_CONFIGURED = 7,
   /**
-   * Unsolicited: lines the server produced out of band (M2.7), collected
-   * after the statement that produced them and delivered before that
-   * statement's own `Executed`/`Completed`/`SessionClosed` reply. See
-   * `server_output_lines`, `server_output_dropped` and
-   * `server_output_invalid_utf8_lines`; `error` carries a failed read.
-   *
-   * M2.11 delivers this only on the **completion path**
-   * (`reldex-db-core`'s `DatabaseSession::take_server_output`, drained
-   * after every reply while output is on) — never as a fully unsolicited,
-   * mid-statement event, which needs the event-queue switch task M2.15
-   * makes (see the crate's module documentation, "What is interim
-   * here"). A caller sees a session's output attributed to the
-   * request whose reply immediately follows it, which is correct for
-   * every case except the two rare mid-statement exceptions
-   * `docs/exec-plans/active/phase-1-m2-5-event-queue.md` §7.5 documents.
+   * Unsolicited: lines the server produced out of band (M2.7) —
+   * `DBMS_OUTPUT` and its kind — read by the session's worker after the
+   * statement that wrote them and delivered **before that statement's
+   * `EXECUTED`**, so every `SERVER_OUTPUT` lies between an execute's
+   * `EXECUTING` and its `EXECUTED` (two documented exceptions land in the
+   * *next* execute's window: output written during a fetch, and output of
+   * a statement that failed and left the session needing validation). One
+   * statement's output may arrive as several events. `request` is `0`.
+   * See `server_output_lines`, `server_output_dropped` and
+   * `server_output_invalid_utf8_lines`; a non-null `error` is a read that
+   * failed, so the output is incomplete and the pane must say why.
    */
   RELDEX_EVENT_KIND_SERVER_OUTPUT = 8,
   /**
-   * The session ended. Delivered for a connect that failed
-   * (`RELDEX_EVENT_KIND_OPENED` with an error) and for a
-   * `reldex_session_close` that actually closed the session — **not**
-   * for the hub being destroyed while a session's statement cannot be
-   * interrupted (ADR-0003 A17: the caller has already released its hub
-   * pointer by then, so nothing could observe it). Read
-   * `transaction_possibly_lost` (`SPEC.md` §10: never hide a transaction
-   * loss).
+   * The session ended. Exactly once per session, unsolicited, carrying no
+   * request id of its own (`request` is `0`): after a close that actually
+   * closed, after a connect that failed or was abandoned, and — since ABI
+   * 3.2 — the moment a session is **lost** mid-statement, without waiting
+   * for the caller to close it. `session_state` is `LOST` or `CLOSED`;
+   * `error` is the failure that lost it (native code and cause intact), or
+   * null for a deliberate end. Read `transaction_possibly_lost` and
+   * surface it (`SPEC.md` §10: never hide a transaction loss); `abandoned`
+   * says the session ended because the caller called
+   * `reldex_session_abandon`; `server_output_dropped` carries output lines
+   * the session lost that no earlier `SERVER_OUTPUT` reported.
+   *
+   * Replies to requests the caller submitted **after** the session ended
+   * may still follow it — each accepted request gets its one reply — but
+   * once this event has been drained the session id is retired: every
+   * later call naming it reports `RELDEX_STATUS_NOT_FOUND`, and it no
+   * longer counts in `reldex_hub_session_count`. Not delivered for
+   * sessions still open when the hub is destroyed: by then nothing can
+   * observe it.
    */
   RELDEX_EVENT_KIND_TERMINAL = 9,
+  /**
+   * Progress, not a reply (ABI 3.2): the worker has **started** the
+   * statement submitted as `executing_request` — it has left the queue,
+   * and `deadline_ms`/`has_deadline` echo the limit actually armed on it.
+   * This is the honest "running, with this limit" state a UI shows on a
+   * driver that cannot cancel (`SPEC.md` §24.8). The one reply to that
+   * request is still its `EXECUTED`, which always follows.
+   *
+   * `request` is `0`, as on every other kind that answers nothing: exactly
+   * one event per accepted request carries that request's id, its reply —
+   * the 3.1 contract, unchanged. Like the other two kinds 3.2 added, it is
+   * never delivered to a caller whose `struct_size` predates 3.2 (see
+   * `reldex_hub_next_event`).
+   */
+  RELDEX_EVENT_KIND_EXECUTING = 10,
+  /**
+   * Unsolicited (ABI 3.2): whether a transaction may be open on this
+   * session flipped; read `transaction_possibly_active`. Advisory — it
+   * drives Commit/Rollback affordances without polling, while a close still
+   * re-decides on the worker. Never dropped: a value not yet drained is
+   * updated in place to the newest one. `request` is `0`.
+   */
+  RELDEX_EVENT_KIND_TRANSACTION_STATE = 11,
+  /**
+   * A result store's segment fetch was answered (M5.2 Stage A; ABI 3.2).
+   * **Not produced by this build** — nothing in this ABI submits a segment
+   * fetch yet (that is M5.2 Stage B) — and delivered as an opaque
+   * notification when it is: `request`, `result`/`has_result` when the
+   * result is one this session reported, `row_count`, and `error`. The
+   * segment's rows are not reachable through this event.
+   */
+  RELDEX_EVENT_KIND_FETCHED_SEGMENT = 12,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -978,12 +1026,11 @@ enum ReldexMockStatement
    */
   RELDEX_MOCK_STATEMENT_DML = 5,
   /**
-   * Panics inside the session's own **pump thread**, which no
-   * `catch_unwind` on an `extern "C"` body can reach. The pump contains it,
-   * marks the session lost, and answers this request *and everything queued
-   * behind it* with one failure event each.
-   *
-   * Mock-only, and compiled in only with the `mock-driver` feature.
+   * Retired with the interim per-session pump thread it used to panic
+   * (M2.15): there is no thread of this library's left between a session
+   * and the queue. Kept, because an enum value is never reused, and now
+   * the same contained **driver** panic as [`Self::Panicking`] — the
+   * session is lost and its `TERMINAL` follows the failed `EXECUTED`.
    */
   RELDEX_MOCK_STATEMENT_PUMP_PANIC = 6,
   /**
@@ -999,6 +1046,20 @@ enum ReldexMockStatement
    * meaning of "1,000".
    */
   RELDEX_MOCK_STATEMENT_EMPTY_QUERY = 7,
+  /**
+   * A procedure call that prints three lines of server output, the last
+   * one reported as having arrived as invalid UTF-8 (ABI 3.2). The lines
+   * are buffered only once `reldex_session_set_server_output` has turned
+   * output on, and arrive as `SERVER_OUTPUT` ahead of the call's
+   * `EXECUTED`. It opens no transaction.
+   */
+  RELDEX_MOCK_STATEMENT_SERVER_OUTPUT = 8,
+  /**
+   * Loses the connection mid-statement: fails with `ORA-03113` and the
+   * session is **lost**, so its `TERMINAL` follows at once, without a
+   * close (ABI 3.2).
+   */
+  RELDEX_MOCK_STATEMENT_LOSE_SESSION = 9,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -2069,6 +2130,142 @@ typedef int32_t ReldexSettingError;
 #endif // __cplusplus
 
 /**
+ * What [`reldex_session_abandon`] found (ABI 3.2).
+ *
+ * `0` is reserved for an outcome this header predates.
+ */
+enum ReldexAbandonOutcome
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * An outcome this header does not know.
+   */
+  RELDEX_ABANDON_OUTCOME_UNKNOWN = 0,
+  /**
+   * The connect had not finished. Its `OPENED` event arrives with a
+   * `RELDEX_ERROR_KIND_CANCELLED` error, then its `TERMINAL`; a connection
+   * that arrives late is closed, never adopted.
+   */
+  RELDEX_ABANDON_OUTCOME_CONNECTING = 1,
+  /**
+   * An open session was released **without committing**: the server rolls
+   * back whatever transaction it held. `*out_transaction_possibly_lost` is
+   * a lower bound available now; the authoritative answer is the
+   * `TERMINAL` event's `transaction_possibly_lost`, which the UI must
+   * surface either way (`SPEC.md` §10).
+   */
+  RELDEX_ABANDON_OUTCOME_OPEN = 2,
+  /**
+   * The session had already ended — closed, lost, or abandoned before.
+   * Nothing happened; its `TERMINAL` is, or was, delivered as usual.
+   */
+  RELDEX_ABANDON_OUTCOME_ALREADY_ENDED = 3,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexAbandonOutcome ReldexAbandonOutcome;
+#else
+typedef int32_t ReldexAbandonOutcome;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * A failure the mock world can script for every connect or every ping
+ * (ABI 3.2), each with the native code a real server would report.
+ */
+enum ReldexMockFailure
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * No failure: the call succeeds.
+   */
+  RELDEX_MOCK_FAILURE_NONE = 0,
+  /**
+   * `ORA-01017`, an authentication failure.
+   */
+  RELDEX_MOCK_FAILURE_AUTHENTICATION = 1,
+  /**
+   * `ORA-12541`, nothing listening at the endpoint.
+   */
+  RELDEX_MOCK_FAILURE_UNREACHABLE = 2,
+  /**
+   * `ORA-03113`, the connection lost.
+   */
+  RELDEX_MOCK_FAILURE_LOST = 3,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexMockFailure ReldexMockFailure;
+#else
+typedef int32_t ReldexMockFailure;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Why a profile was refused — the FFI shape of `reldex_workspace::
+ * ProfileError`, one variant per Rust variant (ABI 3.2, M2.15; mirroring
+ * [`ReldexCredentialError`]).
+ *
+ * Carried as [`crate::ReldexErrorView::native_code`] on the
+ * `RELDEX_ERROR_KIND_CONFIGURATION` error a `reldex_workspace_create_profile`
+ * or `reldex_workspace_update_profile` reply carries. `native_message` names
+ * the field — and, for [`Self::CredentialInEndpoint`], the kind of
+ * credential-looking text it matched — and never the field's text, so a UI
+ * can show it verbatim. Before 3.2 every one of these arrived as the same
+ * `CONFIGURATION` error with nothing typed to tell them apart.
+ */
+enum ReldexProfileError
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A reason this header does not know.
+   */
+  RELDEX_PROFILE_ERROR_UNKNOWN = 0,
+  /**
+   * A required text field is empty (the name: or only whitespace).
+   */
+  RELDEX_PROFILE_ERROR_EMPTY = 1,
+  /**
+   * A text field is too long.
+   */
+  RELDEX_PROFILE_ERROR_TOO_LONG = 2,
+  /**
+   * A text field contains a NUL or another control character.
+   */
+  RELDEX_PROFILE_ERROR_CONTROL_CHARACTER = 3,
+  /**
+   * Port 0 is not a listener.
+   */
+  RELDEX_PROFILE_ERROR_PORT_ZERO = 4,
+  /**
+   * The CA directory path is not valid Unicode.
+   */
+  RELDEX_PROFILE_ERROR_PATH_NOT_UNICODE = 5,
+  /**
+   * An endpoint field contains credential-looking text (refused so a
+   * password never lands in the profile store; ADR-0006).
+   */
+  RELDEX_PROFILE_ERROR_CREDENTIAL_IN_ENDPOINT = 6,
+  /**
+   * "Treat as production" contradicts the environment.
+   */
+  RELDEX_PROFILE_ERROR_PRODUCTION_FLAG_MISMATCH = 7,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexProfileError ReldexProfileError;
+#else
+typedef int32_t ReldexProfileError;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
  * One fetched batch, owned by the caller from the moment its event is handed
  * out until [`reldex_batch_release`].
  *
@@ -2105,7 +2302,7 @@ typedef struct ReldexError ReldexError;
 typedef struct ReldexHistoryList ReldexHistoryList;
 
 /**
- * The application hub: one event queue, one waker, one session registry.
+ * The application hub: one event queue, one session registry, one waker.
  *
  * Opaque to C. Create it with [`reldex_hub_create`] and release it with
  * [`reldex_hub_destroy`], last of all.
@@ -2346,21 +2543,21 @@ typedef struct ReldexLiveCounts {
    */
   uint32_t struct_size;
   /**
-   * Hubs created by `reldex_hub_create` and not yet fully torn down. A hub
-   * outlives `reldex_hub_destroy` until its last session pump exits.
+   * Hubs created by `reldex_hub_create` and not yet destroyed.
    */
   size_t hubs;
   /**
-   * Sessions whose registry entry or pump thread is still alive.
+   * Sessions opened and not yet ended: until the session's `TERMINAL` is
+   * drained, or its hub is destroyed.
    */
   size_t sessions;
   /**
-   * Fetched batches: held by the caller, or queued in an undrained event.
+   * Fetched batches handed out and not yet released.
    */
   size_t batches;
   /**
-   * Error objects: held by the caller, queued in an undrained event, or
-   * sitting in some thread's last-error slot.
+   * Error objects: handed out and not yet released, or sitting in some
+   * thread's last-error slot.
    */
   size_t errors;
   /**
@@ -2373,6 +2570,14 @@ typedef struct ReldexLiveCounts {
    * history pages, and worksheets and worksheet lists.
    */
   size_t misc_objects;
+  /**
+   * Result column-description sets this library holds (ABI 3.2): one per
+   * open result, shared by its batches and kept alive by any the caller
+   * still holds, plus a **lost** session's until the caller next names
+   * that session in `reldex_session_close`, `reldex_session_close_result`
+   * or `reldex_session_abandon`, or destroys the hub.
+   */
+  size_t column_sets;
 } ReldexLiveCounts;
 
 /**
@@ -2532,7 +2737,8 @@ typedef struct ReldexFormatOptions {
 } ReldexFormatOptions;
 
 /**
- * One reply, filled in by [`crate::reldex_hub_next_event`].
+ * One event, filled in by [`crate::reldex_hub_next_event`]: a request's reply,
+ * `Executing` progress, or one of the unsolicited kinds.
  *
  * The caller sets `struct_size` before each call
  * (`ReldexEvent ev = { .struct_size = sizeof ev };`) and **owns** `error` and
@@ -2567,7 +2773,12 @@ typedef struct ReldexEvent {
    */
   uint64_t session;
   /**
-   * The `request_id` the caller passed to the submitting call.
+   * The `request_id` the caller passed to the submitting call, on a reply:
+   * the request it answers. Exactly one event per accepted request carries
+   * that request's id. `0` on every kind that answers nothing — progress
+   * (`Executing`, which names its statement in `executing_request`
+   * instead) and the unsolicited kinds (`ServerOutput`, `TransactionState`,
+   * `Terminal`).
    */
   uint64_t request;
   /**
@@ -2607,6 +2818,12 @@ typedef struct ReldexEvent {
   struct ReldexBatch *batch;
   /**
    * The session's lifecycle as of this event: a [`ReldexSessionState`].
+   *
+   * A successful reply reports `USABLE` (the request succeeded, so the
+   * session was usable when it answered) even if the session was lost
+   * while the reply waited in the queue; that loss is the `TERMINAL`
+   * behind it. A failed reply, a progress event and a notification report
+   * the session's state when the event was taken.
    */
   int32_t session_state;
   /**
@@ -2670,9 +2887,10 @@ typedef struct ReldexEvent {
   uint64_t server_output_buffer_bytes;
   /**
    * `ServerOutput`: how many lines were dropped for this session since the
-   * previous delivered `ServerOutput`, because the session's completion-path
-   * log was full (`reldex-db-core`'s `ServerOutputLog::MAX_RETAINED_LINES` /
-   * `MAX_RETAINED_BYTES`). Zero normally; non-zero means the UI must say
+   * previous delivered `ServerOutput`, because the session already had the
+   * most unsolicited events the queue holds for one session waiting
+   * undrained (256). `Terminal`: lines dropped that no delivered
+   * `ServerOutput` reported. Zero normally; non-zero means the UI must say
    * "output truncated".
    */
   uint32_t server_output_dropped;
@@ -2696,6 +2914,35 @@ typedef struct ReldexEvent {
    * hide transaction loss).
    */
   bool transaction_possibly_lost;
+  /**
+   * `Executing` (ABI 3.2): whether `deadline_ms` is meaningful — false
+   * means the statement runs with no time limit.
+   */
+  bool has_deadline;
+  /**
+   * `TransactionState` (ABI 3.2): whether a transaction may now be open.
+   * Conservative: it can be true with nothing open, never false while
+   * something might be.
+   */
+  bool transaction_possibly_active;
+  /**
+   * `Terminal` (ABI 3.2): the session ended because the caller called
+   * `reldex_session_abandon` — so a loss reported by
+   * `transaction_possibly_lost` is the rollback that abandoning implies,
+   * not a failure.
+   */
+  bool abandoned;
+  /**
+   * `Executing` (ABI 3.2): the deadline armed on the statement, in
+   * milliseconds, when `has_deadline`.
+   */
+  uint64_t deadline_ms;
+  /**
+   * `Executing` (ABI 3.2): the `request_id` of the execute that started.
+   * Its `EXECUTED` — the one event that carries this id in `request` — is
+   * still to come. `0` on every other kind.
+   */
+  uint64_t executing_request;
 } ReldexEvent;
 
 /**
@@ -2744,7 +2991,7 @@ typedef struct ReldexMetadataRequest {
 } ReldexMetadataRequest;
 
 /**
- * Identifies one session for this hub's lifetime. Never reused.
+ * Identifies one session. Never reused, in this process.
  */
 typedef uint64_t ReldexSessionId;
 
@@ -2788,6 +3035,30 @@ typedef struct ReldexMockScenarioConfig {
    * what a deterministic test wants.
    */
   uint64_t block_duration_ms;
+  /**
+   * A [`ReldexMockFailure`] every connect fails with (ABI 3.2): the open's
+   * `OPENED` carries that error and its `TERMINAL` follows. `0`, none.
+   */
+  int32_t connect_failure;
+  /**
+   * A [`ReldexMockFailure`] every `reldex_session_ping` fails with (ABI
+   * 3.2). `RELDEX_MOCK_FAILURE_LOST` also loses the session. `0`, none.
+   */
+  int32_t ping_failure;
+  /**
+   * Parks every connect until [`reldex_mock_release_block`] (ABI 3.2), so
+   * a caller can act on a session that is still connecting — abandon it,
+   * or destroy the hub — deterministically.
+   */
+  bool block_connect;
+  /**
+   * Advertises the `server_output` capability (ABI 3.2), so
+   * `reldex_session_set_server_output` is accepted and
+   * `RELDEX_MOCK_STATEMENT_SERVER_OUTPUT` prints. Off by default, exactly
+   * as in 3.1, where the world did not advertise it and setting output was
+   * refused — a 3.1 caller, whose struct ends before this field, keeps that.
+   */
+  bool server_output;
 } ReldexMockScenarioConfig;
 
 /**
@@ -3680,12 +3951,19 @@ void reldex_batch_release(struct ReldexBatch *batch);
  * reason to make an exception to the rule it would be used to debug.
  *
  * Counts are process-wide and include objects that are not the caller's yet:
- * a `ReldexBatch` sitting inside an event nobody has drained is **live**,
- * because its rows are still in memory. So is the `ReldexError` in a thread's
- * last-error slot, until it is taken or cleared. A session stays live until
- * its pump thread has finished, which after `reldex_hub_destroy` may be a
- * while if it is parked inside an uninterruptible statement (ADR-0003 A17) —
- * that is exactly the leak this is meant to make visible.
+ * the `ReldexError` in a thread's last-error slot is **live** until it is
+ * taken or cleared. Since M2.15 a `ReldexBatch` or `ReldexError` an event
+ * carries is built when `reldex_hub_next_event` hands that event out, so an
+ * event nobody has drained is not counted here; what it holds is still in
+ * memory, and bounded by `db-core`'s per-session limits.
+ *
+ * A session counts from the call that opened it until its
+ * `RELDEX_EVENT_KIND_TERMINAL` is drained, or until `reldex_hub_destroy`,
+ * whichever comes first. Both are exact: nothing the counts see outlives
+ * `reldex_hub_destroy`. What they do **not** see is a session worker still
+ * parked inside an uninterruptible statement after that call — the leak
+ * ADR-0003 A17 describes, which the registry bounds and documents rather
+ * than counts.
  *
  * # Safety
  *
@@ -3859,31 +4137,29 @@ struct ReldexHub *reldex_hub_create(void);
  *
  * Returns **promptly**, even when a session is blocked inside a statement
  * that cannot be interrupted. In order: the waker is unregistered (which
- * waits for any wake already in flight, D5 rule 2), every session is marked
- * closed and asked to cancel whatever it is running, and the hub's own
- * reference is dropped.
+ * waits for any wake already in flight, D5 rule 2); every session still open
+ * is **abandoned** through `db-core`'s session registry — which never
+ * commits, asks the driver to cancel whatever is running, and never waits;
+ * everything still queued is discarded, freeing what it held; and the hub's
+ * memory is released. No `RELDEX_EVENT_KIND_TERMINAL` is delivered for those
+ * sessions: nothing could observe it.
  *
  * # What "promptly" costs when a statement cannot be interrupted
  *
  * Prompt is not the same as finished, and the difference is worth stating
  * plainly. A session parked inside an uninterruptible driver call — which is
  * the *normal* case on `oracledb` 26.0.0-beta.3, whose cancel cannot reach a
- * running statement (ADR-0002 D2, spike S4) — cannot be stopped by this
- * call. Its cancel is best-effort and does nothing there. So until that
- * statement returns on its own, or the process exits:
- *
- * * the session's pump thread stays alive, blocked;
- * * `db-core`'s worker thread for that session and the connection it owns
- *   stay alive with it;
- * * the hub's own allocation stays alive, because the pump holds a reference;
- * * every event already queued stays queued, **including any `ReldexBatch`
- *   it carries**, and is freed only when the last pump finally exits.
- *
- * None of that is reachable by the caller any more, so it is a leak for as
- * long as it lasts. It is the price of never blocking the UI thread on a
- * 10-second statement (spike criterion K6), and it is bounded by the
- * statement, not by Reldex. A caller that needs the memory back before then
- * has no option through this ABI, because the driver offers none.
+ * running statement (ADR-0002 D2, spike S4) — cannot be stopped by this call.
+ * Waiting for the registry's teardown — at most `db-core`'s
+ * `DROP_SHUTDOWN_TIMEOUT` (500 ms) in total, however many sessions are stuck
+ * — therefore happens on a short-lived thread of this library's, not on the
+ * caller's. Past that bound a stuck session's worker thread and the
+ * connection it owns are **detached**: they stay alive until the statement
+ * returns on its own, or the process exits, and then close themselves. That
+ * is a leak for as long as it lasts, bounded by the statement rather than by
+ * Reldex, and it is the price of never blocking the UI thread on a
+ * ten-second statement (spike criterion K6). Everything this library handed
+ * out or counts (`reldex_live_counts`) is released before this returns.
  *
  * Like dropping a `DatabaseSession`, this **never commits**: a transaction
  * still open when the hub is destroyed is rolled back by the server, exactly
@@ -3914,18 +4190,18 @@ void reldex_hub_destroy(struct ReldexHub *hub);
  *
  * * **It may not call any `reldex_*` function — on any hub.** The
  *   re-entrancy guard is per *thread*, not per hub, and that is the contract,
- *   not an implementation detail: a wake runs on a Reldex thread and holds
- *   the lock that keeps the waker alive, so a call back in would deadlock or
- *   re-enter the queue it is being told about. Any entry from inside a waker
- *   reports `RELDEX_STATUS_REENTRANT` (or `false`/`0` from the functions that
- *   return no status) and does nothing.
+ *   not an implementation detail: a wake holds the lock that keeps the waker
+ *   alive, so a call back in would deadlock or re-enter the queue it is being
+ *   told about. Any entry from inside a waker reports
+ *   `RELDEX_STATUS_REENTRANT` (or `false`/`0` from the functions that return
+ *   no status) and does nothing.
  * * **It may not let a C++ exception escape.** Unwinding a C++ exception
  *   through this `extern "C"` frame into Rust is undefined behaviour, and
  *   the `catch_unwind` on every Reldex entry point does **not** contain it —
  *   that catches Rust panics, which are a different mechanism. A waker that
  *   can throw must wrap its own body in `try { … } catch (...) { }`.
- * * **It may not block.** It is called on a session's pump thread, and
- *   blocking there stalls that session's events. One
+ * * **It may not block.** It usually runs on a session's worker thread, and
+ *   blocking there stalls that session. One
  *   `QMetaObject::invokeMethod(..., Qt::QueuedConnection)` and nothing else.
  *
  * # When it fires
@@ -3936,6 +4212,9 @@ void reldex_hub_destroy(struct ReldexHub *hub);
  * wake**, because the queue never became empty. Such a caller must re-post
  * its own drain — ADR-0003 D5's budgeted `drain()` does exactly that, and
  * [`reldex_hub_pending_events`] is how it can report what it left behind.
+ *
+ * It may run on the caller's own thread, inside the `reldex_*` call that
+ * submitted a request (see [`ReldexWakeFn`]).
  *
  * # Safety
  *
@@ -3962,12 +4241,23 @@ size_t reldex_hub_pending_events(const struct ReldexHub *hub);
 /**
  * Takes the next event, or reports that there is none. Never blocks.
  *
- * Returns `true` when `out` was filled. The caller then **owns** `out->error`
- * and `out->batch` when they are non-null. Drain in a loop until this returns
- * `false`, budgeting the loop so a flood cannot starve rendering (ADR-0003 D5
- * suggests 256 events / 4 ms, then re-post) — and see
- * [`reldex_hub_set_waker`] for why a caller that stops early must re-post
- * itself rather than wait for another wake.
+ * **A caller is never given a kind its header predates.** `out->struct_size`
+ * says which header the caller was built against: below 3.2's `ReldexEvent`
+ * size, the kinds ABI 3.2 introduced (`EXECUTING`, `TRANSACTION_STATE`,
+ * `FETCHED_SEGMENT`) are taken off the queue and discarded rather than
+ * delivered — none owns anything or answers a request such a caller can
+ * make — and the waker is not called for a wake whose only news is one of
+ * them, whenever that can be checked without waiting. A 3.1 caller therefore
+ * sees exactly 3.1's event kinds, and a wake with nothing to take at most
+ * rarely — as any caller can when a push races its drain. Drain until empty;
+ * never assume a wake means an event.
+ *
+ * Returns `true` when `out` was filled. The caller then **owns** `out->error`,
+ * `out->batch` and `out->server_output_lines` when they are non-null. Drain in
+ * a loop until this returns `false`, budgeting the loop so a flood cannot
+ * starve rendering (ADR-0003 D5 suggests 256 events / 4 ms, then re-post) —
+ * and see [`reldex_hub_set_waker`] for why a caller that stops early must
+ * re-post itself rather than wait for another wake.
  *
  * **`false` means `*out` was not touched**, whether the queue was empty or
  * the argument was rejected (null, unaligned, or a `struct_size` this build
@@ -3976,16 +4266,24 @@ size_t reldex_hub_pending_events(const struct ReldexHub *hub);
  * is read on the way in; nothing is written unless an event is being
  * delivered.
  *
- * # The event queue is unbounded
+ * Taking a session's `RELDEX_EVENT_KIND_TERMINAL` retires that session — its
+ * id is not found by any later call — and releases what `db-core` held for
+ * it; that can join the session's (idle, finishing) worker thread here.
  *
- * Nothing here applies back-pressure. Every accepted request eventually
- * queues exactly one event, and a `FETCHED` event holds a `ReldexBatch` whose
- * rows are **the caller's memory** from the moment it is handed out. A
- * caller that keeps fetching without draining, or drains without releasing,
- * grows that queue without limit. The bound has to come from the adapter:
- * keep a small number of fetches in flight per result, release each batch
- * when the model is done with it, and use [`reldex_hub_pending_events`] as
- * the only signal this ABI gives about the backlog.
+ * # What bounds the queue
+ *
+ * Per session, `db-core` bounds what can be waiting: a request holds one of
+ * 1,024 slots from the moment it is accepted until **its reply is taken out
+ * of this queue**, so a caller that keeps submitting without draining is
+ * refused (`RELDEX_STATUS_ERROR`, last error `RELDEX_ERROR_KIND_RESOURCE`)
+ * rather than growing the queue; progress events are bounded by the same
+ * number, and unsolicited ones by a per-session cap past which server output
+ * is dropped and counted (`server_output_dropped`) and a transaction-state
+ * change is coalesced, never lost. No producer ever blocks on a slow
+ * consumer. Memory is still the caller's to bound: a `FETCHED` event's
+ * `ReldexBatch` holds its rows until released, so keep a small number of
+ * fetches in flight per result and release each batch when the model is done
+ * with it.
  *
  * # Safety
  *
@@ -3999,13 +4297,10 @@ bool reldex_hub_next_event(struct ReldexHub *hub, struct ReldexEvent *out);
  *
  * Every session from the moment `reldex_hub_open_session` returns a
  * [`crate::ReldexSessionId`] until its `RELDEX_EVENT_KIND_TERMINAL` event has
- * been drained **and** the caller has stopped calling into it — this
- * library's own bookkeeping releases the entry when the pump exits, which for
- * a normally closed session is promptly, and for a session whose statement
- * cannot be interrupted (ADR-0003 A17) is not until that statement returns.
- * Diagnostic, like [`crate::reldex_live_counts`]'s `sessions` field, which
- * this agrees with; that one is process-wide across every hub, this one is
- * scoped to `hub`.
+ * been **drained** — then it is retired, whether it was closed, lost,
+ * abandoned or never opened. Diagnostic, like [`crate::reldex_live_counts`]'s
+ * `sessions` field, which this agrees with; that one is process-wide across
+ * every hub, this one is scoped to `hub`.
  *
  * # Safety
  *
@@ -4020,9 +4315,9 @@ size_t reldex_hub_session_count(const struct ReldexHub *hub);
  * know whether `out` holds all of them).
  *
  * The order is unspecified — a caller after a stable ordering sorts `out`
- * itself. This is a point-in-time snapshot: a session may open or reach its
- * `RELDEX_EVENT_KIND_TERMINAL` between this call returning and the caller
- * reading `out`.
+ * itself. This is a point-in-time snapshot: a session may open or have its
+ * `RELDEX_EVENT_KIND_TERMINAL` drained between this call returning and the
+ * caller reading `out`.
  *
  * # Safety
  *
@@ -4130,14 +4425,15 @@ void reldex_metadata_query_release(struct ReldexMetadataQuery *query);
 struct ReldexStr reldex_mock_statement(int32_t kind);
 
 /**
- * Releases a session's blocked statement, if the mock world it runs in has
- * one parked.
+ * Releases a session's blocked statement — and, with
+ * [`ReldexMockScenarioConfig::block_connect`], its parked connect — if the
+ * mock world it runs in has one.
  *
  * Mock-only, and the reason [`ReldexMockScenarioConfig::block_duration_ms`]
  * may be zero: a test (or spike S15's "a blocked session must not stall the
  * UI" step) blocks a session indefinitely and releases it at a moment of its
- * choosing, with no sleep anywhere. Idempotent, and safe whether or not
- * anything is currently blocked.
+ * choosing, with no sleep anywhere. Idempotent, safe whether or not anything
+ * is currently blocked, and permanent: a released gate never blocks again.
  *
  * # Safety
  *
@@ -4147,16 +4443,16 @@ ReldexStatus reldex_mock_release_block(struct ReldexHub *hub, ReldexSessionId se
 
 /**
  * Opens a session and reports its id immediately; the connection itself is
- * made on the session's own thread.
+ * made on the session's own worker thread.
  *
- * This **never blocks**: `db-core`'s `open_session` waits for the connect to
- * finish, so the wait happens on the session's pump thread and the answer
- * arrives as a `RELDEX_EVENT_KIND_OPENED` event carrying `request`. On
- * failure that same request id comes back as an `OPENED` event with a
- * non-null `error` — exactly one reply either way.
+ * This **never blocks**. The answer arrives as a `RELDEX_EVENT_KIND_OPENED`
+ * event carrying `request`; on failure that same request id comes back as an
+ * `OPENED` event with a non-null `error`, followed by the session's
+ * `TERMINAL` — exactly one reply either way.
  *
  * The session id is valid as soon as this returns, but nothing may be
- * submitted on it until its `OPENED` event arrives without an error.
+ * submitted on it until the connect has succeeded (see
+ * [`reldex_session_execute`] for exactly when that is).
  *
  * # Safety
  *
@@ -4171,7 +4467,9 @@ ReldexStatus reldex_hub_open_session(struct ReldexHub *hub,
 
 /**
  * Submits one statement. The reply is a `RELDEX_EVENT_KIND_EXECUTED` event
- * carrying `request`.
+ * carrying `request`, preceded by a `RELDEX_EVENT_KIND_EXECUTING` event with
+ * the same `request` when the worker starts it, and by any
+ * `RELDEX_EVENT_KIND_SERVER_OUTPUT` the statement wrote.
  *
  * `deadline_ms` arms a per-statement time limit; `0` means none, with the
  * consequence `SPEC.md` §10 requires the UI to state — on a driver that
@@ -4193,11 +4491,22 @@ ReldexStatus reldex_hub_open_session(struct ReldexHub *hub,
  *   caller notices.
  *
  * The simple rule for an adapter is still "wait for `OPENED`", because that
- * is the first moment it can be sure; the rule for this library is the three
- * cases above, and `exactly one reply per accepted request` holds in all of
- * them.
+ * is the first moment it can be sure.
  *
- * Binds are not exported yet (M2.11).
+ * # When the session is already gone
+ *
+ * A request submitted after the session was lost, but before its `TERMINAL`
+ * was drained, is still **accepted** and answered with a failure reply — which
+ * may arrive after the `TERMINAL`. Once `TERMINAL` has been drained the id is
+ * retired and this reports `RELDEX_STATUS_NOT_FOUND`.
+ *
+ * # When the caller does not drain
+ *
+ * A session holds at most 1,024 undrained replies. Past that, this returns
+ * `RELDEX_STATUS_ERROR` with a `RELDEX_ERROR_KIND_RESOURCE` last error and
+ * accepts nothing: drain the queue, then submit again.
+ *
+ * Binds are not exported yet.
  *
  * # Safety
  *
@@ -4248,7 +4557,7 @@ ReldexStatus reldex_session_fetch(struct ReldexHub *hub,
  * with `reldex_last_error_take()` — this call has no status of its own to
  * report them with:
  *
- * * `hub` is null or unaligned, or `session` is not open on it;
+ * * `hub` is null or unaligned, or `session` is not on it;
  * * `result` is not an open result of that session — it was never opened, it
  *   belongs to another session, or it has been closed;
  * * the call came from inside a waker callback, which the ADR-0003 D5
@@ -4280,8 +4589,8 @@ size_t reldex_session_result_column_count(struct ReldexHub *hub,
  * `result` is drained, which is when a UI wants to put its header row up.
  *
  * The description is the one the whole result shares: built once, when the
- * statement was executed, and reported identically by every batch of it.
- * Calling this allocates nothing.
+ * statement's `EXECUTED` was drained, and reported identically by every batch
+ * of it. Calling this allocates nothing.
  *
  * # The one difference from the batch version
  *
@@ -4299,33 +4608,39 @@ size_t reldex_session_result_column_count(struct ReldexHub *hub,
  * NUL-terminated, until the first of:
  *
  * * the caller submits `reldex_session_close_result` for this `result`;
- * * the caller submits `reldex_session_close` for this session;
+ * * the caller submits `reldex_session_close` for this session, or calls
+ *   `reldex_session_abandon` on it;
  * * the caller calls `reldex_hub_destroy`.
  *
- * **Only those three.** Nothing Reldex does on its own ends the lifetime: a
- * statement that fails, a fetch that fails, a cancel, and a session *lost* to
- * an internal panic all leave the strings readable, because the caller — who
- * may still be holding the pointers — did nothing to say otherwise. That is a
- * guarantee, not an accident of timing: a result the caller never closed has
- * its description retired rather than freed.
+ * **Only those.** Nothing Reldex does on its own ends the lifetime: a
+ * statement that fails, a fetch that fails, a cancel, and a session *lost*
+ * mid-statement all leave the strings readable, because the caller — who may
+ * still be holding the pointers — did nothing to say otherwise. A lost
+ * session's descriptions are kept even after its `TERMINAL` has been
+ * drained: until the caller next names that session in
+ * `reldex_session_close`, `reldex_session_close_result` or
+ * `reldex_session_abandon` (each then reports `RELDEX_STATUS_NOT_FOUND`, and
+ * frees them), or destroys the hub. ABI 4.0 (M5.2 Stage B) will shorten
+ * this: a lost session's descriptions valid only until its `TERMINAL` is
+ * drained (ADR-0003 A39).
  *
  * Note what that does **not** promise. On a lost session the result itself is
- * gone — nothing can be fetched from it — so this call reports
- * `RELDEX_STATUS_NOT_FOUND` for it. The two are separate on purpose: what was
- * already handed out stays readable, and what was not is not invented.
+ * gone — nothing can be fetched from it — and once its `TERMINAL` has been
+ * drained this call reports `RELDEX_STATUS_NOT_FOUND` for it. The two are
+ * separate on purpose: what was already handed out stays readable, and what
+ * was not is not invented.
  *
- * A caller that wants the names past those three points must copy them, which
- * is what a Qt model does anyway, building its header `QString`s once with
+ * A caller that wants the names past those points must copy them, which is
+ * what a Qt model does anyway, building its header `QString`s once with
  * `QString::fromUtf8(info.name.ptr, info.name.len)`.
  *
  * Two consequences worth stating, because both are easy to get wrong:
  *
  * * The rule is "valid **at least** until you submit", not "invalid from the
  *   moment you submit". Right after `reldex_session_close_result` this call
- *   may still succeed for a while; that is not a signal that the close has
- *   not landed, and the `RESULT_CLOSED` event remains the only such signal.
- *   Do not read the strings after submitting — but do not treat a successful
- *   read as meaning anything either.
+ *   may still succeed for a while (the description is freed when its
+ *   `RESULT_CLOSED` is drained); that is not a signal that the close has not
+ *   landed, and the `RESULT_CLOSED` event remains the only such signal.
  * * `reldex_hub_destroy` frees them **synchronously, on the thread that
  *   called it**, before it returns. There is no window after it during which
  *   a stale pointer still happens to work.
@@ -4373,8 +4688,9 @@ ReldexStatus reldex_session_close_result(struct ReldexHub *hub,
  * The reply is a `RELDEX_EVENT_KIND_SESSION_CLOSED` event carrying `request`.
  * Read its `close_outcome`: `DECISION_REQUIRED`, `COMMIT_FAILED` and
  * `ROLLBACK_FAILED` all leave the session **open and usable**, so the caller
- * can ask the user and close again. This is the only path that can commit;
- * destroying the hub never does.
+ * can ask the user and close again. A close that closed is followed by the
+ * session's `TERMINAL`. This is the only path that can commit; abandoning a
+ * session or destroying the hub never does.
  *
  * # Safety
  *
@@ -4384,6 +4700,35 @@ ReldexStatus reldex_session_close(struct ReldexHub *hub,
                                   ReldexSessionId session,
                                   ReldexRequestId request,
                                   int32_t disposition);
+
+/**
+ * Abandons a session: releases it **without committing** and without
+ * waiting, whatever it is doing (ABI 3.2).
+ *
+ * This is how a worksheet is disconnected when a close cannot be waited for —
+ * a statement that cannot be interrupted, or a connect that has not
+ * returned. It never blocks and is never refused for lack of room. The
+ * session's `TERMINAL` follows once its worker reaches the abandon —
+ * immediately when it is idle or still connecting, when the current driver
+ * call returns when it is not — carrying `abandoned = true` and the
+ * authoritative `transaction_possibly_lost`. Every request already accepted
+ * still gets its one reply.
+ *
+ * `*out_outcome` receives a [`ReldexAbandonOutcome`]; with
+ * `RELDEX_ABANDON_OUTCOME_OPEN`, `*out_transaction_possibly_lost` is a
+ * conservative early answer the UI may show at once. Nothing may be submitted
+ * on the session afterwards (`RELDEX_STATUS_INVALID_STATE`); a second abandon
+ * reports `ALREADY_ENDED` and does nothing.
+ *
+ * # Safety
+ *
+ * `hub` must be a live hub; each out pointer must be null or point at a
+ * writable value of its type.
+ */
+ReldexStatus reldex_session_abandon(struct ReldexHub *hub,
+                                    ReldexSessionId session,
+                                    int32_t *out_outcome,
+                                    bool *out_transaction_possibly_lost);
 
 /**
  * Commits the session's current transaction. The reply is a
@@ -4510,7 +4855,7 @@ ReldexStatus reldex_session_set_server_output(struct ReldexHub *hub,
  * > before `reldex_hub_destroy` is called.
  *
  * A stale *session id* is safe: ids are never reused, so a cancel naming a
- * session that has since been closed reports `RELDEX_STATUS_NOT_FOUND`
+ * session that has since been retired reports `RELDEX_STATUS_NOT_FOUND`
  * against a live hub. It is only the **hub pointer** that must be sequenced.
  * In a Qt adapter this falls out naturally — the worker that offers Cancel is
  * stopped before the bridge is torn down — but it must be done on purpose.

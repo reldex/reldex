@@ -491,26 +491,23 @@ void TstConnectionManager::destroyingBridgeAfterTheTestConnectSessionIsRegistere
     // `tst_objectbrowsermodel.cpp` uses on `ObjectBrowserModel::m_sessionReady`
     // via `friend class tst_ObjectBrowserModel`.
     //
-    // Whether that window is actually observable from a polling spin was not
-    // assumed -- it was checked. `spinUntil()` re-checks its predicate
-    // between `processEvents(AllEvents, 2)` calls, so it can only catch this
-    // state if the reply that sets `m_testConnectSessionId` lands in a
-    // *different* processEvents() call than the one that runs the rest of
-    // the mock's open->ping->complete->close->terminal chain and
-    // `finishTestConnect()` (which resets it back to 0) -- the same hazard
-    // `destroyingBridgeWithATestConnectInFlightDoesNotCrash()`'s own comment
-    // above describes for `succeeded`. Measured directly: 30/30 runs caught
-    // `m_testConnectSessionId != 0` well within the default 60s spin
-    // deadline (each run settles in well under a second -- see this file's
-    // own timing in the ctest log), with no observed flake in either
-    // direction (never missed, never caught something already reset to 0).
-    // Unlike the `succeeded` spin in the test above -- which starts only
-    // once the mock's chain has already reached COMPLETED, leaving just
-    // close+terminal as the "can it all land in one processEvents() call"
-    // risk -- this spin starts at the very first step (right as the session
-    // opens), before the mock has done any of its own asynchronous work, so
-    // in practice `handleConnectParamsBuilt()` finishing is consistently its
-    // own processEvents() call, with OPENED not yet queued.
+    // The window is held open deterministically, not caught by a polling
+    // spin. The first version spun `spinUntil()` (`processEvents(AllEvents,
+    // 2)`) on `m_testConnectSessionId != 0`, which can only see the state if
+    // the reply that sets it lands in a *different* processEvents() call from
+    // the rest of the mock's open->ping->complete->close->terminal chain and
+    // `finishTestConnect()` (which resets it to 0). That held 30/30 on
+    // Windows while a pump thread sat between the mock and the hub queue.
+    // M2.15 (ABI 3.2) removed that thread -- the mock's worker now pushes
+    // straight into the hub's queue -- and on macOS CI the whole chain then
+    // ran inside the one processEvents() call, so the spin timed out at 60 s
+    // having never seen a non-zero id. So this test now delivers only
+    // *this object's own* queued calls (`ConnectionManager::drain`, which
+    // carries the workspace's resolve-password and build-connect-params
+    // replies and so reaches `handleConnectParamsBuilt()`), never `Bridge`'s
+    // (`Bridge::drain`, the only thing that takes the hub's OPENED). The
+    // session is registered and its OPENED is still sitting undrained in the
+    // hub when `bridge` is deleted, whatever the timing.
     //
     // Crash proof: with the round-2 fix (Bridge.cpp's explicit
     // `delete m_connections` plus `ConnectionManager::m_bridge` as a
@@ -521,7 +518,7 @@ void TstConnectionManager::destroyingBridgeAfterTheTestConnectSessionIsRegistere
     // <- `QObjectPrivate::deleteChildren()` <- `QObject::~QObject()` <-
     // `Bridge`'s own deleting destructor, i.e. the literal round-2 line.
     // Restored immediately after (diff against HEAD confirmed empty before
-    // rebuilding), then this test measured 30/30 as described above.
+    // rebuilding), then this test (in its first, polling form) passed 30/30.
     auto *bridge = new Bridge();
     ConnectionManager *cm = bridge->connections();
     QVERIFY(cm->open());
@@ -533,7 +530,15 @@ void TstConnectionManager::destroyingBridgeAfterTheTestConnectSessionIsRegistere
     const QString idHex = saved.constFirst().at(0).toString();
 
     QVERIFY(cm->testConnect(idHex, QStringLiteral("whatever-the-user-typed")));
-    QVERIFY(spinUntil([cm] { return cm->m_testConnectSessionId != 0; }));
+    QDeadlineTimer deadline(60000);
+    while (cm->m_testConnectSessionId == 0 && !deadline.hasExpired()) {
+        // `cm`'s own posted MetaCalls only: never `Bridge::drain` (see above).
+        QCoreApplication::sendPostedEvents(cm, QEvent::MetaCall);
+        if (cm->m_testConnectSessionId == 0) {
+            QThread::msleep(1);
+        }
+    }
+    QVERIFY(cm->m_testConnectSessionId != 0);
     // The hub sink is registered now -- exactly the state
     // `~ConnectionManager()`'s `unregisterHubSink()` guard is about. Assert
     // and delete immediately, before any further event-loop turn, so nothing

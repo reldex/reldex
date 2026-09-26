@@ -186,8 +186,8 @@ device-check binary — or the session is bound to an `EventSink` and the answer
 `SessionEvent`, into one process-wide `EventQueue` that every session's worker shares. The queue
 consumer is told once, from a worker thread, that the queue stopped being empty (an edge-triggered
 `Waker`, invoked with no core lock held), and drains it; **no thread is parked per outstanding
-request**, which is what the UI needs and what the interim per-session pump in `crates/ffi` exists to
-be replaced by. The guarantees the event path carries — per-session delivery order, exactly one reply
+request**, which is what the UI needs; `crates/ffi`'s hub drains this queue directly and
+translates each event on the draining thread (ADR-0003 A32, M2.15). The guarantees the event path carries — per-session delivery order, exactly one reply
 per accepted request, exactly one `Terminal` per session, `Executing` before its `Executed`, and no
 ordering promised across sessions — are stated in ADR-0002 E1–E6 and each has a test named after it
 in `crates/db-core/tests/event_ordering.rs`. Delivery order is *production* order, not the order

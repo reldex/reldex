@@ -14,14 +14,14 @@ boundary) open; it does not repeat that reasoning.
 
 | Family | Entry points | Notes |
 | --- | --- | --- |
-| Hub / sessions | `reldex_hub_create`/`_destroy`/`_set_waker`, `reldex_hub_open_session`, `reldex_session_execute`/`_fetch`/`_close`/`_close_result`, `reldex_hub_next_event`/`_pending_events`, `reldex_hub_session_count`/`_list_sessions` | One hub per process is typical but not required; a session is scoped to the hub that opened it. |
+| Hub / sessions | `reldex_hub_create`/`_destroy`/`_set_waker`, `reldex_hub_open_session`, `reldex_session_execute`/`_fetch`/`_close`/`_close_result`/`_abandon`, `reldex_hub_next_event`/`_pending_events`, `reldex_hub_session_count`/`_list_sessions` | One hub per process is typical but not required; a session is scoped to the hub that opened it, and its id is not found once its `TERMINAL` has been drained. |
 | Transaction control | `reldex_session_commit`/`_rollback`/`_savepoint`/`_rollback_to_savepoint`/`_ping` | Reply is `RELDEX_EVENT_KIND_COMPLETED`; read `completed_operation` (`ReldexCompletedOperation`) to know which. |
-| Server output | `reldex_session_set_server_output`, `reldex_server_output_lines_count`/`_get`/`_release` | Off by default; a reconnect never carries the setting over. Delivered on the completion path only until M2.15 (see "What is interim" below). |
+| Server output | `reldex_session_set_server_output`, `reldex_server_output_lines_count`/`_get`/`_release` | Off by default; a reconnect never carries the setting over. Delivered ahead of the reply that follows it (see "Events" below). |
 | Statement splitting | `reldex_split_statements` -> `ReldexStatementSpan` | `snprintf`-style capacity contract; honours the caller's `struct_size`. |
 | Metadata | `reldex_metadata_prepare` + `ReldexMetadataQuery` (`_sql`/`_bind_count`/`_column_count`/`_column`/`_reclassify_error`/`_release`) | Vendor-concrete: this is one of the two places (with `workspace.rs`) allowed to name `reldex-driver-oracle-thin` directly. |
 | Batches / cells | `reldex_batch_*`, `reldex_batch_format_column`, `reldex_text_arena_*` | Zero-copy on the dominant column types; see `batch.rs`/`format.rs` module docs for the column-kind contract. |
 | Errors | `ReldexError`, `reldex_error_view`, `reldex_last_error_take`/`_clear` | Per-thread last-error slot; an error attached to an *event* is owned by whoever drains the event instead. |
-| Workspace: settings/profiles | `ReldexWorkspace`, `reldex_workspace_open`/`_close`/`_set_waker`/`_pending_replies`/`_next_reply`, `_resolve_setting`/`_set_setting`/`_clear_setting`, `_create_profile`/`_update_profile`/`_delete_profile`/`_get_profile`/`_list_profiles`, `_build_connect_params` | One service thread per `ReldexWorkspace`, independent of the hub's event queue and waker. |
+| Workspace: settings/profiles | `ReldexWorkspace`, `reldex_workspace_open`/`_close`/`_set_waker`/`_pending_replies`/`_next_reply`, `_resolve_setting`/`_set_setting`/`_clear_setting`, `_create_profile`/`_update_profile`/`_delete_profile`/`_get_profile`/`_list_profiles`, `_build_connect_params`, `ReldexProfileError` | One service thread per `ReldexWorkspace`, independent of the hub's event queue and waker. A refused profile's `CONFIGURATION` error carries a `ReldexProfileError` as `native_code` (ABI 3.2). |
 | Workspace: credentials | `reldex_workspace_credential_get`/`_put`/`_delete`, `_resolve_password`, `ReldexSecret` (`reldex_secret_expose`/`_from_utf8`/`_release`), `ReldexCredentialError`, `ReldexCredentialStoreKind` | A password never crosses as a `ReldexStr` the caller could keep; see "Ownership and lifetime" below. |
 | Workspace: history/worksheets/layout | `reldex_workspace_record_history`/`_list_history`/`_clear_history`, `_save_worksheet`/`_load_worksheets`/`_delete_worksheet`, `_save_layout`/`_load_layout`, `_new_worksheet_id` | Non-transactional state only (`AGENTS.md`): no session, connection or transaction is ever implied. |
 | Diagnostics | `reldex_abi_version`, `reldex_live_counts` | `reldex_live_counts` is a test/diagnostic instrument, not part of the working API — see `counters.rs`'s module doc. |
@@ -33,6 +33,14 @@ boundary) open; it does not repeat that reasoning.
   `struct_size` too small to hold the type's documented minimum is refused, not guessed at.
 - Every enum reserves `0` for "a value this header predates" (D6/D7) — an unknown value from a
   future header is never undefined behaviour on an older one.
+- **Which fields a library fills is decided by its ABI minor, not by `struct_size`.** A field
+  appended in a minor can land inside the previous minor's tail padding, where the returned
+  `struct_size` is the same with or without it: 3.1's `completed_operation` (offset 108) sits inside
+  3.0's 112-byte `ReldexEvent`, and 3.2's `has_deadline`/`transaction_possibly_active`/`abandoned`
+  (145–147) inside 3.1's 152 bytes. An adapter must therefore refuse a library whose minor is below
+  its header's (`Bridge::checkAbiVersion`, `Bridge::StartError::AbiMinorTooOld`); a newer minor is
+  fine. `struct_size` still tells the *library* which header a caller was built against, which is
+  how it avoids handing a caller a kind that header predates (ADR-0003 A35, A38).
 - A caller-owned object (`ReldexBatch`, `ReldexError`, `ReldexSecret`, `ReldexProfileList`,
   `ReldexHistoryList`, `ReldexWorksheetList`, `ReldexMetadataQuery`, `ReldexServerOutputLines`, …) is
   released with its own paired `_release`/`_free` function, never `free()`. `reldex_live_counts`
@@ -49,10 +57,15 @@ boundary) open; it does not repeat that reasoning.
 
 ## Threads
 
-- The hub's session pump and the workspace's service thread are each exactly one thread, spawned
-  and owned by this crate. A request function submits and returns immediately; the answer arrives as
-  an event/reply drained after a waker fires. Never do database or filesystem I/O on the caller's
+- The hub spawns no thread of its own per session: each session's worker thread belongs to
+  `db-core`'s `SessionRegistry`, and events are translated on the caller's thread inside
+  `reldex_hub_next_event`. The workspace's service thread is exactly one thread, spawned and owned
+  by this crate. A request function submits and returns immediately; the answer arrives as an
+  event/reply drained after a waker fires. Never do database or filesystem I/O on the caller's
   thread (`AGENTS.md`).
+- `reldex_hub_destroy` abandons every open session and returns without waiting; if any session is
+  still finishing, the registry's bounded teardown (at most 500 ms in total) runs on a short-lived
+  `reldex-ffi-teardown` thread instead of the caller's (ADR-0003 A33).
 - A waker callback must not block and must not call any `reldex_*` function (D5) — re-entering from
   inside one is refused (`RELDEX_STATUS_REENTRANT`), not undefined behaviour.
 - `Store` (SQLite-backed) and the credential store are both `Send`, not `Sync`, and must live on one
@@ -70,24 +83,53 @@ boundary) open; it does not repeat that reasoning.
   thread), which is exactly the filesystem I/O the bullet above says never to do off this thread.
   Internal behaviour only; `reldex_workspace_open`'s signature is unchanged.
 
-## What is interim here (read this before relying on event timing)
+## Events (ABI 3.2, M2.15)
 
-The hub's per-session event pump (`session.rs`) is a deliberately temporary stand-in for `db-core`'s
-real `EventQueue`/`Waker`/`SessionRegistry` (`docs/exec-plans/active/phase-1.md` §B2/§B3), which
-landed as tasks M2.5/M2.6 (2026-09-21) — this crate has simply not switched onto them yet. That
-switch is task **M2.15**, deliberately split out of M2.11 as real concurrency work (ADR-0003 A29).
-Until M2.15 lands, this build cannot deliver:
+The hub drains `db-core`'s `EventQueue` (`docs/exec-plans/active/phase-1.md` §B2/§B3; ADR-0003
+A29, A32–A36). What a caller can rely on:
 
-- a genuinely unsolicited, mid-statement `RELDEX_EVENT_KIND_TERMINAL` — today it fires only on a
-  close that actually closes, a failed open, or a contained panic;
-- `abandon` relayed through the real `SessionRegistry`;
-- an `EXECUTING`/transaction-state event ahead of a statement's own reply (no such event exists in
-  this header yet; M2.15 is what would add it);
-- server output delivered ahead of the reply that follows it — today it is collected only on the
-  completion path, after every reply, while output is on.
-
-See `lib.rs`'s own module documentation ("What is interim here") and `ReldexEventKind::ServerOutput`'s
-doc comment for the same list next to the code.
+- **Exactly one `RELDEX_EVENT_KIND_TERMINAL` per session**, carrying `transaction_possibly_lost`,
+  `abandoned` and (when the session was lost) the cause in `error`, which the caller owns. It follows
+  a close that closed, a connect that failed or was abandoned, a contained worker panic — and, since
+  3.2, arrives the moment a session is **lost mid-statement**, without waiting for a close. Taking it
+  retires the session: later calls naming it report `RELDEX_STATUS_NOT_FOUND`, and
+  `reldex_hub_session_count`/`reldex_live_counts().sessions` stop counting it.
+- **`reldex_session_abandon`** relays to the registry and never blocks; it reports what it found
+  (`ReldexAbandonOutcome`) and whether a transaction may have been lost. The session's `TERMINAL`
+  then says `abandoned`.
+- **Only a reply carries a request id.** Exactly one event per accepted request has that request's
+  id in `request` — the 3.1 contract, unchanged — and every other event has `0`.
+- **A caller is never given a kind its header predates.** `reldex_hub_next_event` reads the
+  caller's `struct_size`: below 3.2's `ReldexEvent` size, `EXECUTING`, `TRANSACTION_STATE` and
+  `FETCHED_SEGMENT` are discarded, not delivered, and a wake whose only news is one of them is
+  suppressed whenever the library can check without waiting. So such a caller is woken with
+  nothing to take at most rarely — as any caller can be when a push races its drain (the review
+  counted 36 empty drains of 3,327 at 3.1's size, 13 of 3,222 at 3.2's); a caller drains until
+  empty and never assumes a wake means an event. A 3.1 adapter sees 3.1's kinds and nothing else; origin/main's 3.1 `smoke.c`, built against the 3.1
+  header, passes 457/458 against this library. The one check it fails asserts that the library's
+  `sizeof(ReldexEvent)` *equals* the 3.1 header's, which no minor that appends a field can satisfy
+  (3.0 → 3.1 grew it from 112 to 152 bytes; 3.2 to 168); the 3.2 harness checks `>=` instead.
+- **Progress and notifications**: `EXECUTING` (`request == 0`; the statement's id is in
+  `executing_request`, and its deadline in `deadline_ms` when `has_deadline`) precedes that
+  statement's `EXECUTED`; `TRANSACTION_STATE` reports `transaction_possibly_active` when it changes
+  (coalesced, never dropped); `SERVER_OUTPUT` arrives ahead of the reply that follows it, with
+  `server_output_dropped` and `server_output_invalid_utf8_lines`. `FETCHED_SEGMENT` is surfaced as
+  an opaque kind; nothing in 3.2 submits one.
+- **Unknown kinds**: a kind this header predates arrives as its raw value, or as
+  `RELDEX_EVENT_KIND_UNKNOWN` for a `db-core` event this build does not translate. Ignore both (D7).
+- **Bounds**: a session holds at most 1,024 accepted-but-undrained replies; past that a submit is
+  refused with `RELDEX_ERROR_KIND_RESOURCE`, never blocked. Unsolicited events are capped per session
+  (256), with dropped output counted.
+- **What the drain costs**: translation now happens inside `reldex_hub_next_event`, on the caller's
+  thread, including the one `ReldexBatch` allocation per `FETCHED` that the pump used to make on its
+  own thread. Measured before/after in ADR-0003 A37: about **1.1 µs** more per event on the caller
+  during the initial stream and about **2.4 µs** more per event under `streamscroll`; the whole
+  drain did not move beyond noise. Allocations per event taken: `FETCHED` 1 (the `ReldexBatch`
+  box), `EXECUTING`/`TRANSACTION_STATE`/`COMPLETED`/`SERVER_OUTPUT_CONFIGURED`/a DML's `EXECUTED` 0
+  — pinned by `allocations.rs`'s `taking_an_event_allocates_what_it_hands_over_and_nothing_else`;
+  off the hot path, a query's `EXECUTED` 9 (its column descriptions, once per result),
+  `SERVER_OUTPUT` 5 for three lines, `TERMINAL` 1 on a clean close and about 10 when it carries a
+  loss's error.
 
 ## Known limitation: the fetch-size hint and the result-store settings
 

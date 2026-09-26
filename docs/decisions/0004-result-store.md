@@ -100,9 +100,9 @@ show. The adapter no longer owns batches. Caps, byte accounting and the fetch po
 rules, and rules do not belong in C++ or QML (`AGENTS.md`). In the product, the store lives in the
 composition root's consumer, `crates/ffi`'s hub, and is touched only from the thread that drains
 events: the Qt main thread (ADR-0003 D5 rule 3). Appending a segment there costs a pointer push.
-`crates/ffi` still runs its interim per-session pump thread (`src/lib.rs`, "What is interim here").
-The append happens when the hub **drains** a `FETCHED` event, never in that pump, so the pump
-never touches a store (RS5, "Threads").
+Since M2.15 `crates/ffi` has no pump thread: the hub drains `db-core`'s event queue on the Qt main
+thread (ADR-0003 A32). The append happens when the hub **drains** a `FETCHED` event, so no worker
+ever touches a store (RS5, "Threads").
 
 **Segments.** One fetched batch becomes one segment, and a segment is never mutated, moved or
 evicted once appended. Segments are shared as `Arc` and hold plain data only: locators are parked
@@ -516,9 +516,8 @@ amendment and moves the ABI major from 3 to 4, because `FETCHED` changes meaning
   - Reading a segment returned by `_segment` is sound from **any** thread (A12). A published
     segment is an immutable `Arc`, and compaction on the worker finishes before the segment is
     published, so a reader and the worker never touch the same segment.
-  - Appending happens when the hub drains `FETCHED`, not in `crates/ffi`'s interim per-session
-    pump thread (RS1). Replacing the pump with `db-core`'s event queue (M2.5's design) does not
-    change this rule.
+  - Appending happens when the hub drains `FETCHED`, on the draining thread (RS1). M2.15 replaced
+    `crates/ffi`'s per-session pump with `db-core`'s event queue; this rule did not change.
 - **Lifetime.** A segment pointer, and every pointer taken from it, stays valid until the caller
   **submits** `reldex_session_close_result` for that result, submits `reldex_session_close`, or
   calls `reldex_hub_destroy`. That is A20's rule, including "submits, not is answered". The core
