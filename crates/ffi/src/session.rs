@@ -1624,3 +1624,142 @@ fn close_error_to_reldex(error: &CloseError) -> ReldexError {
         | CloseError::Failed(inner) => ReldexError::from_db_error(inner),
     }
 }
+
+#[cfg(all(test, feature = "mock-driver"))]
+mod tests {
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use reldex_db_core::{
+        Cap, CapSource, ConnectionParams, OutValue, ResultCaps, ResultPolicy, ResultStore,
+        SessionEvent, Sourced, Statement,
+    };
+    use reldex_db_driver_api::{Credentials, Endpoint, LobKind};
+    use reldex_driver_mock::{Action, MockDriver, Scenario};
+
+    use super::{Pending, ReldexHub, ResultColumns, translate, with_session};
+    use crate::event::ReldexEventKind;
+    use crate::mock::statements;
+
+    /// The next raw event matching `wanted`, discarding the others.
+    fn next_raw(hub: &ReldexHub, wanted: impl Fn(&SessionEvent) -> bool) -> SessionEvent {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(event) = hub.take_raw().filter(|event| wanted(event)) {
+                return event;
+            }
+            assert!(Instant::now() < deadline, "no event within the hang guard");
+            std::thread::yield_now();
+        }
+    }
+
+    /// Nothing in ABI 3.2 submits a segment fetch or reads a LOB, so these
+    /// two replies are driven straight through `db-core` and only their
+    /// translation is under test: `FetchedSegment` crosses as an opaque
+    /// notification naming the caller's request and result, and `LobChunk` —
+    /// standing in for every variant this build does not know — as
+    /// `RELDEX_EVENT_KIND_UNKNOWN`, not as nothing.
+    #[test]
+    fn a_segment_reply_and_an_unknown_reply_cross_as_notifications() {
+        let raw = crate::reldex_hub_create();
+        let mut id = 0_u64;
+        // SAFETY: `raw` is the live hub just created; `id` is a real local.
+        let status =
+            unsafe { crate::reldex_hub_open_session(raw, std::ptr::null(), 1, &raw mut id) };
+        assert_eq!(status, crate::ReldexStatus::Ok);
+        let check = |hub: &ReldexHub, entry: &Arc<super::SessionEntry>| {
+            let opened = next_raw(hub, |event| matches!(event, SessionEvent::Opened { .. }));
+            assert_eq!(translate(hub, opened).kind, ReldexEventKind::Opened);
+            let session = entry.handle(&hub.registry).expect("the session is open");
+
+            let query = statements::text(statements::GENERATED_QUERY);
+            let request = hub.begin_request(Pending::caller(2));
+            session
+                .submit_execute(request, Statement::new(query))
+                .expect("accepted");
+            let SessionEvent::Executed { outcome, .. } =
+                next_raw(hub, |event| matches!(event, SessionEvent::Executed { .. }))
+            else {
+                unreachable!("filtered on Executed");
+            };
+            let outcome = outcome.expect("the query runs");
+            let result = outcome.result.expect("the query opens a result");
+            let policy = ResultPolicy::new(ResultCaps::new(
+                Sourced::new(Cap::Unlimited, CapSource::Application),
+                Sourced::new(Cap::Unlimited, CapSource::BuiltIn),
+            ));
+            let mut store = ResultStore::new(result, &outcome.columns, policy);
+            let key = entry.register_result(result, ResultColumns::new(outcome.columns));
+            let fetches = store
+                .submit_events(&session, || hub.begin_request(Pending::caller(3)))
+                .expect("the store asks for its first segment");
+            assert!(fetches >= 1);
+            let segment = next_raw(hub, |event| {
+                matches!(event, SessionEvent::FetchedSegment { .. })
+            });
+            let segment = translate(hub, segment);
+            assert_eq!(segment.kind, ReldexEventKind::FetchedSegment);
+            assert_eq!(segment.request, 3);
+            assert_eq!(segment.result, Some(key));
+            assert!(segment.row_count > 0);
+            assert!(segment.error.is_none());
+            crate::ReldexStatus::Ok
+        };
+        // SAFETY: `raw` is live until destroyed below.
+        let checked = unsafe { with_session(raw, id, check) };
+        assert_eq!(checked, crate::ReldexStatus::Ok);
+
+        // A world that can hand out a large object, opened on the same hub.
+        let scenario = Scenario::new();
+        scenario.on_sql(
+            "lob",
+            Action::LobOut {
+                name: "doc".to_owned(),
+                kind: LobKind::Character,
+                bytes: b"text".to_vec(),
+            },
+        );
+        let params = ConnectionParams::new(
+            Endpoint::ConnectString("mock".to_owned()),
+            Credentials::External,
+        );
+        // SAFETY: as above.
+        let unknown = unsafe {
+            crate::hub::with_hub(raw, |hub| {
+                let request = hub.begin_request(Pending::caller(4));
+                let lob_session =
+                    hub.registry
+                        .open(Arc::new(MockDriver::new(scenario)), params, request);
+                next_raw(hub, |event| matches!(event, SessionEvent::Opened { .. }));
+                let session = hub.registry.get(lob_session).expect("open");
+                let request = hub.begin_request(Pending::caller(5));
+                session
+                    .submit_execute(request, Statement::new("lob"))
+                    .expect("accepted");
+                let SessionEvent::Executed { outcome, .. } =
+                    next_raw(hub, |event| matches!(event, SessionEvent::Executed { .. }))
+                else {
+                    unreachable!("filtered on Executed");
+                };
+                let outcome = outcome.expect("the block runs");
+                let Some(OutValue::Lob(lob)) = outcome.out_values.named("doc") else {
+                    panic!("expected a large object");
+                };
+                let chunk = NonZeroUsize::new(16).expect("non-zero");
+                let request = hub.begin_request(Pending::caller(6));
+                session
+                    .submit_read_lob_chunk(request, *lob, chunk)
+                    .expect("accepted");
+                let read = next_raw(hub, |event| matches!(event, SessionEvent::LobChunk { .. }));
+                (translate(hub, read), lob_session.get())
+            })
+        };
+        let (unknown, lob_session) = unknown.expect("the hub is live");
+        assert_eq!(unknown.kind, ReldexEventKind::Unknown);
+        assert_eq!(unknown.request, 6);
+        assert_eq!(unknown.session, lob_session);
+        // SAFETY: `raw` is live and destroyed once.
+        unsafe { crate::reldex_hub_destroy(raw) };
+    }
+}

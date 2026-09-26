@@ -1043,11 +1043,11 @@ enum ReldexMockStatement
    */
   RELDEX_MOCK_STATEMENT_EMPTY_QUERY = 7,
   /**
-   * A PL/SQL block that prints three lines of server output, the last one
-   * reported as having arrived as invalid UTF-8 (ABI 3.2). The lines are
-   * buffered only once `reldex_session_set_server_output` has turned
-   * output on, and arrive as `SERVER_OUTPUT` ahead of the block's
-   * `EXECUTED`.
+   * A procedure call that prints three lines of server output, the last
+   * one reported as having arrived as invalid UTF-8 (ABI 3.2). The lines
+   * are buffered only once `reldex_session_set_server_output` has turned
+   * output on, and arrive as `SERVER_OUTPUT` ahead of the call's
+   * `EXECUTED`. It opens no transaction.
    */
   RELDEX_MOCK_STATEMENT_SERVER_OUTPUT = 8,
   /**

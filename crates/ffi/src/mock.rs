@@ -79,11 +79,11 @@ pub enum ReldexMockStatement {
     /// [`ReldexMockScenarioConfig::rows`] `= 0`, which keeps its documented
     /// meaning of "1,000".
     EmptyQuery = 7,
-    /// A PL/SQL block that prints three lines of server output, the last one
-    /// reported as having arrived as invalid UTF-8 (ABI 3.2). The lines are
-    /// buffered only once `reldex_session_set_server_output` has turned
-    /// output on, and arrive as `SERVER_OUTPUT` ahead of the block's
-    /// `EXECUTED`.
+    /// A procedure call that prints three lines of server output, the last
+    /// one reported as having arrived as invalid UTF-8 (ABI 3.2). The lines
+    /// are buffered only once `reldex_session_set_server_output` has turned
+    /// output on, and arrive as `SERVER_OUTPUT` ahead of the call's
+    /// `EXECUTED`. It opens no transaction.
     ServerOutput = 8,
     /// Loses the connection mid-statement: fails with `ORA-03113` and the
     /// session is **lost**, so its `TERMINAL` follows at once, without a
@@ -215,7 +215,7 @@ pub(crate) mod statements {
     pub(crate) const DML: &str = "UPDATE reldex_rows SET n = n + 1\0";
     /// A second driver panic, kept for the retired pump-panic statement.
     pub(crate) const PUMP_PANIC: &str = "BEGIN reldex_pump_panic; END;\0";
-    pub(crate) const SERVER_OUTPUT: &str = "BEGIN reldex_put_line; END;\0";
+    pub(crate) const SERVER_OUTPUT: &str = "CALL reldex_put_line()\0";
     pub(crate) const LOSE_SESSION: &str = "SELECT reldex_lost FROM dual\0";
 
     /// The text without its trailing NUL, for Rust callers.
@@ -311,7 +311,8 @@ pub(crate) fn build_driver(options: &ReldexOpenOptions) -> Result<DriverChoice, 
             .with_savepoints(true)
             .with_exact_transaction_state(true)
             .with_lob_streaming(true)
-            .with_error_position(true),
+            .with_error_position(true)
+            .with_server_output(true),
     );
 
     let rows = if config.rows == 0 { 1_000 } else { config.rows };
@@ -372,7 +373,7 @@ pub(crate) fn build_driver(options: &ReldexOpenOptions) -> Result<DriverChoice, 
     scenario.on_sql(
         statements::text(statements::SERVER_OUTPUT),
         Action::Execute {
-            statement_kind: StatementKind::PlSqlBlock,
+            statement_kind: StatementKind::Other,
             rows_affected: None,
             opens_transaction: false,
         },

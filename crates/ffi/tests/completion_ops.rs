@@ -3,10 +3,10 @@
 //! reply with a `Completed` event carrying the right
 //! `ReldexCompletedOperation`, `reldex_hub_session_count`/
 //! `reldex_hub_list_sessions` report the hub's live sessions, and
-//! `reldex_server_output_lines_*` behave on the inputs this crate's own test
-//! surface can actually reach (the mock driver has no FFI knob to turn on
-//! the `server_output` capability — see the PR's "weak points" section and
-//! `ReldexEventKind::ServerOutput`'s doc comment).
+//! `reldex_server_output_lines_*` treat a null handle as empty. Real server
+//! output — lines, `dropped`, `invalid_utf8_lines` — is covered in
+//! `tests/events.rs`, since M2.15 gave the mock world a statement that
+//! prints.
 
 #![allow(
     unsafe_code,
@@ -161,12 +161,8 @@ fn hub_session_count_and_list_sessions_report_what_is_actually_open() {
 #[test]
 fn server_output_lines_null_and_empty_inputs_are_handled_without_a_capability_to_produce_real_ones()
 {
-    // The mock driver's only FFI-reachable scenario does not advertise the
-    // `server_output` capability and there is no FFI knob to turn it on
-    // (see the PR's "weak points" section), so this crate's test surface
-    // cannot produce a real `RELDEX_EVENT_KIND_SERVER_OUTPUT` event with
-    // non-empty lines. What *is* reachable, and what this test pins: a null
-    // `lines` pointer is treated as "no lines" rather than dereferenced.
+    // A null `lines` pointer — what every event but `SERVER_OUTPUT` carries —
+    // is treated as "no lines" rather than dereferenced.
     // SAFETY: `lines` is documented as null-safe (reported as empty/0).
     unsafe {
         assert_eq!(reldex_server_output_lines_count(std::ptr::null()), 0);

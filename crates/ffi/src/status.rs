@@ -173,6 +173,19 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_guard_restores_what_it_found() {
+        // A wake can run on the caller's own thread, inside a call (M2.15).
+        let outer = WakerGuard::enter();
+        {
+            let _inner = WakerGuard::enter();
+        }
+        assert_eq!(entry(|| ReldexStatus::Ok), ReldexStatus::Reentrant);
+        drop(outer);
+        assert_eq!(entry(|| ReldexStatus::Ok), ReldexStatus::Ok);
+        let _ = take_last_error();
+    }
+
+    #[test]
     fn the_guard_clears_when_the_waker_returns() {
         {
             let _guard = WakerGuard::enter();

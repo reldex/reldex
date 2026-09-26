@@ -214,6 +214,13 @@ impl ReldexHub {
         lock(&self.queue).pending_dropped_lines(session)
     }
 
+    /// Takes the next `db-core` event without translating it, for the unit
+    /// tests that need what a translation consumes.
+    #[cfg(all(test, feature = "mock-driver"))]
+    pub(crate) fn take_raw(&self) -> Option<SessionEvent> {
+        lock(&self.queue).next()
+    }
+
     /// Keeps a lost session's column descriptions until the hub goes away.
     pub(crate) fn orphan_columns(&self, columns: Vec<Arc<ResultColumns>>) {
         if !columns.is_empty() {
