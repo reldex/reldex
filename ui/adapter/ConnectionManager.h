@@ -65,6 +65,7 @@
 #include <QByteArray>
 #include <QHash>
 #include <QObject>
+#include <QPointer>
 #include <QString>
 #include <QVariantMap>
 #include <QtQml/qqmlregistration.h>
@@ -381,7 +382,19 @@ private:
     friend void reldexConnectionManagerWakeImpl(void *userData) noexcept;
     friend class Bridge;
 
-    Bridge *m_bridge = nullptr;
+    /// `QPointer`, not a plain `Bridge *` (M3.2 round-2 fix, 2026-09-26): a
+    /// raw pointer stays non-null even after the pointee is destroyed, so a
+    /// `m_bridge != nullptr` guard against a dangling `Bridge` was always a
+    /// false positive -- it only ever caught a genuinely-null bridge, which
+    /// never happens (the constructor is always given a valid one). A
+    /// `QPointer` self-nulls once `Bridge` starts destroying itself (before
+    /// `QObjectPrivate::deleteChildren()` gets to this object), which is what
+    /// makes every guard below a real check rather than a no-op. This is
+    /// deliberately redundant with `Bridge::~Bridge()` now explicitly
+    /// deleting this object before its own data members are torn down (see
+    /// that destructor's comment) -- the invariant "never dereference a gone
+    /// `Bridge`" must not depend on which of the two ever fires first.
+    QPointer<Bridge> m_bridge;
     reldex::WorkspaceHandle m_workspace;
     ProfileModel *m_profiles = nullptr;
 

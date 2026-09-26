@@ -27,6 +27,22 @@
 //    anything a drain calls.** `~Bridge` tears the hub down underneath the
 //    loop that is still walking it; `deleteLater()` defers that to the next
 //    return to the event loop, which is after the drain has finished.
+//
+// Teardown order for every dependent this Bridge owns (M3.2 round-2 fix,
+// 2026-09-26): a dependent that is BOTH a QObject child of this Bridge (e.g.
+// `new ConnectionManager(this, this)`) AND reaches back into one of this
+// Bridge's own data members from its own destructor (`m_hubSinks`, via
+// `unregisterHubSink()`) must be deleted explicitly, in `~Bridge()`'s body,
+// before that data member's destructor runs. C++ destroys a derived class's
+// own data members (in reverse declaration order) only *after* that class's
+// destructor body finishes, and only *then* does the `QObject` base
+// destructor run `deleteChildren()` -- so a QObject child left for that
+// automatic cleanup is destroyed after `m_hubSinks` (a plain `QHash` member,
+// not a QObject) has already been destructed, and any callback into it from
+// that child's destructor is a use-after-destruction. `m_session` and
+// `m_connections` both follow this rule below; anything added later that
+// shares this shape (a QObject child + a callback into a Bridge member on
+// teardown) must too.
 
 #include <QAtomicInt>
 #include <QHash>

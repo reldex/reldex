@@ -87,7 +87,18 @@ ConnectionManager::~ConnectionManager()
     // into a half-destroyed object from here on. `reldex_workspace_close`
     // itself never blocks and must not be drained afterwards (reldex.h).
     reldex_workspace_set_waker(m_workspace.get(), nullptr, nullptr);
-    if (m_testConnectSessionId != 0 && m_bridge != nullptr) {
+    // `m_bridge` (a QPointer, not a raw pointer -- see its declaration) is
+    // reachable here with a Test Connect still in flight: nothing stops the
+    // user closing the app while it is busy. `Bridge::~Bridge()` already
+    // deletes this object explicitly, before its own `m_hubSinks` member is
+    // torn down, but this check must hold even if that ever stops being
+    // true -- a QPointer that has gone null is the one condition under which
+    // `unregisterHubSink()` must not be called at all (round-2 fix,
+    // 2026-09-26: a raw-pointer `m_bridge != nullptr` check here always
+    // passed, even with `Bridge` mid-destruction, because a dangling raw
+    // pointer is never null -- it crashed inside `Bridge::unregisterHubSink`,
+    // reproduced 5/5 on MSVC).
+    if (m_testConnectSessionId != 0 && m_bridge) {
         m_bridge->unregisterHubSink(m_testConnectSessionId);
     }
     m_workspace.reset();
@@ -1094,6 +1105,19 @@ void ConnectionManager::handleConnectParamsBuilt(const ReldexWorkspaceReply &rep
         }
     }
 
+    if (!m_bridge) {
+        // Defensive only -- this runs from drain(), which only ever executes
+        // while this object (Bridge's own child) is alive, so `m_bridge`
+        // going null here should not be reachable. Kept anyway so "never
+        // dereference a gone Bridge" holds everywhere this class touches it,
+        // not just in the destructor (see m_bridge's own doc comment).
+        adoptError(nullptr, false);
+        Q_EMIT testConnectFailed(idHex, m_errorMessageKey, m_errorMessage, false);
+        m_testConnectBusy = false;
+        Q_EMIT testConnectStateChanged();
+        return;
+    }
+
     // ADR-0003: which driver a session opens against is a build-time choice,
     // and this build's hub can only ever open the mock driver (see the class
     // documentation's FFI-gap note) -- passing null asks for exactly that,
@@ -1120,6 +1144,12 @@ void ConnectionManager::handleHubEvent(const ReldexEvent &raw, reldex::BatchHand
 {
     Q_UNUSED(batch); // test-connect never executes a statement; nothing to fetch
     if (!m_testConnectBusy || raw.session != m_testConnectSessionId) {
+        return;
+    }
+    if (!m_bridge) {
+        // Defensive only, same reasoning as handleConnectParamsBuilt() above
+        // -- there is no hub left to ping/close on; just stop being busy.
+        finishTestConnect();
         return;
     }
     const QString idHex = idHexOf(idToBytes16(m_testConnectProfileId));
@@ -1177,7 +1207,10 @@ void ConnectionManager::handleHubEvent(const ReldexEvent &raw, reldex::BatchHand
 
 void ConnectionManager::finishTestConnect()
 {
-    if (m_testConnectSessionId != 0) {
+    // `m_bridge` (see its own doc comment): a QPointer, checked here for the
+    // same reason as in the destructor -- this can run with Bridge already
+    // gone.
+    if (m_testConnectSessionId != 0 && m_bridge) {
         m_bridge->unregisterHubSink(m_testConnectSessionId);
     }
     m_testConnectSessionId = 0;

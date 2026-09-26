@@ -97,7 +97,7 @@ ReldexErrorView errorView(int32_t kind, bool hasNative = false, int32_t nativeCo
 // `Bridge::connections()`, never the developer's real store or Windows
 // Credential Manager (`RELDEX_WORKSPACE_IN_MEMORY`/
 // `RELDEX_WORKSPACE_MEMORY_CREDENTIAL_STORE`, read once at construction --
-// see `ConnectionManager::openWorkspace()`).
+// see `ConnectionManager::open()`).
 class TstConnectionManager : public QObject
 {
     Q_OBJECT
@@ -113,6 +113,7 @@ private Q_SLOTS:
     void testConnectSucceedsAgainstTheMockDriver();
     void testConnectFailsTypedWhenAPasswordIsRequiredAndNoneWasGiven();
     void testConnectResolvesAndUsesAStoredPasswordWithoutRetypingIt();
+    void destroyingBridgeWithATestConnectInFlightDoesNotCrash();
     void authFailureAgainstStoredPasswordDecisionCoversAllFourCases();
     void messageKeyForErrorCoversEveryFfiErrorKind();
     void messageKeyForErrorCoversEveryCredentialErrorCode();
@@ -137,7 +138,7 @@ void TstConnectionManager::init()
     // and only *afterwards* runs the previous guard's destructor, which
     // restores/unsets it again, undoing the set. That made every other test
     // in this file silently fall through to the real on-disk default store
-    // (`ConnectionManager::openWorkspace()` itself was never at fault -- this
+    // (`ConnectionManager::open()` itself was never at fault -- this
     // was purely a test-harness ordering bug, found by instrumenting it and
     // seeing `forceInMemory` alternate 1/0/1/0 across declared test order).
     m_inMemory.reset();
@@ -407,15 +408,57 @@ void TstConnectionManager::testConnectResolvesAndUsesAStoredPasswordWithoutRetyp
     // The whole point: resolve_password found it in the store and testConnect
     // used it, without the caller ever having to type it again.
     QVERIFY(cm->testConnectUsedStoredPassword());
-    // Let the session-close/finishTestConnect cycle actually finish (as
-    // testConnectSucceedsAgainstTheMockDriver's own trailing spin does)
-    // before the test function returns and `bridge` goes out of scope --
-    // otherwise `m_testConnectSessionId` is still non-zero when
-    // `~ConnectionManager()` runs as a QObject child during `Bridge`'s own
-    // `~QObject()`, and it calls back into `m_bridge->unregisterHubSink()`
-    // after `Bridge`'s `m_hubSinks` member has already been destructed
-    // (found by a real crash in this exact test during the M3.2 fix round).
-    QVERIFY(spinUntil([cm] { return !cm->testConnectBusy(); }));
+    // Deliberately not spinning any further here: `bridge` goes out of scope
+    // next with the session-close/finishTestConnect cycle not yet finished
+    // (`m_testConnectSessionId` still non-zero, a hub sink still registered)
+    // -- exactly the "destroy while Test Connect is busy" case
+    // destroyingBridgeWithATestConnectInFlightDoesNotCrash() below exists to
+    // prove safe. That dedicated test is the actual regression test for it;
+    // this one stays focused on resolve_password.
+}
+
+void TstConnectionManager::destroyingBridgeWithATestConnectInFlightDoesNotCrash()
+{
+    // Round-2 review regression (2026-09-26): nothing stops the user closing
+    // the app while Test Connect is busy. Before the fix, `~Bridge()` left
+    // `ConnectionManager` -- its own QObject child -- to
+    // `QObjectPrivate::deleteChildren()`'s automatic cleanup, which runs only
+    // *after* `Bridge`'s own data members (including `m_hubSinks`) have
+    // already been destructed; `~ConnectionManager()` still calling
+    // `Bridge::unregisterHubSink()` for a test-connect session that had not
+    // finished closing dereferenced that already-destructed `QHash`.
+    // Reproduced 5/5 as an access violation on MSVC with the fix reverted;
+    // this test crashed every time before `Bridge::~Bridge()` started
+    // deleting `m_connections` explicitly (and `ConnectionManager::m_bridge`
+    // became a `QPointer`, a second, independent line of defence) and passes
+    // deterministically after.
+    auto *bridge = new Bridge();
+    ConnectionManager *cm = bridge->connections();
+    QVERIFY(cm->open());
+    QVERIFY(spinUntil([cm] { return cm->isReady(); }));
+
+    QSignalSpy saved(cm, &ConnectionManager::profileSaved);
+    QVERIFY(cm->createProfile(baseProfileFields()));
+    QVERIFY(spinUntil([&saved] { return saved.count() >= 1; }));
+    const QString idHex = saved.constFirst().at(0).toString();
+
+    QSignalSpy succeeded(cm, &ConnectionManager::testConnectSucceeded);
+    QSignalSpy failed(cm, &ConnectionManager::testConnectFailed);
+    // A typed password, like testConnectSucceedsAgainstTheMockDriver(): no
+    // resolve_password round trip, so the mock's open/ping/complete sequence
+    // is the only thing standing between here and a registered hub sink.
+    QVERIFY(cm->testConnect(idHex, QStringLiteral("whatever-the-user-typed")));
+    QVERIFY(spinUntil([&succeeded, &failed] { return succeeded.count() + failed.count() >= 1; }));
+    QCOMPARE(failed.count(), 0);
+    QCOMPARE(succeeded.count(), 1);
+    // The point of the whole test: test-connect succeeded, but the
+    // session-close/finishTestConnect cycle it triggers has not run yet, so
+    // `cm` is still busy and its hub sink is still registered with `bridge`
+    // -- deliberately not waiting for `!cm->testConnectBusy()` here, unlike
+    // every other test-connect test in this file.
+    QVERIFY(cm->testConnectBusy());
+
+    delete bridge; // must not crash (this is the entire assertion)
 }
 
 void TstConnectionManager::authFailureAgainstStoredPasswordDecisionCoversAllFourCases()

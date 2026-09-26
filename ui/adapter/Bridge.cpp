@@ -189,6 +189,24 @@ Bridge::~Bridge()
     m_session = nullptr;
     m_sessions.clear();
 
+    // 2b. Same teardown-order rule (this class's own documentation above),
+    //     for `ConnectionManager`: it is a QObject child of this Bridge, and
+    //     its own destructor calls back into `unregisterHubSink()` (below)
+    //     when a test-connect is still in flight at teardown -- nothing
+    //     stops the user closing the app while Test Connect is busy. Without
+    //     this explicit delete, `QObject::~QObject()` would destroy it via
+    //     `deleteChildren()` only *after* `m_hubSinks` (a plain data member,
+    //     not a QObject) has already been destructed by this destructor
+    //     returning -- a use-after-destruction, reproduced 5/5 on MSVC as an
+    //     access violation before this fix. `ConnectionManager::m_bridge` is
+    //     also a `QPointer` now (not a raw pointer), so this object no longer
+    //     depends on being deleted in exactly this order to stay safe -- but
+    //     the order is still correct and still documented, the same as
+    //     `m_session` above.
+    delete m_connections;
+    m_connections = nullptr;
+    m_hubSinks.clear();
+
     // 3. Take and release whatever is still queued. A queued FETCHED event
     //    owns a batch, and an undrained batch is our memory (A16).
     drainAndRelease();
