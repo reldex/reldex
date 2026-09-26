@@ -2686,7 +2686,8 @@ impl ReldexWorkspace {
         let Some(waker) = slot.as_ref() else {
             return;
         };
-        // Held across the call, same reasoning as `crate::hub::ReldexHub::wake`.
+        // Held across the call, same reasoning as the hub's waker (`hub.rs`,
+        // `impl reldex_db_core::Waker for Wake`).
         let _guard = WakerGuard::enter();
         (waker.func)(waker.user_data);
     }
@@ -3039,8 +3040,9 @@ fn service_main(
     });
 
     // Panic containment (ADR-0003 D2, should-fix #5 of M2.11's review round
-    // 2): this thread is *ours*, like a session's pump (`session.rs`'s
-    // `pump_main` doc comment) -- an unwind out of it would leave every
+    // 2): this thread is *ours* -- the one thread this crate still spawns
+    // and runs code on (sessions run on `db-core`'s workers since M2.15,
+    // ADR-0003 A32) -- and an unwind out of it would leave every
     // request still in `commands` unanswered forever, since nothing else
     // ever drains that channel. `request`/the reply `kind` a panicked
     // command owed are read from it *before* the call, so they are known
@@ -3560,9 +3562,9 @@ fn run_command(
 /// Records why a workspace call was refused because the workspace itself is
 /// not usable (closed, or its service thread panicked) -- distinct from
 /// [`set_last_argument_error`]'s `RELDEX_STATUS_INVALID_ARGUMENT`, the same
-/// way `crate::hub::set_last_hub_error` is distinct from an argument error
-/// for the hub. A workspace that will never answer is a state problem, not a
-/// bad argument (`ReldexStatus::InvalidState`'s own doc comment: "a session
+/// way a session call refused for the session's state (`INVALID_STATE`) is
+/// distinct from an argument error. A workspace that will never answer is a
+/// state problem, not a bad argument (`ReldexStatus::InvalidState`'s own doc comment: "a session
 /// that is still opening, or one that is closed" -- a workspace is the same
 /// shape).
 fn set_last_workspace_state_error(message: &str) -> ReldexStatus {

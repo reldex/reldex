@@ -510,40 +510,17 @@ directly: building a request, preparing it, and confirming the classifier
 turns a synthetic ORA-00942 into `RELDEX_ERROR_KIND_PERMISSION` while leaving
 an already-`Permission` code (ORA-01031) alone.
 
-### A fourth gap, found while testing this task's own session close
+### A fourth gap, found while testing this task's own session close — fixed in M2.15
 
-`reldex_hub_session_count()`'s doc comment in `reldex.h` says a session's
-entry is released "when the pump exits, which for a normally closed session
-is promptly". It is not, for **any** session, not only a second concurrent
-one: `crates/ffi/src/session.rs`'s `reldex_hub_open_session` inserts into
-`hub.sessions` (~line 625), but nothing removes that entry when a session
-closes normally — its pump thread (`pump_main`) never touches `hub.sessions`,
-and the crate's only removal sites are `reldex_hub_destroy`'s full drain
-(`crates/ffi/src/hub.rs` ~line 268, tears down the whole hub) and the
-failed-thread-spawn error path (`session.rs` ~line 640). Confirmed directly
-against the FFI, bypassing this adapter and this task's code entirely, with a
-throwaway Rust test added temporarily under `crates/ffi/tests/` and removed
-before this branch was pushed (not part of this PR's diff, `crates/**` is out
-of this task's scope): opening one session on an otherwise-empty hub,
-closing it, and draining both its `SESSION_CLOSED` reply and its unsolicited
-`TERMINAL` event (both arrive correctly and in the right order) still leaves
-`reldex_hub_session_count()` unchanged, even after polling for 5 more
-seconds. The same held with a second session left open alongside it, in
-either close order.
-
-This is what first looked like a bug in this task's own session-close code —
-`tst_objectbrowsermodel.cpp`'s teardown test hung for the full 60-second
-`spinUntil` guard waiting for the count to drop. It is not this task's bug:
-the adapter's close protocol (submit `reldex_session_close`, receive
-`SESSION_CLOSED`, receive the unsolicited `TERMINAL`) completes correctly and
-promptly every time; the hub's own bookkeeping simply never reflects it on a
-live hub. `tst_objectbrowsermodel.cpp`'s close test was rewritten to assert
-what the FFI actually delivers (state transitions and the `sessionClosed`
-signal) instead of the count, with a comment pointing here. Flagging this for
-whoever owns `crates/ffi`/`crates/db-core` next: any other code relying on
-`reldex_hub_session_count()` or `reldex_live_counts().sessions` reflecting an
-individual session's close on a hub that is not being destroyed — not just
-this task's — would hang or misreport the same way.
+M6.1 found that `reldex_hub_session_count()` and `reldex_live_counts().sessions`
+never came down after a session closed normally: the interim per-session pump
+never removed the hub's entry, so only `reldex_hub_destroy` did. M2.15 (ABI 3.2,
+ADR-0003 A33) fixed it: a session stops counting the moment its `TERMINAL` is
+drained, whether it was closed, lost, abandoned or never opened, and its id is
+`NOT_FOUND` from then on. `tst_objectbrowsermodel.cpp`'s
+`ownMetadataSessionIsCountedSeparatelyFromAWorksheetSession` asserts it again: the
+count drops by one when the browser's own session closes, and by one more when
+the worksheet's does.
 
 ### A related, non-FFI gap: the row cap has no setting yet
 
