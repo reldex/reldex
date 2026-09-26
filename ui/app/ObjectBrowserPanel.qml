@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import QtQml.Models
 
 import Reldex.Adapter
 
@@ -23,10 +24,22 @@ Item {
     /// session (ADR-0002: a worksheet owns its own session).
     property var bridge: null
 
-    /// The tree index last activated (tapped) by the user. Drives both the
-    /// filter box (which node a typed filter applies to) and the Refresh
-    /// button, without depending on `TreeView`'s own selection machinery.
+    /// The tree index last activated (tapped, or keyboard-activated) by the
+    /// user. Drives both the filter box (which node a typed filter applies
+    /// to) and the Refresh button, without depending on `TreeView`'s own
+    /// selection machinery.
     property var activeIndex: null
+
+    /// Shared by the pointer path (`TapHandler`, per delegate) and the
+    /// keyboard path (`Keys.onReturnPressed`, on `tree` itself, M6.4 minimal
+    /// wiring): both must produce the same result -- the row becomes the
+    /// active one, the filter field reflects its own filter, and the model
+    /// is told to activate it (loads the columns pane for a table/view).
+    function activateModelIndex(idx) {
+        root.activeIndex = idx;
+        filterField.text = browserModel.filterFor(idx);
+        browserModel.activate(idx);
+    }
 
     ObjectBrowserModel {
         id: browserModel
@@ -110,6 +123,21 @@ Item {
         clip: true
         model: browserModel
 
+        // Minimal keyboard wiring (M6.1; the rest -- Narrator verification,
+        // any polish -- is M6.4's, see `ui/README.md` "Object browser
+        // (M6.1)"). A `selectionModel` is what turns on `TreeView`'s own
+        // built-in key handling while it has focus: Up/Down move the current
+        // row, Left collapses (or moves to the parent row if already
+        // collapsed), Right expands (or moves to the first child if already
+        // expanded), Space toggles expanded/collapsed. `focus`/
+        // `activeFocusOnTab` are what let a keyboard-only user reach it at
+        // all -- neither is on by default for a plain `Item`-derived view.
+        focus: true
+        activeFocusOnTab: true
+        selectionModel: ItemSelectionModel {
+            model: browserModel
+        }
+
         Accessible.role: Accessible.Tree
         Accessible.name: qsTr("Object browser")
 
@@ -133,16 +161,34 @@ Item {
             TapHandler {
                 acceptedButtons: Qt.LeftButton
                 onTapped: {
-                    const idx = tree.index(treeDelegate.row, treeDelegate.column);
-                    root.activeIndex = idx;
-                    filterField.text = browserModel.filterFor(idx);
-                    browserModel.activate(idx);
+                    root.activateModelIndex(tree.index(treeDelegate.row, treeDelegate.column));
                 }
             }
         }
 
         onExpanded: (row, depth) => {
             browserModel.expand(tree.index(row, 0));
+        }
+
+        // Return/Enter activates the current row exactly like a tap on it
+        // (loads the columns pane for a table/view) -- `selectionModel`
+        // above already gives Up/Down/Left/Right/Space their built-in
+        // meaning, but "activate" is this panel's own action, not `TreeView`'s.
+        // Guarded on `currentIndex.row >= 0`, not `hasSelection`: arrow-key
+        // navigation alone moves `currentIndex` without adding it to the
+        // selection (no Shift / drag involved), so `hasSelection` stays false
+        // even once there is a perfectly good row to activate.
+        Keys.onReturnPressed: (event) => {
+            if (tree.selectionModel.currentIndex.row >= 0) {
+                root.activateModelIndex(tree.selectionModel.currentIndex);
+            }
+            event.accepted = true;
+        }
+        Keys.onEnterPressed: (event) => {
+            if (tree.selectionModel.currentIndex.row >= 0) {
+                root.activateModelIndex(tree.selectionModel.currentIndex);
+            }
+            event.accepted = true;
         }
     }
 

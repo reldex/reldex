@@ -619,6 +619,9 @@ every `appShellXxx` test that loads `Main.qml` now also loads `Sidebar.qml` →
 `ObjectBrowserPanel.qml` → `ObjectBrowserModel`/`TreeView` offscreen, and
 that suite fails on any QML warning — so a binding error or missing role in
 the new QML surface fails the existing shell tests, not just a dedicated one.
+`objectBrowserTreeKeyboardNavigationExpandsAndActivates()` (review follow-up)
+additionally drives the tree with real synthetic key events — see "Hand-off"
+below (M6.4) for what that covers and what is still owed.
 
 ### The "no freeze" measurement
 
@@ -683,8 +686,24 @@ lead pending the real-driver half above.
   source changes expected.
 - **M6.4** (accessibility): the tree has `Accessible.role: Accessible.Tree`
   and a per-row `Accessible.name`; the filter field, refresh button and
-  columns list all have explicit accessible names. Not yet verified with
-  Narrator (that is M6.4's own acceptance line).
+  columns list all have explicit accessible names. Minimal keyboard wiring is
+  in place (review follow-up, not the original M6.1 pass): `tree` is
+  `focus: true`/`activeFocusOnTab: true` and carries an `ItemSelectionModel`,
+  which is what turns on `TreeView`'s own built-in Up/Down (move current row),
+  Left/Right (collapse/expand), and Space (toggle) key handling; `Return`/
+  `Enter` run this panel's own `activateModelIndex()` — the same path a tap
+  on a delegate takes — via `Keys.onReturnPressed`/`Keys.onEnterPressed` on
+  `tree`. Covered by `tst_coreinfo.cpp`'s
+  `objectBrowserTreeKeyboardNavigationExpandsAndActivates()` with real
+  synthetic key events (`QTest::keyClick`), not `QMetaObject::invokeMethod()`
+  on the QML function directly — unlike the Ctrl+B/Ctrl+J shortcut check
+  above, `Keys.onPressed` only needs the *item* to hold Qt Quick's internal
+  active focus (`forceActiveFocus()` + `qWaitForWindowActive()`), not the
+  *window* to be the OS-active one, which is what made a real key event
+  unreliable enough to avoid for a `Shortcut` item. Still owed to M6.4:
+  Narrator/screen-reader verification (its own acceptance line), and any
+  further keyboard polish (Home/End, type-ahead, a visible focus/current-row
+  indicator) — none of that was in scope for this minimal pass.
 - **M6.6** (packaging): no new third-party dependency; `TreeView`/`TreeViewDelegate`
   come from `QtQuick`/`QtQuick.Controls`, already linked/deployed for the
   rest of the shell.
