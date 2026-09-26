@@ -40,6 +40,14 @@ struct HubDeleter
     void operator()(ReldexHub *hub) const noexcept { reldex_hub_destroy(hub); }
 };
 
+struct MetadataQueryDeleter
+{
+    void operator()(ReldexMetadataQuery *query) const noexcept
+    {
+        reldex_metadata_query_release(query);
+    }
+};
+
 /// Owns one fetched batch. Released exactly once, when this goes out of scope.
 using BatchHandle = std::unique_ptr<ReldexBatch, BatchDeleter>;
 
@@ -57,6 +65,10 @@ using ArenaHandle = std::unique_ptr<ReldexTextArena, ArenaDeleter>;
 /// teardown D5 rule 2 requires (unregister the waker, release every batch,
 /// drain) happens in `~Bridge` before this handle is reset.
 using HubHandle = std::unique_ptr<ReldexHub, HubDeleter>;
+
+/// Owns one prepared metadata statement (M6.1), from `reldex_metadata_prepare`
+/// until it goes out of scope.
+using MetadataQueryHandle = std::unique_ptr<ReldexMetadataQuery, MetadataQueryDeleter>;
 
 template<typename T>
 [[nodiscard]] inline T sized() noexcept
@@ -77,6 +89,10 @@ template<typename T>
     ReldexOpenOptions options = sized<ReldexOpenOptions>();
     options.mock = sized<ReldexMockScenarioConfig>();
     return options;
+}
+[[nodiscard]] inline ReldexMetadataRequest makeMetadataRequest() noexcept
+{
+    return sized<ReldexMetadataRequest>();
 }
 [[nodiscard]] inline ReldexFormatOptions makeFormatOptions() noexcept
 {

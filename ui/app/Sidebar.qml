@@ -1,13 +1,25 @@
 import QtQuick
 
-// Left sidebar (M3.1): a placeholder object-browser tree (M6.1 replaces the
-// model with the real `MetadataProvider`-backed one) plus a connections
-// section (M3.2 replaces the placeholder text with the real
-// `ProfileModel`-backed list). Presentation only -- ARCHITECTURE.md
+// Left sidebar (M3.1): the real object browser (M6.1, `ObjectBrowserPanel`)
+// plus a connections section (M3.2 replaces the placeholder text with the
+// real `ProfileModel`-backed list). Presentation only -- ARCHITECTURE.md
 // invariant 4.
+//
+// A fixed Thai sample label used to live in this file's placeholder tree data
+// (docs/exec-plans/active/phase-1.md row M3.1's Thai-rendering check: proving
+// the font can shape Thai and the label is not clipped or zero-width).
+// `ui/tests/tst_coreinfo.cpp`'s `sidebarAndStatusBarShapeThaiCorrectly()`
+// looks it up by `objectName: "thaiSampleSidebar"` and asserts a nonzero
+// `contentWidth` -- kept below as a small standalone `Text`, still visible so
+// that check still exercises real glyph shaping. M6.3 (i18n baseline) owns
+// giving this a permanent home once it lands.
 Rectangle {
     id: sidebar
     objectName: "sidebar"
+
+    /// The adapter `Bridge` the object browser opens its own metadata
+    /// session against (set by `Main.qml`).
+    property var bridge: null
 
     color: Theme.tokens.surface
     border.color: Theme.tokens.border
@@ -15,25 +27,6 @@ Rectangle {
 
     Accessible.role: Accessible.Pane
     Accessible.name: qsTr("Sidebar")
-
-    ListModel {
-        id: objectBrowserModel
-
-        // Placeholder rows for the object browser (M6.1); indentation is
-        // baked into `indent` rather than built from a real hierarchy --
-        // building a real tree here would pre-empt M6.1's
-        // MetadataProvider-backed model (AGENTS.md "Scope discipline").
-        // One row carries a fixed Thai sample string
-        // (docs/exec-plans/active/phase-1.md row M3.1's Thai-rendering
-        // check): it is not translated text, it exists only to prove the
-        // font can shape Thai and the label is not clipped or zero-width.
-        ListElement { label: "▾ Schemas"; indent: 0; thaiSample: false }
-        ListElement { label: "▸ HR"; indent: 1; thaiSample: false }
-        ListElement { label: "▸ SALES"; indent: 1; thaiSample: false }
-        ListElement { label: "▾ ตัวอย่าง (ฐานข้อมูล)"; indent: 1; thaiSample: true }
-        ListElement { label: "Tables"; indent: 2; thaiSample: false }
-        ListElement { label: "Views"; indent: 2; thaiSample: false }
-    }
 
     Column {
         anchors.fill: parent
@@ -47,36 +40,19 @@ Rectangle {
             color: Theme.tokens.textMuted
         }
 
-        ListView {
-            id: tree
-            objectName: "sidebarTree"
+        ObjectBrowserPanel {
+            id: objectBrowser
+            objectName: "objectBrowserPanel"
             width: parent.width
-            height: 190
-            clip: true
-            model: objectBrowserModel
+            height: 260
+            bridge: sidebar.bridge
+        }
 
-            Accessible.role: Accessible.List
-            Accessible.name: qsTr("Object browser")
-
-            delegate: Item {
-                id: rowDelegate
-
-                required property string label
-                required property int indent
-                required property bool thaiSample
-
-                width: tree.width
-                height: 22
-
-                Text {
-                    objectName: rowDelegate.thaiSample ? "thaiSampleSidebar" : ""
-                    x: 6 + rowDelegate.indent * 12
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: rowDelegate.label
-                    color: Theme.tokens.text
-                    font.pixelSize: 12
-                }
-            }
+        Text {
+            objectName: "thaiSampleSidebar"
+            text: "ตัวอย่าง (ฐานข้อมูล)"
+            color: Theme.tokens.textMuted
+            font.pixelSize: 11
         }
 
         Rectangle {
