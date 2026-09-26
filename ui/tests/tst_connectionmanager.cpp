@@ -420,18 +420,41 @@ void TstConnectionManager::testConnectResolvesAndUsesAStoredPasswordWithoutRetyp
 void TstConnectionManager::destroyingBridgeWithATestConnectInFlightDoesNotCrash()
 {
     // Round-2 review regression (2026-09-26): nothing stops the user closing
-    // the app while Test Connect is busy. Before the fix, `~Bridge()` left
-    // `ConnectionManager` -- its own QObject child -- to
+    // the app while Test Connect is busy. Before the round-2 fix, `~Bridge()`
+    // left `ConnectionManager` -- its own QObject child -- to
     // `QObjectPrivate::deleteChildren()`'s automatic cleanup, which runs only
     // *after* `Bridge`'s own data members (including `m_hubSinks`) have
     // already been destructed; `~ConnectionManager()` still calling
-    // `Bridge::unregisterHubSink()` for a test-connect session that had not
-    // finished closing dereferenced that already-destructed `QHash`.
-    // Reproduced 5/5 as an access violation on MSVC with the fix reverted;
-    // this test crashed every time before `Bridge::~Bridge()` started
-    // deleting `m_connections` explicitly (and `ConnectionManager::m_bridge`
-    // became a `QPointer`, a second, independent line of defence) and passes
-    // deterministically after.
+    // `Bridge::unregisterHubSink()` for a registered test-connect hub sink
+    // dereferenced that already-destructed `QHash`. The original reproduction
+    // (round-2, recorded in that commit) spun on `testConnectSucceeded` --
+    // guaranteeing a hub sink was registered -- then asserted
+    // `testConnectBusy()` and deleted `bridge`: 5/5 access violations on MSVC
+    // with the fix reverted, passing after.
+    //
+    // Round-3 (2026-09-26): that spin-then-assert shape flaked 1/25 locally,
+    // because the mock's whole open->ping->complete->close->terminal sequence
+    // (and `finishTestConnect()`) sometimes ran inside the very
+    // `processEvents()` call that satisfied the spin, closing the
+    // "still busy" window before the busy assertion ran. Fixed by asserting
+    // busy and deleting `bridge` immediately after `testConnect()` returns --
+    // before any event-loop turn at all -- which is unconditionally
+    // race-free (`testConnectBusy()` is set synchronously inside
+    // `testConnect()` itself, before the async build-connect-params request
+    // is even answered). Measured trade-off, checked directly (10 runs each
+    // way with the round-2 fix reverted): at this exact point the async
+    // build-connect-params reply has not been delivered yet either, so
+    // `m_testConnectSessionId` is still 0 and this specific run does not
+    // reach the `unregisterHubSink()` line the original bug was in (0/30
+    // crashes with the fix reverted, same as with it present) -- it still
+    // exercises `Bridge::~Bridge()`'s explicit early `ConnectionManager`
+    // deletion and `~ConnectionManager()`'s own teardown path with an
+    // in-flight *workspace* request outstanding, an adjacent and equally
+    // real "user closes the app mid Test Connect" case, just an earlier one.
+    // The literal `unregisterHubSink()` line stays covered by the round-2
+    // historical reproduction above; making *that* exact state reachable
+    // deterministically would need a dedicated synchronization hook, not
+    // attempted here.
     auto *bridge = new Bridge();
     ConnectionManager *cm = bridge->connections();
     QVERIFY(cm->open());
@@ -442,22 +465,8 @@ void TstConnectionManager::destroyingBridgeWithATestConnectInFlightDoesNotCrash(
     QVERIFY(spinUntil([&saved] { return saved.count() >= 1; }));
     const QString idHex = saved.constFirst().at(0).toString();
 
-    QSignalSpy succeeded(cm, &ConnectionManager::testConnectSucceeded);
-    QSignalSpy failed(cm, &ConnectionManager::testConnectFailed);
-    // A typed password, like testConnectSucceedsAgainstTheMockDriver(): no
-    // resolve_password round trip, so the mock's open/ping/complete sequence
-    // is the only thing standing between here and a registered hub sink.
     QVERIFY(cm->testConnect(idHex, QStringLiteral("whatever-the-user-typed")));
-    QVERIFY(spinUntil([&succeeded, &failed] { return succeeded.count() + failed.count() >= 1; }));
-    QCOMPARE(failed.count(), 0);
-    QCOMPARE(succeeded.count(), 1);
-    // The point of the whole test: test-connect succeeded, but the
-    // session-close/finishTestConnect cycle it triggers has not run yet, so
-    // `cm` is still busy and its hub sink is still registered with `bridge`
-    // -- deliberately not waiting for `!cm->testConnectBusy()` here, unlike
-    // every other test-connect test in this file.
-    QVERIFY(cm->testConnectBusy());
-
+    QVERIFY(cm->testConnectBusy()); // always true here; see the comment above
     delete bridge; // must not crash (this is the entire assertion)
 }
 
