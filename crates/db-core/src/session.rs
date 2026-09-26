@@ -20,6 +20,7 @@ use crate::events::{CompletedOperation, EventSink, RequestId};
 use crate::ids::{LobHandle, ResultId, SessionId};
 use crate::reply::{CloseReplyTo, ReplyPayload, ReplyTo};
 use crate::shared::{SessionLifecycle, SessionShared};
+use crate::store::{FetchRequest, SegmentReply};
 use crate::worker::{self, CloseIntent, Command};
 
 /// How long [`Drop`] waits for a session's worker thread before detaching it.
@@ -1107,6 +1108,26 @@ impl DatabaseSession {
         })
     }
 
+    /// Submits a result store's fetch; its reply is one
+    /// [`crate::SessionEvent::FetchedSegment`], which names the fetch
+    /// (result and sequence) whether it succeeded or failed.
+    ///
+    /// The rows arrive compacted into a [`crate::ResultSegment`] on the
+    /// worker thread, their large objects parked there (ADR-0004 RS1). Only a
+    /// [`crate::ResultStore`] makes a [`FetchRequest`]; hand the reply back to
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// As [`DatabaseSession::submit_execute`].
+    pub fn submit_fetch_segment(&self, request: RequestId, fetch: FetchRequest) -> DbResult<()> {
+        self.submit_event(request, fetch.ticket(), |reply| Command::FetchSegment {
+            fetch: fetch.ticket(),
+            max_rows: fetch.max_rows(),
+            reply,
+        })
+    }
+
     /// Submits a commit; its reply is one [`crate::SessionEvent::Completed`]
     /// with [`CompletedOperation::Commit`].
     ///
@@ -1359,6 +1380,18 @@ impl DatabaseSession {
         self.submit(result, |reply| Command::FetchBatch {
             result,
             max_rows,
+            reply,
+        })
+    }
+
+    /// The completion-path twin of [`DatabaseSession::submit_fetch_segment`],
+    /// for tools and tests that drive a [`crate::ResultStore`] without an
+    /// event queue.
+    #[must_use]
+    pub fn fetch_segment(&self, fetch: FetchRequest) -> Completion<SegmentReply> {
+        self.submit(fetch.ticket(), |reply| Command::FetchSegment {
+            fetch: fetch.ticket(),
+            max_rows: fetch.max_rows(),
             reply,
         })
     }

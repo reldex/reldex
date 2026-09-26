@@ -1,0 +1,13 @@
+key,value
+date,2026-09-26 (baseline 00:05-00:08 +07:00; shrink-in-place run 00:44-00:47; final run 00:58-01:01; live 19c run about 01:10)
+baseline_commit,05bcc48 (origin/main): the M5.1 bench with its prototype store
+after_commit,branch phase-1/m5-2-result-store at 7e1ac5b (the bench measuring the implemented store); live tests at 27f82df
+cpu,AMD Ryzen 7 5700G (8 cores / 16 threads)
+os,Windows 11 Pro build 26200
+toolchain,rustc 1.98.1 / cargo 1.98.1 (MSVC); cargo bench profile (release; thin LTO; codegen-units 1)
+database,Oracle Database 19c EE 19.3 in container reldex-oracle19c (healthy); listener 127.0.0.1:1521 loopback - zero network latency
+machine_state,"other agents were working in other worktrees during every run (cargo processes present); accounted bytes are deterministic, while times and private bytes are noisy: the unchanged batches/rows representations moved by up to 30% between runs"
+os_metric,process PrivateMemorySize64 via PowerShell Get-Process; delta between a sample after warm-up and a sample after the representation is built; one fresh child process per measurement; at 1000 rows the delta is dominated by heap commit granularity and is not meaningful
+accounted_metric,"sum of heap capacities held plus fixed struct sizes (no allocator overhead); for the store exactly what ResultStore::retained_bytes counts: every segment's accounted_bytes (struct, Arc counters, column headers, heap capacities) plus the segment list and first-row index"
+repeats,3 per cell
+live_statement_fetch_hint,"none: Statement::new without with_fetch_rows, as crates/ffi's execute does today, so oracle-thin leaves oracledb's fetch_array_size at its default of 100 rows"

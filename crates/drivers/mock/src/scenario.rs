@@ -119,6 +119,7 @@ pub struct ColumnSpec {
     name: String,
     sql_type: SqlType,
     native_type_name: Option<String>,
+    max_size_bytes: Option<u32>,
 }
 
 impl ColumnSpec {
@@ -129,7 +130,23 @@ impl ColumnSpec {
             name: name.into(),
             sql_type,
             native_type_name: None,
+            max_size_bytes: None,
         }
+    }
+
+    /// Declares the column's maximum size in bytes, the way a describe
+    /// reports `VARCHAR2(n)` (see
+    /// [`reldex_db_driver_api::ColumnMetadata::max_size_bytes`]).
+    #[must_use]
+    pub const fn with_max_size_bytes(mut self, max_size_bytes: u32) -> Self {
+        self.max_size_bytes = Some(max_size_bytes);
+        self
+    }
+
+    /// The declared maximum size in bytes, if set.
+    #[must_use]
+    pub const fn max_size_bytes(&self) -> Option<u32> {
+        self.max_size_bytes
     }
 
     /// Records the server's own type name (required for

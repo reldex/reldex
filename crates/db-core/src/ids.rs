@@ -23,6 +23,11 @@ use reldex_db_driver_api::ResultSetId;
 pub struct SessionId(u64);
 
 impl SessionId {
+    /// Never allocated (allocation starts at 1). Stamped on a
+    /// [`crate::ResultSegment`] compacted outside any session, which by
+    /// construction holds no large object whose handle would need one.
+    pub(crate) const UNOWNED: Self = Self(0);
+
     pub(crate) fn allocate() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Self(NEXT.fetch_add(1, Ordering::Relaxed))
@@ -108,6 +113,17 @@ impl LobHandle {
     #[must_use]
     pub const fn owner(self) -> SessionId {
         self.session
+    }
+
+    /// The handle's number within its session: what a result segment keeps
+    /// per LOB cell (ADR-0004 RS1), `u64` and never 0.
+    pub(crate) const fn serial(self) -> u64 {
+        self.serial
+    }
+
+    /// Rebuilds a handle from its session and [`LobHandle::serial`].
+    pub(crate) const fn from_serial(session: SessionId, serial: u64) -> Self {
+        Self { session, serial }
     }
 }
 

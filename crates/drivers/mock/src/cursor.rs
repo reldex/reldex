@@ -274,6 +274,9 @@ pub(crate) fn build_metadata(columns: &[ColumnSpec]) -> Vec<ColumnMetadata> {
             if let Some(native_type_name) = column.native_type_name() {
                 metadata = metadata.with_native_type_name(native_type_name);
             }
+            if let Some(max_size_bytes) = column.max_size_bytes() {
+                metadata = metadata.with_max_size_bytes(max_size_bytes);
+            }
             metadata
         })
         .collect()

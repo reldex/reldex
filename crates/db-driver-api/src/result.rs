@@ -183,6 +183,20 @@ impl TextColumn {
     pub fn offsets(&self) -> &[usize] {
         &self.offsets
     }
+
+    /// The heap bytes this column holds: the capacity of its buffer and of
+    /// its offsets, whether used or not. What a consumer that bounds its
+    /// memory by bytes counts (ADR-0004 RS3).
+    ///
+    /// A driver reserves text space before it knows how long the values will
+    /// be, and grows it by doubling, so a fetched column typically holds
+    /// spare capacity no value uses. `Clone` allocates exactly what the
+    /// values use, which is how a consumer that *retains* the column — the
+    /// result store (ADR-0004 RS1) — sheds it.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.buffer.capacity() + self.offsets.capacity() * std::mem::size_of::<usize>()
+    }
 }
 
 /// Variable-length byte values stored as one buffer plus offsets.
@@ -256,6 +270,12 @@ impl BytesColumn {
     #[must_use]
     pub fn offsets(&self) -> &[usize] {
         &self.offsets
+    }
+
+    /// The heap bytes this column holds; see [`TextColumn::heap_bytes`].
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.buffer.capacity() + self.offsets.capacity() * std::mem::size_of::<usize>()
     }
 }
 
@@ -513,6 +533,19 @@ impl Column {
         };
         values.get_mut(row)?.take()
     }
+
+    /// Takes the column apart into its values and its NULL mask, without
+    /// copying either.
+    ///
+    /// For a consumer that keeps a column in a layout of its own — the result
+    /// store re-encodes `NUMBER` and drops a driver's spare capacity
+    /// (ADR-0004 RS1). A [`ColumnData::Lob`] column that still holds locators
+    /// carries the thread affinity [`RowBatch`] describes: take it apart on
+    /// the worker thread that owns the connection.
+    #[must_use]
+    pub fn into_parts(self) -> (ColumnData, NullMask) {
+        (self.data, self.nulls)
+    }
 }
 
 /// A batch of rows fetched from a cursor.
@@ -609,6 +642,16 @@ impl RowBatch {
     #[must_use]
     pub fn value(&self, row: usize, column: usize) -> Option<ValueRef<'_>> {
         self.columns.get(column)?.value(row)
+    }
+
+    /// Takes the batch apart into its columns, without copying them.
+    ///
+    /// See [`Column::into_parts`]. Every column has
+    /// [`RowBatch::row_count`] rows. A batch whose large-object locators have
+    /// not been taken keeps its thread affinity in the columns it becomes.
+    #[must_use]
+    pub fn into_columns(self) -> Vec<Column> {
+        self.columns
     }
 }
 
@@ -1272,6 +1315,47 @@ mod tests {
         }
         assert!(TextColumn::new().offsets().is_empty());
         assert!(BytesColumn::new().buffer().is_empty());
+    }
+
+    #[test]
+    fn heap_bytes_count_the_spare_capacity_a_clone_sheds() {
+        // A driver reserves before it knows the lengths (ADR-0004 RS1). The
+        // result store retains a copy made by `Clone`, which must keep the
+        // layout and every value and hold exactly what the values use.
+        let mut text = TextColumn::with_capacity(1_000, 16_000);
+        text.push("alpha");
+        text.push("");
+        text.push("ข้อมูล");
+        let used = text.buffer().len() + size_of_val(text.offsets());
+        assert!(text.heap_bytes() >= 16_000 + 1_000 * size_of::<usize>());
+        let copy = text.clone();
+        assert_eq!(copy.heap_bytes(), used);
+        assert_eq!(copy, text);
+
+        let mut bytes = BytesColumn::with_capacity(100, 1_000);
+        bytes.push(&[1, 2, 3]);
+        assert!(bytes.heap_bytes() >= 1_000);
+        let copy = bytes.clone();
+        assert_eq!(
+            copy.heap_bytes(),
+            copy.buffer().len() + size_of_val(copy.offsets())
+        );
+        assert_eq!(copy.get(0), Some(&[1_u8, 2, 3][..]));
+    }
+
+    #[test]
+    fn a_batch_comes_apart_into_its_columns_and_masks() {
+        let numbers = Column::not_null(ColumnData::Number(vec![Number::from(1_i64)]));
+        let names = text_column(&[None]);
+        let batch = RowBatch::new(vec![numbers, names]).expect("equal lengths");
+        let mut columns = batch.into_columns().into_iter();
+        let (data, nulls) = columns.next().expect("first column").into_parts();
+        assert!(matches!(data, ColumnData::Number(ref values) if values.len() == 1));
+        assert!(!nulls.is_null(0));
+        let (data, nulls) = columns.next().expect("second column").into_parts();
+        assert_eq!(data.kind(), ColumnKind::Text);
+        assert!(nulls.is_null(0));
+        assert!(columns.next().is_none());
     }
 
     #[test]

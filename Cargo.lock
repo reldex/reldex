@@ -722,6 +722,7 @@ version = "0.0.0"
 name = "reldex-workspace"
 version = "0.0.0"
 dependencies = [
+ "reldex-db-core",
  "reldex-db-driver-api",
  "reldex-driver-oracle-thin",
  "rusqlite",

@@ -1,10 +1,12 @@
-//! Evidence for ADR-0004 (`docs/decisions/0004-result-store.md`, task M5.1):
-//! what a **retained** fetched prefix costs, per row, in three
+//! Evidence for ADR-0004 (`docs/decisions/0004-result-store.md`, tasks M5.1
+//! and M5.2): what a **retained** fetched prefix costs, per row, in three
 //! representations, and what it costs to append a million rows to each.
 //!
 //! This is a measurement binary (`harness = false`), not a library test and
-//! not production code. It prints CSV; the numbers ADR-0004 quotes are in
-//! `docs/exec-plans/active/phase-1-m5-1-data/`.
+//! not production code. It prints CSV. The numbers ADR-0004 quotes for the
+//! M5.1 prototype are in `docs/exec-plans/active/phase-1-m5-1-data/`; the
+//! re-run against the implemented store (M5.2) is in
+//! `docs/exec-plans/active/phase-1-m5-2-data/`.
 //!
 //! ```text
 //! cargo bench -p reldex-db-core --bench result_store_shapes -- //!     --csv "$PWD/representation.csv" --mock-csv "$PWD/mock-path.csv"
@@ -22,16 +24,23 @@
 //!   `String` per text cell. The shape ADR-0002 D6 rejected for batches.
 //! - **`batches`** — today's retention: every fetched `RowBatch` kept exactly
 //!   as the driver built it (ADR-0003 D4's MVP rule), capacity slack included.
-//! - **`store`** — the ADR-0004 proposal, prototyped here only: one immutable
-//!   segment per batch, text and bytes copied to their exact size with the
-//!   same buffer-plus-offsets layout, `NUMBER` re-encoded as `i64` with one
-//!   decimal scale per segment column when every value in it fits exactly,
-//!   otherwise kept as `Number`.
+//! - **`store`** — the ADR-0004 store as implemented (M5.2): each batch
+//!   becomes one immutable [`ResultSegment`] through
+//!   [`ResultSegment::compact`] — text and bytes shrunk to their exact size
+//!   in the same buffer-plus-offsets layout, `NUMBER` re-encoded as `i64`
+//!   with one decimal scale per segment column when every value in it fits
+//!   exactly, otherwise kept as `Number` — counted by
+//!   [`ResultSegment::accounted_bytes`] and read through
+//!   [`ResultSegment::value`]. (M5.1 measured a prototype of the same
+//!   layout, which this replaced.) Every compacted cell is checked against
+//!   the batch it came from, `NUMBER` formatting included.
 //!
 //! # What "bytes" means here
 //!
 //! `accounted` is the sum of the heap capacities each representation holds
-//! plus its fixed struct sizes — what a store can count for its own byte cap.
+//! plus its fixed struct sizes — for `store`, exactly what the store counts
+//! against its byte cap ([`reldex_db_core::ResultStore::retained_bytes`]:
+//! every segment's accounted bytes plus its own index).
 //! It does not include the allocator's per-allocation overhead. `os` is the
 //! process's private bytes (working set on Linux) sampled before and after
 //! building the representation in a **fresh child process**, which does
@@ -54,7 +63,10 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use reldex_db_core::{LobHandle, SessionManager, Statement};
+use reldex_db_core::{
+    Cap, CapSource, CellValue, LobHandle, NumberValue, ResultCaps, ResultPolicy, ResultSegment,
+    ResultStore, SessionManager, Sourced, Statement, StoreAction,
+};
 use reldex_db_driver_api::{
     Column, ColumnData, ConnectionParams, Credentials, Endpoint, LobLocator, NullMask, Number,
     RowBatch, TextColumn, Timestamp, Value, ValueRef,
@@ -371,134 +383,34 @@ fn driver_batch(shape: Shape, first_row: u64, rows: usize, fetch_rows: usize) ->
     (RowBatch::new(columns).expect("aligned"), heap)
 }
 
-// ----------------------------------------- the proposed store (prototype)
+// ------------------------------------------------ the store (ADR-0004)
 
-enum NumberStorage {
-    /// Every non-NULL value is `mantissa × 10^-scale`, exactly.
-    Scaled { values: Vec<i64>, scale: u8 },
-    /// At least one value needs more than an `i64` can hold exactly.
-    Decimal(Vec<Number>),
-}
-
-enum StoredData {
-    Number(NumberStorage),
-    Text(TextColumn),
-    Timestamp(Vec<Timestamp>),
-}
-
-struct StoredColumn {
-    nulls: NullMask,
-    data: StoredData,
-}
-
-struct Segment {
-    rows: usize,
-    columns: Box<[StoredColumn]>,
-}
-
-/// `value × 10^scale` as an `i64`, if that is exact.
-fn scaled(value: &Number, scale: i32) -> Option<i64> {
-    if value.is_zero() {
-        return Some(0);
-    }
-    let shift = i32::from(value.exponent()) - value.digit_count() as i32 + scale;
-    if shift < 0 {
-        return None;
-    }
-    let mut mantissa: i128 = 0;
-    for digit in value.digits() {
-        mantissa = mantissa.checked_mul(10)?.checked_add(i128::from(*digit))?;
-    }
-    for _ in 0..shift {
-        mantissa = mantissa.checked_mul(10)?;
-    }
-    let signed = if value.is_negative() {
-        -mantissa
-    } else {
-        mantissa
-    };
-    i64::try_from(signed).ok()
-}
-
-fn compact_numbers(values: &[Number], nulls: &NullMask) -> NumberStorage {
-    let mut scale = 0_i32;
-    for (row, value) in values.iter().enumerate() {
-        if !nulls.is_null(row) {
-            scale = scale.max(value.digit_count() as i32 - i32::from(value.exponent()));
-        }
-    }
-    if scale <= 18 {
-        // Sized exactly: collecting into `Option<Vec<_>>` cannot see the
-        // length and would grow by doubling.
-        let mut converted = Vec::with_capacity(values.len());
-        let exact = values.iter().enumerate().all(|(row, value)| {
-            let cell = if nulls.is_null(row) {
-                Some(0)
-            } else {
-                scaled(value, scale)
-            };
-            cell.map(|cell| converted.push(cell)).is_some()
-        });
-        if exact {
-            return NumberStorage::Scaled {
-                values: converted,
-                scale: scale as u8,
-            };
-        }
-    }
-    NumberStorage::Decimal(values.to_vec())
-}
-
-fn compact(batch: &RowBatch) -> Segment {
-    let columns = batch
-        .columns()
-        .iter()
-        .map(|column| {
-            let nulls = column.nulls().clone();
-            let data = match column.data() {
-                ColumnData::Number(values) => StoredData::Number(compact_numbers(values, &nulls)),
-                // `Clone` allocates exactly `len`: this is the copy-to-size.
-                ColumnData::Text(text) => StoredData::Text(text.clone()),
-                ColumnData::Timestamp(values) => StoredData::Timestamp(values.to_vec()),
-                _ => unreachable!("the bench generates no other kind"),
-            };
-            StoredColumn { nulls, data }
-        })
-        .collect();
-    Segment {
-        rows: batch.row_count(),
-        columns,
-    }
-}
-
-fn segment_bytes(segment: &Segment) -> usize {
-    let mut bytes = size_of::<Segment>() + segment.columns.len() * size_of::<StoredColumn>();
-    for column in &segment.columns {
-        bytes += size_of_val(column.nulls.words());
-        bytes += match &column.data {
-            StoredData::Number(NumberStorage::Scaled { values, .. }) => {
-                values.capacity() * size_of::<i64>()
-            }
-            StoredData::Number(NumberStorage::Decimal(values)) => {
-                values.capacity() * size_of::<Number>()
-            }
-            StoredData::Text(text) => text.buffer().len() + size_of_val(text.offsets()),
-            StoredData::Timestamp(values) => values.capacity() * size_of::<Timestamp>(),
-        };
-    }
-    bytes
-}
-
-/// Proves the re-encoding lost nothing, cell by cell. Not timed.
-fn verify(batch: &RowBatch, segment: &Segment) {
-    for (column, stored) in batch.columns().iter().zip(segment.columns.iter()) {
-        let StoredData::Number(NumberStorage::Scaled { values, scale }) = &stored.data else {
-            continue;
-        };
-        for (row, value) in values.iter().enumerate() {
-            if let Some(ValueRef::Number(original)) = column.value(row) {
-                let back = from_scaled(*value, i16::from(*scale));
-                assert_eq!(&back, original, "row {row}: the scaled form must be exact");
+/// Proves compaction lost nothing, cell by cell, against a fresh copy of the
+/// batch it compacted — and that a `NUMBER` held as a scaled `i64` formats
+/// byte-identically to the `Number` it came from. Not timed.
+fn verify(batch: &RowBatch, segment: &ResultSegment) {
+    let mut scratch = String::new();
+    let mut original = String::new();
+    for (index, column) in batch.columns().iter().enumerate() {
+        for row in 0..batch.row_count() {
+            let stored = segment.value(row, index).expect("in range");
+            match (column.value(row).expect("in range"), stored) {
+                (ValueRef::Null, CellValue::Null) => {}
+                (ValueRef::Number(expected), CellValue::Number(value)) => {
+                    assert_eq!(&value.to_number(), expected, "row {row}: exact");
+                    scratch.clear();
+                    original.clear();
+                    write!(scratch, "{value}").expect("formatting");
+                    write!(original, "{expected}").expect("formatting");
+                    assert_eq!(scratch, original, "row {row}: formatted identically");
+                }
+                (ValueRef::Text(expected), CellValue::Text(value)) => {
+                    assert_eq!(value, expected, "row {row}");
+                }
+                (ValueRef::Timestamp(expected), CellValue::Timestamp(value)) => {
+                    assert_eq!(value, expected, "row {row}");
+                }
+                (expected, value) => panic!("row {row}: {value:?} for {expected:?}"),
             }
         }
     }
@@ -579,7 +491,9 @@ fn child(representation: &str, shape: Shape, rows: usize, fetch_rows: usize) {
     let mut accounted = 0_usize;
     let mut append = Duration::ZERO;
     let mut batches: Vec<RowBatch> = Vec::new();
-    let mut segments: Vec<Segment> = Vec::new();
+    // What a `ResultStore` holds: its segments and each one's first row.
+    let mut segments: Vec<Arc<ResultSegment>> = Vec::new();
+    let mut starts: Vec<usize> = Vec::new();
     let mut row_values: Vec<Box<[Value]>> = Vec::new();
     let mut first = 1_u64;
     let mut left = rows;
@@ -595,10 +509,10 @@ fn child(representation: &str, shape: Shape, rows: usize, fetch_rows: usize) {
             }
             "store" => {
                 let start = Instant::now();
-                let segment = compact(&batch);
+                let segment = Arc::new(ResultSegment::compact(batch).expect("no LOB columns"));
                 append += start.elapsed();
-                verify(&batch, &segment);
-                accounted += segment_bytes(&segment);
+                accounted += segment.accounted_bytes();
+                starts.push(rows - left);
                 segments.push(segment);
             }
             _ => {
@@ -611,7 +525,8 @@ fn child(representation: &str, shape: Shape, rows: usize, fetch_rows: usize) {
         left -= take;
     }
     accounted += batches.capacity() * size_of::<RowBatch>()
-        + segments.capacity() * size_of::<Segment>()
+        + segments.capacity() * size_of::<Arc<ResultSegment>>()
+        + starts.capacity() * size_of::<usize>()
         + row_values.capacity() * size_of::<Box<[Value]>>();
     let after = os_bytes();
 
@@ -652,12 +567,22 @@ fn child(representation: &str, shape: Shape, rows: usize, fetch_rows: usize) {
         accounted as f64 / rows as f64,
         append.as_secs_f64() * 1e3,
     );
+
+    // Every batch moved into its segment, so check each segment against a
+    // fresh copy, after everything above was measured: regenerating and
+    // reading every cell while building disturbed the timings (the random
+    // reads of 32 KiB rows ran 15x slower). A mismatch fails the child, and
+    // with it the run.
+    for (segment, start) in segments.iter().zip(&starts) {
+        let (check, _) = driver_batch(shape, 1 + *start as u64, segment.row_count(), fetch_rows);
+        verify(&check, segment);
+    }
 }
 
 fn read_cell(
     representation: &str,
     batches: &[RowBatch],
-    segments: &[Segment],
+    segments: &[Arc<ResultSegment>],
     rows: &[Box<[Value]>],
     fetch_rows: usize,
     row: usize,
@@ -673,21 +598,13 @@ fn read_cell(
             Some(ValueRef::Timestamp(value)) => u64::from(value.day()),
             _ => 0,
         },
-        "store" => {
-            let stored = &segments[index].columns[column];
-            debug_assert!(local < segments[index].rows);
-            if stored.nulls.is_null(local) {
-                return 0;
-            }
-            match &stored.data {
-                StoredData::Number(NumberStorage::Scaled { values, .. }) => values[local] as u64,
-                StoredData::Number(NumberStorage::Decimal(values)) => {
-                    values[local].digit_count() as u64
-                }
-                StoredData::Text(text) => text.get(local).map_or(0, |text| text.len() as u64),
-                StoredData::Timestamp(values) => u64::from(values[local].day()),
-            }
-        }
+        "store" => match segments[index].value(local, column) {
+            Some(CellValue::Number(NumberValue::Scaled(value))) => value.mantissa() as u64,
+            Some(CellValue::Number(NumberValue::Decimal(value))) => value.digit_count() as u64,
+            Some(CellValue::Text(text)) => text.len() as u64,
+            Some(CellValue::Timestamp(value)) => u64::from(value.day()),
+            _ => 0,
+        },
         _ => match &rows[row][column] {
             Value::Number(value) => value.digit_count() as u64,
             Value::Text(text) => text.len() as u64,
@@ -700,8 +617,15 @@ fn read_cell(
 // ------------------------------------------- through db-core and the mock
 
 /// Fetches `rows` rows of a generated result through a real `db-core`
-/// session and its worker thread, then either retains each `FetchedBatch`
-/// or compacts it. Returns one CSV line.
+/// session and its worker thread, and either retains each `FetchedBatch`
+/// (`batches`) or feeds a real [`ResultStore`], whose segments are compacted
+/// on the worker (`store`, ADR-0004 RS1). Returns one CSV line.
+///
+/// The store runs with one fetch in flight, like the `batches` loop, and its
+/// round-trip byte budget lifted so every request asks for `fetch_rows` rows
+/// as the `batches` loop does: the comparison is of retention, not of
+/// request sizing. Compaction happens inside each fetch's latency, on the
+/// worker, so the `compaction_ms` column is left empty for `store`.
 fn mock_path(
     name: &str,
     columns: Vec<GeneratedColumn>,
@@ -729,24 +653,48 @@ fn mock_path(
         .expect("execute");
     let result = outcome.result.expect("a result");
     let mut fetch_latencies = Vec::new();
-    let mut compaction = Duration::ZERO;
     let mut accounted = 0_usize;
     let mut retained = Vec::new();
-    let mut segments = Vec::new();
-    loop {
-        let asked = Instant::now();
-        let batch = session.fetch_batch(result, max).wait().expect("fetch");
-        fetch_latencies.push(asked.elapsed());
-        if batch.is_empty() {
-            break;
+    let mut store = None;
+    if compacting {
+        let unlimited = Sourced::new(Cap::Unlimited, CapSource::BuiltIn);
+        let policy = ResultPolicy::new(ResultCaps::new(unlimited, unlimited))
+            .with_fetch_rows(max)
+            .with_fetches_in_flight(NonZeroUsize::MIN)
+            .with_round_trip_bytes(NonZeroUsize::MAX);
+        let mut results = ResultStore::new(result, &outcome.columns, policy);
+        results.fetch_all();
+        loop {
+            let mut answered = Vec::new();
+            results
+                .pump(|action| {
+                    if let StoreAction::Fetch(fetch) = action {
+                        let asked = Instant::now();
+                        let reply = session.fetch_segment(fetch).wait();
+                        fetch_latencies.push(asked.elapsed());
+                        answered.push((fetch.ticket(), reply));
+                    }
+                    Ok(())
+                })
+                .expect("submitted");
+            if answered.is_empty() {
+                break;
+            }
+            for (ticket, reply) in answered {
+                results.on_fetched(ticket, reply);
+            }
         }
-        if compacting {
-            let started = Instant::now();
-            let segment = compact(batch.rows());
-            compaction += started.elapsed();
-            accounted += segment_bytes(&segment);
-            segments.push(segment);
-        } else {
+        assert_eq!(results.row_count() as u64, rows, "every row retained");
+        accounted = results.retained_bytes();
+        store = Some(results);
+    } else {
+        loop {
+            let asked = Instant::now();
+            let batch = session.fetch_batch(result, max).wait().expect("fetch");
+            fetch_latencies.push(asked.elapsed());
+            if batch.is_empty() {
+                break;
+            }
             retained.push(batch);
         }
     }
@@ -757,16 +705,16 @@ fn mock_path(
         fetch_latencies[index].as_secs_f64() * 1e6
     };
     let line = format!(
-        "{name},{},{rows},{fetch_rows},{:.1},{:.1},{:.1},{:.1},{:.1},{}",
+        "{name},{},{rows},{fetch_rows},{:.1},{:.1},{:.1},{:.1},{},{}",
         if compacting { "store" } else { "batches" },
         total.as_secs_f64() * 1e3,
         percentile(0.5),
         percentile(0.99),
         percentile(1.0),
-        compaction.as_secs_f64() * 1e3,
+        if compacting { "" } else { "0.0" },
         accounted,
     );
-    black_box((retained, segments));
+    black_box((retained, store));
     drop(session);
     line
 }

@@ -148,6 +148,7 @@ use reldex_db_driver_api::{
 use crate::ids::{LobHandle, ResultId, SessionId};
 use crate::session::{CloseError, ExecuteOutcome, FetchedBatch};
 use crate::shared::SessionLifecycle;
+use crate::store::{FetchTicket, SegmentReply};
 
 /// A caller-chosen correlation id, opaque to the core.
 ///
@@ -406,6 +407,21 @@ pub enum SessionEvent {
         /// result is exhausted.
         batch: DbResult<FetchedBatch>,
     },
+    /// The reply to [`crate::DatabaseSession::submit_fetch_segment`]: the
+    /// next rows of a result store's result, already compacted on the worker
+    /// (ADR-0004 RS1). Hand it to the store with
+    /// [`crate::SessionResults::observe`] or [`crate::ResultStore::on_fetched`].
+    FetchedSegment {
+        /// The session.
+        session: SessionId,
+        /// The request.
+        request: RequestId,
+        /// Which fetch of which result this answers — set on the failure path
+        /// too, so the store can check the sequence and name the result.
+        fetch: FetchTicket,
+        /// The segment, or why it could not be fetched.
+        segment: DbResult<SegmentReply>,
+    },
     /// The reply to [`crate::DatabaseSession::submit_read_lob_chunk`].
     LobChunk {
         /// The session.
@@ -620,6 +636,7 @@ impl SessionEvent {
             | Self::OpenFailed { session, .. }
             | Self::Executed { session, .. }
             | Self::Fetched { session, .. }
+            | Self::FetchedSegment { session, .. }
             | Self::LobChunk { session, .. }
             | Self::Completed { session, .. }
             | Self::SessionClosed { session, .. }
@@ -639,6 +656,7 @@ impl SessionEvent {
             | Self::OpenFailed { request, .. }
             | Self::Executed { request, .. }
             | Self::Fetched { request, .. }
+            | Self::FetchedSegment { request, .. }
             | Self::LobChunk { request, .. }
             | Self::Completed { request, .. }
             | Self::SessionClosed { request, .. }
@@ -660,6 +678,7 @@ impl SessionEvent {
                 | Self::OpenFailed { .. }
                 | Self::Executed { .. }
                 | Self::Fetched { .. }
+                | Self::FetchedSegment { .. }
                 | Self::LobChunk { .. }
                 | Self::Completed { .. }
                 | Self::SessionClosed { .. }

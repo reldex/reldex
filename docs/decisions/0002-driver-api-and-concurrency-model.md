@@ -19,8 +19,8 @@ review), 2026-09-19 (owner confirmation), 2026-09-20 (connect-time warning chann
 2026-09-20 (`SqlDialect` descriptor, M2.4), 2026-09-21 (`SqlDialect` splitter-safety review, M2.4),
 2026-09-24 (server output, M2.7 — amendment T), 2026-09-24 (server-output framing moved to
 `RAW`/`LENGTHB` with per-line UTF-8 decoding, M2.12 — amendment T update), 2026-09-25 (every
-transaction end releases results, from ADR-0004's review — amendment X; decided, not yet
-implemented)
+transaction end releases results, from ADR-0004's review — amendment X; implemented with M5.2
+on 2026-09-26, together with three additive batch accessors the Result Store needs)
 
 ## Context
 
@@ -2235,8 +2235,26 @@ adapter's rules are in `phase-1-m2-5-event-queue.md` §7.5.
 
 ## Amendment: every transaction end releases results (2026-09-25, from ADR-0004's review)
 
-**Status: decided by the lead, not yet implemented.** It lands as a small work item with M5.2 or
-M4.3, whichever comes first (`phase-1.md`, the M5.2 row's follow-up). No new task id.
+**Status: implemented (M5.2 Stage A, 2026-09-26).** Decided by the lead on 2026-09-25; it landed
+with M5.2, before M4.3 (`phase-1.md`, the M5.2 row). No new task id. As built:
+
+- `finish_execute` (`crates/db-core/src/worker.rs`) calls `release_results()` after a successful
+  execute of kind `TransactionControl`, in the `else` of the implicit-commit branch, before the
+  statement's own cursor (if any) is registered. A failed statement releases nothing.
+- The test is `a_typed_transaction_control_statement_releases_results_like_the_commands`
+  (`crates/db-core/tests/transactions.rs`) on both reply paths: typed `COMMIT`, `ROLLBACK`,
+  `SAVEPOINT` and `SET TRANSACTION` each invalidate the open result and its parked LOBs; a failing
+  one does not. Removing the release makes it fail. The Result Store's own tests
+  (`crates/db-core/tests/result_store.rs`) and the live test
+  `a_typed_commit_ends_an_open_result_and_its_lob_cells`
+  (`crates/reldex-core-poc/tests/m5_2_result_store_live.rs`) check the store's side on top.
+
+**Additive batch accessors (same change, no layout change).** The Result Store (ADR-0004 RS1)
+takes a fetched batch apart on the worker instead of copying it cell by cell. `db-driver-api`
+gains three consuming or read-only accessors, and I1/I2's committed layout is unchanged:
+`RowBatch::into_columns`, `Column::into_parts` (the data and its NULL mask), and
+`TextColumn::heap_bytes` / `BytesColumn::heap_bytes` (buffer plus offsets capacity, what a
+byte-capped consumer counts).
 
 ### X1 — a typed `COMMIT` or `ROLLBACK` releases results like the commands do
 
@@ -2267,6 +2285,22 @@ closed or invalidated result handle" rather than succeeding on some paths.
 **What stays out of reach.** A commit inside a PL/SQL block is invisible to the core. After one,
 the cursor behaves as the server says, and D2 still requires an invalidated cursor to be reported
 as an error, never as a short result.
+
+Two failures are also out of reach, because the release follows only a *successful* execute:
+
+- **A DDL that fails still commits on Oracle.** For example, `CREATE TABLE` on an existing name
+  (ORA-00955) after an `INSERT`: the row survives a later `ROLLBACK` (M5.2 review).
+- **A `COMMIT` can fail after the transaction has ended** (ORA-02091).
+
+The worker releases nothing on a failed execute, so the results stay open. Their cursors behave
+as the server says:
+
+- an ordinary cursor keeps fetching;
+- a `FOR UPDATE` cursor fails with ORA-01002.
+
+ADR-0004 records this as Accepted limitation 13 and owner-review point (f). The owner chooses
+between accepting it and extending the driver contract so that `committed_implicitly` is also
+reported on the error path. Nothing is implemented until then.
 
 **Test.** Open a result; run a typed `COMMIT`, then a typed `ROLLBACK`. A later fetch on the
 first result fails with the invalidated-handle error, and its parked LOBs are gone, exactly as

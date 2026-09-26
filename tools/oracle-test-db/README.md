@@ -116,6 +116,20 @@ PowerShell runner clears the password variables again in its `finally` block.
 | `RELDEX_TEST_ORACLE_SYSDBA_USER` / `_SYSDBA_PASSWORD` | `ORACLE_PWD`, as `SYS` | S13 (`AS SYSDBA` over the listener) only |
 | `RELDEX_TEST_ORACLE_TCPS_DSN` / `_TCPS_CA_DIR` / `_TCPS_WRONG_CA_DIR` | the exported CA PEMs, when present | S8, the U-14 canary |
 
+### Tests outside the driver crate
+
+`run-it.sh` runs the Oracle driver crate's `oracle-it` tests by default.
+`RELDEX_IT_PACKAGE` names another crate whose `oracle-it` feature gates live
+tests: tests that need `db-core` as well as the driver cannot live in the
+driver crate, so they live in `reldex-core-poc`, the composition root. The M5.2
+Result Store tests are the first:
+
+```bash
+RELDEX_IT_PACKAGE=reldex-core-poc bash tools/oracle-test-db/run-it.sh m5_2_result_store_live -- --nocapture
+```
+
+`run-it.ps1` reads the same variable.
+
 ### Upstream canaries
 
 Besides the spikes, the driver crate carries a canary suite that asserts each

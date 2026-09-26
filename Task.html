@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-26T00:39:12+07:00",
+  "updatedAt": "2026-09-26T02:17:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1337,8 +1337,8 @@
               "status": "done"
             },
             {
-              "title": "M5.2 ★ Result Store implementation in db-core + FFI batch lifetime rules (opus, review mandatory)",
-              "status": "todo"
+              "title": "M5.2 ★ Result Store implementation in db-core + FFI batch lifetime rules (opus, review mandatory) —  — Stage A (core) done 2026-09-26: db-core ResultStore per ADR-0004 — immutable per-batch column segments (scaled-i64 NUMBER when exact, byte-identical Display; bench within 0.7% of Table 1; 0 allocations on the read path over 2M reads), demand-driven fetching one batch ahead, row/byte caps with provenance and mobile defaults, every transaction end → Ended{TransactionEnded} (ADR-0002 X1 implemented, typed COMMIT live-tested), session loss → Failed with LOB cells SessionEnded; independently reviewed (no must-fix; follow-ups landed); live 19c 5/5, 979 tests; Stage B (FFI batch lifetime rules, ABI 4) pending M2.11/M2.15",
+              "status": "in_progress"
             },
             {
               "title": "M5.3 Grid features: row numbers, NULL visualization, column resize/reorder, type-aware formatting via the bulk formatter, search-in-results (sonnet)",
@@ -1708,6 +1708,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-26",
+      "text": "M5.2 Stage A done: the core now keeps query results the way ADR-0004 decided — compact column segments (a ten-number row costs 118 bytes, measured within 0.7% of the ADR's table, and reading never allocates), the grid asks for rows and the core keeps one batch ahead, row and byte caps carry their source, and every transaction end ends an open result deterministically (typed COMMIT proven on the real database). Independent review found no must-fix; its follow-ups landed: a session lost mid-fetch marks LOB cells as ended with the session, the parked-LOB map gives memory back, and two honest limitations are recorded — a failed DDL or a failed COMMIT still ends the transaction on Oracle without ending the result (a question for the owner), and the product keeps the driver's 100-row wire array on 19c until the upstream O(packets²) cost is addressed. The FFI half (Stage B) follows the M2.11 surface and the M2.15 pump switch."
+    },
     {
       "date": "2026-09-26",
       "text": "Credential Manager test flake resolved: the one-off Windows CI failure came from two tests running at the same time — one of them writes through cmdkey outside Reldex's lock, and the store's whole-file rewrite revived an entry the other test had just deleted. That is the known residual race with outside writers, not a defect in the lock. The test suite now runs that test exclusively; 120 local loops and 4 CI reruns passed, and nothing was weakened."

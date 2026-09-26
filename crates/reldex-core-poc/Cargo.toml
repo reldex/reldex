@@ -10,6 +10,15 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Opt-in integration tests that need the live Oracle test database
+# (`tools/oracle-test-db/`, run with `RELDEX_IT_PACKAGE=reldex-core-poc`).
+# They live here because they need `db-core` and a concrete driver together,
+# which only this composition-root crate may depend on. Off by default so
+# `cargo test --workspace` stays green without a database (`AGENTS.md`,
+# "Testing").
+oracle-it = []
+
 [dependencies]
 # Phase 0 Workstream A: the `reldex-core-poc` binary exercises the **driver
 # contract** on its own, so a failure there is unambiguously a driver problem.

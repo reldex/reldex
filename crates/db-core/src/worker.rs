@@ -55,8 +55,8 @@ use std::thread;
 use reldex_db_driver_api::{
     CancelHandle, CancelKind, ColumnKind, ConnectionId, ConnectionParams, Cursor,
     DatabaseConnection, DatabaseDriver, DbError, DbResult, ErrorKind, LobLocator, ResultSetId,
-    RowBatch, SavepointName, ServerOutputSetting, SessionState, Statement, TransactionState,
-    Warning,
+    RowBatch, SavepointName, ServerOutputSetting, SessionState, Statement, StatementKind,
+    TransactionState, Warning,
 };
 
 use crate::events::{RequestId, SessionEvent};
@@ -66,6 +66,7 @@ use crate::session::{
     CloseDisposition, CloseError, ExecuteOutcome, FetchedBatch, OutValue, OutValues, SessionLimits,
 };
 use crate::shared::{EndedAs, SessionLifecycle, SessionShared};
+use crate::store::{FetchTicket, SegmentReply, compact_batch};
 
 /// Why the worker is being asked to shut down.
 pub(crate) enum CloseIntent {
@@ -94,6 +95,13 @@ pub(crate) enum Command {
         result: ResultId,
         max_rows: NonZeroUsize,
         reply: ReplyTo<FetchedBatch>,
+    },
+    /// Fetch the next batch of an open result for a result store, and
+    /// compact it into a segment here, on the worker (ADR-0004 RS1).
+    FetchSegment {
+        fetch: FetchTicket,
+        max_rows: NonZeroUsize,
+        reply: ReplyTo<SegmentReply>,
     },
     /// Release a result's resources.
     CloseResult {
@@ -151,6 +159,9 @@ impl Command {
                 reply.answer(Err(error));
             }
             Self::FetchBatch { reply, .. } => {
+                reply.answer(Err(error));
+            }
+            Self::FetchSegment { reply, .. } => {
                 reply.answer(Err(error));
             }
             Self::CloseResult { reply, .. }
@@ -602,6 +613,11 @@ impl Worker {
                 max_rows,
                 reply,
             } => self.fetch_batch(result, max_rows, reply),
+            Command::FetchSegment {
+                fetch,
+                max_rows,
+                reply,
+            } => self.fetch_segment(fetch, max_rows, reply),
             Command::CloseResult { result, reply } => {
                 let outcome = match self.owned_result(result) {
                     Ok(id) => self.close_result(id),
@@ -755,6 +771,20 @@ impl Worker {
             // A server that commits around DDL commonly closes cursors too;
             // treat every open result as invalidated (ADR-0002 D2, "Lifecycle
             // of derived handles").
+            self.release_results();
+        } else if statement_kind == StatementKind::TransactionControl {
+            // A `COMMIT` or `ROLLBACK` typed as text ends the transaction
+            // exactly as the commands do, so it releases exactly what they
+            // release (ADR-0002 amendment X1). The kind cannot tell `COMMIT`
+            // from `SAVEPOINT` or `SET TRANSACTION`, and the core must not
+            // parse SQL to find out, so those two release as well: closing a
+            // result early is the safe error, keeping one the user believes
+            // is transaction-scoped is not. Done before the cursor below is
+            // registered, so a statement that returned one keeps it.
+            //
+            // The transaction tracking is deliberately left alone: the same
+            // ambiguity means this cannot be read as "resolved"
+            // (`SessionShared::note_statement`).
             self.release_results();
         }
 
@@ -1082,6 +1112,76 @@ impl Worker {
         Flow::Continue
     }
 
+    /// Fetches for a result store: the same fetch as [`Worker::fetch_batch`],
+    /// then the batch is compacted into a segment **here**, parking every LOB
+    /// locator and keeping its id in the segment, before the reply leaves the
+    /// worker (ADR-0004 RS1). Only plain data crosses the thread boundary,
+    /// exactly as on the batch path (ADR-0002 K1).
+    fn fetch_segment(
+        &mut self,
+        fetch: FetchTicket,
+        max_rows: NonZeroUsize,
+        reply: ReplyTo<SegmentReply>,
+    ) -> Flow {
+        let id = match self.owned_result(fetch.result()) {
+            Ok(id) => id,
+            Err(err) => {
+                reply.answer(Err(err));
+                return Flow::Continue;
+            }
+        };
+        let Some(cursor) = self.cursors.get_mut(&id) else {
+            reply.answer(Err(self.unknown_result_error()));
+            return Flow::Continue;
+        };
+        let torn = &self.torn;
+        let outcome = call(torn, || {
+            let batch = cursor.fetch_batch(max_rows)?;
+            Ok((batch, cursor.is_exhausted()))
+        });
+        let (batch, known_exhausted) = match outcome {
+            Ok(fetched) => fetched,
+            Err(err) => {
+                self.shared.note_error(&err);
+                // After any error from `fetch_batch`, the only legal call on a
+                // cursor is `close()` (ADR-0002 D2).
+                let _ = self.close_result(id);
+                reply.answer(Err(err));
+                return Flow::Continue;
+            }
+        };
+        let exhausted = known_exhausted || batch.is_empty();
+        let mut parked = Vec::new();
+        let session = self.session;
+        let compacted = compact_batch(session, batch, |_, locator| {
+            let handle = self.park_lob(Some(id), locator)?;
+            parked.push(handle);
+            Ok(handle.serial())
+        });
+        match compacted {
+            Ok(segment) => {
+                let answered = reply.answer(Ok(SegmentReply::new(Arc::new(segment), exhausted)));
+                if !answered {
+                    // Nobody will read these; release them on their own
+                    // thread rather than when the result closes.
+                    for lob in parked {
+                        self.lobs.remove(&lob);
+                    }
+                }
+            }
+            Err(err) => {
+                self.shared.note_error(&err);
+                // The rows fetched are lost, so the cursor cannot continue
+                // honestly: close it, with every LOB parked from it, exactly
+                // as a failed fetch does. The store records the result as
+                // failed and its cursor as closed; the worker now agrees.
+                let _ = self.close_result(id);
+                reply.answer(Err(err));
+            }
+        }
+        Flow::Continue
+    }
+
     /// Takes every large-object locator out of `batch` and parks it, so only
     /// plain data reaches the caller (ADR-0002 D1/D2).
     fn park_batch_lobs(
@@ -1240,6 +1340,7 @@ impl Worker {
     /// from it.
     fn close_result(&mut self, id: ResultSetId) -> DbResult<()> {
         self.lobs.retain(|_, parked| parked.result != Some(id));
+        release_spare_capacity(&mut self.lobs);
         match self.cursors.remove(&id) {
             None => Ok(()),
             Some(cursor) => {
@@ -1266,9 +1367,12 @@ impl Worker {
     /// driver's chance to release server-side state, and the contract makes it
     /// idempotent and safe after the connection is gone (ADR-0002 D2).
     fn release_results(&mut self) {
-        self.lobs.clear();
+        // A fresh map, not `clear()`: a cleared map keeps its capacity, and a
+        // result of many LOBs left about 160 bytes per LOB allocated after its
+        // transaction ended, which no byte cap sees (M5.2 review).
+        self.lobs = HashMap::new();
         let cursors: Vec<Box<dyn Cursor>> =
-            self.cursors.drain().map(|(_, cursor)| cursor).collect();
+            std::mem::take(&mut self.cursors).into_values().collect();
         for cursor in cursors {
             if self.torn.get() {
                 drop(cursor);
@@ -1409,5 +1513,49 @@ impl Worker {
         }
         let torn = &self.torn;
         call(torn, || connection.close())
+    }
+}
+
+/// Gives a map's storage back once it holds less than half of what it could.
+///
+/// Parked LOBs come and go by the thousand with a result; `retain` and
+/// `remove` keep the capacity they leave behind, which is client memory no
+/// byte cap counts. Shrinking only past half keeps the cost amortized O(1)
+/// per removal.
+fn release_spare_capacity<K: std::hash::Hash + Eq, V>(map: &mut HashMap<K, V>) {
+    if map.is_empty() {
+        *map = HashMap::new();
+    } else if map.capacity() > 2 * map.len() + 16 {
+        map.shrink_to_fit();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::release_spare_capacity;
+
+    #[test]
+    fn a_map_emptied_or_mostly_emptied_gives_its_storage_back() {
+        let mut map: HashMap<u64, [u8; 64]> = (0..5_000).map(|key| (key, [0; 64])).collect();
+        assert!(map.capacity() >= 5_000);
+
+        map.retain(|key, _| *key < 3_000);
+        release_spare_capacity(&mut map);
+        assert!(map.capacity() >= 3_000, "more than half left: kept");
+
+        map.retain(|key, _| *key < 10);
+        release_spare_capacity(&mut map);
+        assert!(
+            map.capacity() < 100,
+            "{} left for 10 entries",
+            map.capacity()
+        );
+        assert_eq!(map.len(), 10);
+
+        map.clear();
+        release_spare_capacity(&mut map);
+        assert_eq!(map.capacity(), 0);
     }
 }

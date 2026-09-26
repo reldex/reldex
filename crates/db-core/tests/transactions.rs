@@ -295,7 +295,136 @@ fn handles_invalidated_by_a_commit_report_rather_than_looking_exhausted(path: su
     assert!(error.message().contains("result handle"), "{error}");
 }
 
+/// ADR-0002 amendment X1: a `COMMIT`, `ROLLBACK`, `SAVEPOINT` or
+/// `SET TRANSACTION` typed as text (`StatementKind::TransactionControl`)
+/// releases every open result and every parked large object, exactly as the
+/// commands do. The mock is told **not** to invalidate anything itself, so the
+/// release seen here is `db-core`'s own.
+fn a_typed_transaction_control_statement_releases_results_like_the_commands(
+    path: support::ReplyPath,
+) {
+    use reldex_db_driver_api::{ErrorKind, LobKind, SqlType, StatementKind};
+    use reldex_driver_mock::{ColumnSpec, QueryPlan, QuerySource, ScriptedError};
+
+    let scenario = support::scenario();
+    scenario.set_invalidate_handles_on_transaction_end(false);
+    let rows: Vec<Vec<ScriptValue>> = (0..10_i64)
+        .map(|id| {
+            vec![
+                ScriptValue::from(id),
+                ScriptValue::Lob {
+                    kind: LobKind::Character,
+                    bytes: format!("document {id}").into_bytes(),
+                },
+            ]
+        })
+        .collect();
+    scenario.on_sql(
+        "SELECT id, doc FROM t",
+        Action::query(QuerySource::Fixed(QueryPlan::new(
+            vec![
+                ColumnSpec::new("ID", SqlType::Number),
+                ColumnSpec::new("DOC", SqlType::CharacterLob { national: false }),
+            ],
+            rows,
+        ))),
+    );
+    for text in [
+        "COMMIT",
+        "ROLLBACK",
+        "SAVEPOINT s1",
+        "SET TRANSACTION READ ONLY",
+    ] {
+        scenario.on_sql(
+            text,
+            Action::Execute {
+                statement_kind: StatementKind::TransactionControl,
+                rows_affected: None,
+                opens_transaction: false,
+            },
+        );
+    }
+    scenario.on_sql(
+        "COMMIT WORK BROKEN",
+        Action::Fail(ScriptedError::new(
+            ErrorKind::Syntax,
+            "ORA-00900: invalid SQL",
+        )),
+    );
+
+    let session = support::open_on(&scenario, path);
+
+    // A failed transaction-control statement releases nothing.
+    let result = session
+        .execute(Statement::new("SELECT id, doc FROM t"))
+        .wait()
+        .expect("select")
+        .result
+        .expect("cursor");
+    let batch = session
+        .fetch_batch(result, support::n(2))
+        .wait()
+        .expect("first batch");
+    let lob = batch.lob(0, 1).expect("row 0 holds a LOB");
+    session
+        .execute(Statement::new("COMMIT WORK BROKEN"))
+        .wait()
+        .expect_err("the statement fails");
+    assert_eq!(
+        session
+            .fetch_batch(result, support::n(2))
+            .wait()
+            .expect("a failed statement released nothing")
+            .row_count(),
+        2
+    );
+    assert!(
+        !session
+            .read_lob_chunk(lob, support::n(64))
+            .wait()
+            .expect("the LOB is still parked")
+            .is_empty()
+    );
+
+    for text in [
+        "COMMIT",
+        "ROLLBACK",
+        "SAVEPOINT s1",
+        "SET TRANSACTION READ ONLY",
+    ] {
+        let result = session
+            .execute(Statement::new("SELECT id, doc FROM t"))
+            .wait()
+            .expect("select")
+            .result
+            .expect("cursor");
+        let batch = session
+            .fetch_batch(result, support::n(2))
+            .wait()
+            .expect("first batch");
+        let lob = batch.lob(1, 1).expect("row 1 holds a LOB");
+
+        let outcome = session
+            .execute(Statement::new(text))
+            .wait()
+            .expect("transaction control");
+        assert_eq!(outcome.statement_kind, StatementKind::TransactionControl);
+
+        let error = session
+            .fetch_batch(result, support::n(2))
+            .wait()
+            .expect_err("the result was released, exactly as after commit()");
+        assert!(error.message().contains("result handle"), "{text}: {error}");
+        let error = session
+            .read_lob_chunk(lob, support::n(64))
+            .wait()
+            .expect_err("its parked LOBs went with it");
+        assert!(error.message().contains("is closed"), "{text}: {error}");
+    }
+}
+
 support::both_paths! {
+    a_typed_transaction_control_statement_releases_results_like_the_commands,
     commit_resolves_the_transaction,
     rollback_resolves_the_transaction_and_discards_it,
     savepoint_and_rollback_to_savepoint_undo_only_later_work,

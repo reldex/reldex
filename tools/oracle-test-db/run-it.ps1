@@ -3,6 +3,12 @@
 #   pwsh tools/oracle-test-db/run-it.ps1                 # every spike
 #   pwsh tools/oracle-test-db/run-it.ps1 s2_fidelity     # one test file
 #   pwsh tools/oracle-test-db/run-it.ps1 s4_cancel -- --test-threads=1
+#   $env:RELDEX_IT_PACKAGE = 'reldex-core-poc'; pwsh tools/oracle-test-db/run-it.ps1 m5_2_result_store_live
+#
+# `RELDEX_IT_PACKAGE` picks the crate whose `oracle-it` tests run; the default
+# is the Oracle driver's. Tests that need `db-core` as well as the driver live
+# in `reldex-core-poc` (a driver crate may not depend on `db-core`). The bash
+# twin, `run-it.sh`, is the primary entry point and reads the same variable.
 #
 # Run S4 single-threaded, as above: its long joins, `KILL SESSION` and 20-second
 # sleep load this single-instance container enough to flip U-6's outcome when
@@ -93,7 +99,10 @@ if (Test-Path (Join-Path $walletDir 'ewallet.pem')) {
 
 Write-Host "database: $env:RELDEX_TEST_ORACLE_USER@$env:RELDEX_TEST_ORACLE_DSN"
 
-$cargo = @('test', '-p', 'reldex-driver-oracle-thin', '--features', 'oracle-it')
+$package = if ($env:RELDEX_IT_PACKAGE) { $env:RELDEX_IT_PACKAGE } else { 'reldex-driver-oracle-thin' }
+Write-Host "package:  $package"
+
+$cargo = @('test', '-p', $package, '--features', 'oracle-it')
 # A leading `--` means "no test file was named; pass the rest to the harness".
 if ($Test -and $Test -ne '--') {
     $cargo += @('--test', $Test)

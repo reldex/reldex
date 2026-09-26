@@ -139,6 +139,14 @@ pub enum NoLimitConsequence {
     /// Query history is never trimmed: the store file grows without bound
     /// (M4.10).
     HistoryFileGrowsWithoutLimit,
+    /// "Fetch all" pulls the entire result, holding the cursor, the network
+    /// and the server until it ends (`results.max_rows`, ADR-0004 RS3).
+    WholeResultIsFetched,
+    /// Result memory grows until the machine runs out. On desktop the process
+    /// then aborts, taking every worksheet's session and its transaction with
+    /// it; on mobile the operating system ends the app first
+    /// (`results.max_bytes`, ADR-0004 RS3).
+    ResultMemoryUnbounded,
 }
 
 /// Whether a limit-valued setting accepts "no limit".
@@ -187,11 +195,17 @@ pub enum SettingId {
     ServerOutputBuffer,
     /// See [`HISTORY_MAX_ENTRIES_PER_PROFILE`].
     HistoryMaxEntriesPerProfile,
+    /// See [`RESULTS_MAX_ROWS`].
+    ResultsMaxRows,
+    /// See [`RESULTS_MAX_BYTES`].
+    ResultsMaxBytes,
+    /// See [`RESULTS_CLOSE_CURSOR_AT_LIMIT`].
+    ResultsCloseCursorAtLimit,
 }
 
 impl SettingId {
     /// Every setting, in registry order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 11] = [
         Self::ConnectTimeout,
         Self::RewriteTriggerDdl,
         Self::StatementTimeLimit,
@@ -200,6 +214,9 @@ impl SettingId {
         Self::ServerOutputEnabled,
         Self::ServerOutputBuffer,
         Self::HistoryMaxEntriesPerProfile,
+        Self::ResultsMaxRows,
+        Self::ResultsMaxBytes,
+        Self::ResultsCloseCursorAtLimit,
     ];
 
     /// This setting's descriptor.
@@ -214,6 +231,9 @@ impl SettingId {
             Self::ServerOutputEnabled => &DESCRIPTORS[5],
             Self::ServerOutputBuffer => &DESCRIPTORS[6],
             Self::HistoryMaxEntriesPerProfile => &DESCRIPTORS[7],
+            Self::ResultsMaxRows => &DESCRIPTORS[8],
+            Self::ResultsMaxBytes => &DESCRIPTORS[9],
+            Self::ResultsCloseCursorAtLimit => &DESCRIPTORS[10],
         }
     }
 
@@ -539,18 +559,34 @@ pub const REWRITE_TRIGGER_DDL: Setting<bool> = Setting::new(SettingId::RewriteTr
 /// so is more honest than offering a number nobody will wait for.
 pub const STATEMENT_TIME_LIMIT: Setting<TimeLimit> = Setting::new(SettingId::StatementTimeLimit);
 
-/// Rows fetched per round trip. Default **1,000** — the fastest-or-tied
-/// setting in spike S15's sweep, which measured zero network latency; the
-/// owner's sign-off on the number is still pending (`phase-1.md` §C.3 item
-/// 10, M5.6), and it is a user setting either way.
+/// The most rows one round trip may carry. Default **1,000** — the
+/// fastest-or-tied setting in spike S15's sweep, which measured zero network
+/// latency; the owner's sign-off on the number is still pending (`phase-1.md`
+/// §C.3 item 10, M5.6, re-asked as a bytes-per-round-trip budget), and it is a
+/// user setting either way.
+///
+/// An upper bound, not the number every round trip carries (ADR-0006
+/// amendment "Result caps"): the Result Store sizes each request by a
+/// per-round-trip byte budget and the describe's declared column widths, and
+/// asks for at most this many rows (ADR-0004 RS2).
+///
+/// It is **not** passed as the statement's fetch-size hint on the product
+/// path. The adapter's execute sets no hint, so on Oracle the driver's wire
+/// array stays `oracledb`'s default of 100 rows, fixed at execute. That is a
+/// lead decision for M5.2 Stage B: a larger wire array brings back the
+/// per-fetch cost of ADR-0004 Table 3a, so this setting is not passed until
+/// M5.6 has measured a budget or upstream ships a setter for the array size
+/// after execute (ADR-0004 accepted limitations 11 and 12).
 pub const FETCH_ROWS: Setting<u32> = Setting::new(SettingId::FetchRows);
 
-/// How many fetches a result view keeps requested ahead of the one it is
-/// consuming. Default **2** (spike S15: more buys nothing at zero latency; to
-/// be re-measured on a real network in M5.7).
+/// How many fetches one result may have outstanding at once. Default **2**
+/// (spike S15: more buys nothing at zero latency; to be re-measured on a real
+/// network in M5.7).
 ///
-/// Application level only: it tunes the one result pipeline the process has,
-/// not a connection. Widening its levels later is a compatible change.
+/// Per result (ADR-0006 amendment "Result caps", ADR-0004 RS2): each result
+/// has its own fetch policy, and this bounds the fetches outstanding for each.
+/// Application level only: it tunes the result pipeline, not a connection.
+/// Widening its levels later is a compatible change.
 pub const FETCHES_IN_FLIGHT: Setting<u32> = Setting::new(SettingId::FetchesInFlight);
 
 /// Whether the server output (`DBMS_OUTPUT`) pane collects output. Default
@@ -583,7 +619,47 @@ pub const SERVER_OUTPUT_BUFFER: Setting<ByteLimit> = Setting::new(SettingId::Ser
 pub const HISTORY_MAX_ENTRIES_PER_PROFILE: Setting<EntryLimit> =
     Setting::new(SettingId::HistoryMaxEntriesPerProfile);
 
-const DESCRIPTORS: [SettingDescriptor; 8] = [
+/// The most rows one result shows before it stops at its cap (ADR-0004 RS3).
+/// Default **1,000,000** rows on desktop, **100,000** on Android and iOS
+/// (ADR-0004 RS6: reasoned, not measured on a device). Application, profile
+/// and worksheet levels.
+///
+/// Exact: the store fetches one row past it, kept as a lookahead and not
+/// shown, so it can say whether more rows exist. Bounded by the grid's `int`
+/// row index (2,147,483,647), which also bounds "no limit": the whole result
+/// is fetched, up to that ceiling (`NoLimitConsequence::WholeResultIsFetched`).
+pub const RESULTS_MAX_ROWS: Setting<EntryLimit> = Setting::new(SettingId::ResultsMaxRows);
+
+/// The most bytes one result may retain, as the store accounts them
+/// (ADR-0004 RS3). Default **512 MiB** on desktop, **64 MiB** on Android and
+/// iOS (ADR-0004 RS6). Application, profile and worksheet levels; 16 MiB to
+/// 4 GiB less one byte.
+///
+/// Checked before every fetch, with requests shrunk to fit; what fetches
+/// already in flight carry when it is reached is the bounded overshoot
+/// ADR-0004 accepts. "No limit" lets result memory grow until the machine
+/// runs out (`NoLimitConsequence::ResultMemoryUnbounded`).
+pub const RESULTS_MAX_BYTES: Setting<ByteLimit> = Setting::new(SettingId::ResultsMaxBytes);
+
+/// Whether a result that stops at a cap closes its cursor, freeing its server
+/// resources, rather than keeping it open for "Fetch more". Default **off**
+/// (keep it open); application, profile and worksheet levels (ADR-0004 RS3,
+/// ADR-0006 amendment "Result caps").
+///
+/// A cursor kept open lasts only until the transaction ends: every commit or
+/// rollback ends every open result either way.
+pub const RESULTS_CLOSE_CURSOR_AT_LIMIT: Setting<bool> =
+    Setting::new(SettingId::ResultsCloseCursorAtLimit);
+
+/// Whether this build targets a mobile operating system, whose built-in
+/// defaults for the result caps are smaller (ADR-0006 amendment "Result
+/// caps", ADR-0004 RS6).
+const MOBILE: bool = cfg!(any(target_os = "android", target_os = "ios"));
+
+/// One mebibyte.
+const MIB: u32 = 1024 * 1024;
+
+const DESCRIPTORS: [SettingDescriptor; 11] = [
     SettingDescriptor {
         id: SettingId::ConnectTimeout,
         storage_key: "connection.connect_timeout",
@@ -696,6 +772,56 @@ const DESCRIPTORS: [SettingDescriptor; 8] = [
         unlimited: Unlimited::Allowed(NoLimitConsequence::HistoryFileGrowsWithoutLimit),
         takes_effect: TakesEffect::NextStatement,
         summary: "History entries kept per profile before the oldest are trimmed, or no limit.",
+    },
+    SettingDescriptor {
+        id: SettingId::ResultsMaxRows,
+        storage_key: "results.max_rows",
+        group: SettingGroup::Results,
+        kind: ValueKind::EntryLimit,
+        default: SettingValue::EntryLimit(EntryLimit::Count(nz(if MOBILE {
+            100_000
+        } else {
+            1_000_000
+        }))),
+        levels: LevelSet::ALL,
+        bounds: Some(Bounds {
+            min: 1,
+            max: 2_147_483_647,
+        }),
+        unlimited: Unlimited::Allowed(NoLimitConsequence::WholeResultIsFetched),
+        takes_effect: TakesEffect::NextStatement,
+        summary: "Rows one result shows before it stops at its cap, or no limit.",
+    },
+    SettingDescriptor {
+        id: SettingId::ResultsMaxBytes,
+        storage_key: "results.max_bytes",
+        group: SettingGroup::Results,
+        kind: ValueKind::ByteLimit,
+        default: SettingValue::ByteLimit(ByteLimit::Bytes(nz(if MOBILE {
+            64 * MIB
+        } else {
+            512 * MIB
+        }))),
+        levels: LevelSet::ALL,
+        bounds: Some(Bounds {
+            min: 16 * MIB,
+            max: u32::MAX,
+        }),
+        unlimited: Unlimited::Allowed(NoLimitConsequence::ResultMemoryUnbounded),
+        takes_effect: TakesEffect::NextStatement,
+        summary: "Bytes one result may hold before it stops at its cap, or no limit.",
+    },
+    SettingDescriptor {
+        id: SettingId::ResultsCloseCursorAtLimit,
+        storage_key: "results.close_cursor_at_limit",
+        group: SettingGroup::Results,
+        kind: ValueKind::Bool,
+        default: SettingValue::Bool(false),
+        levels: LevelSet::ALL,
+        bounds: None,
+        unlimited: Unlimited::NotAllowed,
+        takes_effect: TakesEffect::NextStatement,
+        summary: "Close a result's cursor when it stops at a cap, instead of keeping it for more.",
     },
 ];
 
@@ -828,6 +954,78 @@ mod tests {
             HISTORY_MAX_ENTRIES_PER_PROFILE.descriptor().unlimited(),
             Unlimited::Allowed(NoLimitConsequence::HistoryFileGrowsWithoutLimit)
         ));
+    }
+
+    /// ADR-0006 amendment "Result caps" (ADR-0004), one line per row of its
+    /// table.
+    #[test]
+    fn the_result_caps_are_registered_as_the_amendment_says() {
+        let (rows, bytes) = if cfg!(any(target_os = "android", target_os = "ios")) {
+            (100_000, 64 << 20)
+        } else {
+            (1_000_000, 512 << 20)
+        };
+        assert_eq!(
+            RESULTS_MAX_ROWS.default_value(),
+            EntryLimit::Count(nz(rows))
+        );
+        assert_eq!(RESULTS_MAX_ROWS.descriptor().levels(), LevelSet::ALL);
+        assert_eq!(
+            RESULTS_MAX_ROWS.descriptor().bounds(),
+            Some(Bounds {
+                min: 1,
+                max: 2_147_483_647
+            })
+        );
+        assert!(matches!(
+            RESULTS_MAX_ROWS.descriptor().unlimited(),
+            Unlimited::Allowed(NoLimitConsequence::WholeResultIsFetched)
+        ));
+
+        assert_eq!(
+            RESULTS_MAX_BYTES.default_value(),
+            ByteLimit::Bytes(nz(bytes))
+        );
+        assert_eq!(RESULTS_MAX_BYTES.descriptor().levels(), LevelSet::ALL);
+        assert_eq!(
+            RESULTS_MAX_BYTES.descriptor().bounds(),
+            Some(Bounds {
+                min: 16 << 20,
+                max: u32::MAX
+            })
+        );
+        assert!(
+            RESULTS_MAX_BYTES
+                .descriptor()
+                .check_value(SettingValue::ByteLimit(ByteLimit::Bytes(
+                    nz((16 << 20) - 1)
+                )))
+                .is_err()
+        );
+        assert!(matches!(
+            RESULTS_MAX_BYTES.descriptor().unlimited(),
+            Unlimited::Allowed(NoLimitConsequence::ResultMemoryUnbounded)
+        ));
+
+        assert!(!RESULTS_CLOSE_CURSOR_AT_LIMIT.default_value());
+        assert_eq!(
+            RESULTS_CLOSE_CURSOR_AT_LIMIT.descriptor().levels(),
+            LevelSet::ALL
+        );
+
+        for setting in [
+            SettingId::ResultsMaxRows,
+            SettingId::ResultsMaxBytes,
+            SettingId::ResultsCloseCursorAtLimit,
+        ] {
+            let descriptor = setting.descriptor();
+            assert_eq!(descriptor.group(), SettingGroup::Results, "{setting}");
+            assert_eq!(
+                descriptor.takes_effect(),
+                TakesEffect::NextStatement,
+                "{setting}"
+            );
+        }
     }
 
     #[test]

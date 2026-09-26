@@ -103,7 +103,13 @@ impl GeneratedColumn {
     }
 
     fn spec(&self) -> ColumnSpec {
-        ColumnSpec::new(self.name(), self.sql_type())
+        let spec = ColumnSpec::new(self.name(), self.sql_type());
+        match self {
+            // `VARCHAR2(40 CHAR)` in AL32UTF8, as Oracle describes it: up to
+            // four bytes a character. ADR-0004's S14 row width assumes it.
+            Self::Name(_) => spec.with_max_size_bytes(NAME_MAX_SIZE_BYTES),
+            Self::Id(_) | Self::Created(_) => spec,
+        }
     }
 
     /// The value at the given 1-based row number.
@@ -115,6 +121,10 @@ impl GeneratedColumn {
         }
     }
 }
+
+/// The byte width [`GeneratedColumn::Name`] declares: 40 characters of up to
+/// four bytes each.
+const NAME_MAX_SIZE_BYTES: u32 = 160;
 
 /// Every `n`th row (1-based) is SQL NULL in [`GeneratedColumn::Name`].
 const NULL_CADENCE: u64 = 100;

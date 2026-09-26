@@ -14,7 +14,7 @@ guard in endpoints, production flag, SID builder moved into the driver, store ha
 performance finding, a narrowed `SchemaMismatch` mapping, corrected ADR-0002 citations and
 `Debug` redaction for history/worksheet text; amended 2026-09-25 by ADR-0004 with three result-cap
 settings, per-target built-in defaults and a per-result `fetches_in_flight` — see "Amendment:
-result caps (ADR-0004)" (registry only; not yet implemented, M5.2).
+result caps (ADR-0004)" (registry only; implemented with M5.2 on 2026-09-26).
 **Task:** M2.9 ★ (`phase-1.md` §C.2); amendment tasks M4.10/M6.2 (`phase-1.md` §M4/§M6, store side
 only); fix round on the same tasks, PR #38 independent review
 
@@ -851,8 +851,17 @@ must-fix, two should-fix, one nit, all landed on the same branch before merge:
 
 ## Amendment: result caps (ADR-0004) (2026-09-25, task M5.1)
 
-**Status:** accepted with ADR-0004. This is registry only: nothing here is implemented yet, and M5.2
-adds it. It needs no schema migration, because a setting is a row keyed by its storage key.
+**Status:** accepted with ADR-0004; **implemented** with M5.2 (Stage A, 2026-09-26). This is
+registry only, and it needed no schema migration, because a setting is a row keyed by its storage
+key. As built (`crates/workspace/src/settings/registry.rs`): `SettingId::ResultsMaxRows`,
+`ResultsMaxBytes` and `ResultsCloseCursorAtLimit` (appended, so no id moved), the constants
+`RESULTS_MAX_ROWS`, `RESULTS_MAX_BYTES` and `RESULTS_CLOSE_CURSOR_AT_LIMIT`, the two
+`NoLimitConsequence` values below, and a `MOBILE` constant (`cfg!(any(target_os = "android",
+target_os = "ios"))`) choosing the built-in defaults. The test
+`the_result_caps_are_registered_as_the_amendment_says` checks each row of the table below, and the
+store tests round-trip each setting through the SQLite file. Turning a resolved setting into the
+store's caps (`reldex_db_core::ResultCaps`, whose `CapSource` mirrors `Level`) is the adapter's
+job, in M5.2's FFI stage; `db-core` does not depend on this crate.
 
 ### Registry addition
 
