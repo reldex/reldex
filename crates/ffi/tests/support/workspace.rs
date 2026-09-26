@@ -1,6 +1,8 @@
 //! A workspace on the in-memory store with the memory credential store, for
 //! the integration tests that prepare a connect (M3.3) from outside the
-//! crate. Nothing here touches the real store or the OS credential store.
+//! crate. Nothing here touches the real store, and nothing touches the OS
+//! credential store except [`TestWorkspace::open_with_platform_store`], which
+//! only the no-store test calls, and only where the platform has no store.
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -36,6 +38,17 @@ impl Drop for TestWorkspace {
 impl TestWorkspace {
     /// Opens an in-memory store with the memory credential store.
     pub(crate) fn open() -> Self {
+        Self::open_with(true)
+    }
+
+    /// Opens an in-memory store with the platform's own credential store.
+    /// Call it only where the platform has none (every platform but Windows
+    /// today): a test must never read or write a real one.
+    pub(crate) fn open_with_platform_store() -> Self {
+        Self::open_with(false)
+    }
+
+    fn open_with(memory_credential_store: bool) -> Self {
         let signal = WakeSignal::for_test();
         let mut handle: *mut ReldexWorkspace = std::ptr::null_mut();
         // SAFETY: `path` is unused (`in_memory: true`); `handle` is a real
@@ -44,7 +57,7 @@ impl TestWorkspace {
             reldex_workspace_open(
                 ReldexStr::empty(),
                 true,
-                true,
+                memory_credential_store,
                 1,
                 std::ptr::from_mut(&mut handle),
             )

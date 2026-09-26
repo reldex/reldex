@@ -311,7 +311,8 @@ pub(crate) fn build_driver(
     let Some(connect) = connect else {
         set_last_error(DbError::new(
             ErrorKind::Configuration,
-            "reldex_hub_open_session: RELDEX_DRIVER_KIND_ORACLE needs `connect`, the summary              reldex_workspace_prepare_connect handed out",
+            "reldex_hub_open_session: RELDEX_DRIVER_KIND_ORACLE needs `connect`, the summary \
+             reldex_workspace_prepare_connect handed out",
         ));
         return Err(ReldexStatus::InvalidArgument);
     };

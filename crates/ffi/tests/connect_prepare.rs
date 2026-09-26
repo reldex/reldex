@@ -20,11 +20,12 @@ mod support;
 use std::mem::offset_of;
 
 use reldex_ffi::{
-    RELDEX_ABI_VERSION_MINOR, ReldexAbandonOutcome, ReldexAuthKind, ReldexDriverKind,
-    ReldexErrorKind, ReldexEventKind, ReldexOpenOptions, ReldexPasswordSourceKind,
-    ReldexPasswordStorageKind, ReldexPromptReasonKind, ReldexStatus, ReldexWorkspaceReplyKind,
-    reldex_abi_version, reldex_connect_summary_release, reldex_hub_open_session,
-    reldex_last_error_take, reldex_secret_expose, reldex_secret_from_utf8, reldex_secret_release,
+    RELDEX_ABI_VERSION_MINOR, ReldexAbandonOutcome, ReldexAuthKind, ReldexCredentialStoreKind,
+    ReldexDriverKind, ReldexErrorKind, ReldexEventKind, ReldexOpenOptions,
+    ReldexPasswordSourceKind, ReldexPasswordStorageKind, ReldexPromptReasonKind, ReldexStatus,
+    ReldexWorkspaceReplyKind, reldex_abi_version, reldex_connect_summary_release,
+    reldex_hub_open_session, reldex_last_error_take, reldex_secret_expose,
+    reldex_secret_from_utf8, reldex_secret_release, reldex_workspace_credential_store_kind,
 };
 
 use support::workspace::{TestWorkspace, profile_details, str_of, summary_view};
@@ -93,6 +94,43 @@ fn a_profile_with_no_stored_password_asks_and_says_why() {
         ReldexPromptReasonKind::NotStored as i32
     );
     assert!(reply.connect.is_null());
+}
+
+/// ADR-0007 S3, Consequences: with no credential store (every platform but
+/// Windows today), every connect of a stored-password profile prompts, and
+/// says that is why. Runs where there is no store; on Windows the platform
+/// store is the real Credential Manager, which no test here may touch.
+#[cfg_attr(not(windows), test)]
+#[cfg_attr(
+    windows,
+    expect(dead_code, reason = "runs only where the platform has no credential store")
+)]
+fn with_no_credential_store_every_connect_prompts() {
+    let workspace = TestWorkspace::open_with_platform_store();
+    // SAFETY: the handle is live; the open reply was taken, so the kind is set.
+    let kind = unsafe { reldex_workspace_credential_store_kind(workspace.handle()) };
+    assert_eq!(kind, ReldexCredentialStoreKind::Absent as i32);
+    let id = workspace.create_profile(&profile_details(
+        "db.example.invalid",
+        1521,
+        "ORCL",
+        "app_owner",
+    ));
+
+    for _ in 0..2 {
+        let reply = workspace.prepare_connect(&id, std::ptr::null());
+        assert!(reply.error.is_null());
+        assert_eq!(
+            reply.password_source_kind,
+            ReldexPasswordSourceKind::PromptRequired as i32
+        );
+        assert_eq!(
+            reply.prompt_reason,
+            ReldexPromptReasonKind::StoreUnavailable as i32
+        );
+        assert!(reply.connect.is_null());
+        assert!(reply.secret.is_null());
+    }
 }
 
 #[test]

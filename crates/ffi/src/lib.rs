@@ -103,9 +103,9 @@
 //! [`reldex_workspace_next_reply`] after its own, independent waker fires —
 //! it does not share the hub's event queue or waker. `crates/ffi/src/
 //! workspace.rs` is also this crate's second composition root (alongside
-//! `metadata.rs`/`splitter.rs`): it is the one place that names
-//! `reldex-driver-oracle-thin` concretely, to map a profile's settings into
-//! real connection parameters. A resolved or fetched password never crosses
+//! `metadata.rs`/`splitter.rs`, and `mock.rs` for opening a session): it
+//! names `reldex-driver-oracle-thin` concretely, to map a profile's settings
+//! into real connection parameters. A resolved or fetched password never crosses
 //! as a plain string the adapter could copy and keep — see
 //! [`ReldexSecret`]/[`reldex_secret_expose`]'s doc comment for the one,
 //! deliberate exception to this crate's outbound-NUL-termination promise.

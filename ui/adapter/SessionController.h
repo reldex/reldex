@@ -123,7 +123,7 @@ class SessionController : public QObject, public ResultFetchSource
     Q_PROPERTY(bool activeProfileIsProduction READ activeProfileIsProduction WRITE
                        setActiveProfileIsProduction NOTIFY activeProfileIsProductionChanged)
 
-    // --- the mock scenario, which is the only driver this build can open ---
+    // --- the mock scenario that open() uses (connectProfile() opens Oracle) ---
     Q_PROPERTY(qint64 mockRows READ mockRows WRITE setMockRows NOTIFY mockConfigChanged)
     Q_PROPERTY(qint64 mockSeed READ mockSeed WRITE setMockSeed NOTIFY mockConfigChanged)
     Q_PROPERTY(qint64 mockPerFetchLatencyUs READ mockPerFetchLatencyUs WRITE
