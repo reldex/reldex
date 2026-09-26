@@ -146,13 +146,13 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 - [ ] M5.3 Grid features: row numbers, NULL visualization, column resize/reorder, type-aware formatting via the bulk formatter, search-in-results (sonnet)
 - [ ] M5.4 Copy: cell, row, range, with/without headers (sonnet)
 - [ ] M5.5 CLOB/BLOB viewers over `read_lob_chunk`, paged, with a size warning (sonnet)
-- [ ] M5.6 ★ Fetch-batch benchmark across row shapes and a real network; pick and record the shipped default (opus, review mandatory)
+- [x] M5.6 ★ Fetch-batch benchmark across row shapes and a real network; pick and record the shipped default (opus, review mandatory) — done 2026-09-26 (PR #46): 375-run matrix on 19c, 3 shapes × batch sizes × loopback/10 ms/40 ms; recommends a 192 KiB per-round-trip budget with `results.fetch_rows` 1,000 as the bound (160 KiB also defensible, 256 KiB is not); the wire-array change itself stays the owner's call (ADR-0004 point (a))
 - [ ] M5.7 Perf gate re-run on the real database; record against M1's numbers (sonnet)
 - [ ] M5.8 ★ Scrolling while a result is still streaming drops ≈ 0.3% of frames (GUI-thread bound: drains + view work) — budget the drain per frame / insert coalescing (opus, review mandatory)
 
 ### M6 — Browse, prove, package
 
-- [ ] M6.1 Object browser: lazy tree over the 9 `SPEC.md` §16 groups, server-side filter, row cap, columns of a selected table (sonnet)
+- [~] M6.1 Object browser: lazy tree over the 9 `SPEC.md` §16 groups, server-side filter, row cap, columns of a selected table (sonnet) — UI half done 2026-09-26 (PR #47): lazy model + panel over the mock driver, own metadata session, filter only ever a bind, review-found refresh/filter race fixed (newest request supersedes), keyboard navigation; real-DB half (permission message, large-schema measurement, row cap as a new SettingId) after M3.3
 - [~] M6.2 Workspace persistence: open worksheets, text, layout, active profile — non-transactional state only (sonnet) —  — store side done 2026-09-25: `worksheet`, `worksheet_setting` (real FK, cascade — closes the ADR-0006 keyed-alone gap) and single-row `layout` tables; non-transactional state only (no session, connection or transaction column exists); Debug redacts text; shell half (restore on start) pending M2.11/M3.x
 - [ ] M6.3 i18n baseline: `qsTr` everywhere, EN + TH catalogues, `lrelease` in the build; Thai rendering test (sonnet)
 - [ ] M6.4 Accessibility baseline: focus order, keyboard-only operation, `Accessible` properties, contrast check (sonnet)

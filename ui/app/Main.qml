@@ -2,6 +2,8 @@ import QtQuick
 import QtQuick.Window
 import QtQuick.Controls
 
+import Reldex.Adapter
+
 // The Reldex app shell (M3.1): a fixed, docking-free layout -- left sidebar,
 // centre worksheet tab bar + content, bottom output panes, status bar --
 // wired to `Theme` (light/dark tokens, live system-scheme follow + user
@@ -16,6 +18,13 @@ import QtQuick.Controls
 // replaces it. See `ui/README.md` "App shell" for the layout diagram and
 // how this differs from `Harness.qml`, the still-reachable S15 measurement
 // window (`ui/app/main.cpp` picks between the two).
+//
+// M6.1 is the first milestone to fill in a placeholder with a real
+// adapter-backed panel (the sidebar's object browser), which is why this
+// file now owns one `Bridge` (ADR-0003 D1) below -- construction only opens
+// the hub itself; no session is opened until something (the object browser,
+// on first expand) actually asks for one, so no I/O happens just from
+// loading this file.
 ApplicationWindow {
     id: root
 
@@ -35,6 +44,17 @@ ApplicationWindow {
 
     title: root.productName
     color: Theme.tokens.background
+
+    // The one `Bridge` (ADR-0003 D1) this window's adapter-backed panels
+    // share -- today just the object browser (M6.1), which opens its own
+    // metadata session against this hub, distinct from any worksheet's
+    // session. M3.2's connection manager and later worksheet execution (M4.x)
+    // are expected to reuse this same instance rather than each creating
+    // their own hub.
+    Bridge {
+        id: bridge
+        objectName: "bridge"
+    }
 
     // Session-only, per the task brief: resets to expanded on every launch.
     // Persisting this is M6.2 ("UI layout" in SPEC.md §20's local-persistence
@@ -79,6 +99,7 @@ ApplicationWindow {
             SplitView.minimumWidth: 160
             SplitView.maximumWidth: 480
             visible: root.sidebarVisible
+            bridge: bridge
         }
 
         SplitView {

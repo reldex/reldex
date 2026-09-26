@@ -160,6 +160,7 @@ set(RELDEX_APP_QML_FILES
     Harness.qml
     Theme.qml
     Sidebar.qml
+    ObjectBrowserPanel.qml
     WorksheetArea.qml
     OutputPanes.qml
     StatusBar.qml

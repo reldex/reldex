@@ -20,6 +20,7 @@
 
 #include <QHash>
 #include <QObject>
+#include <QPointer>
 #include <QString>
 #include <QtQml/qqmlregistration.h>
 
@@ -196,7 +197,30 @@ private:
     [[nodiscard]] quint64 nextRequest(int expectedEventKind);
     [[nodiscard]] bool checkThread() const;
 
-    Bridge *m_bridge = nullptr;
+    // Ownership/teardown rule (found by an ASan use-after-free on PR #47,
+    // CI job qt-asan: `SessionController::closeSession` dereferencing an
+    // already-freed `Bridge`): a `SessionController` does NOT own its
+    // `Bridge` and must never assume it outlives the controller. In the real
+    // app and in `tst_coreinfo`'s QML tests alike, `Bridge` is a QML-owned
+    // sibling of whatever owns this controller (e.g. `Main.qml`'s `Bridge`
+    // versus `ObjectBrowserModel`'s owned `SessionController`, both children
+    // of the same window) -- nothing makes one a parent of the other, so
+    // `QQmlApplicationEngine`'s teardown can (and, per the ASan report, does)
+    // destroy `Bridge` before this controller, in whichever order the QML
+    // object tree happens to list them. `QPointer`, not a raw pointer: every
+    // existing `m_bridge == nullptr`/`!= nullptr` guard in this file already
+    // assumed a raw pointer stays valid or is explicitly cleared, which is
+    // false the instant `Bridge` is destroyed out from under a still-live
+    // `SessionController` -- `QPointer` is what makes those guards actually
+    // catch that instead of dereferencing freed memory (`Bridge::isValid()`
+    // at `closeSession()`'s own guard was the crash site). A `SessionController`
+    // whose `Bridge` has gone this way still needs to behave safely: every
+    // `reldex_*` call this class makes already routes through a `m_bridge ==
+    // nullptr` check first, so once that check starts telling the truth,
+    // `open()`/`execute()`/`closeSession()`/etc. simply report failure the
+    // same way they already do for "no bridge was ever set" -- no new
+    // failure mode, just a guard that used to lie.
+    QPointer<Bridge> m_bridge;
     ResultTableModel *m_model = nullptr;
 
     State m_state = Idle;
