@@ -1,15 +1,21 @@
-//! The one file in this crate that knows a concrete driver exists.
+//! The one file in this crate that turns a [`ReldexDriverKind`] into a
+//! concrete driver.
 //!
-//! ADR-0003 keeps the boundary vendor-neutral, so which driver a session runs
-//! against is a build-time choice: `mock-driver` (the default, and what spike
-//! S15, the C smoke harness and every test here use) selects
-//! `reldex-driver-mock`; a later `oracle-driver` feature will select
-//! `reldex-driver-oracle-thin` and add one arm to
-//! [`ReldexDriverKind`] plus one branch in [`build_driver`]. Nothing else in
-//! the crate changes, because nothing else in the crate names a driver.
+//! ADR-0003 keeps the boundary vendor-neutral. Two drivers can be opened:
+//! the mock (`mock-driver`, the default feature, and what spike S15, the C
+//! smoke harness and every test here use) and, since ABI 3.3 (M3.3), the
+//! Oracle thin driver, which this crate already links for its metadata and
+//! profile bindings. An Oracle session opens with the parameters a
+//! [`ReldexConnectSummary`] carries — built on the workspace service thread
+//! by `reldex_workspace_prepare_connect`, password included — and nothing
+//! else in the crate names a driver.
 
 use std::sync::Arc;
 
+use reldex_db_core::{DbError, ErrorKind};
+
+use crate::ReldexConnectSummary;
+use crate::error::set_last_error;
 use crate::session::ReldexOpenOptions;
 use crate::status::{ReldexStatus, entry, entry_value};
 use crate::strings::{CStruct, ReldexStr};
@@ -22,9 +28,14 @@ use crate::strings::{CStruct, ReldexStr};
 pub enum ReldexDriverKind {
     /// A driver this header does not know, or none requested.
     Unknown = 0,
-    /// The in-process mock driver: no database, deterministic, and the only
-    /// driver a build with the `mock-driver` feature can open.
+    /// The in-process mock driver: no database, deterministic. Only a build
+    /// with the `mock-driver` feature can open it.
     Mock = 1,
+    /// Oracle Database through the thin driver (ABI 3.3). Needs
+    /// `ReldexOpenOptions::connect`: a summary that
+    /// `reldex_workspace_prepare_connect` (or `_build_connect_params`)
+    /// handed out, which carries the parameters to open with.
+    Oracle = 2,
 }
 
 /// Which scripted world a mock session connects to.
@@ -288,9 +299,43 @@ pub(crate) fn release_block(control: &BlockControl) {
 #[cfg(not(feature = "mock-driver"))]
 pub(crate) fn release_block(_control: &BlockControl) {}
 
-/// Builds the driver a session should open against.
+/// Builds the driver a session should open against, recording why in the
+/// thread's last error when it cannot.
+pub(crate) fn build_driver(
+    options: &ReldexOpenOptions,
+    connect: Option<&ReldexConnectSummary>,
+) -> Result<DriverChoice, ReldexStatus> {
+    if options.driver != ReldexDriverKind::Oracle as i32 {
+        return build_mock_driver(options);
+    }
+    let Some(connect) = connect else {
+        set_last_error(DbError::new(
+            ErrorKind::Configuration,
+            "reldex_hub_open_session: RELDEX_DRIVER_KIND_ORACLE needs `connect`, the summary              reldex_workspace_prepare_connect handed out",
+        ));
+        return Err(ReldexStatus::InvalidArgument);
+    };
+    Ok(DriverChoice {
+        driver: Arc::new(reldex_driver_oracle_thin::OracleThinDriver::new()),
+        // A copy, password included: the caller releases its summary (and
+        // its copy of the password with it) as soon as this call returns.
+        params: connect.params().clone(),
+        block: None,
+        connect_block: None,
+    })
+}
+
+fn unsupported_driver() -> ReldexStatus {
+    set_last_error(DbError::new(
+        ErrorKind::Unsupported,
+        "reldex-ffi: this build cannot open a session against the requested driver",
+    ));
+    ReldexStatus::InvalidArgument
+}
+
+/// Builds the mock world a session opens against.
 #[cfg(feature = "mock-driver")]
-pub(crate) fn build_driver(options: &ReldexOpenOptions) -> Result<DriverChoice, ReldexStatus> {
+fn build_mock_driver(options: &ReldexOpenOptions) -> Result<DriverChoice, ReldexStatus> {
     use std::time::Duration;
 
     use reldex_db_driver_api::{
@@ -301,11 +346,11 @@ pub(crate) fn build_driver(options: &ReldexOpenOptions) -> Result<DriverChoice, 
     };
 
     if options.driver != ReldexDriverKind::Mock as i32 {
-        return Err(ReldexStatus::InvalidArgument);
+        return Err(unsupported_driver());
     }
     let config = options.mock;
     if config.scenario != 0 && config.scenario != ReldexMockScenario::S14 as i32 {
-        return Err(ReldexStatus::InvalidArgument);
+        return Err(unsupported_driver());
     }
 
     let scenario = Scenario::new();
@@ -360,7 +405,12 @@ pub(crate) fn build_driver(options: &ReldexOpenOptions) -> Result<DriverChoice, 
                 std::thread::sleep(delay);
                 releaser.release();
             })
-            .map_err(|_| ReldexStatus::Error)?;
+            .map_err(|_| {
+                set_last_error(DbError::internal(
+                    "reldex-ffi: the mock releaser did not start",
+                ));
+                ReldexStatus::Error
+            })?;
     }
 
     scenario.on_sql(
@@ -456,9 +506,8 @@ fn scripted_failure(failure: i32) -> Option<reldex_driver_mock::ScriptedError> {
     Some(reldex_driver_mock::ScriptedError::new(kind, message).with_native(code, message))
 }
 
-/// See the `mock-driver` definition. A build with no driver feature can create
-/// a hub and read the ABI version, but cannot open a session.
+/// See the `mock-driver` definition. Without the feature only Oracle opens.
 #[cfg(not(feature = "mock-driver"))]
-pub(crate) fn build_driver(_options: &ReldexOpenOptions) -> Result<DriverChoice, ReldexStatus> {
-    Err(ReldexStatus::InvalidArgument)
+fn build_mock_driver(_options: &ReldexOpenOptions) -> Result<DriverChoice, ReldexStatus> {
+    Err(unsupported_driver())
 }

@@ -1140,14 +1140,15 @@ impl DriverBinding for OracleDriverBinding {
 }
 
 /// The [`ConnectionParams`] `reldex_workspace::connection_params` built for a
-/// profile, summarised into plain data -- owned by the caller from the
-/// moment the reply that carries it is drained, released with
-/// [`reldex_connect_summary_release`].
+/// profile: summarised into plain data for display
+/// ([`reldex_connect_summary_view`]), and -- since ABI 3.3 (M3.3, ADR-0003
+/// A40) -- carrying the parameters themselves, **password included**, so it
+/// can be handed to `reldex_hub_open_session` as
+/// `ReldexOpenOptions::connect`. The view never exposes the password.
 ///
-/// Not `ConnectionParams` itself: nothing downstream of M2.11 consumes it yet
-/// (session opening against a real driver is M1.8's), so this crate reports
-/// what the mapping produced rather than inventing a second FFI shape for a
-/// type with no consumer. See the PR description's "weak points" note.
+/// Owned by the caller from the moment the reply that carries it is drained;
+/// release it with [`reldex_connect_summary_release`], which wipes the
+/// password, as soon as the open that needs it has returned.
 pub struct ReldexConnectSummary {
     endpoint_kind: i32,
     host: OwnedStr,
@@ -1162,6 +1163,8 @@ pub struct ReldexConnectSummary {
     connect_without_limit: bool,
     allow_unenforced_certificate_pin: bool,
     ca_directory: OwnedStr,
+    /// What a session opens with. Its `Secret` wipes itself on drop.
+    params: ConnectionParams,
 }
 
 impl Drop for ReldexConnectSummary {
@@ -1171,7 +1174,12 @@ impl Drop for ReldexConnectSummary {
 }
 
 impl ReldexConnectSummary {
-    fn new(params: &ConnectionParams) -> Self {
+    /// The parameters a session opens with.
+    pub(crate) const fn params(&self) -> &ConnectionParams {
+        &self.params
+    }
+
+    fn new(params: ConnectionParams) -> Self {
         crate::counters::created(crate::counters::Kind::WorkspaceObject);
         let (endpoint_kind, host, port, service, connect_string) = match params.endpoint() {
             Endpoint::HostPort {
@@ -1230,6 +1238,7 @@ impl ReldexConnectSummary {
             connect_without_limit: flag(EXT_CONNECT_TIMEOUT_UNBOUNDED),
             allow_unenforced_certificate_pin: flag(EXT_ALLOW_UNENFORCED_SERVER_CERT_DN),
             ca_directory: OwnedStr::new(ca_directory),
+            params,
         }
     }
 
@@ -1475,6 +1484,9 @@ pub enum ReldexPasswordSourceKind {
     PromptRequired = 2,
     /// The profile authenticates without a password.
     NotNeeded = 3,
+    /// The caller supplied the password (typed in), so the store was not
+    /// read -- [`crate::reldex_workspace_prepare_connect`] only (ABI 3.3).
+    Supplied = 4,
 }
 
 /// Why the user must be asked for the password -- the FFI shape of
@@ -2305,6 +2317,11 @@ enum WorkspaceCommand {
         id: ProfileId,
         password: Option<Secret>,
     },
+    PrepareConnect {
+        request: u64,
+        id: ProfileId,
+        password: Option<Secret>,
+    },
     CredentialGet {
         request: u64,
         id: ProfileId,
@@ -2374,6 +2391,11 @@ enum WorkspacePayload {
     ProfileFetched(Option<Profile>),
     ProfilesListed(Vec<Profile>),
     ConnectParamsBuilt(ConnectionParams),
+    /// Ready to open (with where the password came from), or a prompt.
+    ConnectPrepared {
+        id: ProfileId,
+        source: Result<(ReldexPasswordSourceKind, ConnectionParams), PromptReason>,
+    },
     CredentialGot(Option<Secret>),
     PasswordResolved(PasswordSource),
     HistoryRecorded(HistoryId),
@@ -2456,7 +2478,17 @@ impl QueuedWorkspaceReply {
                 out.profile_list = Box::into_raw(Box::new(ReldexProfileList::new(profiles)));
             }
             WorkspacePayload::ConnectParamsBuilt(params) => {
-                out.connect = Box::into_raw(Box::new(ReldexConnectSummary::new(&params)));
+                out.connect = Box::into_raw(Box::new(ReldexConnectSummary::new(params)));
+            }
+            WorkspacePayload::ConnectPrepared { id, source } => {
+                out.id = *id.as_bytes();
+                match source {
+                    Ok((kind, params)) => {
+                        out.password_source_kind = kind as i32;
+                        out.connect = Box::into_raw(Box::new(ReldexConnectSummary::new(params)));
+                    }
+                    Err(reason) => prompt_required(&mut out, reason),
+                }
             }
             WorkspacePayload::CredentialGot(secret) => {
                 out.found = secret.is_some();
@@ -2469,22 +2501,7 @@ impl QueuedWorkspaceReply {
                     out.password_source_kind = ReldexPasswordSourceKind::FromStore as i32;
                     out.secret = Box::into_raw(Box::new(ReldexSecret::new(secret)));
                 }
-                PasswordSource::PromptRequired(reason) => {
-                    out.password_source_kind = ReldexPasswordSourceKind::PromptRequired as i32;
-                    out.prompt_reason = match reason {
-                        PromptReason::PromptEachTime => ReldexPromptReasonKind::PromptEachTime,
-                        PromptReason::StoreUnavailable => ReldexPromptReasonKind::StoreUnavailable,
-                        PromptReason::NotStored => ReldexPromptReasonKind::NotStored,
-                        PromptReason::StoreFailed(error) => {
-                            out.error = Box::into_raw(Box::new(ReldexError::from_db_error(
-                                &credential_error("resolve_password", error),
-                            )));
-                            ReldexPromptReasonKind::StoreFailed
-                        }
-                        // `PromptReason` is `#[non_exhaustive]`.
-                        _ => ReldexPromptReasonKind::Unknown,
-                    } as i32;
-                }
+                PasswordSource::PromptRequired(reason) => prompt_required(&mut out, reason),
                 PasswordSource::NotNeeded => {
                     out.password_source_kind = ReldexPasswordSourceKind::NotNeeded as i32;
                 }
@@ -2518,6 +2535,26 @@ impl QueuedWorkspaceReply {
         }
         out
     }
+}
+
+/// Fills a reply that asks for the password, and why. A store failure's
+/// value-free error rides in `error` (the precedent `PasswordResolved` set).
+fn prompt_required(out: &mut ReldexWorkspaceReply, reason: PromptReason) {
+    out.password_source_kind = ReldexPasswordSourceKind::PromptRequired as i32;
+    out.prompt_reason = match reason {
+        PromptReason::PromptEachTime => ReldexPromptReasonKind::PromptEachTime,
+        PromptReason::StoreUnavailable => ReldexPromptReasonKind::StoreUnavailable,
+        PromptReason::NotStored => ReldexPromptReasonKind::NotStored,
+        PromptReason::StoreFailed(error) => {
+            out.error = Box::into_raw(Box::new(ReldexError::from_db_error(&credential_error(
+                "resolve_password",
+                error,
+            ))));
+            ReldexPromptReasonKind::StoreFailed
+        }
+        // `PromptReason` is `#[non_exhaustive]`.
+        _ => ReldexPromptReasonKind::Unknown,
+    } as i32;
 }
 
 /// Which request a [`ReldexWorkspaceReply`] answers.
@@ -2587,6 +2624,13 @@ pub enum ReldexWorkspaceReplyKind {
     /// it (should-fix #7), and every existing test/harness call already
     /// compares against the numeric value, not just the name.
     SettingSet = 21,
+    /// Reply to [`crate::reldex_workspace_prepare_connect`] (ABI 3.3): `id` is
+    /// the profile; either `connect` is ready to open with and
+    /// `password_source_kind` says where its password came from, or
+    /// `password_source_kind` is `PromptRequired` with `prompt_reason` (and,
+    /// for `StoreFailed`, the store's value-free error in `error`). Any other
+    /// non-null `error` is the request's failure.
+    ConnectPrepared = 22,
 }
 
 /// What one completed workspace request looks like on the way out. One flat
@@ -3179,6 +3223,7 @@ const fn command_request(command: &WorkspaceCommand) -> u64 {
         | WorkspaceCommand::GetProfile { request, .. }
         | WorkspaceCommand::ListProfiles { request }
         | WorkspaceCommand::BuildConnectParams { request, .. }
+        | WorkspaceCommand::PrepareConnect { request, .. }
         | WorkspaceCommand::CredentialGet { request, .. }
         | WorkspaceCommand::CredentialPut { request, .. }
         | WorkspaceCommand::CredentialDelete { request, .. }
@@ -3213,6 +3258,7 @@ const fn command_reply_kind(command: &WorkspaceCommand) -> ReldexWorkspaceReplyK
         WorkspaceCommand::GetProfile { .. } => ReldexWorkspaceReplyKind::ProfileFetched,
         WorkspaceCommand::ListProfiles { .. } => ReldexWorkspaceReplyKind::ProfilesListed,
         WorkspaceCommand::BuildConnectParams { .. } => ReldexWorkspaceReplyKind::ConnectParamsBuilt,
+        WorkspaceCommand::PrepareConnect { .. } => ReldexWorkspaceReplyKind::ConnectPrepared,
         WorkspaceCommand::CredentialGet { .. } => ReldexWorkspaceReplyKind::CredentialGot,
         WorkspaceCommand::CredentialPut { .. } => ReldexWorkspaceReplyKind::CredentialPut,
         WorkspaceCommand::CredentialDelete { .. } => ReldexWorkspaceReplyKind::CredentialDeleted,
@@ -3413,44 +3459,26 @@ fn run_command(
             id,
             password,
         } => {
-            let payload = (|| {
-                let profile = store
-                    .profile(id)
-                    .map_err(|error| store_error("build_connect_params", error))?
-                    .ok_or(StoreError::ProfileNotFound(id))
-                    .map_err(|error| store_error("build_connect_params", error))?;
-                let application = store
-                    .application_settings()
-                    .map_err(|error| store_error("build_connect_params", error))?
-                    .value;
-                let profile_layer = store
-                    .profile_settings(id)
-                    .map_err(|error| store_error("build_connect_params", error))?
-                    .value;
-                let context = ResolveContext::new()
-                    .with_application(&application)
-                    .with_profile(&profile_layer);
-                let settings = ConnectSettings::resolve(&context);
-                let params = reldex_workspace::connection_params(
-                    &profile,
-                    &settings,
-                    password,
-                    &OracleDriverBinding,
-                )
-                .map_err(|error| {
-                    DbError::new(
-                        ErrorKind::Configuration,
-                        format!("build_connect_params: {error}"),
-                    )
-                })?;
-                Ok(WorkspacePayload::ConnectParamsBuilt(params))
-            })();
+            let payload = load_profile(store, id, "build_connect_params")
+                .and_then(|profile| {
+                    connect_params(store, &profile, password, "build_connect_params")
+                })
+                .map(WorkspacePayload::ConnectParamsBuilt);
             QueuedWorkspaceReply {
                 kind: ReldexWorkspaceReplyKind::ConnectParamsBuilt as i32,
                 request,
                 payload,
             }
         }
+        WorkspaceCommand::PrepareConnect {
+            request,
+            id,
+            password,
+        } => QueuedWorkspaceReply {
+            kind: ReldexWorkspaceReplyKind::ConnectPrepared as i32,
+            request,
+            payload: prepare_connect(store, credentials, id, password),
+        },
         WorkspaceCommand::CredentialGet { request, id } => {
             let payload = match credentials.get(&CredentialKey::for_profile(id)) {
                 Ok(secret) => Ok(WorkspacePayload::CredentialGot(secret)),
@@ -3617,6 +3645,75 @@ fn run_command(
             }
         }
     }
+}
+
+/// Loads one profile, a missing one being an error.
+fn load_profile(store: &Store, id: ProfileId, what: &str) -> Result<Profile, DbError> {
+    store
+        .profile(id)
+        .map_err(|error| store_error(what, error))?
+        .ok_or(StoreError::ProfileNotFound(id))
+        .map_err(|error| store_error(what, error))
+}
+
+/// `reldex_workspace::connection_params` for `profile`, with its connect
+/// settings resolved (application, then profile; neither may be set per
+/// worksheet) and the Oracle binding.
+fn connect_params(
+    store: &Store,
+    profile: &Profile,
+    password: Option<Secret>,
+    what: &str,
+) -> Result<ConnectionParams, DbError> {
+    let application = store
+        .application_settings()
+        .map_err(|error| store_error(what, error))?
+        .value;
+    let profile_layer = store
+        .profile_settings(profile.id())
+        .map_err(|error| store_error(what, error))?
+        .value;
+    let context = ResolveContext::new()
+        .with_application(&application)
+        .with_profile(&profile_layer);
+    let settings = ConnectSettings::resolve(&context);
+    reldex_workspace::connection_params(profile, &settings, password, &OracleDriverBinding)
+        .map_err(|error| DbError::new(ErrorKind::Configuration, format!("{what}: {error}")))
+}
+
+/// M3.3's connect step, on the service thread: the profile's parameters
+/// joined with `reldex_secrets::resolve_password` (ADR-0007 S3) -- or with
+/// the password the caller supplied, in which case the store is not read at
+/// all. A stored password never leaves this thread except inside the
+/// parameters.
+fn prepare_connect(
+    store: &Store,
+    credentials: &dyn CredentialStore,
+    id: ProfileId,
+    supplied: Option<Secret>,
+) -> Result<WorkspacePayload, DbError> {
+    const WHAT: &str = "prepare_connect";
+    let profile = load_profile(store, id, WHAT)?;
+    let (kind, password) = match supplied {
+        Some(password) => (ReldexPasswordSourceKind::Supplied, Some(password)),
+        None => match reldex_secrets::resolve_password(&profile, credentials) {
+            PasswordSource::FromStore(password) => {
+                (ReldexPasswordSourceKind::FromStore, Some(password))
+            }
+            PasswordSource::NotNeeded => (ReldexPasswordSourceKind::NotNeeded, None),
+            PasswordSource::PromptRequired(reason) => {
+                return Ok(WorkspacePayload::ConnectPrepared {
+                    id,
+                    source: Err(reason),
+                });
+            }
+        },
+    };
+    let params = connect_params(store, &profile, password, WHAT)?;
+    Ok(WorkspacePayload::ConnectPrepared {
+        id,
+        source: Ok((kind, params)),
+    })
 }
 
 // ============================================================================
@@ -4192,6 +4289,51 @@ pub unsafe extern "C" fn reldex_workspace_resolve_password(
             );
         };
         submit(workspace, WorkspaceCommand::ResolvePassword { request, id })
+    })
+}
+
+/// Prepares a connect to `profile` on the service thread (ABI 3.3, M3.3):
+/// resolves its connect settings and, unless `password` is given, asks the
+/// credential store (`reldex_secrets::resolve_password`). The reply
+/// (`RELDEX_WORKSPACE_REPLY_KIND_CONNECT_PREPARED`) either carries a
+/// [`ReldexConnectSummary`] ready for `reldex_hub_open_session`, or says the
+/// user must be asked, and why. A stored password is never handed out: it
+/// travels only inside that summary.
+///
+/// `password`, when non-null, is what the user typed (build it with
+/// [`reldex_secret_from_utf8`]); the store is then not read. It is **not**
+/// consumed. Nothing here retries a stored password: call this again only
+/// when the user asks to connect again (ADR-0007).
+///
+/// # Safety
+///
+/// As [`reldex_workspace_build_connect_params`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reldex_workspace_prepare_connect(
+    workspace: *mut ReldexWorkspace,
+    request: u64,
+    profile: *const u8,
+    password: *const ReldexSecret,
+) -> ReldexStatus {
+    entry(|| {
+        // SAFETY: delegated to this function's contract.
+        let bytes = unsafe { read_id_bytes(profile) };
+        let Ok(id) = ProfileId::from_bytes(bytes) else {
+            return set_last_argument_error(
+                "reldex_workspace_prepare_connect: `profile` is null or not a valid profile id",
+            );
+        };
+        // SAFETY: the caller promises `password` is null or a live
+        // `ReldexSecret` for the duration of this call.
+        let password = unsafe { password.as_ref() }.map(|secret| secret.secret.clone());
+        submit(
+            workspace,
+            WorkspaceCommand::PrepareConnect {
+                request,
+                id,
+                password,
+            },
+        )
     })
 }
 

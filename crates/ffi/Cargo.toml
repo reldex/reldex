@@ -19,12 +19,12 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 workspace = true
 
 [features]
-# The boundary itself is vendor-neutral. A *concrete driver* is a build-time
-# choice, so each one is a feature and the default is the mock: spike S15, the
-# C smoke harness (M1.4) and every test here run with no database at all, and a
-# product build will be `--no-default-features --features oracle-driver` once
-# that feature exists (M1.8 — session opening against a real driver; see
-# `reldex_hub_open_session`). Nothing in `src/session.rs`'s session-opening path
+# The boundary itself is vendor-neutral. The mock driver is a feature and the
+# default: spike S15, the C smoke harness (M1.4) and every test here run with no
+# database at all. The Oracle thin driver is not a feature: it is always linked
+# (see `reldex-driver-oracle-thin` below) and opens through
+# `RELDEX_DRIVER_KIND_ORACLE` since ABI 3.3 (M3.3), so a product build is
+# `--no-default-features`. Nothing in `src/session.rs`'s session-opening path
 # outside `mock.rs` knows which driver it is talking to.
 #
 # `mock-driver` also turns on `reldex-secrets`'s `test-support` feature
@@ -34,6 +34,12 @@ workspace = true
 # store) at all. Neither is compiled into a `--no-default-features` build.
 default = ["mock-driver"]
 mock-driver = ["dep:reldex-driver-mock", "reldex-secrets/test-support"]
+# Opt-in live tests against the Oracle test database (`tools/oracle-test-db/`):
+# `RELDEX_IT_PACKAGE=reldex-ffi bash tools/oracle-test-db/run-it.sh
+# m3_3_connect_live -- --ignored --test-threads=1`. Compiles nothing into the
+# library; off by default so `cargo test --workspace` needs no database
+# (`AGENTS.md`, "Testing").
+oracle-it = []
 
 [dev-dependencies]
 # The tests check fetched cells against the mock's own
