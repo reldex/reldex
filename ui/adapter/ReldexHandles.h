@@ -49,6 +49,29 @@ struct HubDeleter
     void operator()(ReldexHub *hub) const noexcept { reldex_hub_destroy(hub); }
 };
 
+struct WorkspaceDeleter
+{
+    void operator()(ReldexWorkspace *workspace) const noexcept { reldex_workspace_close(workspace); }
+};
+
+struct ProfileListDeleter
+{
+    void operator()(ReldexProfileList *list) const noexcept { reldex_profile_list_release(list); }
+};
+
+struct ConnectSummaryDeleter
+{
+    void operator()(ReldexConnectSummary *summary) const noexcept
+    {
+        reldex_connect_summary_release(summary);
+    }
+};
+
+struct SecretDeleter
+{
+    void operator()(ReldexSecret *secret) const noexcept { reldex_secret_release(secret); }
+};
+
 struct MetadataQueryDeleter
 {
     void operator()(ReldexMetadataQuery *query) const noexcept
@@ -69,6 +92,18 @@ using ArenaHandle = std::unique_ptr<ReldexTextArena, ArenaDeleter>;
 /// Owns one `SERVER_OUTPUT` event's lines.
 using LinesHandle = std::unique_ptr<ReldexServerOutputLines, LinesDeleter>;
 
+/// Owns a profile list handed out by a workspace reply (`ProfileFetched` /
+/// `ProfilesListed`).
+using ProfileListHandle = std::unique_ptr<ReldexProfileList, ProfileListDeleter>;
+
+/// Owns a connect summary handed out by `ConnectParamsBuilt`.
+using ConnectSummaryHandle = std::unique_ptr<ReldexConnectSummary, ConnectSummaryDeleter>;
+
+/// Owns a secret handed out by `CredentialGot`/`PasswordResolved`, or built
+/// locally with `reldex_secret_from_utf8`. Zeroizes on release
+/// (`reldex_secret_release`, ADR-0007 S4 "Hygiene").
+using SecretHandle = std::unique_ptr<ReldexSecret, SecretDeleter>;
+
 /// Owns the hub.
 ///
 /// A handle rather than a raw pointer so a `Bridge` constructor that fails
@@ -77,6 +112,14 @@ using LinesHandle = std::unique_ptr<ReldexServerOutputLines, LinesDeleter>;
 /// teardown D5 rule 2 requires (unregister the waker, release every batch,
 /// drain) happens in `~Bridge` before this handle is reset.
 using HubHandle = std::unique_ptr<ReldexHub, HubDeleter>;
+
+/// Owns the workspace's service thread (settings/profiles/credentials/
+/// history/worksheets/layout, `reldex_workspace_open`/`_close`).
+/// `reldex_workspace_close` never blocks and must not be followed by a drain
+/// (`reldex.h`'s own doc comment); a handle is still the right shape here so
+/// a `ConnectionManager` constructor that fails partway through cannot leak
+/// the workspace or its service thread.
+using WorkspaceHandle = std::unique_ptr<ReldexWorkspace, WorkspaceDeleter>;
 
 /// Owns one prepared metadata statement (M6.1), from `reldex_metadata_prepare`
 /// until it goes out of scope.
@@ -96,6 +139,19 @@ template<typename T>
 [[nodiscard]] inline ReldexErrorView makeErrorView() noexcept { return sized<ReldexErrorView>(); }
 [[nodiscard]] inline ReldexArenaView makeArenaView() noexcept { return sized<ReldexArenaView>(); }
 [[nodiscard]] inline ReldexLiveCounts makeLiveCounts() noexcept { return sized<ReldexLiveCounts>(); }
+[[nodiscard]] inline ReldexWorkspaceReply makeWorkspaceReply() noexcept
+{
+    return sized<ReldexWorkspaceReply>();
+}
+[[nodiscard]] inline ReldexProfileView makeProfileView() noexcept { return sized<ReldexProfileView>(); }
+[[nodiscard]] inline ReldexProfileDetails makeProfileDetails() noexcept
+{
+    return sized<ReldexProfileDetails>();
+}
+[[nodiscard]] inline ReldexConnectSummaryView makeConnectSummaryView() noexcept
+{
+    return sized<ReldexConnectSummaryView>();
+}
 [[nodiscard]] inline ReldexOpenOptions makeOpenOptions() noexcept
 {
     ReldexOpenOptions options = sized<ReldexOpenOptions>();

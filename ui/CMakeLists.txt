@@ -164,6 +164,7 @@ set(RELDEX_APP_QML_FILES
     WorksheetArea.qml
     OutputPanes.qml
     StatusBar.qml
+    ConnectionManagerDialog.qml
 )
 
 enable_testing()

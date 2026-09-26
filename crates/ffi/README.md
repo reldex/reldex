@@ -75,6 +75,13 @@ boundary) open; it does not repeat that reasoning.
 - A panic inside the workspace service thread's command loop is caught (`catch_unwind`): the
   workspace is marked failed, every outstanding and later request gets
   `RELDEX_STATUS_INVALID_STATE` instead of a silent hang, and the process does not abort.
+- `reldex_workspace_open`'s service thread (`service_main`) opens a non-in-memory store with
+  `Store::open_creating`, not `Store::open`: it creates the parent directory and the store file
+  itself (owner-only on Unix) if either is missing, the same rule `Store::open_default` applies to
+  the platform-default path (ADR-0006 P5). Fixed 2026-09-26 (M3.2 fix round) — the C++ adapter used
+  to reimplement this itself before calling here (on whichever thread called it, sometimes the UI
+  thread), which is exactly the filesystem I/O the bullet above says never to do off this thread.
+  Internal behaviour only; `reldex_workspace_open`'s signature is unchanged.
 
 ## Events (ABI 3.2, M2.15)
 

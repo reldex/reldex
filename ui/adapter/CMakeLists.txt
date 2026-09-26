@@ -29,6 +29,10 @@ qt_add_qml_module(reldex_adapter
         ObjectBrowserModel.cpp
         ScrollDriver.h
         ScrollDriver.cpp
+        ProfileModel.h
+        ProfileModel.cpp
+        ConnectionManager.h
+        ConnectionManager.cpp
 )
 
 target_include_directories(reldex_adapter PUBLIC

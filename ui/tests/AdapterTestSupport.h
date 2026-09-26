@@ -13,6 +13,7 @@
 #include <QEventLoop>
 #include <QString>
 #include <QThread>
+#include <QtGlobal>
 #include <QtQuick/QQuickItem>
 
 #include <Bridge.h>
@@ -20,6 +21,35 @@
 #include <SessionController.h>
 
 namespace adapter_test {
+
+// M3.2 fix round, must-fix 1(b) (2026-09-26): a harness-level default so a
+// future test cannot forget to force the workspace in-memory. This header is
+// included by every UI test's own .cpp (tst_bridge, tst_resultmodel,
+// tst_teardown, tst_connectionmanager, and tst_coreinfo -- which loads the
+// real Main.qml, and therefore a real Bridge/ConnectionManager whose
+// Component.onCompleted calls connections.open()). A namespace-scope
+// `inline const` object's constructor runs during static initialization,
+// before QTEST_MAIN/QTEST_GUILESS_MAIN's generated main() constructs
+// anything or loads any QML -- so RELDEX_WORKSPACE_IN_MEMORY is already "1"
+// by the time anything in this process could call
+// ConnectionManager::open(). This is the outermost of three layers (the
+// others: ConnectionManager itself never opens automatically; ui/build.sh
+// --test asserts afterward that the real default store was not touched) --
+// belt, suspenders, and a smoke alarm.
+//
+// tst_connectionmanager's own `aRealOnDiskWorkspaceRoundTripsThroughTheResolvedDefaultPath`
+// test unsets this itself, deliberately, after this constructor has already
+// run -- it is the one test that wants the real (but redirected, via a
+// QTemporaryDir standing in for the platform data directory) on-disk path.
+struct ForceInMemoryWorkspaceForTests
+{
+    ForceInMemoryWorkspaceForTests()
+    {
+        qputenv("RELDEX_WORKSPACE_IN_MEMORY", "1");
+        qputenv("RELDEX_WORKSPACE_MEMORY_CREDENTIAL_STORE", "1");
+    }
+};
+inline const ForceInMemoryWorkspaceForTests forceInMemoryWorkspaceForTests;
 
 /// Finds a descendant by `objectName`, walking the **visual** item tree
 /// (`QQuickItem::childItems()`) rather than `QObject::findChild()`'s

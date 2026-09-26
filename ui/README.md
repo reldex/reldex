@@ -426,6 +426,300 @@ Two rules follow for anything a drain can reach, and both are stated in
   event loop, which is after the drain has finished. Also covered by
   `tst_bridge`, with fetches still in flight at the moment of destruction.
 
+## Connection manager (M3.2)
+
+Two more C++ classes, `ConnectionManager` and `ProfileModel`, plus one QML
+dialog, add profile CRUD, environment/production classification and
+test-connect on top of the M1.6 hub adapter above. They deliberately do not
+touch `SessionController`, `Bridge`'s single worksheet-session slot, or
+`ResultTableModel` — those belong to one user's live worksheet; a connection
+dialog trying and discarding connections is a different, disposable session
+(see "Test-connect" below for how it gets one without touching the real one).
+
+### A second FFI subsystem, not a second `Bridge`
+
+The hub (`ReldexHub*`, session/query execution) and the workspace
+(`ReldexWorkspace*`, settings/profiles/credentials/history) are two
+independent async subsystems in ABI 3.1, each with its own service thread, its
+own event/reply queue and its own waker contract. `Bridge` already owns the
+hub; `ConnectionManager` owns the workspace, with its own complete copy of the
+waker/drain pattern documented above (`reldexConnectionManagerWakeImpl`,
+`postDrain()`, `drain()` — the same edge-triggered wake, the same coalescing
+`QAtomicInt`, the same "never re-enter, re-post instead" rule, the same
+noexcept trampoline verified by a `static_assert` against
+`ReldexWorkspaceWakeFnNoexcept`). `Bridge` constructs one
+`ConnectionManager(this, this)` once its own hub is up, and exposes it as
+`bridge.connections` (`Q_PROPERTY(ConnectionManager *connections ...)`),
+reachable from QML with no further wiring. One workspace per `Bridge`,
+matching one hub per `Bridge`.
+
+### Opening the workspace: never automatic
+
+`ConnectionManager`'s constructor does not open the workspace — it only
+allocates its `ProfileModel` and returns. `Q_INVOKABLE bool open()` is the
+only thing that starts the workspace's service thread, and it is idempotent
+(a call while already open or opening is a no-op returning `true`). The
+app's own startup path calls it once, explicitly, from `Main.qml`:
+
+```qml
+Bridge {
+    id: bridge
+    Component.onCompleted: connections.open()
+}
+```
+
+This is a fix for a real bug found in review (M3.2 fix round, 2026-09-26):
+an earlier version of this class opened the workspace eagerly from its own
+constructor, which meant *every* test that merely constructed a `Bridge` —
+`tst_bridge`, `tst_resultmodel`, `tst_teardown` (12,000 `Bridge`
+constructions in its K5 loop), and `tst_coreinfo`/its DPI variants (which
+load the real `Main.qml`) — silently opened the developer's real,
+on-disk, default workspace store, because none of them had any reason to
+guard against a side effect they never asked for. The fix has three layers:
+
+1. **Lazy, explicit `open()`** (above) — nothing opens a workspace by
+   accident just by existing.
+2. **A harness-level default.** `ui/tests/AdapterTestSupport.h` defines a
+   namespace-scope `inline const` object whose constructor runs before any
+   test's `main()` (including `QTEST_MAIN`/`QTEST_GUILESS_MAIN`'s generated
+   one) and sets `RELDEX_WORKSPACE_IN_MEMORY=1` and
+   `RELDEX_WORKSPACE_MEMORY_CREDENTIAL_STORE=1` in the process environment.
+   Every UI test binary includes that header, so even `tst_coreinfo` loading
+   the real `Main.qml` (which now calls `connections.open()`) stays
+   in-memory — proved end to end by that test passing with the real store's
+   mtime unchanged.
+3. **A CI-detectable guard.** `ui/build.sh --test` snapshots the default
+   store's existence/mtime before `ctest` runs and compares after: absent
+   before and after is the normal CI-runner case; present before with an
+   unchanged mtime is a developer-machine skip (nothing there is ever
+   deleted); either the store being newly created or an existing one's mtime
+   changing fails the build loudly.
+
+A developer running the actual `Reldex` app (not a test) still gets the real
+on-disk store exactly as before — only the *test* harness forces in-memory;
+`Main.qml`'s `Component.onCompleted: connections.open()` is unconditional.
+
+### `ProfileModel` — what a QML list is allowed to see
+
+A plain `QAbstractListModel`: name, environment (plus its display label),
+`treatAsProduction`, an endpoint summary string, and every other non-secret
+field a dialog needs to pre-fill (`get(row)` returns the full row as a
+`QVariantMap`). **It has no password role or property anywhere** — the point
+of routing everything through a model here is that nothing downstream (a
+delegate, a screenshot, a debugger's watch window) can display a password by
+accident, because the model was never handed one to display. Mutation is
+one-way: `resetRows()`/`upsertRow()`/`removeRow()` are called only by
+`ConnectionManager`, in response to a workspace reply — QML never edits the
+model directly, matching "no business rules in QML".
+
+### `ConnectionManager` — the CRUD/test-connect state machine
+
+Every mutating call (`createProfile`, `updateProfile`, `deleteProfile`,
+`testConnect`) is asynchronous: it validates its `QVariantMap` input, issues
+one or more FFI requests keyed by a `quint64` request id, and returns
+immediately. The dialog listens for `profileSaved`/`profileSaveFailed`/
+`profileDeleted`/`profileDeleteFailed`/`testConnectSucceeded`/
+`testConnectFailed` rather than blocking. ADR-0007's write-order and clearing
+rules turn a single "save" into up to three sequential FFI round trips,
+tracked by a small `PendingOp{kind, step, ...}` state machine keyed by request
+id in a `QHash`:
+
+- **create, saving to the credential store**: create the profile as
+  `PromptEachTime` first, `credential_put` the password, then flip the
+  profile to `CredentialStore` **only if the put succeeded** — a failed put
+  leaves a perfectly usable `PromptEachTime` profile rather than one pointing
+  at a credential that was never written.
+- **update, replacing a stored password**: `credential_put` the new password
+  before the profile row is saved, same put-succeeds-first rule.
+- **update switching away from the credential store, or delete**:
+  `credential_delete` first. Per ADR-0007, `NotFound` and `Unavailable` both
+  count as "done" — but the FFI only special-cases `NotFound` (confirmed by
+  reading `crates/ffi/src/workspace.rs`'s `CredentialDelete` handler);
+  `Unavailable` still comes back as `reply.error`. The adapter closes that gap
+  itself: it decodes the error view, and if `has_native && native_code ==
+  RELDEX_CREDENTIAL_ERROR_UNAVAILABLE`, treats it the same as `NotFound` (a
+  `credentialWarning` signal, not a save failure). Any other credential-delete
+  failure still lets the profile save/delete proceed — the flag still flips
+  and the leftover is reported as a warning, left for M2.14's sweep.
+- **stored password refused at connect time**: when `testConnect()` is called
+  with no typed password, it asks `reldex_workspace_resolve_password` where
+  one should come from — ADR-0007 S3's single source of truth — rather than
+  trusting the profile's own `passwordStorage` flag locally (that flag can be
+  stale, e.g. a `credential_put` that failed after create leaves it at
+  `PromptEachTime` even though a stale store entry might still exist). Only
+  when `resolve_password` itself resolves `FromStore` does
+  `m_testConnectUsedStoredPassword` become true; a typed password never
+  touches the credential store and never sets it. `handleHubEvent()`'s
+  `RELDEX_ERROR_KIND_AUTHENTICATION` check is gated on that flag
+  (`ConnectionManager::isAuthFailureAgainstStoredPassword()`, a pure static
+  function taking already-decoded inputs so it stays directly unit-testable)
+  before reporting `testConnectFailed`'s fourth argument
+  (`authFailureWithStoredPassword = true`) instead of retrying the stored
+  password automatically — ADR-0007 forbids that; the dialog shows "stored
+  password refused, you will be prompted; update it?" and leaves the
+  decision to the user. Fixed in the M3.2 fix round (2026-09-26): the first
+  version of this check set the flag on *any* authentication failure,
+  regardless of whether `testConnect()` had used a stored password at all.
+
+### Test-connect uses the existing hub, not a second one
+
+`testConnect()` builds connect params from the saved profile
+(`build_connect_params`, folding any `ConnectError` —
+`InvalidProfile`/`WrongBinding`/`PasswordRequired`/`PasswordNotUsed`/`Binding`
+— into one `RELDEX_ERROR_KIND_CONFIGURATION`), then opens a session on
+`Bridge`'s **existing** `ReldexHub*` via `reldex_hub_open_session`, pings it,
+and closes it — without touching `SessionController` or the one worksheet
+session `Bridge` already owns. `Bridge` gained a second routing table,
+`m_hubSinks` (`QHash<sessionId, QPointer<ConnectionManager>>`), consulted in
+`dispatch()` only when an event's session id is not a `SessionController`'s.
+`ConnectionManager::handleHubEvent()` is that sink's receiving end. A
+test-connect session is unregistered from `m_hubSinks` the moment it finishes
+(success, failure, or close), so a stray late event for it is simply counted
+as an orphan by `Bridge`, never mistaken for a second live reply.
+
+### Error surface (FFI error kind → message key)
+
+| `ReldexErrorKind` | message key | note |
+| --- | --- | --- |
+| `CONFIGURATION` | `error.configuration` | every `ProfileError` and `ConnectError`, **including the credential-pattern refusal** — see "FFI gaps found" below for why this is one key rather than several |
+| `CONNECTION` | `error.connection` | |
+| `AUTHENTICATION` | `error.authentication` | during test-connect, also sets `authFailureWithStoredPassword = true` when `resolve_password` had resolved the password `FromStore` (never for a typed password) |
+| `NETWORK_LOST` | `error.networkLost` | |
+| `TIMEOUT` | `error.timeout` | |
+| `CANCELLED` | `error.cancelled` | |
+| `SYNTAX` | `error.syntax` | |
+| `CONSTRAINT` | `error.constraint` | |
+| `PERMISSION` | `error.permission` | |
+| `TRANSACTION` | `error.transaction` | |
+| `RESOURCE` | `error.resource` | |
+| `DATA_CONVERSION` | `error.dataConversion` | |
+| `UNSUPPORTED` | `error.unsupported` | |
+| `DRIVER_INTERNAL` | `error.driverInternal` | |
+| `OTHER` | `error.other` | |
+| anything a future header adds (0 / unknown) | `error.unknown` | ABI-forward-compat default |
+
+Credential operations (`credential_put`/`credential_delete`/
+`resolve_password`) carry a `ReldexCredentialError` in the error's native code
+instead, mapped one to one: `Unavailable → error.credential.unavailable`,
+`NotFound → error.credential.notFound`, `Denied → error.credential.denied`,
+`TooLarge → error.credential.tooLarge`, `InvalidSecret →
+error.credential.invalidSecret`, `Malformed → error.credential.malformed`,
+`Locked → error.credential.locked`, `Backend → error.credential.backend`,
+anything else → `error.credential.unknown`. None of these keys, nor the FFI's
+own message text shown alongside `error.configuration`, ever includes the raw
+endpoint or password text — `ProfileError::CredentialInEndpoint`'s `Display`
+names only the field and the pattern class (e.g. "the profile's connect
+string looks like it contains a credential (UserPasswordPrefix)"), confirmed
+by reading `crates/workspace/src/profile.rs`.
+
+### QML: `ConnectionManagerDialog.qml`
+
+Reached from `Sidebar.qml`'s new "Manage Connections..." button (which also
+lists profiles inline above it, via `bridge.connections.profiles`). The
+dialog is plain `Row`/`Column` layout, not `QtQuick.Layouts` — no file in this
+codebase used that module yet and `ui/CMakeLists.txt`'s `find_package(Qt6 ...
+COMPONENTS ...)` does not declare it, so this stays with the app's existing
+layout idiom rather than introducing an undeclared dependency (`QtQuick.Layouts`
+is reconsidered at M3.6). It covers: a profile list; New/Edit/Delete with a
+confirm dialog; an environment picker (the "treat as production" toggle is
+enabled only for `Custom`, matching ADR-0006's rule that every other
+environment kind fixes its own production flag); an endpoint form switched by
+kind (Easy Connect / host+service / host+SID / full connect descriptor);
+username; a password field used only for test-connect or for "save to
+credential store" (cleared as soon as either has read it, rather than kept in
+the dialog's own state any longer than needed); a session-role picker
+(Normal/SYSDBA/SYSOPER, `ReldexSessionRoleKind`); "prompt each time" as the
+default and the **only** option when `canStoreCredential` is false
+(`credentialStoreKind == RELDEX_CREDENTIAL_STORE_KIND_NONE`); a Test Connect
+action reporting success or the typed error, including the
+stored-password-refused prompt described above; Save/Close (also reachable
+with Enter/Return, unless the delete-confirmation dialog is the one open).
+
+**What this dialog does *not* expose** (corrected in the M3.2 fix round,
+2026-09-26, after a review found the previous version of this paragraph
+claimed "a disabled transport picker with a note" — that did not match what
+was actually shipped): there is no transport, CA-directory, or
+certificate-pin control at all. Every profile is created with
+`transport: Plain` and an empty `caDirectory`, silently; the dialog shows a
+short caption next to the role picker stating that TCPS, a configurable CA
+and certificate pinning are not yet available. That work — TCPS, a
+configurable CA and the certificate-pin/DN guard — is **M3.5** (Opus).
+
+The dialog `Popup` sets `parent: Overlay.overlay` explicitly. Without it, a
+`Popup` declared inline (as this one is, inside `Sidebar.qml`) takes its
+*declaring* item as `parent` for its own `width`/`x`/`y` centering math — the
+240px-wide sidebar pane, not the window — which rendered the whole dialog
+~200px wide with every field inside effectively collapsed to zero width. This
+was caught by the offscreen/DPI test added in the same fix round
+(`connectionManagerDialogRendersAtCurrentScaleFactor`, `tst_coreinfo.cpp`,
+registered at the default 1x and at 2x in `ui/tests/CMakeLists.txt`) — there
+had been no rendering/geometry coverage of this dialog before.
+
+### Environment variables (workspace)
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `RELDEX_WORKSPACE_IN_MEMORY` | off | `1` opens an in-memory store (no file, no directory) instead of the platform default path — what every offscreen test but one uses |
+| `RELDEX_WORKSPACE_MEMORY_CREDENTIAL_STORE` | off | `1` forces `MemoryCredentialStore` instead of the platform credential store; implied by `RELDEX_WORKSPACE_IN_MEMORY=1` |
+| `RELDEX_WORKSPACE_PATH` | platform default (ADR-0006 P5) | overrides the SQLite file path; directory/file creation with ADR-0006 P5's permissions happens inside `reldex_workspace_open()`'s own service thread (`Store::open_creating`), never in the adapter |
+
+### FFI gaps found
+
+**Fixed since the first version of this class** (M3.2 fix round, 2026-09-26):
+`reldex_workspace_open` did not create the store's directory or apply Unix
+permissions the way `Store::open_default()`/`Store::open_in_directory()` do
+(confirmed by reading `crates/workspace/src/store/paths.rs` and
+`store/mod.rs`: the 0700-directory/0600-file logic lived only in those two
+functions, not in plain `Store::open(path)`, which is what the FFI called).
+`ConnectionManager::ensureStoreDirectoryReady()` used to reimplement
+ADR-0006 P5's directory/file/permission rule in the adapter, on whichever
+thread called `open()` — disk I/O that had no business running on the GUI
+thread. Closed by adding `Store::open_creating()` to `crates/workspace`
+(creates the parent directory and the file itself, owner-only on Unix, then
+delegates to `Store::open_with`) and swapping `service_main`'s call site in
+`crates/ffi/src/workspace.rs` to use it — additive only, the ABI signature of
+`reldex_workspace_open` is unchanged (`crates/ffi/gen-header.sh --check`
+stays clean). `ensureStoreDirectoryReady()` no longer exists.
+
+Not fixed here — `crates/ffi` was otherwise out of scope for this task:
+
+- **`ProfileError` has no per-variant numeric sub-code across the ABI**
+  (unlike `CredentialError`, which does), so every profile/connect-param
+  validation failure — including the credential-pattern refusal — collapses
+  to one `RELDEX_ERROR_KIND_CONFIGURATION` / `error.configuration`. The UI
+  shows the FFI's own message text verbatim in that case (it is already safe:
+  no raw endpoint or password text, per `crates/workspace/src/profile.rs`'s
+  `Display` impls), but a future caller wanting to react differently to, say,
+  "credential pattern refused" versus "environment/production mismatch" has
+  no numeric code to switch on. Deferred to M2.15.
+- **The hub can only open `RELDEX_DRIVER_KIND_MOCK` sessions in this build,
+  and the mock has no configurable open/ping failure**
+  (`ReldexMockScenarioConfig` has no such field). Test-connect's "typed
+  failure" test coverage therefore exercises the
+  `build_connect_params`/profile-validation stage (`PasswordRequired`, folded
+  to `error.configuration`) rather than a real connect/authentication
+  failure; the `authFailureWithStoredPassword` decision path in
+  `handleHubEvent()` is exercised directly via `messageKeyForError()` unit
+  tests instead of end to end, since nothing in this build can make the mock
+  driver fail a connect.
+
+### Hand-off
+
+- **M3.4** (production indicator): read `treatAsProduction` off
+  `ProfileModel`'s role/`get()` map for the active worksheet's profile — it
+  is already validated against ADR-0006's environment rules by the time it
+  reaches the model (`Custom` is the only environment where the adapter lets
+  it vary; every other environment kind fixes it).
+- **M3.6** (settings UI): `ConnectionManager` and `ProfileModel` are reached
+  the same way a settings page would reach them — `bridge.connections`,
+  `bridge.connections.profiles` — no additional wiring needed. The
+  `PendingOp`/`Step` state machine in `ConnectionManager.cpp` (the
+  create/update/delete choreography around `credential_put`/
+  `credential_delete`) is the pattern to reuse for any other settings write
+  that touches the credential store; see "write-order/clearing" above for the
+  two rules it encodes (put-then-flip; `NotFound`/`Unavailable`-count-as-done,
+  with the `Unavailable` gap called out above).
+
 ## Object browser (M6.1)
 
 `ObjectBrowserModel` (`ui/adapter/ObjectBrowserModel.{h,cpp}`) is a lazy
@@ -1308,7 +1602,19 @@ module (`Qt6Charts`, `Qt6WebEngineCore`, etc.) is present.
 - **The mock driver is the only driver.** `SessionController::open()` builds a
   `ReldexOpenOptions` with `RELDEX_DRIVER_KIND_MOCK`, because that is the only
   kind this build of `reldex-ffi` accepts (ADR-0003 A8). Connection profiles
-  and a real driver are M2/M3.
+  exist as of M3.2 (see "Connection manager (M3.2)" above); a real driver is
+  still M3/M4. `ReldexMockScenarioConfig` also has no configurable open/ping
+  failure, which limits M3.2's test-connect failure-path test coverage to the
+  profile-validation stage — see that section's "FFI gaps found".
+- **`ProfileError` has no per-variant numeric sub-code across the ABI**
+  (M3.2). Every profile/connect-param validation failure, including the
+  credential-pattern refusal, surfaces under one `error.configuration`
+  message key. Deferred to M2.15. See "Connection manager (M3.2)" → "FFI gaps
+  found".
+- **The connection dialog has no transport/CA/certificate-pin controls**
+  (M3.2; M3.5, Opus, adds them). Every profile is created with
+  `transport: Plain` and an empty `caDirectory`. See "Connection manager
+  (M3.2)" → "QML: `ConnectionManagerDialog.qml`".
 - **LOBs do not cross the boundary yet** (ADR-0003 A7). A LOB column reports
   its kind and the bulk formatter renders it as the "taken" text; there is no
   handle to read from. That is M2.11.
