@@ -24,8 +24,8 @@ use reldex_ffi::{
     ReldexDriverKind, ReldexErrorKind, ReldexEventKind, ReldexOpenOptions,
     ReldexPasswordSourceKind, ReldexPasswordStorageKind, ReldexPromptReasonKind, ReldexStatus,
     ReldexWorkspaceReplyKind, reldex_abi_version, reldex_connect_summary_release,
-    reldex_hub_open_session, reldex_last_error_take, reldex_secret_expose,
-    reldex_secret_from_utf8, reldex_secret_release, reldex_workspace_credential_store_kind,
+    reldex_hub_open_session, reldex_last_error_take, reldex_secret_expose, reldex_secret_from_utf8,
+    reldex_secret_release, reldex_workspace_credential_store_kind,
 };
 
 use support::workspace::{TestWorkspace, profile_details, str_of, summary_view};
@@ -103,7 +103,10 @@ fn a_profile_with_no_stored_password_asks_and_says_why() {
 #[cfg_attr(not(windows), test)]
 #[cfg_attr(
     windows,
-    expect(dead_code, reason = "runs only where the platform has no credential store")
+    expect(
+        dead_code,
+        reason = "runs only where the platform has no credential store"
+    )
 )]
 fn with_no_credential_store_every_connect_prompts() {
     let workspace = TestWorkspace::open_with_platform_store();
