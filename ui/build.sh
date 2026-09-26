@@ -119,7 +119,63 @@ if [ "${SANITIZE}" -eq 1 ]; then
 fi
 cmake --build "${BUILD_ARGS[@]}"
 
+# --- Must-fix 1(c) (M3.2 fix round, 2026-09-26): a CI-detectable guard
+# against a UI test touching the developer's *real* on-disk default
+# workspace store. No test should ever reach it in the first place --
+# ui/tests/AdapterTestSupport.h forces RELDEX_WORKSPACE_IN_MEMORY=1 (and
+# RELDEX_WORKSPACE_MEMORY_CREDENTIAL_STORE=1) before any test's main() runs,
+# and ConnectionManager::open() is never called automatically outside a test
+# except from the app's own Main.qml startup path -- see that file's and
+# ConnectionManager's class documentation for the full three-layer guard.
+# This is the belt-and-suspenders check that proves it held: snapshot the
+# default store's existence/mtime before ctest runs and compare after.
+#   * Absent before and after: the normal case on a CI runner -- pass.
+#   * Present before, same mtime after: a developer machine with a real
+#     store the tests correctly left alone -- pass (skip-with-message,
+#     nothing is ever deleted; the owner of that file decides its fate).
+#   * Absent before, present after: a test created it -- fail loudly (on a
+#     runner this always fires, turning the job red).
+#   * Present before and after with a changed mtime: a test wrote to it --
+#     fail loudly.
+default_store_path() {
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            if [ -n "${LOCALAPPDATA:-}" ]; then
+                printf '%s/com.reldex.reldex/reldex.sqlite3' "${LOCALAPPDATA}"
+            fi
+            ;;
+        Darwin*)
+            if [ -n "${HOME:-}" ]; then
+                printf '%s/Library/Application Support/com.reldex.reldex/reldex.sqlite3' "${HOME}"
+            fi
+            ;;
+        *)
+            local base="${XDG_DATA_HOME:-}"
+            if [ -z "${base}" ] && [ -n "${HOME:-}" ]; then
+                base="${HOME}/.local/share"
+            fi
+            if [ -n "${base}" ]; then
+                printf '%s/com.reldex.reldex/reldex.sqlite3' "${base}"
+            fi
+            ;;
+    esac
+}
+
+store_mtime() {
+    # GNU stat (Linux, MSYS/Git Bash's coreutils) first, BSD stat (macOS)
+    # second; either failing (e.g. the path does not exist) is not fatal.
+    stat -c '%Y' "$1" 2>/dev/null || stat -f '%m' "$1" 2>/dev/null || true
+}
+
 if [ "${RUN_TESTS}" -eq 1 ]; then
+    STORE_PATH="$(default_store_path)"
+    STORE_EXISTED_BEFORE=0
+    STORE_MTIME_BEFORE=""
+    if [ -n "${STORE_PATH}" ] && [ -e "${STORE_PATH}" ]; then
+        STORE_EXISTED_BEFORE=1
+        STORE_MTIME_BEFORE="$(store_mtime "${STORE_PATH}")"
+    fi
+
     echo "ui/build.sh: running ctest"
     CTEST_ARGS=(--test-dir "${BUILD_DIR}" --output-on-failure)
     if [ "${SANITIZE}" -eq 1 ]; then
@@ -151,4 +207,37 @@ if [ "${RUN_TESTS}" -eq 1 ]; then
         CTEST_ARGS+=(-V)
     fi
     ctest "${CTEST_ARGS[@]}"
+
+    if [ -z "${STORE_PATH}" ]; then
+        echo "ui/build.sh: real default workspace store guard: skipped (no default data directory derivable on this platform/environment)"
+    elif [ "${STORE_EXISTED_BEFORE}" -eq 0 ]; then
+        if [ -e "${STORE_PATH}" ]; then
+            {
+                echo "ui/build.sh: FAIL -- the real default workspace store"
+                echo "  (${STORE_PATH}) did not exist before this test run and exists"
+                echo "  now. A UI test opened the developer's real on-disk store"
+                echo "  instead of an in-memory one -- see ConnectionManager's class"
+                echo "  documentation and ui/tests/AdapterTestSupport.h (must-fix 1,"
+                echo "  M3.2 fix round, 2026-09-26)."
+            } >&2
+            exit 1
+        fi
+        echo "ui/build.sh: real default workspace store guard: absent before and after (ok)"
+    else
+        STORE_MTIME_AFTER="$(store_mtime "${STORE_PATH}")"
+        if [ "${STORE_MTIME_AFTER}" != "${STORE_MTIME_BEFORE}" ]; then
+            {
+                echo "ui/build.sh: FAIL -- the real default workspace store"
+                echo "  (${STORE_PATH}) already existed before this test run but its"
+                echo "  mtime changed (before: ${STORE_MTIME_BEFORE}, after:"
+                echo "  ${STORE_MTIME_AFTER}). A UI test modified the developer's real"
+                echo "  store instead of an in-memory one -- see ConnectionManager's"
+                echo "  class documentation and ui/tests/AdapterTestSupport.h"
+                echo "  (must-fix 1, M3.2 fix round, 2026-09-26). Nothing at that path"
+                echo "  was deleted; this script never touches it."
+            } >&2
+            exit 1
+        fi
+        echo "ui/build.sh: real default workspace store guard: skipped (a real store already exists at ${STORE_PATH}; its mtime is unchanged -- ok)"
+    fi
 fi
