@@ -1,8 +1,15 @@
-//! What a completed request looks like on the way out (ADR-0003 D5).
+//! What an event looks like on the way out (ADR-0003 D5, A35).
 //!
-//! One flat `#[repr(C)]` struct rather than a tagged union: the adapter
-//! switches on `kind` and reads the fields that kind documents. A union would
-//! save a few dozen bytes per event and cost every C++ reader a cast.
+//! Replies to requests, progress (`EXECUTING`) and notifications
+//! (`SERVER_OUTPUT`, `TRANSACTION_STATE`, `TERMINAL`) all cross as one flat
+//! `#[repr(C)]` struct rather than a tagged union: the adapter switches on
+//! `kind` and reads the fields that kind documents. A union would save a few
+//! dozen bytes per event and cost every C++ reader a cast.
+//!
+//! Each one is built by `session::translate` from a `db-core` `SessionEvent`,
+//! on the thread that drains the hub, at the moment it is handed out. The
+//! objects an event owns — its batch, its error, its server-output lines —
+//! are created then too, not when the event was queued (A36).
 
 use reldex_db_core::{CloseError, ExecuteOutcome, StatementKind};
 
