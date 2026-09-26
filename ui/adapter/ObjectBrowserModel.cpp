@@ -428,10 +428,20 @@ void ObjectBrowserModel::expand(const QModelIndex &index, bool force)
     if (node == nullptr || node == m_root.get() || node->kind == NodeKind::Column) {
         return;
     }
-    if (node->loading) {
-        return;
-    }
-    if (force) {
+    if (!force) {
+        // A plain (non-forced) expand on a node that is already loading, or
+        // already has an answer, has nothing new to do.
+        if (node->loading || node->childrenLoaded) {
+            return;
+        }
+    } else {
+        // `force` (a manual refresh, or `setFilter()`, which always forces)
+        // supersedes whatever is queued or already in flight for this node --
+        // deliberately NOT gated on `node->loading`, unlike the `!force`
+        // branch above: this is what makes "the newest request wins" true
+        // for a refresh/filter change that arrives before a previous one for
+        // the same node has settled, instead of that later request being
+        // silently dropped (see `expand()`'s own doc comment).
         const bool removed = beginChildReset(node);
         endChildReset(removed);
         node->childrenLoaded = false;
@@ -439,12 +449,15 @@ void ObjectBrowserModel::expand(const QModelIndex &index, bool force)
         node->errorText.clear();
         node->truncated = false;
         node->shownCount = -1;
-        // Anything already queued/in flight for this node belongs to the
-        // fetch being discarded; bump the generation so a late reply for it
-        // is dropped rather than applied on top of the fresh one below.
+        // Bump the generation so a reply for a fetch already queued/in flight
+        // for this node -- belonging to the request being superseded -- is
+        // recognised as stale and discarded rather than applied
+        // (`m_activeGeneration`'s doc comment has the exact mechanism).
+        // `queueFetch()` below both records this node's new generation and
+        // (re)queues it; if a fetch for this node is already active, it stays
+        // active (its own reply will be discarded when it lands) and this
+        // queues the superseding one to run right after.
         ++m_generation;
-    } else if (node->childrenLoaded) {
-        return;
     }
 
     switch (node->kind) {
@@ -602,6 +615,13 @@ void ObjectBrowserModel::startNextFetchIfIdle()
         return;
     }
     m_activeNode = node;
+    // Captured once, here: the generation THIS fetch is submitted under.
+    // `m_nodeGeneration[node]` may move on again while this fetch is still in
+    // flight (a further refresh/filter change supersedes it); this frozen
+    // copy is what the reply handlers compare against to tell "my own,
+    // current reply" from "a reply for a request this node has moved past"
+    // (`m_activeGeneration`'s own doc comment).
+    m_activeGeneration = m_generation;
 
     ReldexMetadataRequest request = reldex::makeMetadataRequest();
     const QByteArray schemaUtf8 = node->schema.toUtf8();
@@ -680,7 +700,12 @@ void ObjectBrowserModel::onMetadataSessionFailed()
     }
 
     Node *node = m_activeNode;
-    const quint64 generation = m_nodeGeneration.value(node, 0);
+    // `m_activeGeneration`, not a fresh read of `m_nodeGeneration[node]`: the
+    // latter is what the node's generation is NOW, which a refresh/filter
+    // change may already have moved on from while this reply was in flight --
+    // that is exactly the staleness this check exists to catch (see
+    // `m_activeGeneration`'s own doc comment).
+    const quint64 generation = m_activeGeneration;
     const int rawKind = m_metadataSession->errorKind();
     const int nativeCode = m_metadataSession->errorNativeCode();
     const bool hasNative = nativeCode != 0;
@@ -709,6 +734,10 @@ void ObjectBrowserModel::onMetadataSessionFailed()
     if (m_nodeGeneration.value(node, 0) == generation) {
         applyFetchError(node, correctedKind, nativeCode, hasNative, message);
     }
+    // Otherwise: this reply belongs to a request `node` has moved past --
+    // discarded silently, never shown. The fetch that superseded it is
+    // already sitting in `m_pendingQueue` (`expand(force = true)` queued it
+    // when it bumped the generation), so it is what the call below reaches.
     startNextFetchIfIdle();
 }
 
@@ -718,7 +747,10 @@ void ObjectBrowserModel::onMetadataResultComplete()
         return;
     }
     Node *node = m_activeNode;
-    const quint64 generation = m_nodeGeneration.value(node, 0);
+    // See `onMetadataSessionFailed()`'s identical comment: `m_activeGeneration`
+    // is the generation this specific reply belongs to, frozen at submission
+    // time, not `node`'s current one.
+    const quint64 generation = m_activeGeneration;
 
     ResultTableModel *result = m_metadataSession->model();
     const int rows = result != nullptr ? result->rowCount() : 0;
@@ -754,6 +786,8 @@ void ObjectBrowserModel::onMetadataResultComplete()
         }
         applyRows(node, values, truncated);
     }
+    // Otherwise: stale (see `onMetadataSessionFailed()`) -- discarded, and the
+    // superseding fetch already queued for this node is what runs next.
     startNextFetchIfIdle();
 }
 

@@ -148,14 +148,33 @@ public:
     [[nodiscard]] QString columnsPaneError() const { return m_columnsPaneError; }
 
     /// Fetches `index`'s children if they have never been loaded, or if
-    /// `force` asks for a fresh fetch (a manual refresh). A no-op for a leaf
-    /// or for a node already loading. Lazy loading (`SPEC.md` §16): nothing
-    /// is fetched until this is called.
+    /// `force` asks for a fresh fetch (a manual refresh, or `setFilter()`,
+    /// which always forces). A no-op for a leaf or, when `!force`, for a node
+    /// already loading or already loaded.
+    ///
+    /// `force` is safe to call on a node that is already loading -- that is
+    /// the case it exists for. It **supersedes** whatever fetch is queued or
+    /// already in flight for this node rather than being dropped by it: the
+    /// node's generation is bumped (`m_generation`/`m_nodeGeneration`) and a
+    /// fresh fetch is queued for the node's *current* filter text; a reply
+    /// that lands for the superseded fetch is recognised as stale
+    /// (`m_activeGeneration`) and discarded without being applied. The node
+    /// keeps showing "Loading..." throughout -- there is no visible flicker
+    /// back to whatever the superseded fetch would have shown. This is what
+    /// makes "the newest request wins" true for a refresh or a filter change
+    /// issued while a previous one for the same node has not settled yet; see
+    /// `m_activeGeneration`'s own doc comment for the exact mechanism.
+    ///
+    /// Lazy loading (`SPEC.md` §16): nothing is fetched until this is called.
     Q_INVOKABLE void expand(const QModelIndex &index, bool force = false);
     /// Sets the server-side name filter for `index` (a `Connection` or
-    /// `Group` node only) and re-fetches its children. Debouncing when the
-    /// user is typing is the caller's job (presentation timing, not a
-    /// business rule) -- see `ObjectBrowserPanel.qml`'s `Timer`.
+    /// `Group` node only) and re-fetches its children -- always as a `force`
+    /// `expand()`, so a filter change while the previous one is still in
+    /// flight supersedes it (see `expand()`'s doc comment) rather than being
+    /// silently dropped: once the node settles, `filterFor(index)` always
+    /// agrees with the filter that actually produced the displayed rows.
+    /// Debouncing when the user is typing is the caller's job (presentation
+    /// timing, not a business rule) -- see `ObjectBrowserPanel.qml`'s `Timer`.
     Q_INVOKABLE void setFilter(const QModelIndex &index, const QString &text);
     [[nodiscard]] Q_INVOKABLE QString filterFor(const QModelIndex &index) const;
     /// Activates `index` for the columns pane: if it is a table/view `Object`
@@ -217,17 +236,6 @@ private:
         QString filterText;
     };
 
-    /// What one queued fetch is for. Built from a `Node*`; kept separate from
-    /// `Node` so a node can be safely torn down (e.g. by a refresh) while its
-    /// old fetch is still in flight -- the pending entry outlives the node it
-    /// pointed at only long enough to be discarded (`m_activeGeneration`
-    /// guards that).
-    struct PendingFetch
-    {
-        Node *node = nullptr;
-        quint64 generation = 0;
-    };
-
     [[nodiscard]] Node *nodeFor(const QModelIndex &index) const;
     [[nodiscard]] QModelIndex indexFor(Node *node, int column = 0) const;
     void ensureConnectionRoot();
@@ -286,16 +294,38 @@ private:
 
     std::unique_ptr<Node> m_root;
 
+    /// Nodes waiting for their fetch to be submitted, FIFO. A node appears at
+    /// most once (`queueFetch()` checks `contains()` first); `m_nodeGeneration`
+    /// is what a queued node's own generation actually is, not its position
+    /// here.
     QVector<Node *> m_pendingQueue;
     Node *m_activeNode = nullptr;
     reldex::MetadataQueryHandle m_activeQuery;
-    /// Bumped every time a node's pending/active fetch is invalidated (a
-    /// refresh, a filter change, session close). A reply for a stale
-    /// generation is discarded rather than applied to a node that has moved
-    /// on -- the same "stale reply" shape `SessionController` uses for a
-    /// fetch issued against a result that was replaced.
+    /// What "current" means for a node's fetch. Bumped by `expand(force =
+    /// true)` (a manual refresh, or `setFilter()`, which always forces) and by
+    /// whatever invalidates every node at once (`setBridge()`, `closeConnection()`).
+    /// `m_nodeGeneration[node]` is the generation *this node's most recently
+    /// requested* fetch belongs to -- set every time `queueFetch(node)` runs,
+    /// including when it supersedes a fetch already queued or already in
+    /// flight for the same node (`expand(force = true)` no longer refuses to
+    /// re-enter a loading node -- see its own doc comment).
     quint64 m_generation = 0;
     QHash<Node *, quint64> m_nodeGeneration;
+    /// The generation `m_activeNode`'s *in-flight* fetch was actually
+    /// submitted under -- captured once, in `startNextFetchIfIdle()`, at the
+    /// moment `reldex_session_execute()` is called. This is deliberately a
+    /// separate value from `m_nodeGeneration[m_activeNode]`, which can move on
+    /// *while* that fetch is still outstanding (a refresh or a filter change
+    /// arriving before its reply lands bumps `m_nodeGeneration[node]` again
+    /// without touching this). `onMetadataResultComplete()`/
+    /// `onMetadataSessionFailed()` compare the two: equal means the reply is
+    /// for the node's current wish and is applied; unequal means the node
+    /// moved on while this fetch was in flight, so the reply is discarded
+    /// (never applied, never shown) and the fetch `queueFetch()` already
+    /// queued for the newer generation is what actually runs next -- the
+    /// "newest request wins" rule `setFilter()`'s and `expand(force = true)`'s
+    /// own doc comments promise. Meaningless while `m_activeNode` is null.
+    quint64 m_activeGeneration = 0;
 
     int m_rowCap = 500;
 

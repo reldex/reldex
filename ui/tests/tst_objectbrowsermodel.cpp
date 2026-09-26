@@ -3,6 +3,7 @@
 #include <ObjectBrowserModel.h>
 #include <ReldexHandles.h>
 
+#include <QAbstractItemModelTester>
 #include <QByteArray>
 #include <QSignalSpy>
 #include <QTest>
@@ -52,6 +53,8 @@ private Q_SLOTS:
     void describeErrorNeverReturnsTheSameTextForPermissionAndOther();
     void theRealClassifierTurnsAnAmbiguousOracleCodeIntoPermission();
     void applyingFiveThousandObjectsDoesNotBlockTheUiThreadForLong();
+    void aFilterChangeWhileTheFirstFetchIsInFlightSupersedesRatherThanBeingDropped();
+    void destroyingTheModelWhileAFetchIsInFlightDoesNotCrash();
 
 private:
     // Builds a bare `ObjectBrowserModel::Node` the test owns directly
@@ -463,6 +466,98 @@ void tst_ObjectBrowserModel::applyingFiveThousandObjectsDoesNotBlockTheUiThreadF
         QVERIFY2(filterMs[run] < 1000,
                  qPrintable(QStringLiteral("filter run %1 took %2 ms").arg(run).arg(filterMs[run])));
     }
+}
+
+void tst_ObjectBrowserModel::aFilterChangeWhileTheFirstFetchIsInFlightSupersedesRatherThanBeingDropped()
+{
+    // Regression test for the review finding on PR #47: `setFilter()`/
+    // `expand(force = true)` used to be silently dropped by
+    // `if (node->loading) return;` whenever a fetch for the same node was
+    // already outstanding -- the node would settle showing the FIRST
+    // filter's (by then stale) result while `filterFor()` reported the
+    // SECOND, never-queried filter text, with no automatic recovery. Fixed
+    // by letting `force` supersede an in-flight fetch instead of being
+    // refused by it (`expand()`'s doc comment; `m_activeGeneration`).
+    //
+    // Wired under `QAbstractItemModelTester` per the review brief, to also
+    // catch a begin/end-insert-rows mismatch from the extra child-reset this
+    // exercises.
+    Bridge bridge;
+    QVERIFY(bridge.isValid());
+
+    ObjectBrowserModel model;
+    QAbstractItemModelTester tester(&model, QAbstractItemModelTester::FailureReportingMode::Fatal);
+    model.setBridge(&bridge);
+    const QModelIndex connection = model.index(0, 0);
+    QVERIFY(connection.isValid());
+
+    // Counts how many fetches actually reach `SessionController::Executing`
+    // (i.e. `reldex_session_execute()` was actually called) -- friend access
+    // to `m_metadataSession` reaches the model's own session directly, no
+    // `findChild()` needed.
+    int executingCount = 0;
+    bool injected = false;
+
+    model.setFilter(connection, QStringLiteral("abc")); // starts the first fetch
+    QVERIFY(model.m_metadataSession != nullptr);
+    connect(model.m_metadataSession, &SessionController::stateChanged, &model, [&] {
+        if (model.m_metadataSession->state() == SessionController::Executing) {
+            ++executingCount;
+            if (!injected) {
+                injected = true;
+                // Mid-flight, synchronously, the instant the FIRST fetch is
+                // submitted and strictly before any reply can have been
+                // drained: exactly "the user changes the filter again before
+                // the first fetch's reply lands".
+                model.setFilter(connection, QStringLiteral("abcd"));
+            }
+        }
+    });
+
+    QVERIFY(spinUntil(
+            [&] { return model.data(connection, ObjectBrowserModel::HasErrorRole).toBool(); }, 30000));
+    QVERIFY(injected);
+    // Let a second reply, if one is still in flight, land too.
+    QVERIFY(spinUntil([&] { return executingCount >= 2; }, 5000));
+    QTest::qWait(200);
+
+    // A second fetch really was submitted (the superseding one, for "abcd") --
+    // not just the first one's stale reply reinterpreted.
+    QCOMPARE(executingCount, 2);
+    // `filterFor()` never disagrees with what actually produced the
+    // displayed (here: error) state once the node has settled.
+    QCOMPARE(model.filterFor(connection), QStringLiteral("abcd"));
+    QVERIFY(model.data(connection, ObjectBrowserModel::HasErrorRole).toBool());
+    QVERIFY(!model.data(connection, ObjectBrowserModel::LoadingRole).toBool());
+}
+
+void tst_ObjectBrowserModel::destroyingTheModelWhileAFetchIsInFlightDoesNotCrash()
+{
+    // The model's destructor (`closeConnection()`) must never leave a
+    // dangling `this`/`m_metadataSession` for a reply that lands after the
+    // model itself is gone. Destroying `model` here, with a fetch genuinely
+    // outstanding (no `spinUntil` wait for it to settle first), is exactly
+    // the shape an ASan run (CI's `qt-asan` job) would catch a use-after-free
+    // in.
+    Bridge bridge;
+    QVERIFY(bridge.isValid());
+
+    {
+        ObjectBrowserModel model;
+        QAbstractItemModelTester tester(&model,
+                                        QAbstractItemModelTester::FailureReportingMode::Fatal);
+        model.setBridge(&bridge);
+        model.expand(model.index(0, 0)); // starts opening the session / queues a fetch
+        // Deliberately no wait: `model` (and `tester`) are destroyed right
+        // here, with the session possibly still connecting and a fetch
+        // possibly already in flight.
+    }
+
+    // Let whatever was still in flight for the now-destroyed model actually
+    // finish draining on the hub side, so a use-after-free would have had its
+    // chance to happen before the test process exits.
+    QTest::qWait(200);
+    spinUntil([] { return true; }, 200);
 }
 
 QTEST_GUILESS_MAIN(tst_ObjectBrowserModel)
