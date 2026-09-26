@@ -5,10 +5,18 @@
 #   sh tools/oracle-test-db/run-it.sh s2_fidelity      # one test file
 #   sh tools/oracle-test-db/run-it.sh s4_cancel -- --nocapture
 #   RELDEX_IT_PACKAGE=reldex-core-poc sh tools/oracle-test-db/run-it.sh m5_2_result_store_live
+#   QT_QPA_PLATFORM=offscreen RELDEX_IT_EXEC=build/ui-RelWithDebInfo/tst_coreinfo \
+#       sh tools/oracle-test-db/run-it.sh connectFlowAgainstTheRealDatabase
 #
 # `RELDEX_IT_PACKAGE` picks the crate whose `oracle-it` tests run; the default
 # is the Oracle driver's. Tests that need `db-core` as well as the driver live
 # in `reldex-core-poc` (a driver crate may not depend on `db-core`).
+#
+# `RELDEX_IT_EXEC` runs that program instead of `cargo test`, with the same
+# environment and the arguments as given (M3.3: the UI's live end-to-end test,
+# a Qt test binary; on Windows run it from a shell where Qt's DLLs are on
+# PATH, e.g. after `source tools/dev-env/env.sh`). A relative path is taken
+# from the repository root.
 #
 # It loads `tools/oracle-test-db/.env` (untracked; see `.env.example`) and turns
 # it into the environment the tests read. The passwords are never echoed, never
@@ -93,9 +101,13 @@ fi
 echo "database: $RELDEX_TEST_ORACLE_USER@$RELDEX_TEST_ORACLE_DSN"
 
 package="${RELDEX_IT_PACKAGE:-reldex-driver-oracle-thin}"
-echo "package:  $package"
+[ -n "${RELDEX_IT_EXEC:-}" ] || echo "package:  $package"
 
 cd "$repo"
+if [ -n "${RELDEX_IT_EXEC:-}" ]; then
+    echo "program:  $RELDEX_IT_EXEC"
+    exec "$RELDEX_IT_EXEC" "$@"
+fi
 # A leading `--` means "no test file was named; pass the rest to the harness".
 if [ "$#" -gt 0 ] && [ "$1" != "--" ]; then
     first="$1"

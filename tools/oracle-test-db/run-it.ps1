@@ -4,11 +4,18 @@
 #   pwsh tools/oracle-test-db/run-it.ps1 s2_fidelity     # one test file
 #   pwsh tools/oracle-test-db/run-it.ps1 s4_cancel -- --test-threads=1
 #   $env:RELDEX_IT_PACKAGE = 'reldex-core-poc'; pwsh tools/oracle-test-db/run-it.ps1 m5_2_result_store_live
+#   $env:QT_QPA_PLATFORM = 'offscreen'; $env:RELDEX_IT_EXEC = 'build\ui-RelWithDebInfo\tst_coreinfo.exe'
+#       pwsh tools/oracle-test-db/run-it.ps1 connectFlowAgainstTheRealDatabase
 #
 # `RELDEX_IT_PACKAGE` picks the crate whose `oracle-it` tests run; the default
 # is the Oracle driver's. Tests that need `db-core` as well as the driver live
 # in `reldex-core-poc` (a driver crate may not depend on `db-core`). The bash
-# twin, `run-it.sh`, is the primary entry point and reads the same variable.
+# twin, `run-it.sh`, is the primary entry point and reads the same variables.
+#
+# `RELDEX_IT_EXEC` runs that program instead of `cargo test`, with the same
+# environment and the arguments as given (M3.3: the UI's live end-to-end test,
+# a Qt test binary; Qt's DLLs must be on PATH). A relative path is taken from
+# the repository root.
 #
 # Run S4 single-threaded, as above: its long joins, `KILL SESSION` and 20-second
 # sleep load this single-instance container enough to flip U-6's outcome when
@@ -98,6 +105,25 @@ if (Test-Path (Join-Path $walletDir 'ewallet.pem')) {
 }
 
 Write-Host "database: $env:RELDEX_TEST_ORACLE_USER@$env:RELDEX_TEST_ORACLE_DSN"
+
+if ($env:RELDEX_IT_EXEC) {
+    Write-Host "program:  $env:RELDEX_IT_EXEC"
+    $program = @()
+    if ($Test) { $program += $Test }
+    $program += @($Rest | Where-Object { $_ -ne '--' })
+    Push-Location $repo
+    try {
+        & $env:RELDEX_IT_EXEC @program
+        $code = $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+        Remove-Item Env:\RELDEX_TEST_ORACLE_PASSWORD -ErrorAction SilentlyContinue
+        Remove-Item Env:\RELDEX_TEST_ORACLE_SYSTEM_PASSWORD -ErrorAction SilentlyContinue
+        Remove-Item Env:\RELDEX_TEST_ORACLE_SYSDBA_PASSWORD -ErrorAction SilentlyContinue
+    }
+    exit $code
+}
 
 $package = if ($env:RELDEX_IT_PACKAGE) { $env:RELDEX_IT_PACKAGE } else { 'reldex-driver-oracle-thin' }
 Write-Host "package:  $package"
