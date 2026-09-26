@@ -545,6 +545,21 @@ whoever owns `crates/ffi`/`crates/db-core` next: any other code relying on
 individual session's close on a hub that is not being destroyed — not just
 this task's — would hang or misreport the same way.
 
+### A related, non-FFI gap: the row cap has no setting yet
+
+`ObjectBrowserModel::rowCap` (`SPEC.md` §16's server-side row cap for a
+`Schemas`/`ObjectsOfKind` fetch) defaults to a hardcoded `500` and is a plain
+in-memory `Q_PROPERTY`, not backed by `reldex-workspace`'s settings registry —
+tracked by a `TODO(M2.9 wiring)` on the property's own doc comment. When that
+wiring happens it needs a **new** `SettingId` (something like
+`MetadataRowCap`): the two existing row/size settings the FFI already exposes
+are for query *results*, not metadata *lists* —
+`SettingId::ResultsMaxRows`/`ResultsMaxBytes` cap what a worksheet's result
+grid holds, and `SettingId::FetchRows` is the per-round-trip fetch-array-size
+hint (`crates/ffi/README.md` "Known limitation: the fetch-size hint..."); none
+of the three means "how many schemas/objects to list before truncating." Not
+added in this task: out of scope per the review brief that raised it.
+
 ### Error table
 
 `ObjectBrowserModel::describeError()` (private, exercised via

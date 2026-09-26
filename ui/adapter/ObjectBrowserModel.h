@@ -77,9 +77,16 @@ class ObjectBrowserModel : public QAbstractItemModel
             Bridge *bridge READ bridge WRITE setBridge NOTIFY bridgeChanged)
     /// The server-side row cap applied to every `Schemas`/`ObjectsOfKind`
     /// request (`SPEC.md` §16). Plain in-memory default, like
-    /// `AppSettings::themeOverride` -- TODO(M2.9 wiring): once the settings
-    /// model is reachable from the adapter, this should read/write through
-    /// it instead of holding its own default.
+    /// `AppSettings::themeOverride` -- TODO(M2.9 wiring): this needs a *new*
+    /// `SettingId` in `reldex-workspace`'s registry (something like
+    /// `MetadataRowCap`) before it can read/write through the settings model
+    /// instead of holding its own default. The two row/size settings that
+    /// registry already has are for query *results*, not metadata *lists*:
+    /// `SettingId::ResultsMaxRows`/`ResultsMaxBytes` cap a worksheet's result
+    /// grid, and `SettingId::FetchRows` is the per-round-trip fetch-array-size
+    /// hint -- none of them means "how many schemas/objects to list before
+    /// truncating" (see `ui/README.md` "Object browser (M6.1)" for the fuller
+    /// writeup).
     Q_PROPERTY(int rowCap READ rowCap WRITE setRowCap NOTIFY rowCapChanged)
     Q_PROPERTY(bool sessionOpen READ isSessionOpen NOTIFY sessionOpenChanged)
     Q_PROPERTY(quint64 sessionId READ sessionId NOTIFY sessionOpenChanged)
