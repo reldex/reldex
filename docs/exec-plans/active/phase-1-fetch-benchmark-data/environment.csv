@@ -1,0 +1,19 @@
+key,value
+cpu,AMD Ryzen 7 5700G (8 cores / 16 threads)
+ram,63.4 GB
+os,Windows 11 Pro build 26200
+power,Balanced scheme as found (not changed); desktop on AC
+toolchain,rustc 1.98.1 / cargo 1.98.1 (MSVC); `cargo test --release` (release profile: thin LTO; codegen-units 1)
+driver,oracledb 26.0.0-beta.3 (pinned) under reldex-driver-oracle-thin; oracledb called directly only for the prefetch experiment
+database,Oracle Database 19c Enterprise Edition 19.3.0.0.0 (banner from v$version) in container reldex-oracle19c (image doctorkirk/oracle-19c:19.3; 4 GiB memory limit; no CPU limit) on Docker Desktop 29.4.3 (WSL2 backend)
+listener,127.0.0.1:1521 forwarded by Docker Desktop into the WSL2 VM: 'direct' is therefore not zero latency (ping median about 0.8 ms)
+negotiated,SDU 8192 bytes and TNS protocol version 318 (read from the listener's ACCEPT packet by the relay); 318 < 319 so oracledb does not ask for end-of-response and the O(packets^2) re-parse (U-19) applies
+relay,std-only user-space TCP relay in the parent test process (crates/drivers/oracle-thin/tests/m5_6_support/relay.rs): fixed one-way delay RTT/2 per chunk in each direction; pipelined; no loss / jitter / window / slow-start model; optional serialization rate
+links,"direct (listener), rtt0 (relay, no delay), rtt2, rtt10, rtt40 (relay, nominal injected round-trip ms); measured ping per run in runs.csv"
+sampling,"PowerShell Get-Process before and after the timed section, in a fresh child process per run: TotalProcessorTime (ticks; ~16 ms granularity), WorkingSet64/PeakWorkingSet64, PrivateMemorySize64/PeakPagedMemorySize64 (= PagefileUsage / PeakPagefileUsage)"
+machine_state,"shared machine: another worker built in its own worktree during the matrix; its cargo processes were present throughout; at least one build tool was running at the start of 77 of 375 matrix runs (mostly one rustc) and 9 runs started during a heavy build (6-17 compiler processes), all on the rtt10/rtt40 links (see runs.csv machine_state and groups.csv); a non-build desktop process used about 2.2 cores continuously (measured 2.16 cores over 10 s at 11:25 +07:00); CPU load 32-63% at group starts; no power, display or input change was made"
+repeats,"3 runs per cell, interleaved (run 1 of every size, then run 2, then run 3); median and coefficient of variation (sample SD / mean) per cell"
+time_cap,"a run fetches all of the statement's rows (100,000 for numbers10/text5date2; 2,000 for wide4k) unless 10 s pass after at least 5 fetches; ms_per_100k_rows is then extrapolated from the run's own rate"
+run_matrix,"2026-09-26 11:27-12:22 +07:00; harness at commit 8047545; 3 shapes x 8-9 sizes x 5 links x 3 runs = 375 runs, all ok; then the prefetch and SDU extras (prefetch.csv, sdu.csv)"
+run_clob,"2026-09-26 12:22-12:25 +07:00; commit 1a4720b (8047545 plus a merge of main that touches no fetch path); clob x 6 sizes x direct/rtt0/rtt10 x 3 runs = 54 runs, all ok (clob-*.csv)"
+run_bandwidth,"2026-09-26 12:25-12:43 +07:00; commit 1a4720b; text5date2 and wide4k x 8 sizes x rtt10-100mbit/rtt40-20mbit x 3 runs = 96 runs, all ok (bandwidth-*.csv)"

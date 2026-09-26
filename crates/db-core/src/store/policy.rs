@@ -18,10 +18,14 @@ use crate::store::segment::LOB_CELL_BYTES;
 /// ceiling, Qt's `int` (ADR-0004 RS3, "No limit").
 pub const GRID_ROW_CEILING: usize = 2_147_483_647;
 
-/// The bytes one round trip is sized to carry until M5.6 measures the budget
-/// and the owner signs it off (ADR-0004 RS2, owner-review point (a)): a
-/// **placeholder**, about 22 ms on the Oracle 19c curve of ADR-0004 Table 3a.
-pub const DEFAULT_ROUND_TRIP_BYTES: NonZeroUsize = match NonZeroUsize::new(256 * 1024) {
+/// The bytes one round trip is sized to carry when nothing says otherwise:
+/// `results.round_trip_bytes`' built-in default (ADR-0004 RS2).
+///
+/// 192 KiB, measured by M5.6 on Oracle 19c on loopback and through injected
+/// round-trip time (`docs/exec-plans/active/phase-1-fetch-benchmark.md`); it
+/// replaced M5.2's 256 KiB placeholder. The owner's sign-off is pending
+/// (ADR-0004 owner-review point (a)).
+pub const DEFAULT_ROUND_TRIP_BYTES: NonZeroUsize = match NonZeroUsize::new(192 * 1024) {
     Some(bytes) => bytes,
     None => unreachable!(),
 };
@@ -191,8 +195,8 @@ pub struct ResultPolicy {
 }
 
 impl ResultPolicy {
-    /// `caps`, with `results.fetch_rows` and `results.fetches_in_flight` at
-    /// their built-in defaults and the placeholder round-trip budget
+    /// `caps`, with `results.fetch_rows`, `results.fetches_in_flight` and
+    /// `results.round_trip_bytes` at their built-in defaults
     /// ([`DEFAULT_ROUND_TRIP_BYTES`]).
     #[must_use]
     pub const fn new(caps: ResultCaps) -> Self {
@@ -221,7 +225,8 @@ impl ResultPolicy {
         self
     }
 
-    /// The bytes one round trip is sized to carry (ADR-0004 RS2).
+    /// The bytes one round trip is sized to carry:
+    /// `results.round_trip_bytes` (ADR-0004 RS2).
     #[must_use]
     pub const fn with_round_trip_bytes(mut self, bytes: NonZeroUsize) -> Self {
         self.round_trip_bytes = bytes;

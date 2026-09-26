@@ -268,6 +268,16 @@ impl StatementSettings {
     ///
     /// For a freshly built statement: with "no limit" it arms nothing, and
     /// [`Statement`] has no way to disarm a deadline a caller set earlier.
+    ///
+    /// **A trap for M5.2 Stage B.** This unconditionally sends
+    /// `results.fetch_rows` (default 1,000) as the wire array size via
+    /// [`Statement::with_fetch_rows`]. Nothing on the product path calls
+    /// `apply` today; M5.6 measured that a 1,000-row array costs seconds per
+    /// fetch for wide rows on Oracle 19c
+    /// (`docs/exec-plans/active/phase-1-fetch-benchmark.md`, "The wire
+    /// array"). Stage B must not start calling this as it stands — the wire
+    /// array needs to be bounded by `results.round_trip_bytes` and the
+    /// row's width (ADR-0004 RS2), not by the row-count setting alone.
     #[must_use]
     pub fn apply(&self, statement: Statement) -> Statement {
         let mut statement = statement;
