@@ -1064,7 +1064,7 @@ void ConnectionManager::handleConnectParamsBuilt(const ReldexWorkspaceReply &rep
     // and this build's hub can only ever open the mock driver (see the class
     // documentation's FFI-gap note) -- passing null asks for exactly that,
     // its default scenario.
-    quint64 sessionId = 0;
+    ReldexSessionId sessionId = 0;
     const quint64 openRequest = nextRequest();
     const ReldexStatus status =
             reldex_hub_open_session(m_bridge->hub(), nullptr, openRequest, &sessionId);
