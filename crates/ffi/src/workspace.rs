@@ -5531,6 +5531,7 @@ mod tests {
             (SettingId::ResultsMaxRows, None),
             (SettingId::ResultsMaxBytes, None),
             (SettingId::ResultsCloseCursorAtLimit, None),
+            (SettingId::ResultsRoundTripBytes, None),
         ];
         assert_eq!(
             pinned.len(),

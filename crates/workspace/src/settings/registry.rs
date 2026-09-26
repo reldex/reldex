@@ -201,11 +201,13 @@ pub enum SettingId {
     ResultsMaxBytes,
     /// See [`RESULTS_CLOSE_CURSOR_AT_LIMIT`].
     ResultsCloseCursorAtLimit,
+    /// See [`RESULTS_ROUND_TRIP_BYTES`].
+    ResultsRoundTripBytes,
 }
 
 impl SettingId {
     /// Every setting, in registry order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::ConnectTimeout,
         Self::RewriteTriggerDdl,
         Self::StatementTimeLimit,
@@ -217,6 +219,7 @@ impl SettingId {
         Self::ResultsMaxRows,
         Self::ResultsMaxBytes,
         Self::ResultsCloseCursorAtLimit,
+        Self::ResultsRoundTripBytes,
     ];
 
     /// This setting's descriptor.
@@ -234,6 +237,7 @@ impl SettingId {
             Self::ResultsMaxRows => &DESCRIPTORS[8],
             Self::ResultsMaxBytes => &DESCRIPTORS[9],
             Self::ResultsCloseCursorAtLimit => &DESCRIPTORS[10],
+            Self::ResultsRoundTripBytes => &DESCRIPTORS[11],
         }
     }
 
@@ -559,24 +563,29 @@ pub const REWRITE_TRIGGER_DDL: Setting<bool> = Setting::new(SettingId::RewriteTr
 /// so is more honest than offering a number nobody will wait for.
 pub const STATEMENT_TIME_LIMIT: Setting<TimeLimit> = Setting::new(SettingId::StatementTimeLimit);
 
-/// The most rows one round trip may carry. Default **1,000** — the
-/// fastest-or-tied setting in spike S15's sweep, which measured zero network
-/// latency; the owner's sign-off on the number is still pending (`phase-1.md`
-/// §C.3 item 10, M5.6, re-asked as a bytes-per-round-trip budget), and it is a
-/// user setting either way.
+/// The most rows one round trip may carry. Default **1,000**.
 ///
 /// An upper bound, not the number every round trip carries (ADR-0006
-/// amendment "Result caps"): the Result Store sizes each request by a
-/// per-round-trip byte budget and the describe's declared column widths, and
-/// asks for at most this many rows (ADR-0004 RS2).
+/// amendment "Result caps"): the Result Store sizes each request by the
+/// per-round-trip byte budget ([`RESULTS_ROUND_TRIP_BYTES`]) and the row's
+/// width, and asks for at most this many rows (ADR-0004 RS2). At the budget's
+/// default it binds only rows narrower than about 200 bytes. M5.6 measured
+/// that bound on Oracle 19c: 1,000 keeps a narrow row at about 90% of its best
+/// rate both on loopback and at 10 ms round-trip time
+/// (`docs/exec-plans/active/phase-1-fetch-benchmark.md`). The owner's
+/// sign-off is still pending (`phase-1.md` §C.3 item 10), and it is a user
+/// setting either way.
 ///
 /// It is **not** passed as the statement's fetch-size hint on the product
 /// path. The adapter's execute sets no hint, so on Oracle the driver's wire
 /// array stays `oracledb`'s default of 100 rows, fixed at execute. That is a
-/// lead decision for M5.2 Stage B: a larger wire array brings back the
-/// per-fetch cost of ADR-0004 Table 3a, so this setting is not passed until
-/// M5.6 has measured a budget or upstream ships a setter for the array size
-/// after execute (ADR-0004 accepted limitations 11 and 12).
+/// lead decision for M5.2 Stage B, and it stands after M5.6: the hint is fixed
+/// at execute, before the describe's widths are known, so it cannot follow a
+/// row's width, and a width-blind
+/// 1,000-row array brings back the per-fetch cost of ADR-0004 Table 3a for
+/// wide rows. Changing it waits for the owner's ruling on ADR-0004
+/// owner-review point (g) and for a way to size the array after the describe
+/// (accepted limitations 11 and 12).
 pub const FETCH_ROWS: Setting<u32> = Setting::new(SettingId::FetchRows);
 
 /// How many fetches one result may have outstanding at once. Default **2**
@@ -651,15 +660,49 @@ pub const RESULTS_MAX_BYTES: Setting<ByteLimit> = Setting::new(SettingId::Result
 pub const RESULTS_CLOSE_CURSOR_AT_LIMIT: Setting<bool> =
     Setting::new(SettingId::ResultsCloseCursorAtLimit);
 
+/// The bytes one round trip is sized to carry (ADR-0004 RS2). The Result
+/// Store asks for `clamp(budget / row width, 1, results.fetch_rows)` rows a
+/// request: the width is the describe's declared width for the first request,
+/// then the observed average, never above the declared one. Default
+/// **192 KiB**; application, profile and worksheet levels; 16 KiB to 4 MiB.
+///
+/// Measured by M5.6 on Oracle 19c over three row shapes, on loopback and
+/// through 2, 10 and 40 ms of injected round-trip time
+/// (`docs/exec-plans/active/phase-1-fetch-benchmark.md`). 192 KiB is the
+/// budget under which the mixed shape (five texts and two dates) does best on
+/// loopback and at 10 ms together; a round trip at the default then takes
+/// about 20 ms at 10 ms round-trip time.
+/// The owner's sign-off is pending (ADR-0004 owner-review point (a)), and it
+/// is a user setting either way.
+///
+/// - **Profile level** because the best budget grows with the round-trip
+///   time: a profile for a distant server is where a larger one belongs.
+/// - **"No limit" is refused.** Before Oracle 23ai the driver re-reads a
+///   response from its start for every packet (upstream gap U-19), so a round
+///   trip costs about the square of its bytes, and an unbounded round trip is
+///   what this setting exists to prevent.
+/// - **The bounds.** Below 16 KiB (two of the 8 KiB packets 19c negotiates) a
+///   round trip is mostly latency. Above 4 MiB one round trip takes seconds on
+///   19c: 4 MB took 0.85 s on loopback.
+///
+/// On Oracle it sizes the rows the store requests, not yet the driver's wire
+/// array, which stays `oracledb`'s default of 100 rows (ADR-0004 accepted
+/// limitation 12, owner-review point (g)).
+pub const RESULTS_ROUND_TRIP_BYTES: Setting<ByteLimit> =
+    Setting::new(SettingId::ResultsRoundTripBytes);
+
 /// Whether this build targets a mobile operating system, whose built-in
 /// defaults for the result caps are smaller (ADR-0006 amendment "Result
 /// caps", ADR-0004 RS6).
 const MOBILE: bool = cfg!(any(target_os = "android", target_os = "ios"));
 
+/// One kibibyte.
+const KIB: u32 = 1024;
+
 /// One mebibyte.
 const MIB: u32 = 1024 * 1024;
 
-const DESCRIPTORS: [SettingDescriptor; 11] = [
+const DESCRIPTORS: [SettingDescriptor; 12] = [
     SettingDescriptor {
         id: SettingId::ConnectTimeout,
         storage_key: "connection.connect_timeout",
@@ -822,6 +865,21 @@ const DESCRIPTORS: [SettingDescriptor; 11] = [
         unlimited: Unlimited::NotAllowed,
         takes_effect: TakesEffect::NextStatement,
         summary: "Close a result's cursor when it stops at a cap, instead of keeping it for more.",
+    },
+    SettingDescriptor {
+        id: SettingId::ResultsRoundTripBytes,
+        storage_key: "results.round_trip_bytes",
+        group: SettingGroup::Results,
+        kind: ValueKind::ByteLimit,
+        default: SettingValue::ByteLimit(ByteLimit::Bytes(nz(192 * KIB))),
+        levels: LevelSet::ALL,
+        bounds: Some(Bounds {
+            min: 16 * KIB,
+            max: 4 * MIB,
+        }),
+        unlimited: Unlimited::NotAllowed,
+        takes_effect: TakesEffect::NextStatement,
+        summary: "Bytes one round trip is sized to carry, within results.fetch_rows rows.",
     },
 ];
 
@@ -1017,6 +1075,7 @@ mod tests {
             SettingId::ResultsMaxRows,
             SettingId::ResultsMaxBytes,
             SettingId::ResultsCloseCursorAtLimit,
+            SettingId::ResultsRoundTripBytes,
         ] {
             let descriptor = setting.descriptor();
             assert_eq!(descriptor.group(), SettingGroup::Results, "{setting}");
@@ -1024,6 +1083,47 @@ mod tests {
                 descriptor.takes_effect(),
                 TakesEffect::NextStatement,
                 "{setting}"
+            );
+        }
+    }
+
+    /// M5.6 (`phase-1-fetch-benchmark.md`): the measured budget, the bound it
+    /// works under, and a budget that can never be unbounded.
+    #[test]
+    fn the_round_trip_budget_is_registered_as_m5_6_measured_it() {
+        assert_eq!(
+            RESULTS_ROUND_TRIP_BYTES.default_value(),
+            ByteLimit::Bytes(nz(192 << 10))
+        );
+        assert_eq!(FETCH_ROWS.default_value(), 1_000);
+        let descriptor = RESULTS_ROUND_TRIP_BYTES.descriptor();
+        assert_eq!(descriptor.levels(), LevelSet::ALL);
+        assert_eq!(
+            descriptor.bounds(),
+            Some(Bounds {
+                min: 16 << 10,
+                max: 4 << 20
+            })
+        );
+        assert_eq!(descriptor.unlimited(), Unlimited::NotAllowed);
+        assert_eq!(
+            descriptor.check_value(SettingValue::ByteLimit(ByteLimit::Unlimited)),
+            Err(SettingError::UnlimitedNotAllowed {
+                setting: SettingId::ResultsRoundTripBytes
+            })
+        );
+        for (bytes, accepted) in [
+            ((16 << 10) - 1, false),
+            (16 << 10, true),
+            (4 << 20, true),
+            ((4 << 20) + 1, false),
+        ] {
+            assert_eq!(
+                descriptor
+                    .check_value(SettingValue::ByteLimit(ByteLimit::Bytes(nz(bytes))))
+                    .is_ok(),
+                accepted,
+                "{bytes} bytes"
             );
         }
     }
@@ -1098,8 +1198,9 @@ mod tests {
 
     #[test]
     fn a_limit_that_requires_a_number_refuses_unlimited() {
-        // No registered setting refuses "no limit" today; the rule is still
-        // enforced, so build a descriptor that does.
+        // The one registered setting that refuses "no limit" is a byte limit
+        // (`results.round_trip_bytes`); the rule holds for every limit kind,
+        // so build a time limit that refuses it too.
         let strict = SettingDescriptor {
             unlimited: Unlimited::NotAllowed,
             ..DESCRIPTORS[2]

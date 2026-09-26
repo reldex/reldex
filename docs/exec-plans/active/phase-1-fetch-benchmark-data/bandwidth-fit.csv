@@ -1,0 +1,9 @@
+link,shape,metric,points,a_ms,b_ms_per_packet,c_ms_per_packet_sq,max_rel_error
+rtt10-100mbit,text5date2,fetch_p50_ms,8,14.2343,0.17804,0.0155864,0.195
+rtt10-100mbit,text5date2,cpu_ms_per_fetch,8,-0.0411,0.14049,0.0127951,0.339
+rtt10-100mbit,wide4k,fetch_p50_ms,8,13.8493,0.44933,0.0024246,0.144
+rtt10-100mbit,wide4k,cpu_ms_per_fetch,8,0.0744,0.00860,0.0032813,0.323
+rtt40-20mbit,text5date2,fetch_p50_ms,8,43.0620,3.04991,0.0054880,0.042
+rtt40-20mbit,text5date2,cpu_ms_per_fetch,8,0.0354,0.08430,0.0180593,0.269
+rtt40-20mbit,wide4k,fetch_p50_ms,8,42.8800,3.22086,0.0002556,0.004
+rtt40-20mbit,wide4k,cpu_ms_per_fetch,8,0.1013,0.02529,0.0038955,0.393

@@ -3,6 +3,8 @@
 **Status:** Accepted by the lead (2026-09-25), after one independent review round (PR #39).
 **M5.2 Stage A (the core) is implemented** (2026-09-26); see "As implemented: M5.2 Stage A" for
 where the code differs from the text and why. Stage B (ABI 4 in `crates/ffi`, RS5) follows.
+**M5.6 measured the round-trip budget** (2026-09-26): 192 KiB, proposed and registered as
+`results.round_trip_bytes`, owner sign-off pending; see "As measured: M5.6".
 The owner-review list is at "Owner-review points": (a) the fetch-size sign-off, re-asked with a
 corrected diagnosis, (b) whether a 1,000,000-row default cap meets `SPEC.md` §19, (c) no
 browsing past the caps in Phase 1, (d) the mobile caps (for information), (e) upstream Issue J /
@@ -215,6 +217,9 @@ S14 shape, 22 ms for 5 texts + 2 dates, and 23 s for 4 × `VARCHAR2(4000)`.
   about 22 ms on the Table 3a curve (5 texts + 2 dates at 1,000 rows carry roughly 0.3 MB) and
   under 70 ms for wide rows (50 rows of 16 KB). A declared width over-estimates sparse text, so the
   bound errs toward more, smaller round trips; M5.6 weighs that against network latency.
+  **M5.6 measured it (2026-09-26): 192 KiB**, now the setting `results.round_trip_bytes` and
+  `db-core`'s `DEFAULT_ROUND_TRIP_BYTES`, with the owner's sign-off pending ("As measured:
+  M5.6").
 - **Applying it needs a driver change.** `oracle-thin` sets the array size at `execute`, before
   the describe, and `oracledb`'s public `Cursor` has no setter. Its fetch message does read the
   size from the statement's options on every fetch (`messages/fetch.rs`), so a setter is a small
@@ -734,6 +739,10 @@ default on mobile until then.
       by the square of the ratio (Table 3a). So it is not passed until one of two things happens:
       M5.6 measures a budget, or upstream ships a setter for the array size after execute.
     - The cost is more round trips for narrow rows on a real network, which M5.6 measures.
+      **Measured (M5.6):** at 10 ms round-trip time, 100,000 rows take 12.8 s (10 `NUMBER`s) and
+      13.7 s (5 texts + 2 dates) through the 100-row array, against 2.1 s and 4.0 s if the
+      budget sized the wire; on loopback 1.4 against 1.0 s and 2.2 against 2.1 s. The limitation
+      stands: this ADR does not change the wire ("As measured: M5.6").
     - Owner-review point (g).
 13. **A statement that fails but still ended the transaction does not end the stores.** A DDL that
     fails still commits on Oracle, and a `COMMIT` can fail after the transaction was rolled back
@@ -755,6 +764,10 @@ because each is either a setting's default or information.
   - The ADR asks the owner to sign off a **bytes-per-round-trip bound** (RS2) instead of a row
     count. M5.6 measures the bound; M5.2 uses a 256 KiB placeholder. `results.fetch_rows` stays
     as the upper bound and the setting.
+  - **M5.6's proposal (2026-09-26): 192 KiB per round trip, `results.fetch_rows` 1,000 as the
+    row bound**, with a latency ceiling of 50 ms p50 per round trip on loopback and 100 ms at
+    10 ms round-trip time. The number to sign off is `results.round_trip_bytes`' default ("As
+    measured: M5.6").
 - **(b) Whether a 1,000,000-row default cap satisfies `SPEC.md` §19's "1,000,000+".** S14-shape
   rows fit about 7.3 million times in 512 MiB, so the row cap could be raised without touching
   the byte cap. The 512 MiB byte cap and keeping the cursor open at the limit (RS3) are part of
@@ -782,6 +795,10 @@ because each is either a setting's default or information.
   Stage B keeps `oracledb`'s default of 100 rows and does not pass `results.fetch_rows` as the
   fetch-size hint. It waits until M5.6 measures a budget or upstream ships a setter. The owner
   may want the larger array for narrow rows on a slow network; M5.6's data is the input.
+  **M5.6's data:** sizing the wire by the budget would be 3.4–6.1× faster for narrow and mixed
+  rows at 10 ms and 1.1–1.4× on loopback, but no faster for 16 KB rows at 10 ms and 0.4× at
+  40 ms. A width-blind hint cannot serve both; the upstream setter can, with no extra round trip
+  (`phase-1-fetch-benchmark.md`, "The wire array").
 
 Changing a default later is a registry edit and needs no redesign.
 
@@ -1048,7 +1065,8 @@ additive variant) or the `Completion` of `DatabaseSession::fetch_segment`. `fetc
 - **Read-ahead** keeps `retained + requested < demand + rows per round trip`. RS2 wrote
   `demand + fetch_rows`; rows per round trip is the byte-bounded figure RS2 defines, so this is
   the same rule once the byte bound applies. Rows per round trip is
-  `clamp(256 KiB / row width, 1, fetch_rows)`.
+  `clamp(budget / row width, 1, fetch_rows)`, with the budget 256 KiB in Stage A and 192 KiB
+  since M5.6.
 - **Declared widths.** `NUMBER` 44 B, `DATE`/`TIMESTAMP` 16 B, a LOB 256 B, text
   `max_size_bytes + 8` (4,000 + 8 when the describe gives no size), plus one NULL bit per column.
   The observed width replaces the declared one once rows arrive, and never exceeds it.
@@ -1226,7 +1244,7 @@ segments. It checks every cell, `NUMBER` formatting included, after the measurem
 **Accepted limitation 11, precisely.** No driver mechanism was chosen in M5.2, so the limitation
 stands. This is what the store bounds now, and what it still does not.
 
-- **Bounded by the 256 KiB budget:**
+- **Bounded by the budget** (256 KiB in Stage A; 192 KiB since M5.6):
   - each request, and so each segment;
   - the rows one reply hands the consumer;
   - the byte cap's overshoot: at most `fetches_in_flight` requests of rows at declared width, plus
@@ -1253,6 +1271,38 @@ stands. This is what the store bounds now, and what it still does not.
   - A describe before every execute would add a round trip to every query, to help the wide ones.
     It was not built.
   - M5.6 measures the budget either way.
+
+## As measured: M5.6, the round-trip budget (2026-09-26)
+
+M5.6 measured the budget RS2 asks for: `docs/exec-plans/active/phase-1-fetch-benchmark.md`, data
+in `phase-1-fetch-benchmark-data/`. Oracle 19.3 in the local container, `oracledb`
+26.0.0-beta.3, TNS protocol 318, SDU 8,192. Three shapes (10 `NUMBER`s; 5 texts + 2 dates;
+`NUMBER` + 4 × 4000-character texts) at 8–9 rows-per-round-trip sizes each, on loopback and
+through a user-space relay adding 0, 2, 10 and 40 ms: 375 runs, three per cell, interleaved.
+
+- **Proposed:** `results.round_trip_bytes` = **192 KiB**; `results.fetch_rows` = 1,000 as the
+  row bound (unchanged). Registered as a setting (ADR-0006 amendment "The round-trip budget
+  (M5.6)"); `DEFAULT_ROUND_TRIP_BYTES` went from 256 to 192 KiB. The owner's sign-off is point
+  (a).
+- **Why.** For the mixed shape it is the budget whose worse link, loopback or 10 ms, does best:
+  88% of the best rate on loopback and 97% at 10 ms (99% at 2 ms, 70% at 40 ms). 10 `NUMBER`s
+  are bound by `results.fetch_rows` at 88% and 90%. 16 KB rows get 12 rows a round trip: 99% on
+  loopback, 56% at 10 ms, 36% at 40 ms. The best budget grows with the round-trip time, so the
+  setting is allowed at profile level.
+- **Latency ceiling (proposed):** 50 ms p50 per round trip on loopback, 100 ms at 10 ms. The
+  default's slowest round trip is 10.9 ms and 21.2 ms.
+- **The Context's diagnosis, quantified.** A round trip's time is `a + b·P + c·P²` in its
+  packets, with `c` independent of the link (client CPU) and dependent on the shape: 0.076,
+  0.012 and 0.0023 ms/packet² for the three shapes on loopback. Per re-parse the client pays
+  about 1 µs per row and 0.5–0.7 µs per KB, which is why a row bound and a byte bound are both
+  needed.
+- **The SDU** stayed at 8,192 bytes whatever the client asked (up to 2 MB): this server does not
+  grant a larger one, so it is no lever from the client side.
+- **Prefetch** saves exactly one round trip on the first page; the U-3 containment keeps it off.
+- **Accepted limitation 12 stands.** Its cost is now measured (the limitation's own text), and
+  point (g) has the data.
+- **Oracle 23ai is not measured.** A server that marks end-of-response should lose the quadratic
+  term, and the budget could then be several times larger. The harness is reusable for that run.
 
 ## Status
 

@@ -1,0 +1,5 @@
+link,shape,started_epoch_s,cpu_load_percent,waited_for_quiet_s,machine_state
+rtt10-100mbit,text5date2,1790400327,59,1,cargo=2 rustc=0 cl=0 link=0 clippy-driver=0 ninja=0
+rtt10-100mbit,wide4k,1790400573,62,0,cargo=2 rustc=0 cl=0 link=0 clippy-driver=0 ninja=0
+rtt40-20mbit,text5date2,1790400776,59,0,cargo=2 rustc=0 cl=0 link=0 clippy-driver=0 ninja=0
+rtt40-20mbit,wide4k,1790401079,60,0,cargo=2 rustc=0 cl=0 link=0 clippy-driver=0 ninja=0
