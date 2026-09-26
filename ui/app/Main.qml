@@ -13,11 +13,12 @@ import Reldex.Adapter
 // this file's).
 //
 // Presentation only, per ARCHITECTURE.md invariant 4: no business rules
-// here. Every backend-shaped placeholder (session state, results,
-// DBMS_OUTPUT) names the milestone that replaces it; connections (M3.2) and
-// the production indicator (M3.4) are filled in already. See
-// `ui/README.md` "App shell" for the layout diagram and how this differs
-// from `Harness.qml`, the still-reachable S15 measurement window
+// here. Every backend-shaped placeholder (session state, results) names the
+// milestone that replaces it; connections (M3.2), the production indicator
+// (M3.4), and DBMS_OUTPUT (M4.7) are filled in already -- the last through
+// `OutputPanes.qml`'s DBMS_OUTPUT tab, reached through `bridge.serverOutput`
+// below. See `ui/README.md` "App shell" for the layout diagram and how this
+// differs from `Harness.qml`, the still-reachable S15 measurement window
 // (`ui/app/main.cpp` picks between the two).
 //
 // M6.1 is the first milestone to fill in a placeholder with a real
@@ -144,6 +145,10 @@ ApplicationWindow {
                 SplitView.preferredHeight: 170
                 SplitView.minimumHeight: 60
                 visible: root.outputPaneVisible
+                // M4.7: the DBMS_OUTPUT tab reaches `bridge.serverOutput`
+                // through this, the same way `Sidebar` already receives
+                // `bridge` for the object browser/connection manager.
+                bridge: bridge
             }
         }
     }

@@ -17,7 +17,11 @@
 
 #include <AppSettings.h>
 #include <ObjectBrowserModel.h>
+#include <ServerOutputController.h>
+#include <ServerOutputModel.h>
 #include <reldex.h>
+
+#include <QElapsedTimer>
 
 // M1.5 acceptance criteria (docs/exec-plans/active/phase-1.md, row M1.5):
 //   (a) reldex_abi_version() equals the header's ABI version constant.
@@ -57,6 +61,15 @@ private slots:
     void appShellRendersAtCurrentScaleFactor();
     void connectionManagerDialogRendersAtCurrentScaleFactor();
     void objectBrowserTreeKeyboardNavigationExpandsAndActivates();
+
+    // M4.7: DBMS_OUTPUT pane. Adapter-level behavior (settings round-trip,
+    // per-worksheet isolation, truncation reporting, event ordering) is
+    // tst_serveroutput.cpp's job -- these two are QML-level, the same split
+    // tst_objectbrowsermodel/tst_coreinfo already use for the object
+    // browser: this binary is the one with a real QML engine and offscreen
+    // window, so it is where a real ListView can be measured.
+    void dbmsOutputPaneRendersAtCurrentScaleFactor();
+    void dbmsOutputPaneVirtualizesLargeOutputWithoutOneItemPerLine();
 
     // M3.4: persistent production indicator (SPEC.md §17; phase-1.md row
     // M3.4). See ui/README.md "Production indicator (M3.4)".
@@ -542,6 +555,120 @@ void TstCoreInfo::objectBrowserTreeKeyboardNavigationExpandsAndActivates()
     QTest::keyClick(window, Qt::Key_Return);
     QCoreApplication::processEvents();
     QVERIFY(refreshButton->property("enabled").toBool());
+}
+
+void TstCoreInfo::dbmsOutputPaneRendersAtCurrentScaleFactor()
+{
+    // Mirrors connectionManagerDialogRendersAtCurrentScaleFactor() above,
+    // scoped to the DBMS_OUTPUT tab (OutputPanes.qml) -- registered in
+    // CMakeLists.txt as its own ctest process at QT_SCALE_FACTOR=2, on top
+    // of running once more, unfiltered, as part of the plain "tst_coreinfo"
+    // entry at the default 1x.
+    QQmlApplicationEngine engine;
+    engine.loadFromModule("Reldex.App", "Main");
+    QObject *root = engine.rootObjects().constFirst();
+    auto *window = qobject_cast<QQuickWindow *>(root);
+    QVERIFY(window != nullptr);
+
+    auto *bridge = root->findChild<Bridge *>(QStringLiteral("bridge"));
+    QVERIFY(bridge != nullptr);
+    ServerOutputController *serverOutput = bridge->serverOutput();
+    QVERIFY(serverOutput != nullptr);
+
+    // Selecting the DBMS_OUTPUT tab is what OutputPanes.qml's own
+    // onCurrentIndexChanged uses to open this pane lazily (M4.7: no round
+    // trip just from loading Main.qml).
+    auto *tabBar = root->findChild<QQuickItem *>(QStringLiteral("outputTabBar"));
+    QVERIFY(tabBar != nullptr);
+    tabBar->setProperty("currentIndex", 1);
+    QCoreApplication::processEvents();
+    QVERIFY(adapter_test::spinUntil([serverOutput] { return serverOutput->ready(); }));
+    QCoreApplication::processEvents();
+    QTest::qWait(50);
+
+    const QStringList controls = { QStringLiteral("serverOutputEnabledCheckBox"),
+                                    QStringLiteral("serverOutputUnlimitedCheckBox"),
+                                    QStringLiteral("serverOutputBufferField"),
+                                    QStringLiteral("serverOutputClearButton"),
+                                    QStringLiteral("serverOutputRunSampleButton"),
+                                    QStringLiteral("serverOutputList") };
+    for (const QString &name : controls) {
+        auto *item = adapter_test::findVisualChild(window->contentItem(), name);
+        QVERIFY2(item != nullptr, qPrintable(name));
+        QVERIFY2(item->width() > 0.0, qPrintable(name + QStringLiteral(": width is zero")));
+        QVERIFY2(item->height() > 0.0, qPrintable(name + QStringLiteral(": height is zero")));
+    }
+
+    const qreal dpr = window->devicePixelRatio();
+    QVERIFY2(dpr > 0.0, "devicePixelRatio must be positive");
+    if (const QByteArray requested = qgetenv("QT_SCALE_FACTOR"); !requested.isEmpty()) {
+        const qreal expected = requested.toDouble();
+        QVERIFY2(qAbs(dpr - expected) < 0.01,
+                 qPrintable(QStringLiteral("expected QT_SCALE_FACTOR=%1, devicePixelRatio was %2")
+                                    .arg(expected)
+                                    .arg(dpr)));
+    }
+}
+
+void TstCoreInfo::dbmsOutputPaneVirtualizesLargeOutputWithoutOneItemPerLine()
+{
+    // ARCHITECTURE.md "never one QML object per row" applies to the
+    // DBMS_OUTPUT pane's ListView exactly as it does to the result grid
+    // (phase-1.md row M4.7: "large output is virtualized"). This appends
+    // 100,000 lines straight to the model (bypassing the FFI/mock event path
+    // on purpose -- see tst_serveroutput.cpp's own doc comment for why: the
+    // driver's per-session cap on undrained SERVER_OUTPUT events, 256, makes
+    // 100,000 lines through the real pipe an FFI/db-core-level question, not
+    // a UI-virtualization one) and checks two things: how long the append
+    // took, and how many delegate items the ListView actually instantiated
+    // to show them -- which must be far fewer than 100,000.
+    QQmlApplicationEngine engine;
+    engine.loadFromModule("Reldex.App", "Main");
+    QObject *root = engine.rootObjects().constFirst();
+    auto *window = qobject_cast<QQuickWindow *>(root);
+    QVERIFY(window != nullptr);
+
+    auto *bridge = root->findChild<Bridge *>(QStringLiteral("bridge"));
+    QVERIFY(bridge != nullptr);
+    ServerOutputController *serverOutput = bridge->serverOutput();
+    QVERIFY(serverOutput != nullptr);
+
+    auto *tabBar = root->findChild<QQuickItem *>(QStringLiteral("outputTabBar"));
+    QVERIFY(tabBar != nullptr);
+    tabBar->setProperty("currentIndex", 1);
+    QCoreApplication::processEvents();
+    QVERIFY(adapter_test::spinUntil([serverOutput] { return serverOutput->ready(); }));
+
+    QStringList lines;
+    lines.reserve(100000);
+    for (int i = 0; i < 100000; ++i) {
+        lines.append(QStringLiteral("DBMS_OUTPUT line %1 of 100000").arg(i));
+    }
+    QElapsedTimer timer;
+    timer.start();
+    serverOutput->model()->appendLines(lines);
+    const qint64 elapsedMs = timer.elapsed();
+    qInfo("M4.7: appended 100,000 DBMS_OUTPUT lines to the model in %lld ms",
+          static_cast<long long>(elapsedMs));
+
+    // A real scene-graph frame tick is needed before the ListView's
+    // delegates settle -- same reasoning as
+    // appShellThaiSampleTextIsNotZeroWidth()'s own comment on this.
+    QCoreApplication::processEvents();
+    QTest::qWait(50);
+
+    auto *listView = adapter_test::findVisualChild(window->contentItem(),
+                                                    QStringLiteral("serverOutputList"));
+    QVERIFY(listView != nullptr);
+    QCOMPARE(listView->property("count").toInt(), 100000);
+
+    auto contentItem = listView->property("contentItem").value<QQuickItem *>();
+    QVERIFY(contentItem != nullptr);
+    const int liveDelegates = contentItem->childItems().size();
+    qInfo("M4.7: ListView instantiated %d delegate item(s) for 100,000 lines", liveDelegates);
+    QVERIFY2(liveDelegates < 1000,
+             qPrintable(QStringLiteral("expected far fewer than 100,000 delegates, got %1")
+                                .arg(liveDelegates)));
 }
 
 namespace {

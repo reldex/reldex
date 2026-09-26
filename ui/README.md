@@ -1125,6 +1125,263 @@ lead pending the real-driver half above.
   come from `QtQuick`/`QtQuick.Controls`, already linked/deployed for the
   rest of the shell.
 
+## DBMS_OUTPUT pane (M4.7)
+
+Fills in `OutputPanes.qml`'s DBMS_OUTPUT tab (a placeholder since M3.1) with
+three new adapter classes and a real `ListView`, on top of two additions to
+`SessionController`/`Bridge`: per-worksheet enable/size, a Clear button, and
+truncation/invalid-UTF-8/read-failure reporting that is never silent
+(`SPEC.md` §9/§24 item 10, `ARCHITECTURE.md` "Server output").
+
+### The three new classes
+
+- **`SettingsController`** — the first adapter-side consumer of
+  `reldex-workspace`'s settings registry (ADR-0006 P2:
+  `effective = worksheet ?? profile ?? application ?? built-in`, with
+  provenance). Generic over `SettingId`: nothing in it is server-output-
+  specific, so it is also what closes "Object browser (M6.1)"'s own
+  documented gap above ("the row cap has no setting yet") whenever that
+  wiring happens. It owns **its own** `ReldexWorkspace*` handle — a
+  deliberate, documented deviation from "Connection manager (M3.2)"'s "one
+  workspace per `Bridge`" above. `ConnectionManager`'s own class
+  documentation says plainly "it does not resolve settings"; ADR-0006 P6
+  says plainly that a second handle on the same store file is safe ("two
+  handles on one file ... are safe: WAL readers never block the writer"),
+  so this class opens one rather than reaching into `ConnectionManager`'s
+  private one and coupling the two classes' request/reply bookkeeping
+  together for no benefit. Cost: one more SQLite connection and one more
+  idle thread per process — cheap next to that coupling.
+- **`ServerOutputModel`** — a `QAbstractListModel` of plain `QString` lines.
+  No formatting, no FFI-owned memory retained past the call that hands lines
+  over (unlike `ResultTableModel`, which borrows from a live `ReldexBatch`).
+  Measured (`ui/tests/tst_serveroutput.cpp`,
+  `oneHundredThousandLinesAppendQuicklyWithoutPerLineObjects`, and
+  `ui/tests/tst_coreinfo.cpp`,
+  `dbmsOutputPaneVirtualizesLargeOutputWithoutOneItemPerLine`, RelWithDebInfo
+  build, offscreen platform): appending 100,000 lines in one
+  `beginInsertRows`/`endInsertRows` pair took **1 ms**; a real `ListView`
+  bound to the model, at the app shell's default 1280×800 window size,
+  instantiated **44** delegate `Item`s to show them — not 100,000, per
+  `ARCHITECTURE.md`'s "never one QML object per row" (`reuseItems: true`,
+  `cacheBuffer: 400`).
+- **`ServerOutputController`** (`bridge.serverOutput`) — ties the two above
+  together for one worksheet: it owns its own dedicated `SessionController`
+  (a second, independent mock session on the same hub `bridge.session`
+  uses — the same pattern `ObjectBrowserModel` already uses for its own
+  metadata session, "distinct from any worksheet's session"), resolves and
+  writes `server_output.enabled`/`server_output.buffer` at that worksheet's
+  scope, and calls `reldex_session_set_server_output` whenever either value
+  changes. `Bridge` constructs one, with a worksheet id from
+  `reldex_workspace_new_worksheet_id()`, alongside `m_session`/
+  `m_connections` in its constructor; `~Bridge()` deletes it (and the
+  `SettingsController`) explicitly, in the same order-sensitive way it
+  already deletes `m_session`/`m_connections` (see `Bridge.h`'s own
+  top-of-file comment on why) — `ServerOutputController`'s own
+  `SessionController` registers itself in `Bridge::m_sessions` and
+  unregisters itself from there in its destructor, exactly like the shared
+  one does.
+
+### `SessionController` additions
+
+Additive only (new properties/methods/signals; nothing existing changed
+shape) — ADR-0003 A26's rule applied to this adapter's own C++ surface, not
+just the FFI:
+
+- `mockServerOutputSupported` (a `bool` property, default `false`): must be
+  set before `open()`; without it the mock's `server_output` capability is
+  not advertised and `reldex_session_set_server_output` is refused
+  (`ReldexMockScenarioConfig::server_output`, ABI 3.2).
+- `setServerOutput(mode, bufferBytes)` — `reldex_session_set_server_output`.
+- `serverOutputConfigured(mode, bufferBytes)` /
+  `serverOutputConfigureFailed()` — the `SERVER_OUTPUT_CONFIGURED` reply.
+- `serverOutputReceived(lines, dropped, invalidUtf8Lines, readFailed,
+  errorMessage)` — one `SERVER_OUTPUT` event (`request == 0`, handled in
+  `handleEvent()`'s early switch alongside `EXECUTING`/`TRANSACTION_STATE`,
+  never touching the reply/request bookkeeping every other kind goes
+  through), or a synthetic call from `handleTerminal()` with empty `lines`
+  when the session ends still holding dropped-but-unreported lines
+  (ADR-0003 A34). `dropped`/`invalidUtf8Lines` are each event's own
+  incremental count, never a running total — `ServerOutputController`
+  accumulates.
+- `handleEvent()` gained a fourth parameter, `reldex::LinesHandle lines`
+  (the `SERVER_OUTPUT` event's `ReldexServerOutputLines*`, RAII-owned):
+  before this task `Bridge::dispatch()` released it unread ("today's
+  `Bridge` releases them unshown", the M2.15 hand-off note this task
+  closes). The one other call site, `tst_bridge.cpp`'s synthetic-event
+  test, passes an empty `reldex::LinesHandle()`.
+
+### Per-worksheet, today: what "worksheet" means before M4.9
+
+As of M3.4, every worksheet tab in `WorksheetArea.qml` still shares the one
+`SessionController`/session `Bridge` owns — per-tab sessions are M4.9's "N
+sessions, per-tab state" work, not done yet. `bridge.serverOutput` mirrors
+that exact maturity level: **one instance, representing whichever worksheet
+is active**, the same way `SessionController.activeProfileIsProduction`
+(M3.4) is one flag for "the" worksheet today. Its *settings*, though, are
+already genuinely worksheet-scoped: the worksheet id it resolves/writes
+against is real (`reldex_workspace_new_worksheet_id()`), so the moment a
+second instance exists (M4.9), two worksheets' DBMS_OUTPUT settings are
+already isolated with no further registry work.
+
+This is proven directly, not just asserted: `tst_serveroutput.cpp`'s
+`twoWorksheetsAreIsolatedSettingsAndOutputAlike()` constructs two
+independent `ServerOutputController`s, sharing one `SettingsController` (one
+store) but each with its own worksheet id, and shows that enabling one
+never enables the other, and that only the pane that ran a statement shows
+its lines — because each pane also owns its own session, output isolation
+falls out of the same construction, with no additional wiring.
+
+### The sample-statement button, and what it stands in for
+
+Real `DBMS_OUTPUT` is a side effect of the user's own PL/SQL, run through a
+worksheet's *execution* session. There is no such session to run it
+through yet — `WorksheetArea.qml`'s editor is still M4.1's placeholder — so
+the pane's "Run sample PL/SQL" button
+(`ServerOutputController::runSampleStatement()`) runs the mock's own
+canned `RELDEX_MOCK_STATEMENT_SERVER_OUTPUT` on this pane's dedicated
+session instead: three lines, the last one reported as invalid UTF-8
+(replaced with U+FFFD, M2.12), matching exactly what
+`crates/ffi/tests/events.rs`'s own server-output tests script. This is the
+same role `Bridge::run()`/`SessionController.runOnOpen` already play for
+the result grid — a stand-in a real editor replaces without this class
+changing shape: once a worksheet owns a real execution session, that
+session's own `serverOutputReceived`/`serverOutputConfigured` signals are
+exactly what `ServerOutputController` already knows how to consume.
+
+### Truncation, invalid UTF-8, and a failed read — never silent
+
+The pane shows, right under its controls, whichever of these apply
+(`serverOutputTruncationNotice`, `Theme.tokens.warning`, or
+`Theme.tokens.error` when a read has failed):
+
+- **Dropped lines** — `server_output_dropped`, summed across every
+  `SERVER_OUTPUT`/`TERMINAL` this session has seen since the pane was last
+  cleared (ADR-0003 A34: the per-session cap is 256 undrained unsolicited
+  events; past it, output is dropped and counted, never silently). Tested
+  by flooding 300 statements' worth of output without draining in between
+  (`tst_serveroutput.cpp`'s
+  `truncationPastTheMocksCapIsReportedNeverSilent()`, mirroring
+  `crates/ffi/tests/events.rs`'s own
+  `server_output_past_the_cap_is_dropped_and_counted_on_the_next_output`):
+  256 events' worth land with `dropped == 0` each, and the very next
+  statement's event reports the other 44 statements' 3 lines each (132) as
+  dropped. That report needs a *next* event: with nothing submitted after
+  the flood, `droppedLines()` correctly stays 0 indefinitely (found by
+  temporary diagnostic logging while chasing what first looked like test
+  flakiness — it was not: the count was never spontaneous, and the test
+  was briefly wrong to expect it without submitting one more statement
+  first, matching `crates/ffi/tests/events.rs`'s separate
+  `server_output_dropped_with_nothing_after_it_is_reported_on_terminal`,
+  which gets it from a session close instead). Genuine flakiness *was*
+  found and fixed one step earlier: submitting 300 statements without
+  draining does not, by itself, guarantee draining has not already started
+  concurrently by the time this thread's event loop first turns (this
+  adapter has no equivalent of that Rust test's own
+  `reldex_hub_pending_events`-based barrier) — a fixed `QThread::msleep(500)`
+  between the flood and the first `spinUntil`, which processes no events at
+  all, stands in for it.
+- **Invalid UTF-8 lines** — a count (`server_output_invalid_utf8_lines`,
+  M2.12), never garbage text: the bytes were already replaced with U+FFFD
+  before crossing the FFI, so the line itself renders correctly and the
+  count is shown alongside it.
+- **A failed read** (`error` non-null on a `SERVER_OUTPUT` event) — the
+  output is known incomplete; the pane says so with the error's own message
+  rather than staying silent about the gap. Not exercised end-to-end by a
+  test in this build: the mock driver's `take_server_output` has no
+  scripted way to fail from this adapter's reach (unlike
+  `crates/drivers/mock`'s own Rust-level `fail_take_server_output`, which is
+  not wired through `crates/ffi/src/mock.rs`) — `readFailed`/
+  `readFailureMessage` are wired and exercised by construction (they read
+  the same `ReldexEvent::error` field `handleTerminal`/`adoptError` already
+  do), just not proven against a real failing read in this build.
+
+The pane also states, always, in a fixed line under the controls, that the
+user's own `DBMS_OUTPUT` calls override every setting it shows: an
+`ENABLE(2000)` in the user's own code overflows at 2,000 bytes even under
+an "Unlimited" pane, and a `DISABLE` in the user's own code stops output
+until the next statement's `ENABLE` (SPEC.md/ADR-0002 amendment T; this is
+a `DBMS_OUTPUT`/Oracle-package fact stated to the user, not a Reldex
+setting — the pane's own `enabled`/`bufferBytes` govern only what Reldex
+*asks* the server for with `reldex_session_set_server_output`, never what
+the server actually does with a session that calls the package itself).
+
+### Output arrives before the reply, in arrival order
+
+`tst_serveroutput.cpp`'s `outputArrivesBeforeTheReplyThatFollowsIt()`
+connects directly to the pane's own (otherwise private —
+`friend class TstServerOutputController`, the same pattern
+`ConnectionManager`/`ObjectBrowserModel` already use for their own test
+classes) `SessionController::executed()` and shows the model already holds
+all three lines by the time that signal fires — the adapter-level proof
+that ADR-0003 A32's per-session production order (already proven at the
+FFI/`db-core` level by `crates/ffi/tests/events.rs`'s
+`server_output_arrives_ahead_of_the_reply_that_follows_it`) survives
+translation into Qt signals and a model update, since nothing in
+`Bridge::dispatch()`/`SessionController::handleEvent()`/
+`ServerOutputController::handleSessionServerOutput()` defers or reorders
+anything — every step is a direct, same-thread call.
+
+### Settings-registry wiring, concretely
+
+No new `SettingId` was needed: `server_output.enabled`/`server_output.buffer`
+already existed (ADR-0006 P2, `crates/workspace/src/settings/registry.rs`),
+already had their numeric ABI ids pinned by
+`every_setting_id_is_pinned_to_its_numeric_abi_id`
+(`crates/ffi/src/workspace.rs`, `ReldexSettingId::ServerOutputEnabled = 6`,
+`ServerOutputBuffer = 7`), and already crossed the FFI via
+`reldex_workspace_resolve_setting`/`_set_setting`/`_clear_setting` — this
+task is the first thing in `ui/adapter` to actually call them. No FFI or
+`crates/**` change was made; `crates/ffi/gen-header.sh --check` reports the
+header unchanged.
+
+**A foreign key `ready()` waits for.** `crates/workspace/src/store/schema.rs`
+declares `worksheet_setting.worksheet_id ... REFERENCES worksheet (id)`.
+`reldex_workspace_new_worksheet_id()` only mints a fresh id — pure, no I/O,
+by its own doc comment — so a worksheet-scoped *write*
+(`setValue`/`clearValue` at `RELDEX_SETTING_LEVEL_WORKSHEET`) for an id
+that was never actually saved fails that constraint (`setFailed`, silently
+as far as the caller is concerned, since nothing was listening). Reading is
+unaffected: `resolve()` with no matching row simply falls through to the
+next level, which is exactly why this went unnoticed until a test tried to
+*write* one — `tst_serveroutput.cpp`'s first draft could resolve a
+worksheet-scoped setting but never saw `setEnabled(true)` take effect;
+`pane.ready()` became true (it did not yet depend on the worksheet
+existing) while every subsequent write silently no-opped. Fixed with
+`SettingsController::ensureWorksheet(worksheetId)` — one
+`reldex_workspace_save_worksheet` call with a blank title/text/profile,
+idempotent by that function's own contract ("inserts it if `id` is new,
+otherwise replaces its state ... in place") — issued alongside the two
+initial resolves in `ServerOutputController::requestResolveAll()`, with
+`ready()` now also gated on it (`maybeArmAndUpdateReady()`'s
+`everythingKnown`). This makes `ready()` mean what callers need it to mean:
+safe to write, not just safe to read. It leaves one honest gap for M4.9:
+each `ServerOutputController`'s worksheet row is a real but content-free
+placeholder (blank title/text/tab order) until a worksheet actually has
+one to save from a real editor — a later `reldex_workspace_save_worksheet`
+for the same id (M4.9) replaces it in place, per that function's own
+contract, so this is not a conflict, just an earlier, blanker first write.
+
+### Hand-off
+
+- **M4.9** (per-tab sessions): construct one `ServerOutputController` per
+  worksheet tab instead of the one `Bridge` owns today — additive, see "Per
+  worksheet, today" above.
+- **M4.1** (the real editor): once a worksheet has a real execution session,
+  point a `ServerOutputController` at *that* session's
+  `serverOutputReceived`/`serverOutputConfigured` signals instead of its own
+  dedicated one, and retire `runSampleStatement()`.
+- **A read failure** is wired but not exercised end-to-end (see "Truncation,
+  invalid UTF-8, and a failed read" above) — closing
+  `crates/ffi/src/mock.rs`'s gap (wiring `fail_take_server_output` through)
+  would let a future test drive it for real.
+- No display option for the pane's own line-count/byte cap (how many lines
+  the *pane itself* retains before evicting old ones, independent of the
+  server-side buffer) exists yet — this build keeps every line for the
+  session's lifetime, which is bounded by how much a user's own script
+  actually prints, not by anything this pane enforces. Tracked as a
+  follow-up if a real workload shows it matters (`AGENTS.md` "Scope
+  discipline": not built speculatively).
+
 ## Instrumentation, and how M1.8 runs the S15 measurement
 
 `ui/adapter/Metrics.{h,cpp}` holds every hook, compiled in and **off by

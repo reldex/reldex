@@ -60,6 +60,10 @@
 // `ConnectionManager` is a Q_PROPERTY type too (`connections`), for the same
 // reason as the three above.
 #include "ConnectionManager.h"
+// M4.7: `ServerOutputController` (a Q_PROPERTY type, `serverOutput`) and its
+// `SettingsController` (not QML-facing -- see that class's own doc comment).
+#include "ServerOutputController.h"
+#include "SettingsController.h"
 
 class Bridge : public QObject
 {
@@ -81,6 +85,9 @@ class Bridge : public QObject
     /// test-connect. Owns its own workspace service thread, independent of
     /// this Bridge's hub (ADR-0006 P6/M2.11 README "Threads").
     Q_PROPERTY(ConnectionManager *connections READ connections CONSTANT)
+    /// M4.7: the DBMS_OUTPUT pane's adapter object. See that class's own
+    /// documentation for what "the active worksheet's pane" means today.
+    Q_PROPERTY(ServerOutputController *serverOutput READ serverOutput CONSTANT)
     /// Spike S15's measurement driver (M1.8). Inert unless the environment
     /// asks for a measurement run; see `ui/adapter/ScrollDriver.h`.
     Q_PROPERTY(ScrollDriver *scrollDriver READ scrollDriver CONSTANT)
@@ -124,6 +131,11 @@ public:
     [[nodiscard]] Metrics *metrics() const noexcept { return m_metrics; }
     [[nodiscard]] ScrollDriver *scrollDriver() const noexcept { return m_scrollDriver; }
     [[nodiscard]] ConnectionManager *connections() const noexcept { return m_connections; }
+    [[nodiscard]] ServerOutputController *serverOutput() const noexcept { return m_serverOutput; }
+    /// C++-only (tests, and `ServerOutputController`'s own construction):
+    /// not exposed to QML (`SettingsController`'s own doc comment explains
+    /// why -- it is a generic settings gateway, not this pane's alone).
+    [[nodiscard]] SettingsController *settings() const noexcept { return m_settings; }
 
     [[nodiscard]] int drainEventBudget() const noexcept { return m_drainEventBudget; }
     void setDrainEventBudget(int events);
@@ -195,6 +207,8 @@ private:
     Metrics *m_metrics = nullptr;
     ScrollDriver *m_scrollDriver = nullptr;
     ConnectionManager *m_connections = nullptr;
+    SettingsController *m_settings = nullptr;
+    ServerOutputController *m_serverOutput = nullptr;
 
     /// 1 while a drain is posted but has not started. Written from a Reldex
     /// worker thread (the waker) and from the Qt thread (`drain()`), so it is

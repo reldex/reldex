@@ -113,6 +113,15 @@ set_tests_properties(tst_connectionmanagerdialog_dpi200 PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_SCALE_FACTOR=2"
 )
 
+# M4.7: DBMS_OUTPUT pane DPI coverage, same pattern as the connection-manager
+# dialog above -- 1x once, unfiltered, as part of the plain "tst_coreinfo"
+# entry, and its own process at 2x.
+add_test(NAME tst_dbmsoutputpane_dpi200
+         COMMAND tst_coreinfo dbmsOutputPaneRendersAtCurrentScaleFactor)
+set_tests_properties(tst_dbmsoutputpane_dpi200 PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_SCALE_FACTOR=2"
+)
+
 # M3.4: DPI coverage for the persistent production indicator (status bar,
 # worksheet header, tab badge), at the default 1x (as part of the plain
 # "tst_coreinfo" entry above) and 2x, same pattern as the connection-manager
@@ -174,6 +183,11 @@ reldex_add_adapter_test(tst_teardown)
 # developer's own); every other one is in-memory (RELDEX_WORKSPACE_IN_MEMORY).
 reldex_add_adapter_test(tst_connectionmanager)
 reldex_add_adapter_test(tst_objectbrowsermodel)
+# M4.7: DBMS_OUTPUT pane -- SettingsController/ServerOutputController/
+# ServerOutputModel. The QML-level "no per-line item" proof (a real
+# ListView) lives in tst_coreinfo below instead, the same split
+# tst_objectbrowsermodel/tst_coreinfo already use for the object browser.
+reldex_add_adapter_test(tst_serveroutput)
 
 # K5 is 10,000 teardown iterations plus 2,000 connect-teardown iterations; the
 # default CTest timeout of 1500 s is generous but this is the one test that
