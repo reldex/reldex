@@ -8,12 +8,13 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use reldex_ffi::{
-    ReldexAuthKind, ReldexConnectSummary, ReldexConnectSummaryView, ReldexDatabaseType,
-    ReldexEndpointKind, ReldexEnvironmentKind, ReldexPasswordStorageKind, ReldexProfileDetails,
-    ReldexSecret, ReldexServiceTargetKind, ReldexSessionRoleKind, ReldexSettingId,
-    ReldexSettingLevel, ReldexSettingValue, ReldexStatus, ReldexStr, ReldexTransportKind,
-    ReldexValueKind, ReldexWorkspace, ReldexWorkspaceReply, reldex_connect_summary_view,
-    reldex_workspace_close, reldex_workspace_create_profile, reldex_workspace_credential_put,
+    ReldexAuthKind, ReldexConnectSummary, ReldexConnectSummaryView, ReldexCredentialStoreKind,
+    ReldexDatabaseType, ReldexEndpointKind, ReldexEnvironmentKind, ReldexPasswordStorageKind,
+    ReldexProfileDetails, ReldexSecret, ReldexServiceTargetKind, ReldexSessionRoleKind,
+    ReldexSettingId, ReldexSettingLevel, ReldexSettingValue, ReldexStatus, ReldexStr,
+    ReldexTransportKind, ReldexValueKind, ReldexWorkspace, ReldexWorkspaceReply,
+    reldex_connect_summary_view, reldex_workspace_close, reldex_workspace_create_profile,
+    reldex_workspace_credential_put, reldex_workspace_credential_store_kind,
     reldex_workspace_next_reply, reldex_workspace_open, reldex_workspace_prepare_connect,
     reldex_workspace_set_setting, reldex_workspace_set_waker,
 };
@@ -81,6 +82,15 @@ impl TestWorkspace {
         };
         let opened = workspace.wait_for(1);
         assert!(opened.error.is_null(), "the memory workspace must open");
+        if memory_credential_store {
+            // SAFETY: `handle` is live, and its open reply has been taken.
+            let kind = unsafe { reldex_workspace_credential_store_kind(handle) };
+            assert_eq!(
+                kind,
+                ReldexCredentialStoreKind::Memory as i32,
+                "a test must never reach the OS credential store"
+            );
+        }
         workspace
     }
 
