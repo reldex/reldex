@@ -99,6 +99,20 @@ extern "C" {
  */
 typedef void (*ReldexWakeFn)(void *user_data);
 
+/**
+ * Called when the workspace's reply queue goes from empty to non-empty.
+ * Same contract as `ReldexWakeFn` (ADR-0003 D5), and hand-written here for
+ * the same reason: declared inside `extern "C"` so it has C linkage in a
+ * C++ build, matching `reldex_workspace_set_waker`'s parameter exactly
+ * instead of drifting into the C++-linkage typedef cbindgen would emit for
+ * a plain Rust `pub type` alias above this block.
+ *
+ * It is called from the workspace's own service thread, never the
+ * caller's, and never the hub's -- a workspace does not share the hub's
+ * event queue or waker.
+ */
+typedef void (*ReldexWorkspaceWakeFn)(void *user_data);
+
 /* The C++ standard level, as MSVC also reports it.
  *
  * MSVC leaves __cplusplus at 199711L unless /Zc:__cplusplus is passed, and
@@ -131,6 +145,19 @@ typedef void (*ReldexWakeFn)(void *user_data);
  */
 using ReldexWakeFnNoexcept = void (*)(void *user_data) noexcept;
 #define RELDEX_HAVE_WAKE_FN_NOEXCEPT 1
+
+/**
+ * `ReldexWorkspaceWakeFn` with the no-exceptions rule made compiler-visible.
+ * Same reasoning as `ReldexWakeFnNoexcept`: a `noexcept` function pointer
+ * converts to `ReldexWorkspaceWakeFn` implicitly, so
+ * `reldex_workspace_set_waker` takes it unchanged, and removing `noexcept`
+ * later stops the assignment from compiling instead of leaving undefined
+ * behaviour for an exception to hit at run time.
+ *
+ * Defined only under C++17 or later, same guard as `ReldexWakeFnNoexcept`.
+ */
+using ReldexWorkspaceWakeFnNoexcept = void (*)(void *user_data) noexcept;
+#define RELDEX_HAVE_WORKSPACE_WAKE_FN_NOEXCEPT 1
 #endif  // C++17
 
 #ifdef __cplusplus
@@ -1844,12 +1871,200 @@ enum ReldexWorkspaceReplyKind
    * a layout had ever been saved.
    */
   RELDEX_WORKSPACE_REPLY_KIND_LAYOUT_LOADED = 20,
+  /**
+   * Reply to [`crate::reldex_workspace_set_setting`]. Added after `20`
+   * rather than resequenced among the values above it, even though ABI
+   * 3.1 has not shipped (ADR-0003 A26): `reldex_workspace_set_setting`
+   * wrongly answered with `SettingCleared` until this review round found
+   * it (should-fix #7), and every existing test/harness call already
+   * compares against the numeric value, not just the name.
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_SETTING_SET = 21,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
 typedef enum ReldexWorkspaceReplyKind ReldexWorkspaceReplyKind;
 #else
 typedef int32_t ReldexWorkspaceReplyKind;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Why a credential-store call failed -- the FFI shape of `reldex_secrets::
+ * CredentialError`, one variant per Rust variant (M2.10 hand-off criterion:
+ * `CredentialError` crosses the ABI as a numeric enum, not folded into
+ * `RELDEX_ERROR_KIND_OTHER` with nothing to tell `Locked` from `Backend`
+ * from `Malformed`).
+ *
+ * Carried as [`crate::ReldexErrorView::native_code`] on every error
+ * `credential_error` (private to this crate) builds, with `has_native` set
+ * -- the same slot a
+ * database driver's own vendor error number uses; the platform's own
+ * OS-level code, when [`Self::Locked`]/[`Self::Backend`] carry one
+ * (`reldex_secrets::CredentialError::Locked`/`Backend`'s `code`), is folded
+ * into `native_message` (`CredentialError`'s own `Display` already renders
+ * it), not a second numeric field.
+ *
+ * M3.2's rules for what to do with each of these, recorded next to the enum
+ * they will switch on rather than left to be reconstructed from the diff:
+ * - [`Self::Unavailable`]: no store is usable at all; there is nothing to
+ *   check, so treat the password as already cleared and fall back to
+ *   prompting every time.
+ * - [`Self::NotFound`]: nothing was stored; not itself an error condition
+ *   (see [`crate::ReldexWorkspaceReply::found`] on
+ *   `reldex_workspace_credential_get`/`_delete`).
+ * - [`Self::Denied`], [`Self::Locked`], [`Self::Backend`]: the entry may
+ *   still exist but could not be read or removed right now -- report it as
+ *   a leftover to sweep (ADR-0007 S4, M2.14), never assume it is gone.
+ * - [`Self::TooLarge`], [`Self::InvalidSecret`], [`Self::Malformed`]: the
+ *   write, or the entry already there, was refused; the profile falls back
+ *   to "prompt each time".
+ * - Offer "save this password" only when
+ *   [`crate::reldex_credential_store_kind_can_store`] is true for the
+ *   workspace's [`ReldexCredentialStoreKind`].
+ */
+enum ReldexCredentialError
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A reason this header does not know.
+   */
+  RELDEX_CREDENTIAL_ERROR_UNKNOWN = 0,
+  /**
+   * [`CredentialError::Unavailable`].
+   */
+  RELDEX_CREDENTIAL_ERROR_UNAVAILABLE = 1,
+  /**
+   * [`CredentialError::NotFound`].
+   */
+  RELDEX_CREDENTIAL_ERROR_NOT_FOUND = 2,
+  /**
+   * [`CredentialError::Denied`].
+   */
+  RELDEX_CREDENTIAL_ERROR_DENIED = 3,
+  /**
+   * [`CredentialError::TooLarge`]. The limit itself is not carried as a
+   * number; it is in the error's message text.
+   */
+  RELDEX_CREDENTIAL_ERROR_TOO_LARGE = 4,
+  /**
+   * [`CredentialError::InvalidSecret`].
+   */
+  RELDEX_CREDENTIAL_ERROR_INVALID_SECRET = 5,
+  /**
+   * [`CredentialError::Malformed`].
+   */
+  RELDEX_CREDENTIAL_ERROR_MALFORMED = 6,
+  /**
+   * [`CredentialError::Locked`].
+   */
+  RELDEX_CREDENTIAL_ERROR_LOCKED = 7,
+  /**
+   * [`CredentialError::Backend`].
+   */
+  RELDEX_CREDENTIAL_ERROR_BACKEND = 8,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexCredentialError ReldexCredentialError;
+#else
+typedef int32_t ReldexCredentialError;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Which credential-store backend a workspace opened -- the FFI shape of
+ * `reldex_secrets::CredentialStoreKind` (M2.10 hand-off criterion:
+ * `CredentialStoreKind` crosses the ABI as a numeric enum). Read with
+ * [`crate::reldex_workspace_credential_store_kind`], valid once
+ * `RELDEX_WORKSPACE_REPLY_KIND_OPENED` has been drained without an error.
+ */
+enum ReldexCredentialStoreKind
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * Not yet known (the workspace has not finished opening), or a kind
+   * this header does not know.
+   */
+  RELDEX_CREDENTIAL_STORE_KIND_UNKNOWN = 0,
+  /**
+   * Windows Credential Manager.
+   */
+  RELDEX_CREDENTIAL_STORE_KIND_WINDOWS_CREDENTIAL_MANAGER = 1,
+  /**
+   * No credential store on this platform; every password is asked for at
+   * every connect.
+   */
+  RELDEX_CREDENTIAL_STORE_KIND_ABSENT = 2,
+  /**
+   * An in-process, per-process-lifetime store. Only ever reported by a
+   * workspace opened with `use_memory_credential_store` (the `mock-driver`
+   * feature); a product build never reports it.
+   */
+  RELDEX_CREDENTIAL_STORE_KIND_MEMORY = 3,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexCredentialStoreKind ReldexCredentialStoreKind;
+#else
+typedef int32_t ReldexCredentialStoreKind;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Why a setting value was refused -- the FFI shape of `reldex_workspace::
+ * settings::SettingError`, one variant per Rust variant (M2.11's review
+ * round 2, should-fix #10: "the level is wrong" and "the value's kind is
+ * wrong" were both `RELDEX_ERROR_KIND_CONFIGURATION` with nothing typed to
+ * tell them apart).
+ *
+ * Carried as [`crate::ReldexErrorView::native_code`] on every
+ * `RELDEX_ERROR_KIND_CONFIGURATION` error `store_error` (private to this
+ * crate) builds from a `StoreError::InvalidSetting`, the same slot a
+ * database driver's own
+ * vendor error number uses; see [`ReldexCredentialError`]'s doc comment for
+ * the identical reasoning applied there.
+ */
+enum ReldexSettingError
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A reason this header does not know.
+   */
+  RELDEX_SETTING_ERROR_UNKNOWN = 0,
+  /**
+   * [`SettingError::LevelNotAllowed`]: the setting may not be set at the
+   * requested [`ReldexSettingLevel`].
+   */
+  RELDEX_SETTING_ERROR_LEVEL_NOT_ALLOWED = 1,
+  /**
+   * [`SettingError::KindMismatch`]: `ReldexSettingValue::kind` does not
+   * match the setting's own [`ReldexValueKind`].
+   */
+  RELDEX_SETTING_ERROR_KIND_MISMATCH = 2,
+  /**
+   * [`SettingError::OutOfBounds`]: the number is outside the setting's
+   * accepted range. The range itself is not carried as a number; it is in
+   * the error's message text.
+   */
+  RELDEX_SETTING_ERROR_OUT_OF_BOUNDS = 3,
+  /**
+   * [`SettingError::UnlimitedNotAllowed`]: `no_limit` was set for a
+   * setting that requires a limit.
+   */
+  RELDEX_SETTING_ERROR_UNLIMITED_NOT_ALLOWED = 4,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexSettingError ReldexSettingError;
+#else
+typedef int32_t ReldexSettingError;
 #endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
 
@@ -2924,14 +3139,6 @@ typedef struct ReldexWorksheetView {
 } ReldexWorksheetView;
 
 /**
- * Called when the workspace's reply queue goes from empty to non-empty. Same
- * contract as [`crate::ReldexWakeFn`] (ADR-0003 D5): must not block, must
- * not call any `reldex_*` function, and is called from the workspace's
- * service thread, never the caller's.
- */
-typedef void (*ReldexWorkspaceWakeFn)(void *user_data);
-
-/**
  * A setting's value, flattened to one shape for every
  * [`ReldexValueKind`] (`SPEC.md` §15's typed settings, crossed as data since
  * the FFI chooses a setting at run time -- the same reason
@@ -3095,10 +3302,6 @@ typedef struct ReldexWorkspaceReply {
    */
   int32_t setting_id;
   /**
-   * The resolved value, for `SettingResolved`.
-   */
-  struct ReldexSettingValue setting_value;
-  /**
    * A [`ReldexSettingLevel`], for `SettingResolved`.
    */
   int32_t setting_source;
@@ -3143,7 +3346,21 @@ typedef struct ReldexWorkspaceReply {
    */
   struct ReldexWorksheetList *worksheet_list;
   /**
-   * The saved layout, for `LayoutLoaded` when `found`.
+   * The resolved value, for `SettingResolved`. Moved here, after every
+   * pointer field, in M2.11's review round 2 (should-fix #11): embedded
+   * inline *before* `profile_list` and everything after it, a future
+   * growth of `ReldexSettingValue` itself would have shifted every field
+   * below it -- exactly the hazard `struct_size`-prefixed growth exists
+   * to avoid. Reordering is still additive here only because ABI 3.1 has
+   * not shipped (ADR-0003 A26); after it ships, a field may only be
+   * *appended*, never moved.
+   */
+  struct ReldexSettingValue setting_value;
+  /**
+   * The saved layout, for `LayoutLoaded` when `found`. Was already the
+   * last field, so it never had `setting_value`'s hazard; kept here,
+   * still last, for the same "every inline growable struct sits after
+   * every pointer field" rule now that `setting_value` moved to join it.
    */
   struct ReldexLayout layout;
 } ReldexWorkspaceReply;
@@ -4438,11 +4655,54 @@ void reldex_connect_summary_release(struct ReldexConnectSummary *summary);
  * Borrows the secret's text. The borrow is valid only until
  * [`reldex_secret_release`]; do not copy it into a longer-lived buffer.
  *
+ * **Kept, not removed** (M2.11's review round 2, should-fix #9, offered
+ * removal as the default unless a consumer needs it):
+ * `reldex_workspace_build_connect_params` is not the only place a resolved
+ * password goes. A "show password" toggle
+ * on a connect dialog (a password field is not `IDENTIFIED BY "…"` shown
+ * once and forgotten; SPEC.md's connection manager assumes ordinary
+ * password-field affordances) needs the bytes, not just the ability to feed
+ * them into one specific call -- and both this crate's own tests and the C
+ * smoke harness already need this exact function to prove
+ * `credential_get`/`resolve_password`/`credential_put` round-trip a
+ * password byte-exact, which nothing else in this ABI can show. It zeroizes
+ * on release regardless of how many times it was exposed
+ * ([`reldex_secret_release`]'s doc comment, ADR-0007 S6) -- exposure only
+ * ever *borrows*, it never copies the bytes into a second, unmanaged
+ * allocation this object would then also have to track and wipe.
+ *
  * # Safety
  *
  * `secret` must be null (reported as empty) or a live [`ReldexSecret`].
  */
 struct ReldexStr reldex_secret_expose(const struct ReldexSecret *secret);
+
+/**
+ * Builds an owned, zeroizing [`ReldexSecret`] from `text`, so a caller can
+ * hand a typed-in password to [`reldex_workspace_build_connect_params`] or
+ * [`reldex_workspace_credential_put`] through the same owned shape a
+ * resolved or fetched one already uses (M2.11's review round 2, should-fix
+ * #9: M3.3's connect dialog saves a password only *after* a successful
+ * connect, so the typed text needs to survive from "the user typed it" to
+ * "the connect succeeded" as one of these, not a plain string the caller
+ * manages itself and might copy or leak along the way).
+ *
+ * Copies `text` into the new [`ReldexSecret`], which owns and zeroizes its
+ * own copy on release ([`reldex_secret_release`]). **The caller's own
+ * buffer is not wiped by this call** -- it is the caller's, on the caller's
+ * stack or heap, and remains the caller's responsibility to clear once this
+ * returns, the same as passing a password into any other `ReldexStr`
+ * parameter in this ABI.
+ *
+ * Returns null, with the last error set, if `text` is null or not valid
+ * UTF-8.
+ *
+ * # Safety
+ *
+ * `text` must point at `text.len` readable UTF-8 bytes, read only for the
+ * duration of this call.
+ */
+struct ReldexSecret *reldex_secret_from_utf8(struct ReldexStr text);
 
 /**
  * Releases a secret, wiping its bytes (`reldex-secrets`'s `Secret::drop`,
@@ -4602,6 +4862,32 @@ ReldexStatus reldex_workspace_set_waker(struct ReldexWorkspace *workspace,
  * `workspace` must be null (reported as 0) or a live workspace.
  */
 size_t reldex_workspace_pending_replies(const struct ReldexWorkspace *workspace);
+
+/**
+ * Which credential-store backend this workspace opened -- a
+ * [`ReldexCredentialStoreKind`] (M2.10 hand-off criterion). Never blocks
+ * and does not go through the reply queue: the kind is recorded once, on
+ * the service thread, right before it pushes `RELDEX_WORKSPACE_REPLY_KIND_
+ * OPENED`, so it is available by the time a caller has drained that reply.
+ * `RELDEX_CREDENTIAL_STORE_KIND_UNKNOWN` before then, or if the open
+ * itself failed.
+ *
+ * # Safety
+ *
+ * `workspace` must be null (reported as
+ * `RELDEX_CREDENTIAL_STORE_KIND_UNKNOWN`) or a live workspace.
+ */
+int32_t reldex_workspace_credential_store_kind(const struct ReldexWorkspace *workspace);
+
+/**
+ * Whether `kind` can save a password at all -- the FFI shape of
+ * `reldex_secrets::CredentialStoreKind::can_store` (M2.10 hand-off: a
+ * connection dialog offers "save this password" only when this is `true`;
+ * when it is `false` the profile is saved as "prompt each time" instead). A
+ * `kind` this header does not know reports `false`, the safe default: never
+ * offer to save into a backend an old adapter cannot identify.
+ */
+bool reldex_credential_store_kind_can_store(int32_t kind);
 
 /**
  * Takes the next reply, or reports that there is none. Never blocks. Same
@@ -4768,6 +5054,20 @@ ReldexStatus reldex_workspace_credential_get(struct ReldexWorkspace *workspace,
 
 /**
  * Stores `password` for `profile`, replacing whatever was there.
+ *
+ * **An empty `password` is refused** (M2.11's review round 2, a nit asking
+ * this to be decided and documented, not left implicit): an empty string is
+ * never a real password, and storing one would make
+ * [`reldex_workspace_resolve_password`] report `FromStore` for a profile
+ * that has nothing meaningful saved, silently turning "connect with an
+ * empty password" into the resolved answer instead of "prompt" or "not
+ * stored". Delete the credential instead
+ * ([`reldex_workspace_credential_delete`]) when there is nothing to save.
+ * This mirrors the credential store's own refusal of a password containing
+ * a control character ([`crate::ReldexCredentialError::InvalidSecret`]) —
+ * both are "this is not a value that could ever be a real password",
+ * checked as close to the argument as it can be rather than left to the
+ * backend to notice.
  *
  * # Safety
  *
