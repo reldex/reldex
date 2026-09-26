@@ -1284,8 +1284,9 @@ through a user-space relay adding 0, 2, 10 and 40 ms: 375 runs, three per cell, 
   row bound (unchanged). Registered as a setting (ADR-0006 amendment "The round-trip budget
   (M5.6)"); `DEFAULT_ROUND_TRIP_BYTES` went from 256 to 192 KiB. The owner's sign-off is point
   (a).
-- **Why.** For the mixed shape it is the budget whose worse link, loopback or 10 ms, does best:
-  88% of the best rate on loopback and 97% at 10 ms (99% at 2 ms, 70% at 40 ms). 10 `NUMBER`s
+- **Why.** It gives the mixed shape the best balance of loopback and 10 ms: 88% of the best rate
+  on loopback and 97% at 10 ms (99% at 2 ms, 70% at 40 ms). 160 KiB ties it on the worse link
+  (92% and 89%) but gives up 8 points at 10 ms; larger budgets give up loopback. 10 `NUMBER`s
   are bound by `results.fetch_rows` at 88% and 90%. 16 KB rows get 12 rows a round trip: 99% on
   loopback, 56% at 10 ms, 36% at 40 ms. The best budget grows with the round-trip time, so the
   setting is allowed at profile level.

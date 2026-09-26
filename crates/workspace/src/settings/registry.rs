@@ -668,10 +668,10 @@ pub const RESULTS_CLOSE_CURSOR_AT_LIMIT: Setting<bool> =
 ///
 /// Measured by M5.6 on Oracle 19c over three row shapes, on loopback and
 /// through 2, 10 and 40 ms of injected round-trip time
-/// (`docs/exec-plans/active/phase-1-fetch-benchmark.md`). 192 KiB is the
-/// budget under which the mixed shape (five texts and two dates) does best on
-/// loopback and at 10 ms together; a round trip at the default then takes
-/// about 20 ms at 10 ms round-trip time.
+/// (`docs/exec-plans/active/phase-1-fetch-benchmark.md`). 192 KiB gives the
+/// mixed shape (five texts and two dates) the best balance of loopback and
+/// 10 ms throughput, 88% and 97% of each link's best; a round trip at the
+/// default then takes about 20 ms at 10 ms round-trip time.
 /// The owner's sign-off is pending (ADR-0004 owner-review point (a)), and it
 /// is a user setting either way.
 ///

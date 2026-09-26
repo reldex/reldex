@@ -18,10 +18,10 @@ README lists every file). **Harness:** `crates/drivers/oracle-thin/tests/m5_6_fe
   loopback and 100 ms p50 at 10 ms round-trip time** for every measured shape. With
   `fetches_in_flight` = 2 that keeps "Stop fetching" under about 200 ms at 10 ms. The default is
   far inside it: at most 10.9 ms on loopback and 21.2 ms at 10 ms.
-- **Why 192 KiB.** It maximises the mixed shape's throughput on loopback and at 10 ms together:
-  the worst of the two is 88% of that link's best, and no other budget does better on both
-  (Decision). Narrow rows are bound by `results.fetch_rows` at about 90% of their best on both
-  links.
+- **Why 192 KiB.** It gives the mixed shape the best balance of loopback and 10 ms throughput:
+  88% and 97% of each link's best. 160 KiB ties it on the worse link (92% and 89%) but gives up
+  8 points at 10 ms; larger budgets give up loopback (Decision). Narrow rows are bound by
+  `results.fetch_rows` at about 90% of their best on both links.
 - **The cost of it.** Wide rows (about 16 KB) get 12 rows a round trip. That is 99% of their best
   on loopback but 56% at 10 ms and 36% at 40 ms. The best budget grows with the round-trip time,
   which is why the setting is allowed at profile level.
@@ -424,8 +424,8 @@ one more reason the budget can be set per profile.
 ### The criteria
 
 1. **Objective:** the mixed shape's throughput on loopback and at 10 ms round-trip time, together.
-   "Together" is the worse of the two, as a share of that link's best; ties go to the geometric
-   mean.
+   "Together" is the worse of the two, as a share of that link's best. Differences of up to two
+   points are ties, because they are inside the runs' CoV; ties go to the geometric mean.
 2. **Latency ceiling:** a round trip at the default stays under 50 ms p50 on loopback and 100 ms
    p50 at 10 ms, for every measured shape. It keeps "Stop fetching" (at most `fetches_in_flight`
    = 2 round trips) near 200 ms at 10 ms, and it bounds how far a future default may go.
