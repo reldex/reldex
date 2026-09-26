@@ -104,18 +104,19 @@ fn exclusively() -> std::sync::MutexGuard<'static, ()> {
 
 /// Asserts the only other thread that could allocate into this count is idle.
 ///
-/// The counter is process-wide, and a session's pump thread allocates while it
-/// turns a completion into an event. Arming while one is still working would
-/// measure it too — a flaky non-zero that has nothing to do with the call
-/// under test. Every request this file submits has been answered and drained
-/// by the time it measures, so the pump is parked in `recv`; this states that
-/// precondition instead of assuming it.
-fn assert_the_pump_is_parked(harness: &Harness) {
+/// The counter is process-wide, and a session's worker thread allocates while
+/// it runs a request and builds its events. Arming while one is still working
+/// would measure it too — a flaky non-zero that has nothing to do with the
+/// call under test. Every request this file submits has been answered and
+/// drained by the time it measures, so the worker is parked waiting for its
+/// next command; this states that precondition instead of assuming it.
+fn assert_the_worker_is_parked(harness: &Harness) {
     // SAFETY: the hub is live for the harness's lifetime.
     let pending = unsafe { reldex_hub_pending_events(harness.hub()) };
     assert_eq!(
         pending, 0,
-        "an undrained event means the pump has been working; nothing may be measured until it is          parked"
+        "an undrained event means the worker has been working; nothing may be measured until it \
+         is parked"
     );
     assert!(
         harness.poll_event().is_none(),
@@ -203,7 +204,7 @@ fn formatting_a_warm_window_allocates_nothing() {
     // Warm-up: this one is allowed to allocate, because the arena starts with
     // no capacity and the offsets vector has to grow. Amortised growth is
     // exactly what this pass excludes.
-    assert_the_pump_is_parked(&harness);
+    assert_the_worker_is_parked(&harness);
     let warm_up = allocations_during(format_window);
     // SAFETY: the arena is live.
     assert_eq!(
@@ -348,7 +349,7 @@ fn describing_every_column_allocates_nothing() {
     // test.
     describe_all();
 
-    assert_the_pump_is_parked(&harness);
+    assert_the_worker_is_parked(&harness);
     let first = allocations_during(describe_all);
     assert_eq!(
         first, 0,

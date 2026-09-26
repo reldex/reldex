@@ -3,15 +3,17 @@
 //! Spike criterion K5 is written in terms of ASan, which is not available on
 //! the development machine — and the failure most likely to actually happen at
 //! this boundary is not a use-after-free anyway. It is a `ReldexBatch*` or a
-//! `ReldexError*` that nobody released, or a session whose pump thread never
-//! exited: invisible to every other test until memory runs out.
-//! [`reldex_live_counts`] turns that into an assertion, and these are the three
-//! paths worth asserting it on.
+//! `ReldexError*` that nobody released, or a session this crate never let go
+//! of: invisible to every other test until memory runs out.
+//! [`reldex_live_counts`] turns that into an assertion, and these are the
+//! paths worth asserting it on — including, since M2.15, on a hub that stays
+//! alive: a session stops counting when its `TERMINAL` is drained, however it
+//! ended, not when the hub goes away.
 //!
 //! The counters are process-wide, so the tests in this binary take a lock and
 //! run one at a time rather than measuring each other. Nothing here asserts a
-//! duration: a pump thread's exit is observed with the deadline helper, which
-//! fails only when something is genuinely stuck.
+//! duration: anything that finishes on another thread is observed with the
+//! deadline helper, which fails only when something is genuinely stuck.
 
 #![allow(
     unsafe_code,
@@ -58,9 +60,10 @@ fn forget_last_error() {
 
 /// Waits until every count is back to `baseline`, then asserts it.
 ///
-/// A hub's teardown finishes on its session pump threads, so the counts fall
-/// slightly after `reldex_hub_destroy` returns — waiting for it is the honest
-/// shape, and the deadline makes a genuine leak fail rather than hang.
+/// Everything this crate counts is released before `reldex_hub_destroy`
+/// returns, but waiting is still the honest shape for a check that runs after
+/// other threads have been involved, and the deadline makes a genuine leak
+/// fail rather than hang.
 fn settles_back_to(baseline: ReldexLiveCounts, what: &str) {
     wait_until(what, || counts() == baseline);
     assert_eq!(counts(), baseline, "{what}");
@@ -146,17 +149,18 @@ fn destroying_a_hub_with_undrained_events_frees_what_they_hold() {
                 ReldexStatus::Ok
             );
         }
-        // Deliberately drain nothing. The batches exist, queued, and are this
-        // library's to free.
+        // Deliberately drain nothing. The rows exist, queued inside
+        // `db-core`'s events, and are this library's to free.
         wait_until("every fetch to be answered", || {
             // SAFETY: the hub is live.
             let pending = unsafe { reldex_hub_pending_events(harness.hub()) };
             pending >= FETCHES as usize
         });
-        assert!(
-            counts().batches >= baseline.batches + FETCHES as usize,
-            "a batch inside an undrained event is live: its rows are in memory"
-        );
+        // A `ReldexBatch` is made — and counted — when its event is drained,
+        // so what an undrained event holds is `db-core`'s, not a handed-out
+        // object; the hub's destroy below drops the queue that holds it.
+        assert_eq!(counts().batches, baseline.batches);
+        assert_eq!(counts().sessions, baseline.sessions + 1);
     }
 
     settles_back_to(
@@ -166,7 +170,7 @@ fn destroying_a_hub_with_undrained_events_frees_what_they_hold() {
 }
 
 #[test]
-fn the_contained_pump_panic_leaks_nothing() {
+fn a_contained_driver_panic_leaks_nothing() {
     let _guard = exclusively();
     forget_last_error();
     let baseline = counts();
@@ -174,10 +178,10 @@ fn the_contained_pump_panic_leaks_nothing() {
     {
         let harness = Harness::new();
         let session = harness.open(config());
-        // The panicking request, and one queued behind it that the containment
-        // has to answer as well.
+        // The panicking request, and one queued behind it that must be
+        // answered as well.
         assert_eq!(
-            harness.execute(session, 10, ReldexMockStatement::PumpPanic),
+            harness.execute(session, 10, ReldexMockStatement::Panicking),
             ReldexStatus::Ok
         );
         assert_eq!(
@@ -191,23 +195,145 @@ fn the_contained_pump_panic_leaks_nothing() {
             take_error(&first).is_some(),
             "the contained panic is reported as a failure"
         );
-        let second = harness.next_event();
-        assert_eq!(second.request, 11);
-        assert!(
-            take_error(&second).is_some(),
-            "the request behind it is answered too"
-        );
+        // Request 11 and the session's `TERMINAL`, in whichever order the
+        // worker reached them.
+        let mut answered = false;
+        let mut terminal = false;
+        while !(answered && terminal) {
+            let event = harness.next_event();
+            assert!(
+                take_error(&event).is_some(),
+                "everything after the loss reports why"
+            );
+            if event.kind == ReldexEventKind::Terminal as i32 {
+                terminal = true;
+            } else {
+                assert_eq!(event.request, 11);
+                answered = true;
+            }
+        }
         assert_eq!(
             counts().errors,
             baseline.errors,
-            "both error objects were freed"
+            "every error object was freed"
+        );
+        assert_eq!(
+            counts().sessions,
+            baseline.sessions,
+            "the lost session stopped counting once its TERMINAL was drained"
         );
     }
 
     settles_back_to(
         baseline,
-        "the session lost to a pump panic to release everything",
+        "the session lost to a driver panic to release everything",
     );
+}
+
+/// Opens a session on `harness` and returns its id, asserting the counts
+/// moved by exactly one session.
+fn open_counted(
+    harness: &Harness,
+    baseline: ReldexLiveCounts,
+    config: ReldexMockScenarioConfig,
+) -> u64 {
+    let session = harness.open(config);
+    assert_eq!(counts().sessions, baseline.sessions + 1);
+    assert_eq!(harness.session_count(), 1);
+    session
+}
+
+/// Asserts `session` no longer counts anywhere: not in the process-wide
+/// counts, not in the hub's own count or list, and not as a known id.
+fn assert_retired(harness: &Harness, baseline: ReldexLiveCounts, session: u64, how: &str) {
+    assert_eq!(counts().sessions, baseline.sessions, "{how}: live counts");
+    assert_eq!(
+        harness.session_count(),
+        0,
+        "{how}: reldex_hub_session_count"
+    );
+    // SAFETY: the hub is live; a null `out` asks only for the count.
+    let listed =
+        unsafe { reldex_ffi::reldex_hub_list_sessions(harness.hub(), std::ptr::null_mut(), 0) };
+    assert_eq!(listed, 0, "{how}: reldex_hub_list_sessions");
+    assert_eq!(
+        harness.execute(session, 999, ReldexMockStatement::GeneratedQuery),
+        ReldexStatus::NotFound,
+        "{how}: the retired id is not found"
+    );
+    forget_last_error();
+}
+
+#[test]
+fn a_closed_session_stops_counting_once_its_terminal_is_drained() {
+    // The bug M2.15 fixes: `reldex_hub_session_count()` and
+    // `reldex_live_counts().sessions` only ever went down when the hub was
+    // destroyed, so a long-lived hub counted every session it had ever
+    // opened.
+    let _guard = exclusively();
+    forget_last_error();
+    let baseline = counts();
+
+    let harness = Harness::new();
+    let session = open_counted(&harness, baseline, config());
+    assert_eq!(
+        harness.close(session, 2, ReldexCloseDisposition::None),
+        ReldexStatus::Ok
+    );
+    let closed = harness.next_event();
+    assert_eq!(closed.kind, ReldexEventKind::SessionClosed as i32);
+    assert!(closed.error.is_null());
+    // Still counted: per-session state ends on `TERMINAL`, never before.
+    assert_eq!(counts().sessions, baseline.sessions + 1);
+    let terminal = harness.next_event();
+    assert_eq!(terminal.kind, ReldexEventKind::Terminal as i32);
+    assert_retired(&harness, baseline, session, "a clean close");
+}
+
+#[test]
+fn a_lost_session_stops_counting_once_its_terminal_is_drained() {
+    let _guard = exclusively();
+    forget_last_error();
+    let baseline = counts();
+
+    let harness = Harness::new();
+    let session = open_counted(&harness, baseline, config());
+    assert_eq!(
+        harness.execute(session, 2, ReldexMockStatement::LoseSession),
+        ReldexStatus::Ok
+    );
+    let failed = harness.next_event();
+    assert_eq!(failed.request, 2);
+    take_error(&failed).expect("the loss explains itself");
+    let terminal = harness.next_event();
+    assert_eq!(terminal.kind, ReldexEventKind::Terminal as i32);
+    take_error(&terminal).expect("a lost session's TERMINAL carries the cause");
+    assert_retired(&harness, baseline, session, "a session lost mid-statement");
+}
+
+#[test]
+fn a_failed_open_stops_counting_once_its_terminal_is_drained() {
+    let _guard = exclusively();
+    forget_last_error();
+    let baseline = counts();
+
+    let harness = Harness::new();
+    let (session, opened) = harness.open_raw(
+        ReldexMockScenarioConfig {
+            connect_failure: reldex_ffi::ReldexMockFailure::Authentication as i32,
+            ..config()
+        },
+        1,
+    );
+    assert_eq!(opened.kind, ReldexEventKind::Opened as i32);
+    take_error(&opened).expect("the failed connect explains itself");
+    assert_eq!(counts().sessions, baseline.sessions + 1);
+    let terminal = harness.next_event();
+    assert_eq!(terminal.kind, ReldexEventKind::Terminal as i32);
+    take_error(&terminal).expect("a failed open's TERMINAL carries the cause");
+    assert_retired(&harness, baseline, session, "a failed open");
+    drop(harness);
+    settles_back_to(baseline, "a failed open to release everything");
 }
 
 /// A workspace profile shaped enough for `reldex_workspace_credential_put`/

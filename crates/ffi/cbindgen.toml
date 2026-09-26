@@ -274,6 +274,10 @@ include = [
   "ReldexCredentialError",
   "ReldexCredentialStoreKind",
   "ReldexSettingError",
+  # M2.15 (ABI 3.2): `reldex_session_abandon`'s `*out_outcome` and the mock
+  # world's `connect_failure`/`ping_failure` fields are `int32_t` too.
+  "ReldexAbandonOutcome",
+  "ReldexMockFailure",
 ]
 # Defined by hand in `after_includes`, with C language linkage; see the note
 # there. Generating it as well would define it twice.

@@ -4,7 +4,7 @@
 //! This is also the `db-core`-level independence proof the mock crate's own
 //! tests could not give: there, a blocked statement and a live one are two
 //! driver connections; here they are two real sessions, each with its own
-//! worker thread and its own pump, feeding one shared event queue.
+//! worker thread, feeding one shared `db-core` event queue.
 
 #![allow(
     unsafe_code,
@@ -105,8 +105,8 @@ fn a_blocked_session_does_not_delay_another_and_every_request_is_answered_once()
 #[test]
 fn a_request_that_races_a_close_still_gets_its_one_reply() {
     // Requests accepted before a close runs are answered by `db-core` with the
-    // session's terminal error; the pump drains them rather than dropping
-    // them, so the adapter never waits forever for a reply that will not come.
+    // session's terminal error rather than dropped, so the adapter never waits
+    // forever for a reply that will not come.
     let harness = Harness::new();
     let session = harness.open(config(50_000));
     assert_eq!(
@@ -154,16 +154,12 @@ fn a_request_that_races_a_close_still_gets_its_one_reply() {
 }
 
 #[test]
-fn a_panic_in_the_pump_answers_every_request_behind_it_instead_of_stranding_them() {
-    // The pump runs on a thread of ours, so the `catch_unwind` on every
-    // `extern "C"` body cannot reach it. Without containment here, a panic
-    // would leave every outstanding request unanswered and the adapter's
-    // spinner would never stop — the worst kind of failure, because nothing
-    // reports it.
-    //
-    // `ReldexMockStatement::PumpPanic` is a reserved statement text that makes
-    // the pump panic when it reaches that request. It changes no ABI and is
-    // compiled in only with the mock driver.
+fn a_driver_panic_answers_every_request_behind_it_and_ends_the_session() {
+    // The worker contains a panic inside a driver call (ADR-0002 K6): the
+    // statement fails, the session is lost, every request still owed a reply
+    // gets one, and the session's `TERMINAL` follows the failed reply at once
+    // — without the caller closing anything. Rule 5 has no exception for "the
+    // driver broke".
     let harness = Harness::new();
     let session = harness.open(config(50_000));
     assert_eq!(
@@ -174,27 +170,37 @@ fn a_panic_in_the_pump_answers_every_request_behind_it_instead_of_stranding_them
     assert_eq!(executed.request, 1);
     let result = executed.result;
 
-    // The panic, then more work queued behind it. All are accepted, so all
-    // must be answered — rule 5 does not have an exception for "the library
-    // broke".
     assert_eq!(
-        harness.execute(session, 2, ReldexMockStatement::PumpPanic),
+        harness.execute(session, 2, ReldexMockStatement::Panicking),
         ReldexStatus::Ok
     );
     let mut expected = vec![2_u64];
     for request in 3..7_u64 {
-        // A request may be refused if the pump has already torn the session
-        // down; only the accepted ones are owed a reply.
-        if harness.fetch(session, request, result, 1_000) == ReldexStatus::Ok {
-            expected.push(request);
-        }
+        // Accepted until the `TERMINAL` is drained, which nothing here has
+        // done yet; each accepted request is owed exactly one reply.
+        assert_eq!(
+            harness.fetch(session, request, result, 1_000),
+            ReldexStatus::Ok
+        );
+        expected.push(request);
     }
 
     let mut answered: Vec<u64> = Vec::new();
+    let mut terminal: Option<ReldexEvent> = None;
     let mut lost = 0_u32;
-    while answered.len() < expected.len() {
+    while answered.len() < expected.len() || terminal.is_none() {
         let event: ReldexEvent = harness.next_event();
         assert_eq!(event.session, session);
+        if event.kind == ReldexEventKind::Terminal as i32 {
+            assert!(terminal.is_none(), "exactly one TERMINAL per session");
+            assert!(
+                answered.contains(&2),
+                "the TERMINAL follows the reply of the request that lost the session"
+            );
+            support::take_error(&event);
+            terminal = Some(event);
+            continue;
+        }
         OwnedBatch(event.batch);
         if !event.error.is_null() {
             if event.session_state == reldex_ffi::ReldexSessionState::Lost as i32 {
@@ -203,15 +209,14 @@ fn a_panic_in_the_pump_answers_every_request_behind_it_instead_of_stranding_them
             // SAFETY: the error came from the event and is freed once.
             unsafe { reldex_ffi::reldex_error_free(event.error) };
         }
-        // A reply the containment synthesised must have the same *shape* a
-        // success would have had, result id included (ADR-0003 A21): the
-        // fetches queued behind the panic are `FETCHED` events for `result`,
-        // and an adapter that routes on `event.result` must not have to
-        // special-case the failure path.
+        // A failure reply has the same *shape* a success would have had,
+        // result id included (ADR-0003 A21): an adapter that routes on
+        // `event.result` must not have to special-case the failure path.
         if event.kind == ReldexEventKind::Fetched as i32 {
             assert!(
                 event.has_result,
-                "a FETCHED reply must name its result even when the pump answered it after a                  panic (request {})",
+                "a FETCHED reply must name its result even after the session was lost \
+                 (request {})",
                 event.request
             );
             assert_eq!(event.result, result);
@@ -227,23 +232,22 @@ fn a_panic_in_the_pump_answers_every_request_behind_it_instead_of_stranding_them
         lost >= 1,
         "the session must be reported lost, not merely failed"
     );
-    // The panic ended the session, same as any other way a session can end,
-    // so exactly one `Terminal` follows every reply the containment answered
-    // (M2.11) — conservatively `transaction_possibly_lost`, since nothing
-    // resolved whatever the session held.
-    let terminal = harness.next_event();
-    assert_eq!(terminal.kind, ReldexEventKind::Terminal as i32);
-    assert!(terminal.transaction_possibly_lost);
+    let terminal = terminal.expect("the loop ends only once TERMINAL has arrived");
+    assert_eq!(
+        terminal.session_state,
+        reldex_ffi::ReldexSessionState::Lost as i32
+    );
+    assert!(!terminal.abandoned);
     assert!(
         harness.poll_event().is_none(),
         "and nothing is answered twice"
     );
 
-    // The session is gone: nothing further is accepted, so nothing further is
-    // owed.
+    // Draining the `TERMINAL` retired the session: nothing further is
+    // accepted, so nothing further is owed.
     assert_eq!(
         harness.execute(session, 99, ReldexMockStatement::GeneratedQuery),
-        ReldexStatus::InvalidState
+        ReldexStatus::NotFound
     );
     support::free_error(reldex_ffi::reldex_last_error_take());
 }

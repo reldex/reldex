@@ -11,7 +11,7 @@
 //! | Object | Crossing form | Owner | Released by |
 //! | --- | --- | --- | --- |
 //! | Application hub | `ReldexHub*` (opaque) | Rust | [`reldex_hub_destroy`] |
-//! | Session | `uint64_t` id | Rust registry | [`reldex_session_close`] |
+//! | Session | `uint64_t` id | Rust registry | [`reldex_session_close`] or [`reldex_session_abandon`], then its `TERMINAL` drained |
 //! | Result set | `uint64_t` id (session-scoped) | Rust registry | [`reldex_session_close_result`], or session close |
 //! | Fetched batch | `ReldexBatch*` (opaque) | **caller**, from the moment [`reldex_hub_next_event`] hands it out | [`reldex_batch_release`] |
 //! | Error | `ReldexError*` (opaque) + [`ReldexErrorView`] | **caller**, likewise | [`reldex_error_free`] |
@@ -48,10 +48,10 @@
 //!    events for one session are delivered in the order that session produced
 //!    them. A request that is **rejected** (a non-`RELDEX_STATUS_OK` return
 //!    from the submitting call) was never accepted and produces no event.
-//!    This holds even when the library itself fails: a panic in a session's
-//!    pump thread is caught, the session is marked lost, and every request
-//!    still owed a reply — the one in flight and everything queued behind it —
-//!    gets one failure event.
+//!    Both are `db-core`'s own guarantees (`phase-1-m2-5-event-queue.md`
+//!    §3.1), and they hold when a driver call panics: the session's worker
+//!    contains the panic, the session is lost, every request still owed a
+//!    reply gets one failure event, and its `TERMINAL` follows.
 //!
 //! # Errors
 //!
@@ -70,33 +70,15 @@
 //! An error attached to an *event* is different: it is owned, it crosses on
 //! the queue, and it belongs to whoever drains the event.
 //!
-//! # What is interim here
+//! # Where events come from (M2.15)
 //!
-//! `db-core` today offers `Completion<T>` and a blocking `open_session`.
-//! `EventQueue`/`EventSink`/`Waker`/`SessionRegistry`
-//! (`docs/exec-plans/active/phase-1.md` §B2/§B3) **have** landed, as tasks
-//! M2.5/M2.6 (2026-09-21) — but this crate has not switched the FFI pump onto
-//! them yet. That switch is a separate task, **M2.15** (`docs/exec-plans/
-//! active/phase-1.md`, after M2.14; ADR-0003 A29 records why it was split out
-//! of M2.11 rather than attempted alongside a review-round fix pass), not
-//! something M2.11 does. So the event pump still lives *here*, as one thread
-//! per session that owns that session's pending `Completion`s and turns them
-//! into events (see the module docs in `src/session.rs`). It is deliberately
-//! small and deliberately temporary: when M2.15 lands, `session.rs` loses the
-//! pump and forwards a `db-core` `SessionEvent` instead, and nothing in the C
-//! ABI has to change.
-//!
-//! **What the interim pump cannot deliver today, until M2.15:** a genuinely
-//! unsolicited, mid-statement [`ReldexEventKind::Terminal`] — this build only
-//! ever produces one on a close that actually closes, a failed open, or a
-//! contained panic, never on a loss the pump discovers between requests;
-//! `abandon` is not relayed through the real `SessionRegistry`; there are no
-//! `EXECUTING`/`TRANSACTION_STATE` events; and [`ReldexEventKind::ServerOutput`]
-//! is delivered only on the completion path (drained after a reply while
-//! output is on), never as a truly unsolicited event ahead of it. Each of
-//! these is also stated next to the relevant type's own doc comment. The
-//! interim pump blocks; it never polls, so no polling interval can distort
-//! the S15 measurements.
+//! The hub owns one `db-core` `EventQueue` and the `SessionRegistry` that
+//! opens every session bound to it. Each session's worker thread pushes its
+//! events into that queue; [`reldex_hub_next_event`] takes them out on the
+//! caller's thread and translates them. There is no thread of this crate's
+//! per session, nothing polls, and a `TERMINAL` arrives the moment a session
+//! is lost, not only when it is closed. See the module docs in `src/hub.rs`
+//! and `src/session.rs`.
 //!
 //! Not yet exported, and out of scope for M1.3: binds and LOB reads. Commit /
 //! rollback / savepoint / ping, server output control, statement splitting,
@@ -218,16 +200,16 @@ pub use metadata::{
     reldex_metadata_query_sql,
 };
 pub use mock::{
-    ReldexDriverKind, ReldexMockScenario, ReldexMockScenarioConfig, ReldexMockStatement,
-    reldex_mock_release_block, reldex_mock_statement,
+    ReldexDriverKind, ReldexMockFailure, ReldexMockScenario, ReldexMockScenarioConfig,
+    ReldexMockStatement, reldex_mock_release_block, reldex_mock_statement,
 };
 pub use session::{
-    ReldexCancelKind, ReldexCancelOutcome, ReldexCloseDisposition, ReldexOpenOptions,
-    ReldexRequestId, ReldexResultId, ReldexSessionId, reldex_hub_open_session,
-    reldex_session_close, reldex_session_close_result, reldex_session_commit,
-    reldex_session_connect_warnings, reldex_session_execute, reldex_session_fetch,
-    reldex_session_ping, reldex_session_request_cancel, reldex_session_result_column,
-    reldex_session_result_column_count, reldex_session_rollback,
+    ReldexAbandonOutcome, ReldexCancelKind, ReldexCancelOutcome, ReldexCloseDisposition,
+    ReldexOpenOptions, ReldexRequestId, ReldexResultId, ReldexSessionId, reldex_hub_open_session,
+    reldex_session_abandon, reldex_session_close, reldex_session_close_result,
+    reldex_session_commit, reldex_session_connect_warnings, reldex_session_execute,
+    reldex_session_fetch, reldex_session_ping, reldex_session_request_cancel,
+    reldex_session_result_column, reldex_session_result_column_count, reldex_session_rollback,
     reldex_session_rollback_to_savepoint, reldex_session_savepoint,
     reldex_session_set_server_output,
 };
@@ -295,7 +277,16 @@ pub const RELDEX_ABI_VERSION_MAJOR: u32 = 3;
 /// this build. The brief for M2.11 asked for a major bump (`3` to `4`); this
 /// is recorded as a deliberate deviation, not an oversight — see the PR
 /// description's "deviations" section and ADR-0003's M2.11 amendment.
-pub const RELDEX_ABI_VERSION_MINOR: u32 = 1;
+///
+/// `2` because M2.15 moves the event path onto `db-core`'s event queue and
+/// session registry, again purely additively: new event kinds (`EXECUTING`,
+/// `TRANSACTION_STATE`, `FETCHED_SEGMENT`), new *trailing* `ReldexEvent` and
+/// `ReldexMockScenarioConfig` fields, `reldex_session_abandon` and two new
+/// enums. What an existing symbol can now *deliver* changed — a `TERMINAL` on
+/// a loss mid-statement, a session id that is retired once its `TERMINAL` is
+/// drained — without changing its shape; ADR-0003's M2.15 amendment lists
+/// each change.
+pub const RELDEX_ABI_VERSION_MINOR: u32 = 2;
 
 /// The ABI version this library implements: `(major << 16) | minor`.
 ///

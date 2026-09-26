@@ -256,17 +256,16 @@ fn an_unknown_result_or_column_reports_why() {
     assert_eq!(column_count(&harness, session, result + 1_000), 0);
 }
 
-/// The documented lifetime lists three invalidators, all caller-initiated.
-/// "A session the pump lost to a panic" is not one of them, and this is the
-/// path that used to break it: the containment called `shut_down`, which
-/// cleared the result map on the **pump** thread and dropped the last claim on
-/// strings the caller was still holding pointers into.
+/// The documented lifetime lists its invalidators, all caller-initiated. "A
+/// session lost mid-statement" is not one of them — not even once its
+/// `TERMINAL` has been drained and the session retired, which is when this
+/// crate lets go of everything else the session held.
 ///
-/// The names are compared against a copy taken before the panic, so a failure
+/// The names are compared against a copy taken before the loss, so a failure
 /// shows up as wrong content rather than only as a sanitizer report — and
 /// nothing here reads memory whose life the contract does not guarantee.
 #[test]
-fn losing_a_session_to_a_pump_panic_does_not_free_its_column_names() {
+fn losing_a_session_mid_statement_does_not_free_its_column_names() {
     let harness = Harness::new();
     let session = harness.open(config());
     assert_eq!(
@@ -296,20 +295,20 @@ fn losing_a_session_to_a_pump_panic_does_not_free_its_column_names() {
 
     // Lose the session. Nothing is submitted for `result`.
     assert_eq!(
-        harness.execute(session, 11, ReldexMockStatement::PumpPanic),
+        harness.execute(session, 11, ReldexMockStatement::LoseSession),
         ReldexStatus::Ok
     );
-    let mut lost = false;
-    for _ in 0..8 {
-        let event = harness.next_event();
-        support::release_batch(&event);
-        support::take_error(&event);
-        if event.session_state == reldex_ffi::ReldexSessionState::Lost as i32 {
-            lost = true;
-            break;
-        }
-    }
-    assert!(lost, "the panicking statement must report the session lost");
+    let failed = harness.next_event();
+    assert_eq!(failed.request, 11);
+    assert_eq!(
+        failed.session_state,
+        reldex_ffi::ReldexSessionState::Lost as i32,
+        "the statement must report the session lost"
+    );
+    support::take_error(&failed);
+    let terminal = harness.next_event();
+    assert_eq!(terminal.kind, ReldexEventKind::Terminal as i32);
+    support::take_error(&terminal);
 
     // The pointers taken before the panic must still read the same. `read`
     // also checks the NUL at `ptr[len]`, which a freed buffer would not have
@@ -320,8 +319,8 @@ fn losing_a_session_to_a_pump_panic_does_not_free_its_column_names() {
         "a session lost to an internal panic must not end the documented lifetime of a result's column names"
     );
 
-    // The result itself is gone — the session is lost and nothing can be
-    // fetched from it — so the accessor reports that rather than pretending.
+    // The result itself is gone — the session is lost and, its `TERMINAL`
+    // drained, retired — so the accessor reports that rather than pretending.
     // The two facts are separate on purpose: what was already handed out
     // stays readable; what was not is not invented.
     assert_eq!(column_count(&harness, session, result), 0);

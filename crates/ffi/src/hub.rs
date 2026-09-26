@@ -1,28 +1,37 @@
-//! The hub: the event queue, the edge-triggered waker, and the object every
-//! other call hangs off (ADR-0003 D5/D7).
+//! The hub: `db-core`'s event queue and session registry, the edge-triggered
+//! waker, and the object every other call hangs off (ADR-0003 D5/D7).
 //!
-//! # Why there is no polling anywhere
+//! # What the hub is made of
 //!
-//! Events are produced by session pump threads (see [`crate::session`]), each
-//! of which is **blocked** in `Completion::wait` until its session replies.
-//! Pushing an event that makes the queue non-empty calls the waker once; the
-//! adapter drains with [`reldex_hub_next_event`] until it returns false. No
-//! part of this path sleeps, retries or has a tick, so no polling interval can
-//! sit between a row arriving and the UI hearing about it — which is exactly
-//! what spike S15's K2 (first-row latency) and K4 (per-batch cost) would
-//! otherwise measure instead of the boundary.
+//! One `db-core` [`EventQueue`] and the [`SessionRegistry`] that opens every
+//! session bound to it (`docs/exec-plans/active/phase-1-m2-5-event-queue.md`
+//! §3.1, §6, §7). Each session's worker thread pushes its events straight into
+//! that queue; [`reldex_hub_next_event`] takes them out and translates them on
+//! the caller's thread (`session::translate`). There is **no thread of this
+//! crate's** between a worker and the adapter: nothing parks per session or
+//! per request, and nothing polls, so no interval can sit between a row
+//! arriving and the UI hearing about it — which is what spike S15's K2
+//! (first-row latency) and K4 (per-batch cost) would otherwise measure.
+//!
+//! The waker is the queue's own ([`EventQueue::set_waker`]): edge-triggered on
+//! empty → non-empty, called with no `db-core` lock held, and read-locked for
+//! the duration of a wake so that unregistering waits for one in flight. This
+//! crate adds only the re-entrancy guard around the adapter's callback.
 
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use reldex_db_core::SessionManager;
+use reldex_db_core::{
+    EventCaps, EventQueue, RequestId, SessionEvent, SessionId, SessionManager, SessionRegistry,
+    event_channel,
+};
 
+use crate::batch::ResultColumns;
 use crate::error::set_last_argument_error;
-use crate::event::{QueuedEvent, ReldexEvent};
+use crate::event::ReldexEvent;
 use crate::session::SessionEntry;
 use crate::status::{ReldexStatus, WakerGuard, entry, entry_value};
 use crate::strings::{check_out_struct, write_out_struct};
@@ -35,7 +44,13 @@ use crate::strings::{check_out_struct, write_out_struct};
 /// deadlocking. The C++ trampoline should do exactly one thing:
 /// `QMetaObject::invokeMethod(bridge, &Bridge::drain, Qt::QueuedConnection)`.
 ///
-/// It is called from a Reldex thread, never from the caller's.
+/// It is called from whichever thread made the queue non-empty: usually a
+/// session's worker thread, but it **can be the caller's own thread**, inside
+/// the `reldex_*` call that submitted a request — a request whose session has
+/// already ended is answered on the spot, and if that answer is what made the
+/// queue non-empty, the submitting thread is the one that wakes
+/// (`phase-1-m2-5-event-queue.md` §6). A trampoline that only posts to an
+/// event loop is correct either way.
 ///
 /// The header's typedef for this is **hand-written** in `cbindgen.toml`'s
 /// `after_includes`, not generated: cbindgen emits its typedefs above the
@@ -46,7 +61,8 @@ use crate::strings::{check_out_struct, write_out_struct};
 /// agree.
 pub type ReldexWakeFn = Option<extern "C" fn(user_data: *mut c_void)>;
 
-struct WakerSlot {
+/// The adapter's callback, registered with `db-core`'s queue.
+struct Wake {
     func: extern "C" fn(*mut c_void),
     user_data: *mut c_void,
 }
@@ -54,114 +70,172 @@ struct WakerSlot {
 // SAFETY: `user_data` is an opaque token this library never dereferences; it
 // only hands it back to `func`. ADR-0003 D5 makes the adapter responsible for
 // the callback being safe to invoke from a Reldex thread, and
-// `reldex_hub_set_waker` guarantees the unregister side: it does not return
-// while a call is in flight, so the adapter can tear its bridge down.
-unsafe impl Send for WakerSlot {}
-// SAFETY: as above — the slot is only ever read behind the hub's `RwLock`.
-unsafe impl Sync for WakerSlot {}
+// `reldex_hub_set_waker` guarantees the unregister side: `EventQueue::set_waker`
+// does not return while a wake is in flight, so the adapter can tear its
+// bridge down.
+unsafe impl Send for Wake {}
+// SAFETY: as above — `func` and `user_data` are only read, never written,
+// after construction.
+unsafe impl Sync for Wake {}
 
-/// The application hub: one event queue, one waker, one session registry.
-///
-/// Opaque to C. Create it with [`reldex_hub_create`] and release it with
-/// [`reldex_hub_destroy`], last of all.
-pub struct ReldexHub {
-    events: Mutex<VecDeque<QueuedEvent>>,
-    waker: RwLock<Option<WakerSlot>>,
-    pub(crate) sessions: Mutex<HashMap<u64, Arc<SessionEntry>>>,
-    pub(crate) next_session_id: AtomicU64,
-    pub(crate) manager: SessionManager,
-    destroyed: AtomicBool,
+impl reldex_db_core::Waker for Wake {
+    fn wake(&self) {
+        // Any `reldex_*` call the callback makes is refused while this is held
+        // — including on the caller's own thread, where a submit can wake —
+        // rather than deadlocking or re-entering the queue it is being told
+        // about (D5 rule 1).
+        let _guard = WakerGuard::enter();
+        (self.func)(self.user_data);
+    }
 }
 
-impl Drop for ReldexHub {
+/// What a reply will have to say that its `db-core` event does not: the
+/// caller's own request id, and — for a fetch or a result close — which of the
+/// session's results it names and the columns a batch is described with.
+pub(crate) struct Pending {
+    pub(crate) caller: u64,
+    pub(crate) result: Option<u64>,
+    pub(crate) columns: Option<Arc<ResultColumns>>,
+}
+
+impl Pending {
+    pub(crate) const fn caller(caller: u64) -> Self {
+        Self {
+            caller,
+            result: None,
+            columns: None,
+        }
+    }
+}
+
+/// Decrements the live-hub count when the hub's memory is actually released,
+/// without making [`ReldexHub`] itself a `Drop` type — `reldex_hub_destroy`
+/// has to move the registry out of it.
+struct LiveHub;
+
+impl LiveHub {
+    fn new() -> Self {
+        crate::counters::created(crate::counters::Kind::Hub);
+        Self
+    }
+}
+
+impl Drop for LiveHub {
     fn drop(&mut self) {
         crate::counters::destroyed(crate::counters::Kind::Hub);
     }
 }
 
+/// The application hub: one event queue, one session registry, one waker.
+///
+/// Opaque to C. Create it with [`reldex_hub_create`] and release it with
+/// [`reldex_hub_destroy`], last of all.
+pub struct ReldexHub {
+    /// `EventQueue` is `Send` but not `Sync` — one consumer, by type. The
+    /// mutex is what lets the hub be shared with the one call that may come
+    /// from another thread (`reldex_session_request_cancel`, which never
+    /// touches it); on the drain path it is uncontended.
+    queue: Mutex<EventQueue>,
+    pub(crate) registry: SessionRegistry,
+    pub(crate) sessions: Mutex<HashMap<u64, Arc<SessionEntry>>>,
+    /// Keyed by the `db-core` request id this hub allocated (never the
+    /// caller's, which is caller-chosen and unchecked): an entry lives from
+    /// the moment a request is accepted until its one reply is drained.
+    pending: Mutex<HashMap<u64, Pending>>,
+    next_request: AtomicU64,
+    /// Column descriptions of results that were open when their session was
+    /// **lost** — nothing the caller did ended their documented lifetime, so
+    /// they are freed only by [`reldex_hub_destroy`]; see
+    /// [`crate::reldex_session_result_column`].
+    orphaned_columns: Mutex<Vec<Arc<ResultColumns>>>,
+    _live: LiveHub,
+}
+
+/// Locks `mutex`, recovering from poisoning: every structure behind one of
+/// this crate's mutexes stays consistent across a panic, which `catch_unwind`
+/// has already turned into `RELDEX_STATUS_PANIC`.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl ReldexHub {
     fn new() -> Self {
-        crate::counters::created(crate::counters::Kind::Hub);
+        let (sink, queue) = event_channel(EventCaps::new());
         Self {
-            events: Mutex::new(VecDeque::new()),
-            waker: RwLock::new(None),
+            queue: Mutex::new(queue),
+            registry: SessionRegistry::new(SessionManager::new(), sink),
             sessions: Mutex::new(HashMap::new()),
-            next_session_id: AtomicU64::new(1),
-            manager: SessionManager::new(),
-            destroyed: AtomicBool::new(false),
+            pending: Mutex::new(HashMap::new()),
+            next_request: AtomicU64::new(1),
+            orphaned_columns: Mutex::new(Vec::new()),
+            _live: LiveHub::new(),
         }
     }
 
-    /// Queues one event and wakes the consumer if the queue was empty.
-    ///
-    /// The queue lock is released *before* the waker is called, so a waker
-    /// that breaks the contract and calls back in blocks on the re-entrancy
-    /// guard rather than on this mutex.
-    pub(crate) fn push_event(&self, event: QueuedEvent) {
-        let was_empty = {
-            let mut queue = self
-                .events
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let was_empty = queue.is_empty();
-            queue.push_back(event);
-            was_empty
-        };
-        if was_empty {
-            self.wake();
+    /// The live entry for `session`, if this hub still has one.
+    pub(crate) fn session_entry(&self, session: u64) -> Option<Arc<SessionEntry>> {
+        lock(&self.sessions).get(&session).map(Arc::clone)
+    }
+
+    /// Records what a request's reply will need and allocates the `db-core`
+    /// request id it is submitted under. Undo with [`Self::abandon_request`]
+    /// if the submit is refused.
+    pub(crate) fn begin_request(&self, pending: Pending) -> RequestId {
+        let id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        lock(&self.pending).insert(id, pending);
+        RequestId(id)
+    }
+
+    /// Forgets a request `db-core` refused: nothing was accepted, so no reply
+    /// will come for it.
+    pub(crate) fn abandon_request(&self, request: RequestId) {
+        lock(&self.pending).remove(&request.0);
+    }
+
+    /// What `event` owes the caller: taken out of the table when `event` is
+    /// its request's one reply, only read when it is progress (`Executing`)
+    /// that the reply will still follow.
+    pub(crate) fn pending_for(&self, event: &SessionEvent) -> Option<Pending> {
+        let request = event.request()?;
+        let mut pending = lock(&self.pending);
+        if event.is_reply() {
+            pending.remove(&request.0)
+        } else {
+            pending
+                .get(&request.0)
+                .map(|known| Pending::caller(known.caller))
         }
     }
 
-    fn wake(&self) {
-        if self.destroyed.load(Ordering::Acquire) {
-            return;
+    /// Output lines this session lost that no delivered event has reported.
+    pub(crate) fn pending_dropped_lines(&self, session: SessionId) -> u32 {
+        lock(&self.queue).pending_dropped_lines(session)
+    }
+
+    /// Keeps a lost session's column descriptions until the hub goes away.
+    pub(crate) fn orphan_columns(&self, columns: Vec<Arc<ResultColumns>>) {
+        if !columns.is_empty() {
+            lock(&self.orphaned_columns).extend(columns);
         }
-        let slot = self
-            .waker
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(waker) = slot.as_ref() else {
-            return;
-        };
-        // Held across the call on purpose: `set_waker` takes the write lock, so
-        // it cannot return while this is running — which is exactly the
-        // use-after-free ADR-0003 D5 rule 2 and spike criterion K5 are about.
-        let _guard = WakerGuard::enter();
-        (waker.func)(waker.user_data);
-    }
-
-    fn next_event(&self) -> Option<QueuedEvent> {
-        self.events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop_front()
-    }
-
-    fn pending_events(&self) -> usize {
-        self.events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
     }
 
     fn set_waker(&self, func: ReldexWakeFn, user_data: *mut c_void) {
-        let mut slot = self
-            .waker
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *slot = func.map(|func| WakerSlot { func, user_data });
-    }
-
-    fn is_destroyed(&self) -> bool {
-        self.destroyed.load(Ordering::Acquire)
+        let waker =
+            func.map(|func| Arc::new(Wake { func, user_data }) as Arc<dyn reldex_db_core::Waker>);
+        // Does not return while a wake is in flight: `EventQueue` read-locks
+        // its registration for the duration of every wake (D5 rule 2, spike
+        // criterion K5).
+        lock(&self.queue).set_waker(waker);
     }
 }
 
 /// Runs `body` with the hub the caller named, or reports why it could not.
 ///
-/// The hub is reference-counted: this borrows the caller's reference without
-/// touching the count, so a session pump can clone it and keep the hub alive
-/// past [`reldex_hub_destroy`] while it finishes.
+/// The hub is reference-counted only so this can borrow the caller's
+/// reference without touching the count; since M2.15 nothing else holds one,
+/// so [`reldex_hub_destroy`] frees it before it returns.
 ///
 /// # Safety
 ///
@@ -182,15 +256,6 @@ pub(crate) unsafe fn with_hub<T>(
     Some(body(&arc))
 }
 
-/// Records why a hub call was refused, so `reldex_last_error_take()` after a
-/// non-OK status always describes *that* call.
-fn set_last_hub_error(message: &str) -> ReldexStatus {
-    crate::error::set_last_error(reldex_db_core::DbError::internal(format!(
-        "reldex-ffi: {message}"
-    )));
-    ReldexStatus::InvalidState
-}
-
 /// Creates the hub. Returns `NULL` only if allocation failed.
 ///
 /// One per application is the intended shape; nothing here forbids more — but
@@ -209,31 +274,29 @@ pub extern "C" fn reldex_hub_create() -> *mut ReldexHub {
 ///
 /// Returns **promptly**, even when a session is blocked inside a statement
 /// that cannot be interrupted. In order: the waker is unregistered (which
-/// waits for any wake already in flight, D5 rule 2), every session is marked
-/// closed and asked to cancel whatever it is running, and the hub's own
-/// reference is dropped.
+/// waits for any wake already in flight, D5 rule 2); every session still open
+/// is **abandoned** through `db-core`'s session registry — which never
+/// commits, asks the driver to cancel whatever is running, and never waits;
+/// everything still queued is discarded, freeing what it held; and the hub's
+/// memory is released. No `RELDEX_EVENT_KIND_TERMINAL` is delivered for those
+/// sessions: nothing could observe it.
 ///
 /// # What "promptly" costs when a statement cannot be interrupted
 ///
 /// Prompt is not the same as finished, and the difference is worth stating
 /// plainly. A session parked inside an uninterruptible driver call — which is
 /// the *normal* case on `oracledb` 26.0.0-beta.3, whose cancel cannot reach a
-/// running statement (ADR-0002 D2, spike S4) — cannot be stopped by this
-/// call. Its cancel is best-effort and does nothing there. So until that
-/// statement returns on its own, or the process exits:
-///
-/// * the session's pump thread stays alive, blocked;
-/// * `db-core`'s worker thread for that session and the connection it owns
-///   stay alive with it;
-/// * the hub's own allocation stays alive, because the pump holds a reference;
-/// * every event already queued stays queued, **including any `ReldexBatch`
-///   it carries**, and is freed only when the last pump finally exits.
-///
-/// None of that is reachable by the caller any more, so it is a leak for as
-/// long as it lasts. It is the price of never blocking the UI thread on a
-/// 10-second statement (spike criterion K6), and it is bounded by the
-/// statement, not by Reldex. A caller that needs the memory back before then
-/// has no option through this ABI, because the driver offers none.
+/// running statement (ADR-0002 D2, spike S4) — cannot be stopped by this call.
+/// Waiting for the registry's teardown — at most `db-core`'s
+/// `DROP_SHUTDOWN_TIMEOUT` (500 ms) in total, however many sessions are stuck
+/// — therefore happens on a short-lived thread of this library's, not on the
+/// caller's. Past that bound a stuck session's worker thread and the
+/// connection it owns are **detached**: they stay alive until the statement
+/// returns on its own, or the process exits, and then close themselves. That
+/// is a leak for as long as it lasts, bounded by the statement rather than by
+/// Reldex, and it is the price of never blocking the UI thread on a
+/// ten-second statement (spike criterion K6). Everything this library handed
+/// out or counts (`reldex_live_counts`) is released before this returns.
 ///
 /// Like dropping a `DatabaseSession`, this **never commits**: a transaction
 /// still open when the hub is destroyed is rolled back by the server, exactly
@@ -253,40 +316,78 @@ pub extern "C" fn reldex_hub_create() -> *mut ReldexHub {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reldex_hub_destroy(hub: *mut ReldexHub) {
     entry_value((), || {
-        if hub.is_null() {
+        if hub.is_null() || !hub.is_aligned() {
             return;
         }
         // SAFETY: delegated to this function's contract; the borrow ends before
         // the reference is dropped below.
         unsafe {
             with_hub(hub, |hub| {
-                hub.destroyed.store(true, Ordering::Release);
                 // Unregister first: after this returns, no wake is in flight
                 // and none will start, so the adapter's bridge can go away.
                 hub.set_waker(None, std::ptr::null_mut());
-                let entries: Vec<Arc<SessionEntry>> = {
-                    let mut sessions = hub
-                        .sessions
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    sessions.drain().map(|(_, entry)| entry).collect()
-                };
+                let entries: Vec<Arc<SessionEntry>> = lock(&hub.sessions)
+                    .drain()
+                    .map(|(_, entry)| entry)
+                    .collect();
                 for entry in entries {
-                    entry.shut_down();
-                    // Destroying the hub is the last of the three documented
-                    // invalidators for a result's column descriptions, and it
-                    // is the caller's own call — so the strings are freed
-                    // here, synchronously, on this thread, rather than
-                    // whenever the pump thread happens to exit.
-                    drop(entry.take_lost_columns());
+                    // Abandon, never close: nothing is committed, nothing is
+                    // waited for. Destroying the hub is also the last of the
+                    // documented invalidators for a result's column
+                    // descriptions, so they are freed here, on this thread.
+                    entry.tear_down(&hub.registry);
                 }
+                lock(&hub.orphaned_columns).clear();
             });
         }
         // SAFETY: the caller promises this pointer came from `Arc::into_raw` in
         // `reldex_hub_create` and has not been destroyed, so this consumes
         // exactly the one strong reference that call created.
-        drop(unsafe { Arc::from_raw(hub.cast_const()) });
+        let hub = unsafe { Arc::from_raw(hub.cast_const()) };
+        match Arc::try_unwrap(hub) {
+            Ok(hub) => {
+                let ReldexHub {
+                    queue,
+                    registry,
+                    pending,
+                    ..
+                } = hub;
+                // Ends the stream: whatever is still queued is discarded, and
+                // every event a session produces from now on is dropped on
+                // arrival.
+                drop(queue);
+                drop(pending);
+                reap(registry);
+            }
+            // Only a caller breaking the contract above — another thread still
+            // inside a call on this hub — can hold a second reference. That
+            // thread's reference frees the hub when it returns.
+            Err(shared) => drop(shared),
+        }
     });
+}
+
+/// Drops the registry, which waits — against one shared deadline — for every
+/// session it still holds to finish its abandon. Off the caller's thread when
+/// there is anything to wait for, so `reldex_hub_destroy` stays prompt; inline
+/// when the registry is empty (every session retired on its `TERMINAL`, the
+/// normal case) or a thread cannot be spawned.
+fn reap(registry: SessionRegistry) {
+    if registry.is_empty() {
+        return;
+    }
+    let mut slot = Some(registry);
+    let spawned = std::thread::Builder::new()
+        .name("reldex-ffi-teardown".to_owned())
+        .spawn({
+            let registry = slot.take();
+            move || drop(registry)
+        });
+    if let Err(error) = spawned {
+        // The closure — and the registry inside it — was dropped with the
+        // failed spawn, here, inline: correct, only not prompt.
+        drop(error);
+    }
 }
 
 /// Registers (or, with a null `fn`, unregisters) the wake callback.
@@ -299,18 +400,18 @@ pub unsafe extern "C" fn reldex_hub_destroy(hub: *mut ReldexHub) {
 ///
 /// * **It may not call any `reldex_*` function — on any hub.** The
 ///   re-entrancy guard is per *thread*, not per hub, and that is the contract,
-///   not an implementation detail: a wake runs on a Reldex thread and holds
-///   the lock that keeps the waker alive, so a call back in would deadlock or
-///   re-enter the queue it is being told about. Any entry from inside a waker
-///   reports `RELDEX_STATUS_REENTRANT` (or `false`/`0` from the functions that
-///   return no status) and does nothing.
+///   not an implementation detail: a wake holds the lock that keeps the waker
+///   alive, so a call back in would deadlock or re-enter the queue it is being
+///   told about. Any entry from inside a waker reports
+///   `RELDEX_STATUS_REENTRANT` (or `false`/`0` from the functions that return
+///   no status) and does nothing.
 /// * **It may not let a C++ exception escape.** Unwinding a C++ exception
 ///   through this `extern "C"` frame into Rust is undefined behaviour, and
 ///   the `catch_unwind` on every Reldex entry point does **not** contain it —
 ///   that catches Rust panics, which are a different mechanism. A waker that
 ///   can throw must wrap its own body in `try { … } catch (...) { }`.
-/// * **It may not block.** It is called on a session's pump thread, and
-///   blocking there stalls that session's events. One
+/// * **It may not block.** It usually runs on a session's worker thread, and
+///   blocking there stalls that session. One
 ///   `QMetaObject::invokeMethod(..., Qt::QueuedConnection)` and nothing else.
 ///
 /// # When it fires
@@ -321,6 +422,9 @@ pub unsafe extern "C" fn reldex_hub_destroy(hub: *mut ReldexHub) {
 /// wake**, because the queue never became empty. Such a caller must re-post
 /// its own drain — ADR-0003 D5's budgeted `drain()` does exactly that, and
 /// [`reldex_hub_pending_events`] is how it can report what it left behind.
+///
+/// It may run on the caller's own thread, inside the `reldex_*` call that
+/// submitted a request (see [`ReldexWakeFn`]).
 ///
 /// # Safety
 ///
@@ -337,9 +441,6 @@ pub unsafe extern "C" fn reldex_hub_set_waker(
         // SAFETY: delegated to this function's contract for `hub`.
         let status = unsafe {
             with_hub(hub, |hub| {
-                if hub.is_destroyed() {
-                    return set_last_hub_error("reldex_hub_set_waker: the hub has been destroyed");
-                }
                 hub.set_waker(func, user_data);
                 ReldexStatus::Ok
             })
@@ -364,18 +465,18 @@ pub unsafe extern "C" fn reldex_hub_set_waker(
 pub unsafe extern "C" fn reldex_hub_pending_events(hub: *const ReldexHub) -> usize {
     entry_value(0, || {
         // SAFETY: delegated to this function's contract.
-        unsafe { with_hub(hub, |hub| hub.pending_events()) }.unwrap_or(0)
+        unsafe { with_hub(hub, |hub| lock(&hub.queue).len()) }.unwrap_or(0)
     })
 }
 
 /// Takes the next event, or reports that there is none. Never blocks.
 ///
-/// Returns `true` when `out` was filled. The caller then **owns** `out->error`
-/// and `out->batch` when they are non-null. Drain in a loop until this returns
-/// `false`, budgeting the loop so a flood cannot starve rendering (ADR-0003 D5
-/// suggests 256 events / 4 ms, then re-post) — and see
-/// [`reldex_hub_set_waker`] for why a caller that stops early must re-post
-/// itself rather than wait for another wake.
+/// Returns `true` when `out` was filled. The caller then **owns** `out->error`,
+/// `out->batch` and `out->server_output_lines` when they are non-null. Drain in
+/// a loop until this returns `false`, budgeting the loop so a flood cannot
+/// starve rendering (ADR-0003 D5 suggests 256 events / 4 ms, then re-post) —
+/// and see [`reldex_hub_set_waker`] for why a caller that stops early must
+/// re-post itself rather than wait for another wake.
 ///
 /// **`false` means `*out` was not touched**, whether the queue was empty or
 /// the argument was rejected (null, unaligned, or a `struct_size` this build
@@ -384,16 +485,24 @@ pub unsafe extern "C" fn reldex_hub_pending_events(hub: *const ReldexHub) -> usi
 /// is read on the way in; nothing is written unless an event is being
 /// delivered.
 ///
-/// # The event queue is unbounded
+/// Taking a session's `RELDEX_EVENT_KIND_TERMINAL` retires that session — its
+/// id is not found by any later call — and releases what `db-core` held for
+/// it; that can join the session's (idle, finishing) worker thread here.
 ///
-/// Nothing here applies back-pressure. Every accepted request eventually
-/// queues exactly one event, and a `FETCHED` event holds a `ReldexBatch` whose
-/// rows are **the caller's memory** from the moment it is handed out. A
-/// caller that keeps fetching without draining, or drains without releasing,
-/// grows that queue without limit. The bound has to come from the adapter:
-/// keep a small number of fetches in flight per result, release each batch
-/// when the model is done with it, and use [`reldex_hub_pending_events`] as
-/// the only signal this ABI gives about the backlog.
+/// # What bounds the queue
+///
+/// Per session, `db-core` bounds what can be waiting: a request holds one of
+/// 1,024 slots from the moment it is accepted until **its reply is taken out
+/// of this queue**, so a caller that keeps submitting without draining is
+/// refused (`RELDEX_STATUS_ERROR`, last error `RELDEX_ERROR_KIND_RESOURCE`)
+/// rather than growing the queue; progress events are bounded by the same
+/// number, and unsolicited ones by a per-session cap past which server output
+/// is dropped and counted (`server_output_dropped`) and a transaction-state
+/// change is coalesced, never lost. No producer ever blocks on a slow
+/// consumer. Memory is still the caller's to bound: a `FETCHED` event's
+/// `ReldexBatch` holds its rows until released, so keep a small number of
+/// fetches in flight per result and release each batch when the model is done
+/// with it.
 ///
 /// # Safety
 ///
@@ -414,9 +523,12 @@ pub unsafe extern "C" fn reldex_hub_next_event(hub: *mut ReldexHub, out: *mut Re
             return false;
         }
         let take = |hub: &Arc<ReldexHub>| {
-            let Some(event) = hub.next_event() else {
+            // The queue's lock is released before translating: translation
+            // can retire a session, which must not happen under it.
+            let Some(event) = lock(&hub.queue).next() else {
                 return false;
             };
+            let event = crate::session::translate(hub, event);
             // SAFETY: `out` was just checked non-null, aligned and large
             // enough, and the caller promises it is writable. Nothing between
             // then and now can have changed it: D5 rule 3 keeps every call but
@@ -432,13 +544,10 @@ pub unsafe extern "C" fn reldex_hub_next_event(hub: *mut ReldexHub, out: *mut Re
 ///
 /// Every session from the moment `reldex_hub_open_session` returns a
 /// [`crate::ReldexSessionId`] until its `RELDEX_EVENT_KIND_TERMINAL` event has
-/// been drained **and** the caller has stopped calling into it — this
-/// library's own bookkeeping releases the entry when the pump exits, which for
-/// a normally closed session is promptly, and for a session whose statement
-/// cannot be interrupted (ADR-0003 A17) is not until that statement returns.
-/// Diagnostic, like [`crate::reldex_live_counts`]'s `sessions` field, which
-/// this agrees with; that one is process-wide across every hub, this one is
-/// scoped to `hub`.
+/// been **drained** — then it is retired, whether it was closed, lost,
+/// abandoned or never opened. Diagnostic, like [`crate::reldex_live_counts`]'s
+/// `sessions` field, which this agrees with; that one is process-wide across
+/// every hub, this one is scoped to `hub`.
 ///
 /// # Safety
 ///
@@ -447,15 +556,7 @@ pub unsafe extern "C" fn reldex_hub_next_event(hub: *mut ReldexHub, out: *mut Re
 pub unsafe extern "C" fn reldex_hub_session_count(hub: *const ReldexHub) -> usize {
     entry_value(0, || {
         // SAFETY: delegated to this function's contract.
-        unsafe {
-            with_hub(hub, |hub| {
-                hub.sessions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .len()
-            })
-        }
-        .unwrap_or(0)
+        unsafe { with_hub(hub, |hub| lock(&hub.sessions).len()) }.unwrap_or(0)
     })
 }
 
@@ -465,9 +566,9 @@ pub unsafe extern "C" fn reldex_hub_session_count(hub: *const ReldexHub) -> usiz
 /// know whether `out` holds all of them).
 ///
 /// The order is unspecified — a caller after a stable ordering sorts `out`
-/// itself. This is a point-in-time snapshot: a session may open or reach its
-/// `RELDEX_EVENT_KIND_TERMINAL` between this call returning and the caller
-/// reading `out`.
+/// itself. This is a point-in-time snapshot: a session may open or have its
+/// `RELDEX_EVENT_KIND_TERMINAL` drained between this call returning and the
+/// caller reading `out`.
 ///
 /// # Safety
 ///
@@ -484,10 +585,7 @@ pub unsafe extern "C" fn reldex_hub_list_sessions(
         // SAFETY: delegated to this function's contract.
         unsafe {
             with_hub(hub, |hub| {
-                let sessions = hub
-                    .sessions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let sessions = lock(&hub.sessions);
                 if !out.is_null() && out.is_aligned() {
                     // SAFETY: `index < capacity` (bounded by `.take`) and the
                     // caller promises `out` has room for `capacity` elements;
