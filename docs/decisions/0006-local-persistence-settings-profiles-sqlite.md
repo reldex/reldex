@@ -377,6 +377,19 @@ the product). No `dirs`, `directories` or `tempfile`: the test temp directory is
 - **M2.11 must** lift `tests/support/oracle_binding.rs` into `crates/ffi` behind its Oracle driver
   feature — it maps extension keys only and wires the driver's `sid_endpoint` — run the `Store` on
   the workspace service thread, carry `ProfileId` as 16 bytes, and name settings by numeric id.
+  **Delivered:** `OracleDriverBinding` in `crates/ffi/src/workspace.rs`, on the `ReldexWorkspace`
+  service thread this task adds; `ProfileId`/`WorksheetId` cross as 16 raw bytes throughout;
+  settings cross by `ReldexSettingId` (see ADR-0003's M2.11 amendment for the FFI-side detail).
+  **Deviation (noted in M2.11 review round 2):** `reldex-driver-oracle-thin` ended up an
+  *unconditional* dependency of `crates/ffi/Cargo.toml`, not "behind its Oracle driver feature" as
+  written above — `crates/ffi` is the one place allowed to name a concrete driver
+  (`ARCHITECTURE.md` §2), and metadata/settings/profile mapping (families 4-7) needs the driver's
+  extension-key constants, SQL dialect and `sid_endpoint` regardless of which driver a build will
+  actually open a connection against. None of that opens a database connection or reaches the
+  network, so gating it behind a feature would buy no isolation and would just make
+  `cargo test --workspace`'s default run skip real coverage of the mapping. Kept unconditional, with
+  the reasoning next to the dependency itself in `Cargo.toml`; `mock-driver`, the feature that does
+  gate something (whether a session can actually be opened), is unaffected.
 - **M3.4** shows the production indicator from `Profile::treat_as_production()`, not from the
   environment enum.
 - M4.10 and M6.2 add tables as migration steps 2 and 3. M6.2 also decides when a closed
@@ -739,7 +752,10 @@ real user's file.
 
 - M2.11 additionally lifts: `HistoryId`/`HistoryOutcome`/`HistoryPage` and `WorksheetId`'s
   worksheet-table-backed existence check into whatever numeric/opaque form the FFI gives the UI;
-  neither type crosses the boundary as designed here.
+  neither type crosses the boundary as designed here. **Delivered:** `HistoryId` crosses as a
+  `uint64_t` (new `to_ffi_value`/`from_ffi_value` pair on the Rust type, additive); `HistoryOutcome`
+  as `ReldexHistoryOutcomeKind` + a native-code/row-count pair; `HistoryPage` as the caller-owned,
+  opaque `ReldexHistoryList` (`reldex_history_list_count`/`_get`/`_release`).
 - M4.x (UI) decides re-run semantics (replace vs. insert at caret), pagination UX, and whether to
   build the "do not record this statement" opt-out named above.
 - M6.2 (UI) decides restore ordering, how a restored worksheet without its profile still connected

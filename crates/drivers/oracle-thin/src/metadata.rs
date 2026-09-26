@@ -266,8 +266,16 @@ fn reclassify_ambiguous_permission_error(error: &DbError) -> Option<DbError> {
 /// returns it without touching the network. Dictionary SQL for all nine
 /// object groups lives only here (`AGENTS.md`: vendor-specific database
 /// behavior stays in drivers).
+///
+/// `pub`, not `pub(crate)` (M2.11): `crates/ffi` is the composition root that
+/// wires a concrete `MetadataCatalog` into the vendor-neutral FFI surface
+/// (`ARCHITECTURE.md` §2 — it is the one place allowed to name a concrete
+/// driver), and — being a zero-sized, stateless type — it needs nothing more
+/// than to construct one; there is no live connection to obtain it from at
+/// that point. `Statement::sql()`/`OracleConnection::metadata_catalog()`
+/// remain the path a real session uses.
 #[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct OracleMetadataCatalog;
+pub struct OracleMetadataCatalog;
 
 impl MetadataCatalog for OracleMetadataCatalog {
     fn prepare(&self, request: MetadataRequest) -> DbResult<PreparedMetadataQuery> {

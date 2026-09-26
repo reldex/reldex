@@ -732,3 +732,150 @@ Stated in the same round: what a grid should do with a `RELDEX_COLUMN_KIND_UNSUP
 route it through `reldex_batch_format_column` like any other non-text kind, never read
 `data`/`offsets` as if they were UTF-8 — and show `native_type_name` when the user asks what the
 type actually is.
+
+## Amendment: M2.11 — events, statement splitting, metadata, settings/profiles/credentials/history/worksheets/layout (2026-09-26)
+
+M2.11 lands the remainder of the C ABI's "second round": the full `SessionEvent` set including
+`ServerOutput` and the terminal `Terminal` event; server output control; statement splitting;
+metadata (a statement plus its column contract); and — the largest piece — settings, profiles,
+credential-store access, connection-parameter composition, history, worksheets and layout, all
+through one new object, `ReldexWorkspace`. Status is unchanged: this ADR is still not Accepted.
+
+### A26 — the ABI version moved to 3.1, not 4.0, and that is a deliberate deviation from the brief
+
+The M2.11 brief asked for a major bump (3 → 4). `RELDEX_ABI_VERSION_MINOR` moved 0 → 1 instead.
+Every family M2.11 adds is purely additive — new opaque types, new functions, new `struct_size`-
+prefixed structs, new enum variants appended after the existing ones with their `0` case already
+reserved for "unknown" (D7) — and nothing existing changed shape or meaning.
+`RELDEX_ABI_VERSION_MINOR`'s own doc comment (`crates/ffi/src/lib.rs`) states the rule this follows:
+a minor bump is for exactly a symbol, a *trailing* struct field, or an enum value being added, with
+an older adapter kept working by D7's `struct_size`-prefix and reserved-`0` mechanisms (correcting an
+earlier version of this entry, which misattributed that sentence to D7 itself rather than to the
+constant's own doc comment). An old adapter built against ABI 3.0 still links and runs correctly
+against this library; it simply does not call the M2.11 functions. Recorded here, next to D7, rather
+than silently overriding the brief, because "the brief asked for X and the diff did Y" is exactly the
+kind of drift this ADR exists to catch — the reviewer should see the reasoning and either accept the
+deviation or ask for the major bump instead.
+
+**M2.11 review round 2 additions, still under ABI 3.1 (ADR-0004 reserves major version 4 for
+M5.2; this task does not touch it):**
+
+* `crates/ffi/src/splitter.rs`'s `reldex_split_statements` now honours the caller's `struct_size` on
+  each written `ReldexStatementSpan` via `write_out_struct` (should-fix 11) instead of writing at this
+  build's own size regardless of what the caller declared — a correctness fix, not an ABI change.
+* `ReldexWorkspaceReply`'s two growable fields, `setting_value: ReldexSettingValue` and
+  `layout: ReldexLayout`, sat inline in the *middle* of the struct — a real ABI-growth hazard, since a
+  future append to either one would shift the byte offset of every field declared after it, unlike an
+  append at the very end. Both are moved to immediately before the end of the struct (should-fix 11).
+  This is still an additive change, not a breaking one: ABI 3.1 has not shipped on `main` yet, Rust,
+  C and C++ all access struct fields by name rather than position, and no adapter exists yet to have
+  compiled against the old layout — so this is a pre-release fix, not a case that would otherwise need
+  a major bump.
+* `crates/ffi/tests/fences.rs`'s line-count budget (ADR-0003 D2, "a reviewer must be able to read the
+  whole crate in an hour") was raised a third time, to 13,600, to accommodate this round's genuine
+  correctness and testability additions (`CredentialError`/`SettingError` carrying a native code,
+  panic containment on the workspace service thread with a real fault-injection test, the structural
+  header guard, typed-password-in, and their tests) — see that test's own comment for the full
+  accounting.
+
+### A27 — `cbindgen.toml`'s `[export] include` allowlist is easy to forget, and this task found it twice
+
+D6/D7's rule that every enum crosses the boundary as a plain `int32_t` (so an unknown value is never
+undefined behaviour) has a `cbindgen` consequence stated in `cbindgen.toml` itself: an enum reached
+only through an `int32_t` field or parameter, never by value in an exported signature, is invisible
+to `cbindgen`'s default reachability walk and must be added to `[export] include` by hand, or it
+silently never reaches the header — no error, no warning, just a missing set of `RELDEX_*_KIND_*`
+`#define`s the C/C++ side has no way to notice until it tries to use one.
+
+Regenerating the header for this task (`item 8` of the brief: "regenerate and verify the header")
+found this had already happened twice, silently, before this task began fixing it:
+
+* six enums from the families this task's *predecessor* commits landed — `ReldexCompletedOperation`,
+  `ReldexServerOutputMode` (event/session control), `ReldexSplitKind`, `ReldexEndedBy` (statement
+  splitting), `ReldexMetadataRequestKind`, `ReldexMetadataObjectKind` (metadata) — were defined in
+  Rust, used correctly by their own functions, covered by passing Rust tests, and simply never
+  reached `include/reldex.h` at all;
+* all fifteen of M2.11's own new settings/profile/credential/history/reply-kind enums
+  (`ReldexSettingId` through `ReldexWorkspaceReplyKind`) had the same gap the moment they were
+  written, for the same reason.
+
+Both gaps were invisible to every gate that ran before this task: `cargo test --workspace` passed
+(the enums work fine from Rust), `cargo clippy` passed, and `gen-header.sh --check` passed too —
+because the *committed* header was already missing them in exactly the same way a freshly generated
+one would be, so there was nothing to diff against. The only thing that could have caught it earlier
+is what caught it now: a C smoke-harness case that actually tries to write
+`RELDEX_SPLIT_KIND_PLAIN` or `RELDEX_SETTING_ID_FETCH_ROWS` and fails to compile. `cbindgen.toml` now
+lists all twenty-one enums with a comment explaining why the allowlist exists and what adding a new
+one to it looks like; `crates/ffi/tests/header.rs`'s `every_export_reaches_the_header` test (which
+walks every `#[unsafe(no_mangle)]` function, not every type) did not and structurally cannot catch
+this class of gap, since the *function* using the enum is always present — only the type it names is
+missing. **Added (M2.11 review round 2, should-fix 3):** `every_repr_c_type_reaches_the_header` in
+the same file now does exactly that — it scans `src/*.rs` for a `#[repr(C)]`/`#[repr(i32)]`
+immediately before a `pub struct`/`pub enum` and asserts the name reaches `include/reldex.h`,
+independent of `cbindgen.toml`'s allowlist, so this stops depending on the smoke harness happening
+to exercise every enum.
+
+### A28 — a session close that actually closes now delivers two events, not one
+
+D5 rule 5 says "exactly one reply event is delivered for every accepted request." M2.11's `Terminal`
+event (`SPEC.md` §10: never hide a transaction loss) is delivered *in addition to* `SessionClosed`
+when a close actually ends the session — pushed in the same batch, before the next wake, so one
+waker call covers both. The rule as stated still holds for `SessionClosed` (the one reply to the
+`reldex_session_close` request, carrying `request`); `Terminal` is a second, *unsolicited* event for
+the same session, carrying no request id of its own (`request` is `0`) and answering nothing —
+exactly the same "queued event with no request behind it" shape `ServerOutput` already has. An
+adapter that drains "the" reply to a close and immediately assumes the queue is empty again is now
+wrong; it must drain until empty, the same discipline every other multi-event sequence already
+requires. The C smoke harness's session-close blocks were fixed to do this as part of this task;
+before the fix, they would have failed the moment `bash ui/build.sh --test` (or `ui/tests/ffi_smoke/
+run.sh`) actually ran, which nothing had done since `Terminal` was added — the fix, and the fact that
+nothing had caught it yet, are both recorded here for the reviewer's benefit, not left implicit in a
+diff.
+
+### A29 — the interim pump is unchanged; the switch is split out as M2.15, not attempted here
+
+A5 records that the per-session pump in `crates/ffi/src/session.rs` is deliberately interim, to be
+replaced when `db-core`'s `SessionRegistry`/`EventQueue`/`Waker` (`docs/exec-plans/active/
+phase-1.md` §B2/§B3, tasks M2.5/M2.6) land. **Correction (M2.11 review round 2):** an earlier
+version of this entry said those tasks "have not landed as of M2.11" — false, and caught by an
+independent reviewer. M2.5 and M2.6 landed 2026-09-21, well before this task. What is still true,
+and is the actual reason the pump is unchanged, is that *this crate has not switched onto them* —
+`Terminal` and `ServerOutput` are both produced by the same interim per-session-thread pump, not by
+a real event-queue switch, and the module documentation for `ServerOutput` (and `crate::lib`'s "What
+is interim here") says so plainly: it is delivered only on the completion path (drained after every
+reply while output is on), not as a genuinely unsolicited, mid-statement event.
+
+That switch is real concurrency work — replacing a thread-per-session pump with a shared event queue
+and waker while every existing ordering guarantee (D5) keeps holding — and does not belong riding
+along with M2.11's already-large review-round fix pass. It is split out as its own task, **M2.15**
+("FFI pump switch to the M2.5 event queue"), `opus`, review mandatory, listed in `phase-1.md` after
+M2.14 and in `TASKS.md`. Until M2.15 lands, the interim pump cannot deliver: a genuinely unsolicited,
+mid-statement `Terminal` (today's only fires on close, failed open, or a contained panic); `abandon`
+relayed through the real `SessionRegistry`; `EXECUTING`/`TRANSACTION_STATE` events; or server output
+ahead of the reply that follows it. `crates/ffi/src/lib.rs`'s module documentation lists the same
+four gaps next to the code, and `crates/ffi/README.md`'s limitations section points here.
+
+### A30 — `ReldexSecret`'s exposed text is the one exception to A13's NUL-termination promise
+
+A13 established that every outbound `ReldexStr` is NUL-terminated at `ptr[len]`. `reldex_secret_
+expose`'s returned view is the one deliberate exception: it borrows directly from a `zeroize`-backed
+`reldex_db_driver_api::Secret`, which owns exactly its password bytes and nothing past them —
+appending a NUL would mean either an extra allocation on a path whose entire purpose is holding as
+few copies of a password in memory as possible, or writing one byte past what the secret's own
+zeroizing `Drop` is responsible for. The header's doc comment on `reldex_secret_expose` and
+`ReldexSecret` both say so explicitly, and the C smoke harness compares the exposed text by length
+(`memcmp`), never by assuming `ptr[len] == '\0'` — the one call site in this codebase that must not
+make A13's usual assumption.
+
+### A31 — connection parameters cross as a purpose-built summary, not `ConnectionParams` itself
+
+`reldex_workspace_build_connect_params` reports a `ReldexConnectSummary`, a small flat set of fields
+(endpoint, port, service/connect string, TLS mode, timeout, role, the two boolean flags,
+`ca_directory`) rather than a full FFI mirror of `reldex_db_driver_api::ConnectionParams`. Nothing
+downstream of M2.11 consumes a `ConnectionParams` yet — opening a session against the real Oracle
+driver is M1.8's job, still ahead — so this crate reports what the mapping actually produced instead
+of inventing a second FFI shape, sized for a consumer that does not exist yet, for a type whose real
+shape may still change before M1.8 needs it. When M1.8 lands and something needs to *open a session*
+with these parameters (not just inspect them), that is the point to decide whether `ReldexConnectSummary`
+grows into the real crossing shape or a second, session-opening-specific one is added beside it —
+recorded here as a known, deliberate gap rather than a decision made by omission.

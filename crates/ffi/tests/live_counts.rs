@@ -23,8 +23,13 @@ mod support;
 use std::sync::{Mutex, MutexGuard};
 
 use reldex_ffi::{
-    ReldexCloseDisposition, ReldexEventKind, ReldexLiveCounts, ReldexMockScenarioConfig,
-    ReldexMockStatement, ReldexStatus, reldex_hub_pending_events, reldex_live_counts,
+    ReldexAuthKind, ReldexCloseDisposition, ReldexDatabaseType, ReldexEndpointKind,
+    ReldexEnvironmentKind, ReldexEventKind, ReldexLiveCounts, ReldexMockScenarioConfig,
+    ReldexMockStatement, ReldexPasswordStorageKind, ReldexProfileDetails, ReldexServiceTargetKind,
+    ReldexSessionRoleKind, ReldexStatus, ReldexStr, ReldexTransportKind, ReldexWorkspaceReply,
+    reldex_hub_pending_events, reldex_live_counts, reldex_workspace_close,
+    reldex_workspace_create_profile, reldex_workspace_credential_put, reldex_workspace_next_reply,
+    reldex_workspace_open, reldex_workspace_pending_replies, reldex_workspace_resolve_password,
 };
 
 use support::{Harness, take_error, wait_until};
@@ -202,5 +207,144 @@ fn the_contained_pump_panic_leaks_nothing() {
     settles_back_to(
         baseline,
         "the session lost to a pump panic to release everything",
+    );
+}
+
+/// A workspace profile shaped enough for `reldex_workspace_credential_put`/
+/// `reldex_workspace_resolve_password` to accept it -- the fields the
+/// credential path itself reads, not a realistic connection.
+fn workspace_profile_details() -> ReldexProfileDetails {
+    ReldexProfileDetails {
+        struct_size: u32::try_from(size_of::<ReldexProfileDetails>()).expect("fits"),
+        name: reldex_str("undrained-reply leak check"),
+        database_type: ReldexDatabaseType::Oracle as i32,
+        environment: ReldexEnvironmentKind::Test as i32,
+        environment_label: ReldexStr::empty(),
+        treat_as_production: false,
+        endpoint_kind: ReldexEndpointKind::HostPort as i32,
+        host: reldex_str("db.example.invalid"),
+        port: 1521,
+        service_target_kind: ReldexServiceTargetKind::ServiceName as i32,
+        service_name_or_sid: reldex_str("ORCL"),
+        connect_string: ReldexStr::empty(),
+        auth_kind: ReldexAuthKind::Password as i32,
+        username: reldex_str("app_owner"),
+        password_storage: ReldexPasswordStorageKind::CredentialStore as i32,
+        role: ReldexSessionRoleKind::Normal as i32,
+        transport: ReldexTransportKind::Plain as i32,
+        ca_directory: ReldexStr::empty(),
+        allow_unenforced_certificate_pin: false,
+    }
+}
+
+fn reldex_str(text: &'static str) -> ReldexStr {
+    ReldexStr {
+        ptr: text.as_ptr(),
+        len: text.len(),
+    }
+}
+
+/// Waits for `request`'s reply and returns it, draining nothing else (every
+/// call site below has exactly one request outstanding at a time).
+fn drain_workspace_reply(
+    workspace: *mut reldex_ffi::ReldexWorkspace,
+    request: u64,
+) -> ReldexWorkspaceReply {
+    let found = std::cell::RefCell::new(None);
+    wait_until(
+        &format!("the workspace to answer request {request}"),
+        || {
+            // SAFETY: `workspace` is live for the duration of this test; `out` is
+            // a real local, zeroed (a valid all-zero bit pattern for this flat
+            // `#[repr(C)]` struct of integers, bools and raw pointers) with
+            // `struct_size` set.
+            let mut out: ReldexWorkspaceReply = unsafe { std::mem::zeroed() };
+            out.struct_size = u32::try_from(size_of::<ReldexWorkspaceReply>()).expect("fits");
+            let taken =
+                unsafe { reldex_workspace_next_reply(workspace, std::ptr::from_mut(&mut out)) };
+            if taken && out.request == request {
+                *found.borrow_mut() = Some(out);
+                true
+            } else {
+                taken && out.request != request
+            }
+        },
+    );
+    found.into_inner().expect("the awaited reply was captured")
+}
+
+#[test]
+fn closing_a_workspace_with_an_undrained_reply_frees_what_it_holds() {
+    // Should-fix #8 (M2.11 review round 2): `reldex_workspace_close`'s doc
+    // comment used to say an undrained reply "must still be drained and
+    // released or it leaks". That was wrong -- closing frees the reply
+    // queue, and every reply in it, including a `ReldexSecret` nobody ever
+    // called `reldex_secret_release` on. This proves it with the same
+    // instrument the review used: the process-wide live-object count.
+    let _guard = exclusively();
+    forget_last_error();
+    let baseline = counts();
+
+    {
+        let mut handle: *mut reldex_ffi::ReldexWorkspace = std::ptr::null_mut();
+        // SAFETY: `handle` is a real local out-pointer; an in-memory store
+        // with an in-memory credential store needs no filesystem or OS
+        // credential-manager access.
+        let status = unsafe {
+            reldex_workspace_open(
+                ReldexStr::empty(),
+                true,
+                true,
+                1,
+                std::ptr::from_mut(&mut handle),
+            )
+        };
+        assert_eq!(status, ReldexStatus::Ok);
+        assert!(!handle.is_null());
+        let opened = drain_workspace_reply(handle, 1);
+        assert!(opened.error.is_null(), "the memory workspace must open");
+
+        let details = workspace_profile_details();
+        // SAFETY: `handle` is live; `details` is a real local.
+        let status =
+            unsafe { reldex_workspace_create_profile(handle, 2, std::ptr::from_ref(&details)) };
+        assert_eq!(status, ReldexStatus::Ok);
+        let created = drain_workspace_reply(handle, 2);
+        assert!(created.error.is_null(), "profile creation must succeed");
+        let id = created.id;
+
+        // SAFETY: `handle` is live; `id` is a real local array.
+        let status = unsafe {
+            reldex_workspace_credential_put(handle, 3, id.as_ptr(), reldex_str("leak-check-pw"))
+        };
+        assert_eq!(status, ReldexStatus::Ok);
+        let put = drain_workspace_reply(handle, 3);
+        assert!(put.error.is_null(), "storing the password must succeed");
+
+        // Submitted, and deliberately never drained: the reply -- carrying a
+        // live `ReldexSecret` once the service thread answers it -- sits in
+        // the queue when this workspace is closed below.
+        // SAFETY: as above.
+        let status = unsafe { reldex_workspace_resolve_password(handle, 4, id.as_ptr()) };
+        assert_eq!(status, ReldexStatus::Ok);
+        wait_until("the undrained resolve_password reply to be queued", || {
+            // SAFETY: `handle` is live.
+            (unsafe { reldex_workspace_pending_replies(handle) }) >= 1
+        });
+        assert!(
+            counts().misc_objects > baseline.misc_objects,
+            "the workspace, and now a secret sitting in its queue, are live"
+        );
+
+        // SAFETY: `handle` is a live workspace this test alone owns; closing
+        // it with an undrained reply still queued is exactly the case under
+        // test, not a use-after-free (`reldex_workspace_next_reply` is never
+        // called on `handle` again after this).
+        unsafe { reldex_workspace_close(handle) };
+    }
+
+    settles_back_to(
+        baseline,
+        "closing the workspace to free the undrained reply and the secret inside it",
     );
 }

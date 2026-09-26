@@ -44,10 +44,13 @@ use reldex_db_core::{
     CancelKind, CancelOutcome, CloseDisposition, CloseError, Completion, DatabaseSession, DbError,
     ErrorKind, ExecuteOutcome, FetchedBatch, ResultId, Statement,
 };
+use reldex_db_driver_api::{SavepointName, ServerOutputBuffer, ServerOutputSetting};
 
 use crate::batch::{ReldexBatch, ReldexColumnInfo, ResultColumns};
 use crate::error::{ReldexError, ReldexSessionState, set_last_argument_error, set_last_error};
-use crate::event::{QueuedEvent, ReldexEventKind};
+use crate::event::{
+    QueuedEvent, ReldexCompletedOperation, ReldexEventKind, ReldexServerOutputMode,
+};
 use crate::format::ReldexTextArena;
 use crate::hub::{ReldexHub, with_hub};
 use crate::mock::{BlockControl, ReldexMockScenarioConfig, build_driver, release_block};
@@ -256,6 +259,36 @@ enum PumpCommand {
         request: u64,
         disposition: Option<CloseDisposition>,
     },
+    /// `reldex_session_commit`.
+    Commit {
+        request: u64,
+        completion: Completion<()>,
+    },
+    /// `reldex_session_rollback`.
+    Rollback {
+        request: u64,
+        completion: Completion<()>,
+    },
+    /// `reldex_session_savepoint`.
+    Savepoint {
+        request: u64,
+        completion: Completion<()>,
+    },
+    /// `reldex_session_rollback_to_savepoint`.
+    RollbackToSavepoint {
+        request: u64,
+        completion: Completion<()>,
+    },
+    /// `reldex_session_ping`.
+    Ping {
+        request: u64,
+        completion: Completion<()>,
+    },
+    /// `reldex_session_set_server_output`.
+    SetServerOutput {
+        request: u64,
+        completion: Completion<ServerOutputSetting>,
+    },
     /// Panics inside the pump, to prove the containment below actually answers
     /// the requests behind it. Reachable only through the mock driver's
     /// reserved statement text; see [`crate::mock::statements::PUMP_PANIC`].
@@ -283,6 +316,14 @@ impl PumpCommand {
                 (ReldexEventKind::ResultClosed, *request, Some(*key))
             }
             Self::Close { request, .. } => (ReldexEventKind::SessionClosed, *request, None),
+            Self::Commit { request, .. }
+            | Self::Rollback { request, .. }
+            | Self::Savepoint { request, .. }
+            | Self::RollbackToSavepoint { request, .. }
+            | Self::Ping { request, .. } => (ReldexEventKind::Completed, *request, None),
+            Self::SetServerOutput { request, .. } => {
+                (ReldexEventKind::ServerOutputConfigured, *request, None)
+            }
             #[cfg(feature = "mock-driver")]
             Self::PanicForTest { request } => (ReldexEventKind::Executed, *request, None),
         }
@@ -1020,6 +1061,275 @@ pub unsafe extern "C" fn reldex_session_close(
     })
 }
 
+/// Commits the session's current transaction. The reply is a
+/// `RELDEX_EVENT_KIND_COMPLETED` event carrying `request`, with
+/// `completed_operation` set to `RELDEX_COMPLETED_OPERATION_COMMIT`.
+///
+/// # Safety
+///
+/// `hub` must be a live hub.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reldex_session_commit(
+    hub: *mut ReldexHub,
+    session: ReldexSessionId,
+    request: ReldexRequestId,
+) -> ReldexStatus {
+    entry(|| {
+        // SAFETY: delegated to this function's contract for `hub`.
+        unsafe {
+            with_session(hub, session, |entry| {
+                let outcome = entry.submit(|session, _slot| {
+                    let completion = session.commit();
+                    Ok((
+                        PumpCommand::Commit {
+                            request,
+                            completion,
+                        },
+                        (),
+                    ))
+                });
+                report(outcome, "commit")
+            })
+        }
+    })
+}
+
+/// Rolls back the session's current transaction. The reply is a
+/// `RELDEX_EVENT_KIND_COMPLETED` event, `completed_operation`
+/// `RELDEX_COMPLETED_OPERATION_ROLLBACK`.
+///
+/// # Safety
+///
+/// `hub` must be a live hub.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reldex_session_rollback(
+    hub: *mut ReldexHub,
+    session: ReldexSessionId,
+    request: ReldexRequestId,
+) -> ReldexStatus {
+    entry(|| {
+        // SAFETY: delegated to this function's contract for `hub`.
+        unsafe {
+            with_session(hub, session, |entry| {
+                let outcome = entry.submit(|session, _slot| {
+                    let completion = session.rollback();
+                    Ok((
+                        PumpCommand::Rollback {
+                            request,
+                            completion,
+                        },
+                        (),
+                    ))
+                });
+                report(outcome, "rollback")
+            })
+        }
+    })
+}
+
+/// Marks a savepoint named `name` in the session's current transaction. The
+/// reply is a `RELDEX_EVENT_KIND_COMPLETED` event, `completed_operation`
+/// `RELDEX_COMPLETED_OPERATION_SAVEPOINT`.
+///
+/// # Safety
+///
+/// `hub` must be a live hub, and `name` must point at `name.len` readable
+/// bytes of UTF-8 text.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reldex_session_savepoint(
+    hub: *mut ReldexHub,
+    session: ReldexSessionId,
+    request: ReldexRequestId,
+    name: ReldexStr,
+) -> ReldexStatus {
+    entry(|| {
+        // SAFETY: delegated to this function's contract for `name`.
+        let Some(text) = (unsafe { name.as_str() }) else {
+            return set_last_argument_error(
+                "reldex_session_savepoint: `name` is null or is not valid UTF-8",
+            );
+        };
+        let name = match SavepointName::new(text) {
+            Ok(name) => name,
+            Err(error) => {
+                set_last_error(DbError::new(ErrorKind::Configuration, error.to_string()));
+                return ReldexStatus::InvalidArgument;
+            }
+        };
+        // SAFETY: delegated to this function's contract for `hub`.
+        unsafe {
+            with_session(hub, session, move |entry| {
+                let outcome = entry.submit(move |session, _slot| {
+                    let completion = session.savepoint(name);
+                    Ok((
+                        PumpCommand::Savepoint {
+                            request,
+                            completion,
+                        },
+                        (),
+                    ))
+                });
+                report(outcome, "savepoint")
+            })
+        }
+    })
+}
+
+/// Rolls the session's current transaction back to a savepoint named `name`.
+/// The reply is a `RELDEX_EVENT_KIND_COMPLETED` event, `completed_operation`
+/// `RELDEX_COMPLETED_OPERATION_ROLLBACK_TO_SAVEPOINT`.
+///
+/// # Safety
+///
+/// As [`reldex_session_savepoint`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reldex_session_rollback_to_savepoint(
+    hub: *mut ReldexHub,
+    session: ReldexSessionId,
+    request: ReldexRequestId,
+    name: ReldexStr,
+) -> ReldexStatus {
+    entry(|| {
+        // SAFETY: delegated to this function's contract for `name`.
+        let Some(text) = (unsafe { name.as_str() }) else {
+            return set_last_argument_error(
+                "reldex_session_rollback_to_savepoint: `name` is null or is not valid UTF-8",
+            );
+        };
+        let name = match SavepointName::new(text) {
+            Ok(name) => name,
+            Err(error) => {
+                set_last_error(DbError::new(ErrorKind::Configuration, error.to_string()));
+                return ReldexStatus::InvalidArgument;
+            }
+        };
+        // SAFETY: delegated to this function's contract for `hub`.
+        unsafe {
+            with_session(hub, session, move |entry| {
+                let outcome = entry.submit(move |session, _slot| {
+                    let completion = session.rollback_to_savepoint(name);
+                    Ok((
+                        PumpCommand::RollbackToSavepoint {
+                            request,
+                            completion,
+                        },
+                        (),
+                    ))
+                });
+                report(outcome, "rollback_to_savepoint")
+            })
+        }
+    })
+}
+
+/// Pings the session: a round trip with no statement, used to validate a
+/// connection the driver flagged as needing revalidation. The reply is a
+/// `RELDEX_EVENT_KIND_COMPLETED` event, `completed_operation`
+/// `RELDEX_COMPLETED_OPERATION_PING`.
+///
+/// # Safety
+///
+/// `hub` must be a live hub.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reldex_session_ping(
+    hub: *mut ReldexHub,
+    session: ReldexSessionId,
+    request: ReldexRequestId,
+) -> ReldexStatus {
+    entry(|| {
+        // SAFETY: delegated to this function's contract for `hub`.
+        unsafe {
+            with_session(hub, session, |entry| {
+                let outcome = entry.submit(|session, _slot| {
+                    let completion = session.ping();
+                    Ok((
+                        PumpCommand::Ping {
+                            request,
+                            completion,
+                        },
+                        (),
+                    ))
+                });
+                report(outcome, "ping")
+            })
+        }
+    })
+}
+
+/// Turns this session's server output collection on or off (M2.7; ADR-0002
+/// amendment T). The reply is a `RELDEX_EVENT_KIND_SERVER_OUTPUT_CONFIGURED`
+/// event carrying `request`; read `server_output_mode` and
+/// `server_output_buffer_bytes` there for the setting **actually in force** —
+/// a driver may clamp a requested buffer size into the range its server
+/// accepts.
+///
+/// **Off by default, and only the user turns it on.** While on, every
+/// statement this session runs pays at least one extra round trip
+/// (`docs/exec-plans/active/phase-1-m2-5-event-queue.md` §7.5). A reconnect
+/// is a new session, and a new session starts with output off: this library
+/// never carries the setting over one.
+///
+/// `mode` is a [`crate::ReldexServerOutputMode`]:
+/// `RELDEX_SERVER_OUTPUT_MODE_DISABLED` turns output off;
+/// `RELDEX_SERVER_OUTPUT_MODE_ENABLED_UNLIMITED` turns it on with no buffer
+/// limit; `RELDEX_SERVER_OUTPUT_MODE_ENABLED_BYTES` turns it on with
+/// `buffer_bytes` as the requested limit (`buffer_bytes` is ignored for the
+/// other two modes).
+///
+/// # Safety
+///
+/// `hub` must be a live hub.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reldex_session_set_server_output(
+    hub: *mut ReldexHub,
+    session: ReldexSessionId,
+    request: ReldexRequestId,
+    mode: i32,
+    buffer_bytes: u64,
+) -> ReldexStatus {
+    entry(|| {
+        let setting = if mode == ReldexServerOutputMode::Disabled as i32 {
+            ServerOutputSetting::Disabled
+        } else if mode == ReldexServerOutputMode::EnabledUnlimited as i32 {
+            ServerOutputSetting::Enabled(ServerOutputBuffer::Unlimited)
+        } else if mode == ReldexServerOutputMode::EnabledBytes as i32 {
+            let Ok(bytes) = u32::try_from(buffer_bytes) else {
+                return set_last_argument_error(
+                    "reldex_session_set_server_output: `buffer_bytes` does not fit in 32 bits",
+                );
+            };
+            let Some(bytes) = std::num::NonZeroU32::new(bytes) else {
+                return set_last_argument_error(
+                    "reldex_session_set_server_output: `buffer_bytes` must be above zero for \
+                     RELDEX_SERVER_OUTPUT_MODE_ENABLED_BYTES",
+                );
+            };
+            ServerOutputSetting::Enabled(ServerOutputBuffer::Bytes(bytes))
+        } else {
+            return set_last_argument_error(
+                "reldex_session_set_server_output: `mode` is not a ReldexServerOutputMode value \
+                 this build accepts as input",
+            );
+        };
+        // SAFETY: delegated to this function's contract for `hub`.
+        unsafe {
+            with_session(hub, session, move |entry| {
+                let outcome = entry.submit(move |session, _slot| {
+                    let completion = session.set_server_output(setting);
+                    Ok((
+                        PumpCommand::SetServerOutput {
+                            request,
+                            completion,
+                        },
+                        (),
+                    ))
+                });
+                report(outcome, "set_server_output")
+            })
+        }
+    })
+}
+
 /// Asks the session's driver to stop whatever it is running.
 ///
 /// Deliberately callable from **any** thread, unlike every other function
@@ -1264,6 +1574,16 @@ fn answer_after_panic(
     while let Ok(command) = rx.try_recv() {
         answer(command.reply_shape());
     }
+    // Exactly one `Terminal`, after every reply this panic owed, same as a
+    // clean close — a panicked pump is still one session ending, and a
+    // consumer that retires per-session state on `Terminal` must see one.
+    // Conservative (`true`): nothing here resolved anything the session may
+    // have held, so a transaction cannot be ruled out.
+    hub.push_event(
+        QueuedEvent::new(ReldexEventKind::Terminal, id, 0)
+            .with_session_state(ReldexSessionState::Lost)
+            .with_transaction_possibly_lost(true),
+    );
 }
 
 /// Opens the connection, then turns completions into events until there is
@@ -1289,6 +1609,15 @@ fn pump_body(
             hub.push_event(
                 QueuedEvent::new(ReldexEventKind::Opened, id, open_request)
                     .with_error(ReldexError::from_db_error(&error)),
+            );
+            // A connect that never opened a connection never held a
+            // transaction, and `Terminal` still follows `OpenFailed` exactly
+            // once, same as every other session this registry-less pump ever
+            // names (`docs/exec-plans/active/phase-1-m2-5-event-queue.md` §7.1).
+            hub.push_event(
+                QueuedEvent::new(ReldexEventKind::Terminal, id, 0)
+                    .with_session_state(ReldexSessionState::Lost)
+                    .with_transaction_possibly_lost(false),
             );
             return;
         }
@@ -1389,6 +1718,10 @@ fn run_command_inner(
                 Err(error) => QueuedEvent::new(ReldexEventKind::Executed, id, request)
                     .with_error(ReldexError::from_db_error(&error)),
             };
+            // Before the statement's own reply, per `phase-1-m2-5-event-queue.md`
+            // §7.5: server output a statement wrote is delivered ahead of that
+            // statement's own reply, never after.
+            drain_server_output(hub, session, id);
             hub.push_event(event.with_session_state(session.session_state().into()));
             false
         }
@@ -1467,13 +1800,137 @@ fn run_command_inner(
                 ReldexSessionState::Closed
             };
             hub.push_event(event.with_session_state(state));
+            if !still_open {
+                // Exactly one `Terminal` for this session (`SPEC.md` §10):
+                // `false` for `Ok(())` — the disposition resolved the
+                // transaction, nothing was left unresolved; `true` for
+                // `Failed` — the close itself lost the session, so whatever
+                // it held is the server's decision, not ours.
+                let transaction_possibly_lost = outcome.is_err();
+                hub.push_event(
+                    QueuedEvent::new(ReldexEventKind::Terminal, id, 0)
+                        .with_session_state(ReldexSessionState::Closed)
+                        .with_transaction_possibly_lost(transaction_possibly_lost),
+                );
+            }
             !still_open
+        }
+        PumpCommand::Commit {
+            request,
+            completion,
+        } => run_completed(
+            hub,
+            session,
+            id,
+            request,
+            completion,
+            ReldexCompletedOperation::Commit,
+        ),
+        PumpCommand::Rollback {
+            request,
+            completion,
+        } => run_completed(
+            hub,
+            session,
+            id,
+            request,
+            completion,
+            ReldexCompletedOperation::Rollback,
+        ),
+        PumpCommand::Savepoint {
+            request,
+            completion,
+        } => run_completed(
+            hub,
+            session,
+            id,
+            request,
+            completion,
+            ReldexCompletedOperation::Savepoint,
+        ),
+        PumpCommand::RollbackToSavepoint {
+            request,
+            completion,
+        } => run_completed(
+            hub,
+            session,
+            id,
+            request,
+            completion,
+            ReldexCompletedOperation::RollbackToSavepoint,
+        ),
+        PumpCommand::Ping {
+            request,
+            completion,
+        } => run_completed(
+            hub,
+            session,
+            id,
+            request,
+            completion,
+            ReldexCompletedOperation::Ping,
+        ),
+        PumpCommand::SetServerOutput {
+            request,
+            completion,
+        } => {
+            let event = match completion.wait() {
+                Ok(setting) => {
+                    QueuedEvent::new(ReldexEventKind::ServerOutputConfigured, id, request)
+                        .with_server_output_setting(setting)
+                }
+                Err(error) => {
+                    QueuedEvent::new(ReldexEventKind::ServerOutputConfigured, id, request)
+                        .with_error(ReldexError::from_db_error(&error))
+                }
+            };
+            hub.push_event(event.with_session_state(session.session_state().into()));
+            false
         }
         #[cfg(feature = "mock-driver")]
         PumpCommand::PanicForTest { request } => {
             panic!("reldex-ffi: deliberate pump panic for request {request}");
         }
     }
+}
+
+/// The shared body of `Commit`/`Rollback`/`Savepoint`/`RollbackToSavepoint`/
+/// `Ping`: wait, drain server output ahead of the reply (§7.5), push
+/// `Completed`.
+fn run_completed(
+    hub: &Arc<ReldexHub>,
+    session: &Arc<DatabaseSession>,
+    id: u64,
+    request: u64,
+    completion: Completion<()>,
+    operation: ReldexCompletedOperation,
+) -> bool {
+    let event = match completion.wait() {
+        Ok(()) => QueuedEvent::new(ReldexEventKind::Completed, id, request)
+            .with_completed_operation(operation),
+        Err(error) => QueuedEvent::new(ReldexEventKind::Completed, id, request)
+            .with_completed_operation(operation)
+            .with_error(ReldexError::from_db_error(&error)),
+    };
+    drain_server_output(hub, session, id);
+    hub.push_event(event.with_session_state(session.session_state().into()));
+    false
+}
+
+/// Drains this session's completion-path server output log and, if it holds
+/// anything, pushes it as a `RELDEX_EVENT_KIND_SERVER_OUTPUT` event ahead of
+/// the reply that follows. A no-op — no allocation, no event — when the log
+/// is empty, which is the overwhelmingly common case (output is off by
+/// default, and even with it on, most statements print nothing).
+fn drain_server_output(hub: &Arc<ReldexHub>, session: &Arc<DatabaseSession>, id: u64) {
+    let log = session.take_server_output();
+    if log.is_empty() {
+        return;
+    }
+    let event = QueuedEvent::new(ReldexEventKind::ServerOutput, id, 0)
+        .with_server_output_log(log)
+        .with_session_state(session.session_state().into());
+    hub.push_event(event);
 }
 
 /// Renders a close failure as the error the adapter shows.

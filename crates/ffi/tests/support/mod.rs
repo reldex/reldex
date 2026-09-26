@@ -16,7 +16,8 @@ use reldex_ffi::{
     ReldexStatus, ReldexStr, reldex_batch_release, reldex_error_free, reldex_error_view,
     reldex_hub_create, reldex_hub_destroy, reldex_hub_next_event, reldex_hub_set_waker,
     reldex_mock_statement, reldex_session_close, reldex_session_close_result,
-    reldex_session_execute, reldex_session_fetch,
+    reldex_session_commit, reldex_session_execute, reldex_session_fetch, reldex_session_ping,
+    reldex_session_rollback, reldex_session_rollback_to_savepoint, reldex_session_savepoint,
 };
 
 /// How long a test waits for an event before calling it a hang.
@@ -230,6 +231,44 @@ impl Harness {
     ) -> ReldexStatus {
         // SAFETY: the hub is live.
         unsafe { reldex_session_close(self.hub, session, request, disposition as i32) }
+    }
+
+    pub(crate) fn commit(&self, session: u64, request: u64) -> ReldexStatus {
+        // SAFETY: the hub is live.
+        unsafe { reldex_session_commit(self.hub, session, request) }
+    }
+
+    pub(crate) fn rollback(&self, session: u64, request: u64) -> ReldexStatus {
+        // SAFETY: the hub is live.
+        unsafe { reldex_session_rollback(self.hub, session, request) }
+    }
+
+    pub(crate) fn savepoint(&self, session: u64, request: u64, name: &str) -> ReldexStatus {
+        let text = ReldexStr {
+            ptr: name.as_ptr(),
+            len: name.len(),
+        };
+        // SAFETY: `name` outlives the call, which copies what it needs.
+        unsafe { reldex_session_savepoint(self.hub, session, request, text) }
+    }
+
+    pub(crate) fn rollback_to_savepoint(
+        &self,
+        session: u64,
+        request: u64,
+        name: &str,
+    ) -> ReldexStatus {
+        let text = ReldexStr {
+            ptr: name.as_ptr(),
+            len: name.len(),
+        };
+        // SAFETY: `name` outlives the call, which copies what it needs.
+        unsafe { reldex_session_rollback_to_savepoint(self.hub, session, request, text) }
+    }
+
+    pub(crate) fn ping(&self, session: u64, request: u64) -> ReldexStatus {
+        // SAFETY: the hub is live.
+        unsafe { reldex_session_ping(self.hub, session, request) }
     }
 
     /// Takes the next event without waiting.
