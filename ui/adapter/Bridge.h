@@ -41,6 +41,10 @@
 #include "ScrollDriver.h"
 #include "SessionController.h"
 
+// `ConnectionManager` is a Q_PROPERTY type too (`connections`), for the same
+// reason as the three above.
+#include "ConnectionManager.h"
+
 class Bridge : public QObject
 {
     Q_OBJECT
@@ -56,6 +60,10 @@ class Bridge : public QObject
     Q_PROPERTY(bool valid READ isValid CONSTANT)
     Q_PROPERTY(SessionController *session READ session CONSTANT)
     Q_PROPERTY(Metrics *metrics READ metrics CONSTANT)
+    /// M3.2's connection manager: profile list, create/edit/delete,
+    /// test-connect. Owns its own workspace service thread, independent of
+    /// this Bridge's hub (ADR-0006 P6/M2.11 README "Threads").
+    Q_PROPERTY(ConnectionManager *connections READ connections CONSTANT)
     /// Spike S15's measurement driver (M1.8). Inert unless the environment
     /// asks for a measurement run; see `ui/adapter/ScrollDriver.h`.
     Q_PROPERTY(ScrollDriver *scrollDriver READ scrollDriver CONSTANT)
@@ -76,6 +84,7 @@ public:
     [[nodiscard]] SessionController *session() const noexcept { return m_session; }
     [[nodiscard]] Metrics *metrics() const noexcept { return m_metrics; }
     [[nodiscard]] ScrollDriver *scrollDriver() const noexcept { return m_scrollDriver; }
+    [[nodiscard]] ConnectionManager *connections() const noexcept { return m_connections; }
 
     [[nodiscard]] int drainEventBudget() const noexcept { return m_drainEventBudget; }
     void setDrainEventBudget(int events);
@@ -86,6 +95,14 @@ public:
     /// unregistered or destroyed.
     void registerSession(quint64 id, SessionController *controller);
     void unregisterSession(quint64 id);
+
+    /// As `registerSession`, for `ConnectionManager`'s test-connect probe --
+    /// a second, concrete consumer of hub events rather than a general
+    /// interface, matching this class's existing direct coupling to
+    /// `SessionController` (no `HubEventSink` abstraction exists yet; adding
+    /// one for exactly one more caller would be speculative).
+    void registerHubSink(quint64 id, ConnectionManager *sink);
+    void unregisterHubSink(quint64 id);
 
     /// The hub's queue depth. Diagnostic only (A4): `drain()` loops on
     /// `reldex_hub_next_event` instead, which is the same information without
@@ -137,6 +154,7 @@ private:
     SessionController *m_session = nullptr;
     Metrics *m_metrics = nullptr;
     ScrollDriver *m_scrollDriver = nullptr;
+    ConnectionManager *m_connections = nullptr;
 
     /// 1 while a drain is posted but has not started. Written from a Reldex
     /// pump thread (the waker) and from the Qt thread (`drain()`), so it is
@@ -149,6 +167,7 @@ private:
     bool m_draining = false;
 
     QHash<quint64, QPointer<SessionController>> m_sessions;
+    QHash<quint64, QPointer<ConnectionManager>> m_hubSinks;
 
     int m_drainEventBudget = 256; // ADR-0003 D5
     int m_drainTimeBudgetMs = 4; // ADR-0003 D5

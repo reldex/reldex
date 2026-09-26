@@ -153,6 +153,13 @@ Bridge::Bridge(QObject *parent)
 
     // Commit. `isValid()` is true from here and nowhere earlier.
     m_hub = std::move(hub);
+
+    // M3.2: its own workspace service thread, independent of the hub above
+    // (ADR-0006 P6). Created last, and its own constructor never throws past
+    // a partial state (it owns its workspace handle the same RAII way `m_hub`
+    // is owned here), so a failure inside it cannot leave this Bridge's own
+    // invariant ("m_hub set means isValid()") in question.
+    m_connections = new ConnectionManager(this, this);
 }
 
 Bridge::~Bridge()
@@ -224,6 +231,16 @@ void Bridge::registerSession(quint64 id, SessionController *controller)
 void Bridge::unregisterSession(quint64 id)
 {
     m_sessions.remove(id);
+}
+
+void Bridge::registerHubSink(quint64 id, ConnectionManager *sink)
+{
+    m_hubSinks.insert(id, sink);
+}
+
+void Bridge::unregisterHubSink(quint64 id)
+{
+    m_hubSinks.remove(id);
 }
 
 qint64 Bridge::pendingEvents() const
@@ -365,11 +382,16 @@ void Bridge::dispatch(ReldexEvent &raw)
     m_metrics->markFirstEvent();
 
     const auto owner = m_sessions.constFind(raw.session);
-    if (owner == m_sessions.cend() || owner->isNull()) {
-        ++m_orphanEvents;
-        return; // the handles release what the event carried
+    if (owner != m_sessions.cend() && !owner->isNull()) {
+        (*owner)->handleEvent(raw, std::move(batch), std::move(error));
+        return;
     }
-    (*owner)->handleEvent(raw, std::move(batch), std::move(error));
+    const auto sink = m_hubSinks.constFind(raw.session);
+    if (sink != m_hubSinks.cend() && !sink->isNull()) {
+        (*sink)->handleHubEvent(raw, std::move(batch), std::move(error));
+        return;
+    }
+    ++m_orphanEvents; // the handles release what the event carried
 }
 
 void Bridge::drainAndRelease()

@@ -146,6 +146,12 @@ endfunction()
 reldex_add_adapter_test(tst_bridge)
 reldex_add_adapter_test(tst_resultmodel)
 reldex_add_adapter_test(tst_teardown)
+# M3.2: ConnectionManager/ProfileModel -- profile list round-trip, the
+# credential-pattern refusal, environment/production flag rules, ADR-0007's
+# write-order/clearing choreography, and test-connect against the mock
+# driver. One test opens a real on-disk store (a QTemporaryDir, never the
+# developer's own); every other one is in-memory (RELDEX_WORKSPACE_IN_MEMORY).
+reldex_add_adapter_test(tst_connectionmanager)
 
 # K5 is 10,000 teardown iterations plus 2,000 connect-teardown iterations; the
 # default CTest timeout of 1500 s is generous but this is the one test that

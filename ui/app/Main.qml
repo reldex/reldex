@@ -2,6 +2,8 @@ import QtQuick
 import QtQuick.Window
 import QtQuick.Controls
 
+import Reldex.Adapter
+
 // The Reldex app shell (M3.1): a fixed, docking-free layout -- left sidebar,
 // centre worksheet tab bar + content, bottom output panes, status bar --
 // wired to `Theme` (light/dark tokens, live system-scheme follow + user
@@ -45,6 +47,18 @@ ApplicationWindow {
     function toggleSidebar() { root.sidebarVisible = !root.sidebarVisible }
     function toggleOutputPane() { root.outputPaneVisible = !root.outputPaneVisible }
 
+    // M3.2: the app's one Bridge (one hub, one workspace service thread --
+    // ADR-0006 P6). Every other milestone's placeholder in this shell
+    // (session state, results, DBMS_OUTPUT, the production indicator) names
+    // itself as the reason this was not created in M3.1; the connection
+    // manager is the first of those to actually need it. Named the same way
+    // Harness.qml already does ("bridge"), so a test can reach it the same
+    // way there.
+    Bridge {
+        id: bridge
+        objectName: "bridge"
+    }
+
     // VSCode's own bindings for the same two affordances (sidebar / bottom
     // panel), chosen because they are already muscle memory for a large
     // share of this product's target users.
@@ -79,6 +93,7 @@ ApplicationWindow {
             SplitView.minimumWidth: 160
             SplitView.maximumWidth: 480
             visible: root.sidebarVisible
+            connectionManager: bridge.connections
         }
 
         SplitView {

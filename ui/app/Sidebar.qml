@@ -1,13 +1,20 @@
 import QtQuick
+import QtQuick.Controls
 
 // Left sidebar (M3.1): a placeholder object-browser tree (M6.1 replaces the
 // model with the real `MetadataProvider`-backed one) plus a connections
-// section (M3.2 replaces the placeholder text with the real
-// `ProfileModel`-backed list). Presentation only -- ARCHITECTURE.md
-// invariant 4.
+// section (M3.2: the real `ProfileModel`-backed list, and the entry point
+// into `ConnectionManagerDialog`). Presentation only -- ARCHITECTURE.md
+// invariant 4: every list row, environment label and production badge below
+// comes straight off `ConnectionManager`'s model; this file only lays it out.
 Rectangle {
     id: sidebar
     objectName: "sidebar"
+
+    // M3.2: `Main.qml` passes `bridge.connections`. `var`, not a typed
+    // `ConnectionManager`, so this file (and a test that loads it standalone)
+    // does not need to import `Reldex.Adapter` just to name the type.
+    property var connectionManager: null
 
     color: Theme.tokens.surface
     border.color: Theme.tokens.border
@@ -15,6 +22,11 @@ Rectangle {
 
     Accessible.role: Accessible.Pane
     Accessible.name: qsTr("Sidebar")
+
+    ConnectionManagerDialog {
+        id: connectionManagerDialog
+        connectionManager: sidebar.connectionManager
+    }
 
     ListModel {
         id: objectBrowserModel
@@ -93,14 +105,84 @@ Rectangle {
         }
 
         Text {
-            // M3.2 replaces this with the real ProfileModel-backed list.
             objectName: "connectionsPlaceholder"
+            // `ListView.count`, not the model's `rowCount()`: the latter is a
+            // plain C++ method with no `NOTIFY`, so a QML binding on it would
+            // never re-evaluate as profiles are added or removed. `count` is
+            // the view's own reactive property.
+            visible: connectionsList.count === 0
             text: qsTr("No connections configured yet.")
             color: Theme.tokens.textMuted
             font.pixelSize: 12
             font.italic: true
             wrapMode: Text.WordWrap
             width: parent.width
+        }
+
+        ListView {
+            id: connectionsList
+            objectName: "connectionsList"
+            visible: count > 0
+            width: parent.width
+            height: 120
+            clip: true
+            model: sidebar.connectionManager ? sidebar.connectionManager.profiles : null
+
+            Accessible.role: Accessible.List
+            Accessible.name: qsTr("Connections")
+
+            delegate: ItemDelegate {
+                id: connectionDelegate
+
+                required property int index
+                required property string name
+                required property bool treatAsProduction
+                required property string endpointSummary
+
+                width: connectionsList.width
+                Accessible.name: name
+                onClicked: {
+                    connectionManagerDialog.loadRow(index)
+                    connectionManagerDialog.open()
+                }
+
+                contentItem: Column {
+                    Row {
+                        spacing: 4
+                        Text {
+                            text: connectionDelegate.name
+                            color: Theme.tokens.text
+                            font.pixelSize: 12
+                        }
+                        Text {
+                            visible: connectionDelegate.treatAsProduction
+                            text: qsTr("PROD")
+                            color: Theme.tokens.error
+                            font.bold: true
+                            font.pixelSize: 9
+                        }
+                    }
+                    Text {
+                        text: connectionDelegate.endpointSummary
+                        color: Theme.tokens.textMuted
+                        font.pixelSize: 10
+                        elide: Text.ElideRight
+                        width: connectionsList.width
+                    }
+                }
+            }
+        }
+
+        Button {
+            objectName: "manageConnectionsButton"
+            text: qsTr("Manage Connections...")
+            width: parent.width
+            enabled: sidebar.connectionManager !== null
+            Accessible.name: qsTr("Manage connections")
+            onClicked: {
+                connectionManagerDialog.resetDraftForNew()
+                connectionManagerDialog.open()
+            }
         }
     }
 }
