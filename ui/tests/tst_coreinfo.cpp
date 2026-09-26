@@ -54,6 +54,7 @@ private slots:
     void appShellThaiSampleTextIsNotZeroWidth();
     void appShellMainRegionsHaveAccessibleNames();
     void appShellRendersAtCurrentScaleFactor();
+    void connectionManagerDialogRendersAtCurrentScaleFactor();
 };
 
 void TstCoreInfo::initTestCase()
@@ -381,6 +382,90 @@ void TstCoreInfo::appShellRendersAtCurrentScaleFactor()
                                       .filePath(QStringLiteral("shell-scale-%1.png").arg(dpr));
         qInfo() << "DPI grab" << path << grab.size() << "devicePixelRatio" << dpr;
         QVERIFY2(grab.save(path), qPrintable(path));
+    }
+}
+
+void TstCoreInfo::connectionManagerDialogRendersAtCurrentScaleFactor()
+{
+    // Should-fix (M3.2 fix round, 2026-09-26): the connection-manager dialog
+    // (ui/app/ConnectionManagerDialog.qml) had no offscreen/DPI coverage --
+    // mirrors appShellRendersAtCurrentScaleFactor() above, scoped to the
+    // dialog Sidebar.qml always instantiates (not lazily). Registered in
+    // CMakeLists.txt as its own ctest process at QT_SCALE_FACTOR=2, on top of
+    // running once more, unfiltered, as part of the plain "tst_coreinfo"
+    // entry at the default 1x -- covering "1280x800 and 2x" per the task
+    // brief without a third/fourth ctest process.
+    QQmlApplicationEngine engine;
+    engine.loadFromModule("Reldex.App", "Main");
+    QObject *root = engine.rootObjects().constFirst();
+    auto *window = qobject_cast<QQuickWindow *>(root);
+    QVERIFY(window != nullptr);
+    QCOMPARE(window->width(), 1280);
+    QCOMPARE(window->height(), 800);
+
+    auto *bridge = root->findChild<Bridge *>(QStringLiteral("bridge"));
+    QVERIFY(bridge != nullptr);
+    ConnectionManager *connections = bridge->connections();
+    QVERIFY(connections != nullptr);
+    // Main.qml's own Component.onCompleted already called open(); just wait
+    // for it to finish (the in-memory test store is instant, but this must
+    // never race the drain).
+    QVERIFY(adapter_test::spinUntil([connections] { return connections->isReady(); }));
+
+    // `Popup`/`QQuickPopup` is a `QObject`, not a `QQuickItem` (its C++ type
+    // is a Qt Quick Controls *private* header, so this stays at the public
+    // QObject/QML-property level throughout, deliberately never casting to
+    // it) -- findChild<QObject*>(), not findChild<QQuickItem*>(), and every
+    // read below goes through property()/invokeMethod() rather than a
+    // concrete-type call.
+    QObject *dialog = root->findChild<QObject *>(QStringLiteral("connectionManagerDialog"));
+    QVERIFY(dialog != nullptr);
+    QVERIFY(QMetaObject::invokeMethod(dialog, "open"));
+    QCoreApplication::processEvents();
+    QCoreApplication::processEvents();
+    QVERIFY(dialog->property("opened").toBool());
+    // As appShellThaiSampleTextIsNotZeroWidth() above notes: layout (here,
+    // the dialog's open transition plus its Column/Flickable content) defers
+    // to an actual scene-graph frame tick, which a bare processEvents() can
+    // return before -- this needs a real wait.
+    QTest::qWait(50);
+
+    QVERIFY2(dialog->property("width").toReal() > 0.0, "connectionManagerDialog: width is zero");
+    QVERIFY2(dialog->property("height").toReal() > 0.0, "connectionManagerDialog: height is zero");
+
+    // The Popup's own visual item tree starts at its contentItem, not at the
+    // Popup object itself.
+    auto *dialogContent = dialog->property("contentItem").value<QQuickItem *>();
+    QVERIFY(dialogContent != nullptr);
+
+    // Every control that is visible for a *new* profile (the dialog's state
+    // right after open()) -- deleteConnectionButton is deliberately excluded,
+    // it is hidden until an existing row is selected.
+    const QStringList controls = { QStringLiteral("nameField"), QStringLiteral("environmentCombo"),
+                                    QStringLiteral("roleCombo"), QStringLiteral("passwordField"),
+                                    QStringLiteral("savePasswordCheckBox"),
+                                    QStringLiteral("testConnectButton"),
+                                    QStringLiteral("saveConnectionButton"),
+                                    QStringLiteral("newConnectionButton") };
+    for (const QString &name : controls) {
+        // findVisualChild(), not findChild(): several of these are inside a
+        // Popup's own visual (not QObject) child tree, same reason
+        // appShellThaiSampleTextIsNotZeroWidth() above uses it for a
+        // ListView delegate.
+        auto *item = adapter_test::findVisualChild(dialogContent, name);
+        QVERIFY2(item != nullptr, qPrintable(name));
+        QVERIFY2(item->width() > 0.0, qPrintable(name + QStringLiteral(": width is zero")));
+        QVERIFY2(item->height() > 0.0, qPrintable(name + QStringLiteral(": height is zero")));
+    }
+
+    const qreal dpr = window->devicePixelRatio();
+    QVERIFY2(dpr > 0.0, "devicePixelRatio must be positive");
+    if (const QByteArray requested = qgetenv("QT_SCALE_FACTOR"); !requested.isEmpty()) {
+        const qreal expected = requested.toDouble();
+        QVERIFY2(qAbs(dpr - expected) < 0.01,
+                 qPrintable(QStringLiteral("expected QT_SCALE_FACTOR=%1, devicePixelRatio was %2")
+                                    .arg(expected)
+                                    .arg(dpr)));
     }
 }
 

@@ -102,6 +102,17 @@ foreach(reldexDpiPercent IN ITEMS 100 150 200)
     )
 endforeach()
 
+# M3.2 fix round should-fix (2026-09-26): DPI coverage for the connection-
+# manager dialog, at 1280x800 (asserted inside the function itself, which
+# also runs once, unfiltered, as part of the plain "tst_coreinfo" entry above
+# at the default 1x) and 2x, mirroring the app-shell DPI registrations above
+# without needing a third/fourth process for 1x again.
+add_test(NAME tst_connectionmanagerdialog_dpi200
+         COMMAND tst_coreinfo connectionManagerDialogRendersAtCurrentScaleFactor)
+set_tests_properties(tst_connectionmanagerdialog_dpi200 PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_SCALE_FACTOR=2"
+)
+
 # M1.4: the Qt-free C/C++ smoke harness (ADR-0003 D10 item 2). Reuses the
 # reldex_ffi-shared target and RELDEX_FFI_INCLUDE_DIR that ui/CMakeLists.txt
 # already imported/set; see ui/tests/ffi_smoke/CMakeLists.txt for the guard

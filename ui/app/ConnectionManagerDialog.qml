@@ -4,7 +4,8 @@ import QtQuick.Controls
 // Connection manager dialog (M3.2, SPEC.md §17): list, create/edit/delete
 // with confirm, environment picker (production flag free only for Custom,
 // ADR-0006 P3), an endpoint form for Easy Connect/service, SID, or a full
-// connect string, and a test-connect action against the existing session hub.
+// connect string, a session-role picker (Normal/SYSDBA/SYSOPER), and a
+// test-connect action against the existing session hub.
 //
 // Presentation only (ARCHITECTURE.md invariant 4): every validation rule,
 // every ADR-0007 write-order/clearing choice, and every FFI-error-to-message
@@ -14,6 +15,15 @@ import QtQuick.Controls
 // the adapter is still what refuses a mismatched save, this is only the
 // convenience that keeps the user from round-tripping into that refusal.
 //
+// What this dialog does NOT expose (M3.2 fix round, 2026-09-26 -- corrected
+// after a review found the previous doc claim, "a disabled transport picker
+// with a note", did not match what was actually shipped): there is no
+// transport, CA-directory, or certificate-pin control at all. Every profile
+// is created with `transport: Plain` and an empty `caDirectory`, silently.
+// TCPS (TLS), a configurable CA and the certificate-pin/DN guard are M3.5's
+// scope (Opus) -- see the short caption next to the role picker below, which
+// is the "note" that previously did not exist.
+//
 // Plain `Row`/`Column` throughout, not `QtQuick.Layouts`: that module is not
 // among `ui/CMakeLists.txt`'s Qt components, and every other file in this
 // shell already lays itself out with anchors/explicit widths -- adding a new
@@ -22,6 +32,17 @@ import QtQuick.Controls
 Popup {
     id: root
     objectName: "connectionManagerDialog"
+
+    // A bug the M3.2 fix round's new DPI test caught (2026-09-26): without
+    // this, a `Popup` declared inline (as this one is, inside Sidebar.qml)
+    // takes its *declaring* item as `parent` -- the 240px-wide sidebar pane,
+    // not the window -- so `width`/`x` below resolved against a 240px
+    // parent instead of the whole app window, rendering the dialog roughly
+    // 200px wide (unusably narrow; every field inside effectively collapsed
+    // to zero width). `Overlay.overlay` is the standard Qt Quick Controls
+    // attachment point for a popup that should size/center against the
+    // whole window regardless of where it happens to be declared.
+    parent: Overlay.overlay
 
     modal: true
     focus: true
@@ -130,6 +151,21 @@ Popup {
                     ? qsTr("The stored password was refused. You will be prompted next time -- update it?")
                     : message
         }
+    }
+
+    // Enter-to-save: two shortcuts because "Return" (the main keyboard) and
+    // "Enter" (the numeric keypad) are distinct Qt key sequences. Disabled
+    // while the delete-confirmation Dialog is open so Enter there answers
+    // that Yes/No prompt instead of reaching through to Save.
+    Shortcut {
+        sequence: "Return"
+        enabled: root.opened && !deleteConfirm.opened
+        onActivated: saveButton.clicked()
+    }
+    Shortcut {
+        sequence: "Enter"
+        enabled: root.opened && !deleteConfirm.opened
+        onActivated: saveButton.clicked()
     }
 
     Row {
@@ -414,6 +450,31 @@ Popup {
                             onToggled: root.savePassword = checked
                         }
                     }
+
+                    Column {
+                        width: parent.width
+                        spacing: 2
+                        Text { text: qsTr("Role"); color: Theme.tokens.textMuted; font.pixelSize: 11 }
+                        ComboBox {
+                            id: roleCombo
+                            objectName: "roleCombo"
+                            width: parent.width
+                            Accessible.name: qsTr("Session role")
+                            model: [qsTr("Normal"), qsTr("SYSDBA"), qsTr("SYSOPER")]
+                            // ReldexSessionRoleKind is 1-based (0 is "unknown").
+                            currentIndex: (root.draft.sessionRole || 1) - 1
+                            onActivated: function (index) { root.draft.sessionRole = index + 1 }
+                        }
+                        Text {
+                            text: qsTr("Connections use a plain, unencrypted transport. TCPS "
+                                       + "(TLS), a configurable certificate authority and "
+                                       + "certificate pinning are not yet available here.")
+                            color: Theme.tokens.textMuted
+                            font.pixelSize: 10
+                            wrapMode: Text.WordWrap
+                            width: parent.width
+                        }
+                    }
                 }
             }
 
@@ -433,7 +494,15 @@ Popup {
                     objectName: "testConnectButton"
                     text: root.connectionManager.testConnectBusy ? qsTr("Testing...") : qsTr("Test Connect")
                     enabled: !root.isNew && !root.connectionManager.testConnectBusy
-                    onClicked: root.connectionManager.testConnect(root.draft.id, root.password)
+                    onClicked: {
+                        root.connectionManager.testConnect(root.draft.id, root.password)
+                        // The adapter has already copied whatever password
+                        // was typed into its own request by the time this
+                        // call returns (it is never retained past that) --
+                        // nothing is served by keeping it in this dialog's
+                        // own state a moment longer than needed.
+                        root.password = ""
+                    }
                 }
                 Button {
                     objectName: "deleteConnectionButton"
@@ -442,6 +511,7 @@ Popup {
                     onClicked: deleteConfirm.open()
                 }
                 Button {
+                    id: saveButton
                     objectName: "saveConnectionButton"
                     text: qsTr("Save")
                     highlighted: true
@@ -451,6 +521,9 @@ Popup {
                         } else {
                             root.connectionManager.updateProfile(root.draft.id, root.fieldsForSave())
                         }
+                        // Same as Test Connect above: fieldsForSave() has
+                        // already read it into the outgoing request.
+                        root.password = ""
                     }
                 }
                 Button {
