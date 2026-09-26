@@ -378,10 +378,11 @@ Six milestones. M1 is the de-risking gate and nothing downstream starts until it
 | M2.8 | `[x]` done 2026-09-24 — reviewed twice (2 must-fix fixed); see §B4 item 3 "As implemented" | Metadata catalog descriptor (`MetadataCatalog`) + Oracle dictionary SQL for the 9 object groups | `sonnet` | SPEC §16; spike S12 | Contract + driver | M2.3 | Each group returns a declared column contract; server-side name filter and row cap; permission failures classify as `ErrorKind::Permission`, not driver failure | M |
 | M2.9 ★ | `[x]` done 2026-09-25 — reviewed (accept with follow-ups, all landed); ADR-0006; see "M2.9 notes" | Settings model: three-level resolution with provenance; profile model; SQLite store | `opus` | SPEC §17/§20; owner decisions | `db-core` workspace/settings module + schema | — | `effective = worksheet ?? profile ?? application ?? built-in`, with the source reported; truth-table test; schema migration path; **no secret ever written to SQLite** | L |
 | M2.10 ★ | `[x]` done 2026-09-25 — reviewed (1 must-fix landed); ADR-0007; Windows CI round-trips; follow-up M2.14 | Credential store: `CredentialStore` trait + Windows Credential Manager implementation | `opus` | SPEC §17; ARCHITECTURE §13 item 9 | `crates/secrets` + core wiring | M2.9 | Password round-trips through Credential Manager keyed by profile UUID; absence of a store means **prompt each time**, never a plaintext fallback; nothing secret in logs or `Debug`; licence of every new dep recorded. **As implemented:** see "M2.10 notes" below ([ADR-0007](../../decisions/0007-credential-store.md)) | M |
-| M2.11 | `[ ]` todo | FFI surface for M2.5–M2.10 + regenerate and verify header | `sonnet` | M1.3 | `crates/ffi` extension | M2.5–M2.10 | `cbindgen --verify` clean; C smoke harness extended. **M2.9 hand-off:** the production Oracle `DriverBinding` (lift `crates/workspace/tests/support/oracle_binding.rs`) maps extension keys only and wires the driver's `reldex_driver_oracle_thin::sid_endpoint` for SID endpoints; settings cross the ABI by a numeric id, never the storage key; `ProfileId` as 16 bytes (ADR-0006 P4) **M2.10 hand-off:** the composition root calls `reldex_secrets::platform_default()` once and keeps it as an `Arc<dyn CredentialStore>` on the workspace service thread. `CredentialStoreKind`, `CredentialError`, `PromptReason` and `PasswordSource` cross the ABI as numeric enums. A password crosses only as bytes passed into a call, or handed out by a call that has a paired wipe-and-free function (ADR-0007 Consequences). | M |
+| M2.11 | `[x]` done 2026-09-26 — ABI 3.1 additive; reviewed twice; pump switch → M2.15 | FFI surface for M2.5–M2.10 + regenerate and verify header | `sonnet` | M1.3 | `crates/ffi` extension | M2.5–M2.10 | `cbindgen --verify` clean; C smoke harness extended. **M2.9 hand-off:** the production Oracle `DriverBinding` (lift `crates/workspace/tests/support/oracle_binding.rs`) maps extension keys only and wires the driver's `reldex_driver_oracle_thin::sid_endpoint` for SID endpoints; settings cross the ABI by a numeric id, never the storage key; `ProfileId` as 16 bytes (ADR-0006 P4) **M2.10 hand-off:** the composition root calls `reldex_secrets::platform_default()` once and keeps it as an `Arc<dyn CredentialStore>` on the workspace service thread. `CredentialStoreKind`, `CredentialError`, `PromptReason` and `PasswordSource` cross the ABI as numeric enums. A password crosses only as bytes passed into a call, or handed out by a call that has a paired wipe-and-free function (ADR-0007 Consequences). | M |
 | M2.12 | `[x]` done 2026-09-25 — reviewed (1 must-fix landed); live 6/6 + 9/9; fuzz 120k | Server output framing over `RAW`/`LENGTHB` with per-line UTF-8 decoding in Rust, so one invalid line loses only itself | `sonnet` | M2.7 review; ADR-0002 T2 "Known limit" | `oracle-thin` `server_output.rs` change + live test | M2.7 | Today a line that is not valid UTF-8 loses every line of its read (up to 4,096 good lines) through the crate's strict `from_utf8` (`db_value.rs:164`). After this, only that line is lost and it is reported. The `LENGTH4` == Rust char count assumption is gone. Single-byte database character sets no longer exceed `max_bytes` (≈3× today, review N7). | S |
 | M2.13 | `[ ]` todo | Per-statement server-output drain bound: a total cap reported through `dropped`/`failure`, or a cancel flag checked between reads like abandon | `opus` | M2.7 review; ADR-0002 T6 | `db-core` worker change + tests | M2.7, M4.7 | Today the drain has no length bound, cannot be cancelled on Oracle, and holds `Executed` back until it finishes (10M lines ≈ 2.5k round trips). After this, a statement's reply is never held longer than the bound, and what was not read is reported, never silent. This is safe because the next `PUT` purges leftovers (measured, T6). | S |
 | M2.14 | `[ ]` todo — planned (M2.10 review follow-up) | Credential orphan sweep: delete `Reldex/profile/*` Credential Manager entries whose profile no longer exists | `sonnet` | ADR-0007 S4 "Residual" + Consequences | `crates/secrets` sweep + a call from the workspace service thread | M3.3 | Enumerates with `CredEnumerateW` filtered to `Reldex/profile/*` and deletes entries whose UUID names no profile. Runs at startup and after a profile is deleted, and reports counts. Never touches an entry outside the namespace (tested with a non-Reldex entry beside it). Cleans up both the residual lost-delete race with other applications and a failed clear | S |
+| M2.15 ★ | `[ ]` todo — planned (M2.11 review round 2, must-fix 2) | FFI pump switch to the M2.5 event queue: real `Terminal` on a loss mid-statement (not only close/failed-open/panic), `abandon` relayed through the real `SessionRegistry` plus an abandoned hint, `EXECUTING`/`TRANSACTION_STATE` events, and server output delivered ahead of the reply that follows it, not only after | `opus` | M2.5, M2.6; ADR-0003 A29 | `crates/ffi/src/session.rs` pump replaced by a `db-core` `SessionEvent` forward | M2.11 | Replaces the thread-per-session interim pump with a direct forward of `db-core`'s `EventQueue`/`Waker` (`phase-1-m2-5-event-queue.md` §3.1/§6/§7.2); every existing D5 ordering guarantee (exactly one reply per accepted request, `Terminal` exactly once) still holds; the C ABI does not change shape, only what it can now deliver. Real concurrency work — review mandatory — deliberately not attempted alongside M2.11's review-round fix pass (ADR-0003 A29). | M |
 
 **Parallelism.** M2.1/M2.2 (driver), M2.4 (sql-text), M2.9/M2.10 (settings/secrets) and M2.5/M2.6 (events) are four independent tracks. M2.11 gates on all of them.
 **Mandatory review:** M2.1, M2.3, M2.5, M2.6, M2.7, M2.9, M2.10 — concurrency, contract change, and security.
@@ -485,6 +486,65 @@ Evidence: `cargo test -p reldex-secrets`, looped 10 times:
 
 The C ABI is unchanged and `reldex.h` byte-identical.
 
+**M2.11 notes (as implemented; draft PR #42 open, gates green locally).** The decision record is
+[ADR-0003](../../decisions/0003-qt-rust-integration.md)'s "Amendment: M2.11" section (A26–A31).
+
+Seven families landed in `crates/ffi`, the largest of them (`workspace.rs`, settings through layout)
+sharing one new service thread the crate owns:
+
+- the `SessionEvent` variants the interim per-session pump can produce today, including
+  `ServerOutput` and the `Terminal` event (`transaction_possibly_lost`) — **not** the switch onto the
+  real M2.5 event queue, which is split out as task M2.15 (see "M2.11 notes" below and ADR-0003 A29);
+- server output control (`reldex_session_set_server_output`), reporting the mode/buffer **actually
+  in force**;
+- statement splitting (`reldex_split_statements`) and metadata (`reldex_metadata_prepare` +
+  `ReldexMetadataQuery`);
+- settings (numeric id, typed value, provenance), profiles (CRUD, credential-pattern refusal),
+  connection-parameter composition through the real Oracle `DriverBinding`, credentials
+  (`reldex_secret_*`, never a plain string the UI could keep), and history/worksheets/layout — all
+  through `ReldexWorkspace`.
+
+`RELDEX_ABI_VERSION_MINOR` moved `0` → `1` (purely additive; ADR-0003 A26) rather than the major bump
+the task brief asked for — a recorded deviation, not an oversight. Regenerating the header for this
+task found, and fixed, two `cbindgen.toml` allowlist gaps affecting **six enums from families
+landed by earlier work in this same task** and all fifteen of M2.11's own settings/profile/
+credential/history/reply-kind enums — every one of them was reachable and correct from Rust, but
+never reached `include/reldex.h` at all until this task's header-regeneration step caught it
+(ADR-0003 A27). The C smoke harness (`ui/tests/ffi_smoke/smoke.c`) was extended to exercise every
+family, which is also what caught A27 and a second gap: a session close that actually closes now
+delivers `SessionClosed` **and** `Terminal` in the same batch (ADR-0003 A28), which the pre-M2.11
+harness did not know to drain.
+
+**Independent review round 2 (PR #42 @957f4ba), landed in the same task.** Must-fix 1:
+`CredentialStoreKind`/`CredentialError` now cross the ABI as numeric enums
+(`ReldexCredentialStoreKind`/`ReldexCredentialError`), carried with a native code, instead of folding
+into `RELDEX_ERROR_KIND_OTHER` as before — the M2.10 hand-off criterion this row states was not
+actually met until this round. Must-fix 2: the FFI pump switch onto the real M2.5 event queue is
+**not** done in this task; it was incorrectly implied fixed by A29's own now-corrected false claim
+that M2.5/M2.6 "have not landed" (they landed 2026-09-21). The switch is real concurrency work, split
+out as task **M2.15** below, and until it lands the interim pump cannot deliver: a genuinely
+unsolicited, mid-statement `Terminal` (today only on close/failed-open/panic); `abandon` relayed
+through the real `SessionRegistry`; `EXECUTING`/`TRANSACTION_STATE` events; or server output ahead of
+the reply that follows it (`crates/ffi/src/lib.rs`'s module documentation lists the same four gaps
+next to the code). Should-fixes landed: a structural header guard independent of the allowlist
+(`every_repr_c_type_reaches_the_header`); `catch_unwind` around the workspace service thread with a
+fault-injection test; `set_setting` replying `SETTING_SET` instead of the wrong `SETTING_CLEARED`;
+`reldex_secret_from_utf8` (typed password in); a settings-id pinning test;
+`reldex_split_statements` honouring the caller's `struct_size`; `ReldexSettingValue`/`ReldexLayout`
+moved to the end of `ReldexWorkspaceReply` so they can grow; `ReldexWorkspaceWakeFn` generated inside
+`extern "C"` with a `noexcept` alias; and a corrected `reldex_workspace_close` doc comment (draining
+after close is a use-after-free, not something required to avoid a leak). See ADR-0003's A26, A27
+and A29, and `crates/ffi/README.md`, for the full account.
+
+Gates green locally: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D
+warnings`, `cargo test --workspace` (447/447 C smoke-harness checks; one unrelated, pre-existing
+`crates/secrets` test — `lock_squat`'s per-user Credential Manager mutex, "accepted platform
+limitation (S4)" per the M2.10 notes above — is flaky under concurrent Reldex processes on the same
+Windows account, reproduced independently by another task running at the same time; `crates/secrets`
+has zero diff on this branch), `crates/ffi/gen-header.sh --check`, `RUSTDOCFLAGS="-D warnings" cargo
+doc --workspace --no-deps`, and `bash ui/tests/ffi_smoke/run.sh` (both the C11 and C++17 smoke
+targets).
+
 ---
 
 ### M3 — Connect: shell, connection manager, first real session
@@ -530,7 +590,7 @@ The C ABI is unchanged and `reldex.h` byte-identical.
 
 **M4.10 as implemented, store side only (branch `phase-1/m4-10-m6-2-store`, ADR-0006 amendment).** `crates/workspace` gained `history` (bounded per profile, FIFO-trimmed, statement text verbatim, no bind value ever captured) and `record_history`/`history`/`clear_history`. Row still `[ ]` todo — what M4.10 needs beyond this:
 - [ ] "Store + QML" per the plan row's Outputs column: the QML history panel and re-run action (M4.x UI work).
-- [ ] M2.11 exposes `record_history`/`history`/`clear_history` and the `HistoryId`/`HistoryOutcome`/`HistoryPage` types over the FFI.
+- [ ] M2.11 exposes `record_history`/`history`/`clear_history` and the `HistoryId`/`HistoryOutcome`/`HistoryPage` types over the FFI. (Delivered as `reldex_workspace_record_history`/`reldex_workspace_list_history`/`reldex_workspace_clear_history` and `ReldexHistoryOutcomeKind`/`ReldexHistoryList`/`ReldexHistoryRecordView` — see "M2.11 notes" above; checkbox left for the lead pending review.)
 - [ ] Owner sign-off on `history.max_entries_per_profile`'s default (1,000) and bound (1,000,000) — currently the implementer's numbers, unreviewed, the same status other lead defaults had before review.
 
 **M4.10 fix round (2026-09-25, PR #38 independent review).** The trim's cost was O(min(rows, limit)) per insert, not O(1) — flat at a small limit but growing to tens of milliseconds per insert at a large one as the table grew (measured up to 30 ms/insert at 50,000 rows, limit 100,000/1,000,000). Fixed with schema 4's `history_meta` per-profile counter: a steady-state insert now deletes exactly the one row pushed past the bound, by an indexed point delete, independent of both the limit and the table's size — measured flat (~21–50 µs in-memory, ~530–580 µs on a real file) across every tested limit including the shipped 1,000,000, so that bound is kept, not shrunk. Full design and the before/after measurement table are in the ADR-0006 amendment's "P9 amendment" subsection. Also fixed in the same round: the `SchemaMismatch` error mapping narrowed to the message shapes that actually prove a schema difference (was mapping every bare SQLite prepare failure, risking mislabelling a future Reldex-side SQL bug); three "ADR-0002 E7" citations corrected to `SPEC.md` §20/§24.16 and ADR-0002 D2 (E7 is about idempotent close reporting, a different concern); `Debug` on `HistoryEntry`/`HistoryRecord`/`WorksheetState` now redacts the statement/worksheet text.
@@ -580,7 +640,7 @@ The C ABI is unchanged and `reldex.h` byte-identical.
 
 **M6.2 as implemented, store side only (branch `phase-1/m4-10-m6-2-store`, ADR-0006 amendment).** `crates/workspace` gained `worksheet` (title/text/caret/scroll/tab order, `ON DELETE SET NULL` from its profile), `worksheet_setting` (the real foreign-key target `Scope::Worksheet` settings needed since M2.9, `ON DELETE CASCADE`) and the single-row `layout` (active worksheet/profile, pane sizes, window geometry, both references `ON DELETE SET NULL`) — `save_worksheet`/`load_worksheets`/`delete_worksheet`, `save_layout`/`load_layout`. Non-transactional state only: no session id, no transaction flag, restoring never implies a connection (SPEC §20/§24.16; ADR-0002 D2 — transaction state lives in `DatabaseSession`, not here). Row still `[ ]` todo — what M6.2 needs beyond this:
 - [ ] "Store + shell" per the plan row's Outputs column: the shell actually saving/restoring on close/startup (M6.x UI work).
-- [ ] M2.11 exposes `save_worksheet`/`load_worksheets`/`delete_worksheet`/`save_layout`/`load_layout` and the `Worksheet`/`WorksheetState`/`Layout`/`PaneSizes`/`WindowGeometry` types over the FFI.
+- [ ] M2.11 exposes `save_worksheet`/`load_worksheets`/`delete_worksheet`/`save_layout`/`load_layout` and the `Worksheet`/`WorksheetState`/`Layout`/`PaneSizes`/`WindowGeometry` types over the FFI. (Delivered as `reldex_workspace_save_worksheet`/`reldex_workspace_load_worksheets`/`reldex_workspace_delete_worksheet`/`reldex_workspace_save_layout`/`reldex_workspace_load_layout` and `ReldexWorksheetView`/`ReldexWorksheetList`/`ReldexLayout` — see "M2.11 notes" above; checkbox left for the lead pending review.)
 - [ ] M4.1 decides whether `caret`/`scroll` are UTF-16 code-unit offsets (to match `QQuickTextDocument`); the store treats them as opaque `u32`s either way.
 
 **M6.7 as implemented (branch `phase-1/m6-7-ui-ci`).** `.github/workflows/ui.yml` already carried M6.7's full scope as a byproduct of M1.4/M1.5 — this task's real work was verifying that against the acceptance line, closing the one documentation gap (CI-Actions-dependency licences), and recording current evidence here rather than only in ADR-0003's original spike numbers.

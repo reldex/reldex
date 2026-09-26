@@ -25,6 +25,7 @@ private Q_SLOTS:
     void aNestedEventLoopDuringADrainNeverReEntersIt();
     void deleteLaterFromInsideADrainTearsDownCleanly();
     void eventsWithNoOwnerAreReleasedAndCounted();
+    void closingASessionDrainsTheUnsolicitedTerminalEventWithoutAsserting();
 };
 
 void TstBridge::theAbiVersionIsCheckedBeforeAnythingElse()
@@ -284,6 +285,30 @@ void TstBridge::eventsWithNoOwnerAreReleasedAndCounted()
     bridge.unregisterSession(session->sessionId());
     QVERIFY(spinUntil([&bridge] { return bridge.orphanEvents() > 0; }));
     QVERIFY(bridge.orphanEvents() > 0);
+}
+
+void TstBridge::closingASessionDrainsTheUnsolicitedTerminalEventWithoutAsserting()
+{
+    // Regression test: `TERMINAL` (ADR-0003 A28) is delivered request-less
+    // (`request == 0`) right after `SESSION_CLOSED` whenever a close
+    // actually ends the session, and request ids here start at 1
+    // (SessionController.h). `handleEvent()` used to look `0` up in
+    // `m_outstanding`, never find it, and hit
+    // `Q_ASSERT_X(known, ...)` -- invisible under this project's default
+    // RelWithDebInfo build (`Q_ASSERT_X` compiles to nothing there), so this
+    // only reproduces built with `-DCMAKE_BUILD_TYPE=Debug`. This test does
+    // not itself force that build type; it is the regression check to run
+    // under one, and passes unconditionally now that the guard is fixed.
+    Bridge bridge;
+    QVERIFY(bridge.isValid());
+    SessionController *session = bridge.session();
+    QVERIFY(session->open());
+    QVERIFY(spinUntil([session] { return session->state() == SessionController::Ready; }));
+
+    QSignalSpy closed(session, &SessionController::sessionClosed);
+    QVERIFY(session->closeSession());
+    QVERIFY(spinUntil([session] { return session->state() == SessionController::Closed; }));
+    QCOMPARE(closed.count(), 1);
 }
 
 QTEST_GUILESS_MAIN(TstBridge)

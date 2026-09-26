@@ -427,3 +427,78 @@ pub unsafe extern "C" fn reldex_hub_next_event(hub: *mut ReldexHub, out: *mut Re
         unsafe { with_hub(hub, take) }.unwrap_or(false)
     })
 }
+
+/// How many sessions this hub currently holds an entry for.
+///
+/// Every session from the moment `reldex_hub_open_session` returns a
+/// [`crate::ReldexSessionId`] until its `RELDEX_EVENT_KIND_TERMINAL` event has
+/// been drained **and** the caller has stopped calling into it — this
+/// library's own bookkeeping releases the entry when the pump exits, which for
+/// a normally closed session is promptly, and for a session whose statement
+/// cannot be interrupted (ADR-0003 A17) is not until that statement returns.
+/// Diagnostic, like [`crate::reldex_live_counts`]'s `sessions` field, which
+/// this agrees with; that one is process-wide across every hub, this one is
+/// scoped to `hub`.
+///
+/// # Safety
+///
+/// `hub` must be null (reported as 0) or a live hub.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reldex_hub_session_count(hub: *const ReldexHub) -> usize {
+    entry_value(0, || {
+        // SAFETY: delegated to this function's contract.
+        unsafe {
+            with_hub(hub, |hub| {
+                hub.sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len()
+            })
+        }
+        .unwrap_or(0)
+    })
+}
+
+/// Fills `out` with up to `capacity` of this hub's session ids and returns
+/// how many sessions there are in total (which may be more than `capacity`,
+/// exactly like `snprintf`'s return value: compare it against `capacity` to
+/// know whether `out` holds all of them).
+///
+/// The order is unspecified — a caller after a stable ordering sorts `out`
+/// itself. This is a point-in-time snapshot: a session may open or reach its
+/// `RELDEX_EVENT_KIND_TERMINAL` between this call returning and the caller
+/// reading `out`.
+///
+/// # Safety
+///
+/// `hub` must be null (reported as 0) or a live hub. `out` must be null (to
+/// ask only for the count) or point at `capacity` writable
+/// [`crate::ReldexSessionId`]s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reldex_hub_list_sessions(
+    hub: *const ReldexHub,
+    out: *mut u64,
+    capacity: usize,
+) -> usize {
+    entry_value(0, || {
+        // SAFETY: delegated to this function's contract.
+        unsafe {
+            with_hub(hub, |hub| {
+                let sessions = hub
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !out.is_null() && out.is_aligned() {
+                    // SAFETY: `index < capacity` (bounded by `.take`) and the
+                    // caller promises `out` has room for `capacity` elements;
+                    // already inside this function's outer `unsafe` block.
+                    for (index, id) in sessions.keys().take(capacity).enumerate() {
+                        out.add(index).write(*id);
+                    }
+                }
+                sessions.len()
+            })
+        }
+        .unwrap_or(0)
+    })
+}

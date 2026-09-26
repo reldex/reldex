@@ -81,6 +81,67 @@ impl From<ErrorKind> for ReldexErrorKind {
     }
 }
 
+impl ReldexErrorKind {
+    /// The Rust [`ErrorKind`] this value names, for the one place M2.11 needs
+    /// to build an error going *into* the library rather than reading one
+    /// coming out —
+    /// [`crate::reldex_metadata_query_reclassify_error`], which lets the C
+    /// smoke harness (and, eventually, an object browser) round-trip an error
+    /// through a `MetadataCatalog`'s classifier without this crate inventing
+    /// a second, input-shaped error type.
+    ///
+    /// `None` for `Unknown` (`0`): a caller building an error has no "kind
+    /// this header predates" to name, so `0` here means "refused", not "some
+    /// other category".
+    pub(crate) const fn to_error_kind(self) -> Option<ErrorKind> {
+        Some(match self {
+            Self::Unknown => return None,
+            Self::Configuration => ErrorKind::Configuration,
+            Self::Connection => ErrorKind::Connection,
+            Self::Authentication => ErrorKind::Authentication,
+            Self::NetworkLost => ErrorKind::NetworkLost,
+            Self::Timeout => ErrorKind::Timeout,
+            Self::Cancelled => ErrorKind::Cancelled,
+            Self::Syntax => ErrorKind::Syntax,
+            Self::Constraint => ErrorKind::Constraint,
+            Self::Permission => ErrorKind::Permission,
+            Self::Transaction => ErrorKind::Transaction,
+            Self::Resource => ErrorKind::Resource,
+            Self::DataConversion => ErrorKind::DataConversion,
+            Self::Unsupported => ErrorKind::Unsupported,
+            Self::DriverInternal => ErrorKind::DriverInternal,
+            Self::Other => ErrorKind::Other,
+        })
+    }
+
+    /// Reads a raw `int32_t` the way [`crate::reldex_metadata_query_reclassify_error`]
+    /// takes `kind_in`: any value this enum does not name is refused, the
+    /// same as a `struct_size` too small to be real, rather than silently
+    /// becoming [`Self::Unknown`] — a caller building an error should not be
+    /// able to send one silently uncategorised the way an unfamiliar *older*
+    /// header's value crosses on the way out.
+    pub(crate) fn from_i32(value: i32) -> Option<Self> {
+        Some(match value {
+            x if x == Self::Configuration as i32 => Self::Configuration,
+            x if x == Self::Connection as i32 => Self::Connection,
+            x if x == Self::Authentication as i32 => Self::Authentication,
+            x if x == Self::NetworkLost as i32 => Self::NetworkLost,
+            x if x == Self::Timeout as i32 => Self::Timeout,
+            x if x == Self::Cancelled as i32 => Self::Cancelled,
+            x if x == Self::Syntax as i32 => Self::Syntax,
+            x if x == Self::Constraint as i32 => Self::Constraint,
+            x if x == Self::Permission as i32 => Self::Permission,
+            x if x == Self::Transaction as i32 => Self::Transaction,
+            x if x == Self::Resource as i32 => Self::Resource,
+            x if x == Self::DataConversion as i32 => Self::DataConversion,
+            x if x == Self::Unsupported as i32 => Self::Unsupported,
+            x if x == Self::DriverInternal as i32 => Self::DriverInternal,
+            x if x == Self::Other as i32 => Self::Other,
+            _ => return None,
+        })
+    }
+}
+
 /// What the driver believes about the session after a failure, plus the two
 /// core-side terminal states.
 ///

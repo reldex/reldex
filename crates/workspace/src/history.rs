@@ -51,6 +51,14 @@ pub const MAX_STATEMENT_BYTES: usize = 1024 * 1024;
 /// only ever gets one back from [`crate::store::Store::record_history`] or
 /// [`crate::store::Store::history`] and hands it back as
 /// [`HistoryPage::before`] for the next page.
+///
+/// [`Self::to_ffi_value`]/[`Self::from_ffi_value`] (M2.11) are the one
+/// sanctioned way to carry an id across a boundary that cannot hold a Rust
+/// value directly — a C caller's pagination cursor — the same numeric-id
+/// pattern `crate::settings::SettingId`'s FFI crossing already uses. Nothing
+/// about that value is meaningful outside "the id this crate handed out",
+/// and it is never persisted by anything but this crate's own `history`
+/// table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HistoryId(i64);
 
@@ -61,6 +69,19 @@ impl HistoryId {
 
     pub(crate) const fn as_row_id(self) -> i64 {
         self.0
+    }
+
+    /// The id's underlying value, for a caller that must carry it across a
+    /// boundary this crate's own type cannot cross (M2.11's C ABI).
+    #[must_use]
+    pub const fn to_ffi_value(self) -> i64 {
+        self.0
+    }
+
+    /// Rebuilds an id from the value [`Self::to_ffi_value`] returned.
+    #[must_use]
+    pub const fn from_ffi_value(value: i64) -> Self {
+        Self(value)
     }
 }
 

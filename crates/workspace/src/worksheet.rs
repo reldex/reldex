@@ -55,6 +55,27 @@ pub enum WorksheetError {
         /// The cap.
         max: usize,
     },
+    /// `caret` names a position past the end of `text`.
+    ///
+    /// [`WorksheetState::caret`] is opaque to this crate — the editor
+    /// chooses its unit (a UTF-16 code-unit offset, to match
+    /// `QQuickTextDocument`, is the documented example) — so this check does
+    /// not (and cannot) decode `text` to confirm `caret` lands on a
+    /// character boundary in whatever unit the caller meant. It only refuses
+    /// the one thing that is wrong in *every* unit a caret could reasonably
+    /// be counted in: a UTF-16 code-unit count, a UTF-32/scalar-value count,
+    /// and a byte offset are never more than the UTF-8 byte length of the
+    /// same text (a UTF-16 surrogate pair is 2 units for 4 bytes; every
+    /// shorter encoding is 1 unit for 1-3 bytes), so `caret` above the byte
+    /// length cannot be a real position in any of them.
+    CaretOutOfBounds {
+        /// The caret position that was offered.
+        caret: u32,
+        /// The text's length in bytes -- the loosest upper bound across
+        /// every unit `caret` might be counted in (see this variant's own
+        /// doc comment).
+        len: usize,
+    },
 }
 
 impl fmt::Display for WorksheetError {
@@ -70,6 +91,10 @@ impl fmt::Display for WorksheetError {
             Self::TextTooLong { bytes, max } => write!(
                 f,
                 "the worksheet's text is {bytes} bytes, more than the {max}-byte cap"
+            ),
+            Self::CaretOutOfBounds { caret, len } => write!(
+                f,
+                "the caret position {caret} is past the end of the text ({len} bytes)"
             ),
         }
     }
@@ -135,6 +160,12 @@ impl WorksheetState {
             return Err(WorksheetError::TextTooLong {
                 bytes: self.text.len(),
                 max: MAX_WORKSHEET_TEXT_BYTES,
+            });
+        }
+        if usize::try_from(self.caret).unwrap_or(usize::MAX) > self.text.len() {
+            return Err(WorksheetError::CaretOutOfBounds {
+                caret: self.caret,
+                len: self.text.len(),
             });
         }
         Ok(())
@@ -328,6 +359,29 @@ mod tests {
         let mut untitled = state("select ผู้ใช้ from dual; -- 🎉");
         untitled.title = String::new();
         assert_eq!(untitled.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_caret_past_the_end_of_the_text_is_refused() {
+        let mut past_end = state("select 1;");
+        past_end.caret = 10; // the text is 9 bytes
+        assert_eq!(
+            past_end.validate(),
+            Err(WorksheetError::CaretOutOfBounds { caret: 10, len: 9 })
+        );
+
+        // Exactly at the end -- "the caret is after the last character" --
+        // is a normal, everyday position, not out of bounds.
+        let mut at_end = state("select 1;");
+        at_end.caret = 9;
+        assert_eq!(at_end.validate(), Ok(()));
+
+        // A caret inside Thai/emoji text, at a byte length far below the
+        // text's own byte length, is accepted regardless of which unit it
+        // is actually counted in (this crate does not decode to check).
+        let mut inside_multibyte = state("ผู้ใช้ 🎉");
+        inside_multibyte.caret = 3;
+        assert_eq!(inside_multibyte.validate(), Ok(()));
     }
 
     #[test]
