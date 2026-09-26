@@ -33,6 +33,14 @@ boundary) open; it does not repeat that reasoning.
   `struct_size` too small to hold the type's documented minimum is refused, not guessed at.
 - Every enum reserves `0` for "a value this header predates" (D6/D7) — an unknown value from a
   future header is never undefined behaviour on an older one.
+- **Which fields a library fills is decided by its ABI minor, not by `struct_size`.** A field
+  appended in a minor can land inside the previous minor's tail padding, where the returned
+  `struct_size` is the same with or without it: 3.1's `completed_operation` (offset 108) sits inside
+  3.0's 112-byte `ReldexEvent`, and 3.2's `has_deadline`/`transaction_possibly_active`/`abandoned`
+  (145–147) inside 3.1's 152 bytes. An adapter must therefore refuse a library whose minor is below
+  its header's (`Bridge::checkAbiVersion`, `Bridge::StartError::AbiMinorTooOld`); a newer minor is
+  fine. `struct_size` still tells the *library* which header a caller was built against, which is
+  how it avoids handing a caller a kind that header predates (ADR-0003 A35, A38).
 - A caller-owned object (`ReldexBatch`, `ReldexError`, `ReldexSecret`, `ReldexProfileList`,
   `ReldexHistoryList`, `ReldexWorksheetList`, `ReldexMetadataQuery`, `ReldexServerOutputLines`, …) is
   released with its own paired `_release`/`_free` function, never `free()`. `reldex_live_counts`

@@ -19,6 +19,7 @@ class TstBridge : public QObject
 
 private Q_SLOTS:
     void theAbiVersionIsCheckedBeforeAnythingElse();
+    void aLibraryOlderThanTheHeaderIsRefusedWithATypedError();
     void aDrainBudgetOfOneStillDeliversEveryEvent();
     void aFailingStatementSurfacesKindNativeCodeAndPosition();
     void aBlockedStatementDoesNotStallTheEventLoop();
@@ -39,6 +40,25 @@ void TstBridge::theAbiVersionIsCheckedBeforeAnythingElse()
     QVERIFY(bridge.metrics() != nullptr);
     QCOMPARE(bridge.drainEventBudget(), 256); // ADR-0003 D5
     QCOMPARE(bridge.drainTimeBudgetMs(), 4);
+    QCOMPARE(bridge.startError(), Bridge::StartError::None);
+}
+
+void TstBridge::aLibraryOlderThanTheHeaderIsRefusedWithATypedError()
+{
+    // Field presence is decided by the ABI minor, not by `struct_size`: a
+    // field a 3.1 library never fills can sit in its struct's tail padding
+    // (ADR-0003 A38), so an adapter must not run against an older minor.
+    constexpr quint32 major = RELDEX_ABI_VERSION_MAJOR;
+    constexpr quint32 minor = RELDEX_ABI_VERSION_MINOR;
+    static_assert(minor > 0, "this test needs a header minor to go below");
+    QCOMPARE(Bridge::checkAbiVersion((major << 16) | minor), Bridge::StartError::None);
+    QCOMPARE(Bridge::checkAbiVersion((major << 16) | (minor + 1)), Bridge::StartError::None);
+    QCOMPARE(Bridge::checkAbiVersion((major << 16) | (minor - 1)),
+             Bridge::StartError::AbiMinorTooOld);
+    QCOMPARE(Bridge::checkAbiVersion(((major + 1) << 16) | minor),
+             Bridge::StartError::AbiMajorMismatch);
+    QCOMPARE(Bridge::checkAbiVersion(((major - 1) << 16) | (minor + 5)),
+             Bridge::StartError::AbiMajorMismatch);
 }
 
 void TstBridge::aDrainBudgetOfOneStillDeliversEveryEvent()

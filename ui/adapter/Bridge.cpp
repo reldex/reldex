@@ -98,6 +98,19 @@ bool Bridge::checkThread(const char *what) const
     return false;
 }
 
+Bridge::StartError Bridge::checkAbiVersion(quint32 libraryVersion) noexcept
+{
+    const quint32 major = libraryVersion >> 16;
+    const quint32 minor = libraryVersion & 0xFFFFu;
+    if (major != static_cast<quint32>(RELDEX_ABI_VERSION_MAJOR)) {
+        return StartError::AbiMajorMismatch;
+    }
+    if (minor < static_cast<quint32>(RELDEX_ABI_VERSION_MINOR)) {
+        return StartError::AbiMinorTooOld;
+    }
+    return StartError::None;
+}
+
 Bridge::Bridge(QObject *parent)
     : QObject(parent)
 {
@@ -114,11 +127,16 @@ Bridge::Bridge(QObject *parent)
     m_scrollDriver = new ScrollDriver(this, this);
 
     const quint32 abi = reldex_abi_version();
-    if ((abi >> 16) != static_cast<quint32>(RELDEX_ABI_VERSION_MAJOR)) {
+    m_startError = checkAbiVersion(abi);
+    if (m_startError != StartError::None) {
         // ADR-0003 D7: refuse to start, do not guess. `valid` stays false and
         // every operation on this Bridge is a no-op.
-        qCritical("reldex-ffi ABI major %u does not match the header's %u; refusing to start",
-                  abi >> 16, static_cast<quint32>(RELDEX_ABI_VERSION_MAJOR));
+        qCritical("reldex-ffi ABI %u.%u cannot serve this adapter's header %u.%u (%s); "
+                  "refusing to start",
+                  abi >> 16, abi & 0xFFFFu, static_cast<quint32>(RELDEX_ABI_VERSION_MAJOR),
+                  static_cast<quint32>(RELDEX_ABI_VERSION_MINOR),
+                  m_startError == StartError::AbiMajorMismatch ? "major differs"
+                                                               : "library minor is older");
         return;
     }
 
@@ -132,6 +150,7 @@ Bridge::Bridge(QObject *parent)
     reldex::HubHandle hub(reldex_hub_create());
     if (!hub) {
         qCritical("reldex_hub_create() failed; this Bridge reports itself invalid");
+        m_startError = StartError::HubCreateFailed;
         delete m_session;
         m_session = nullptr;
         return;
@@ -147,6 +166,7 @@ Bridge::Bridge(QObject *parent)
         qCritical("reldex_hub_set_waker() failed with status %d; this Bridge reports itself "
                   "invalid rather than never delivering an event",
                   static_cast<int>(status));
+        m_startError = StartError::WakerRegistrationFailed;
         delete m_session;
         m_session = nullptr;
         hub.reset(); // destroys the hub; no waker was registered

@@ -1036,3 +1036,20 @@ here. If it ever matters, the next steps are a recycled `ReldexBatch` allocation
 `drain_into` (one queue lock per drain). Neither is worth its complexity at ~1 µs per event against
 a ~240 µs drain. The raw JSON is not committed. The numbers above were taken on a loaded machine and
 should be re-taken on a quiet one before anyone quotes them as more than a direction.
+
+### A38 — field presence is decided by the ABI minor, not by `struct_size` (M2.15 review)
+
+`struct_size` tells the library which header a caller was built against, and the library uses it:
+it writes `min(declared, its own size)` and, since M2.15, never hands a caller a kind that header
+predates (A35). The other direction does not work. A field appended in a minor can land inside the
+previous minor's tail padding, where the size the library reports back is identical with or without
+it. 3.1's `completed_operation` (offset 108) already sat inside 3.0's 112-byte `ReldexEvent`, and
+3.2's `has_deadline`, `transaction_possibly_active` and `abandoned` (offsets 145–147) sit inside
+3.1's 152 bytes. A 3.2 adapter loaded against a stale 3.1 library would read `abandoned` from bytes
+that library never wrote.
+
+So an adapter refuses to start against a library whose **minor is below its header's**, and says
+why: `Bridge::checkAbiVersion` returns `Bridge::StartError::AbiMinorTooOld` (major mismatch stays
+`AbiMajorMismatch`), tested with synthetic versions in `tst_bridge`. A newer minor is accepted: it
+only adds. This keeps D7's promise in the direction it can be kept — an old adapter on a new library
+— and refuses the direction that cannot.
