@@ -55,6 +55,7 @@ private Q_SLOTS:
     void applyingFiveThousandObjectsDoesNotBlockTheUiThreadForLong();
     void aFilterChangeWhileTheFirstFetchIsInFlightSupersedesRatherThanBeingDropped();
     void destroyingTheModelWhileAFetchIsInFlightDoesNotCrash();
+    void destroyingTheBridgeBeforeTheModelDoesNotCrash();
 
 private:
     // Builds a bare `ObjectBrowserModel::Node` the test owns directly
@@ -558,6 +559,48 @@ void tst_ObjectBrowserModel::destroyingTheModelWhileAFetchIsInFlightDoesNotCrash
     // chance to happen before the test process exits.
     QTest::qWait(200);
     spinUntil([] { return true; }, 200);
+}
+
+void tst_ObjectBrowserModel::destroyingTheBridgeBeforeTheModelDoesNotCrash()
+{
+    // Mirrors the ordering `QQmlApplicationEngine` teardown produced on CI's
+    // `qt-asan` job (PR #47, tst_coreinfo): `Bridge` and the
+    // `ObjectBrowserModel` that references it are unrelated QML-owned
+    // siblings -- nothing parents one to the other, so nothing guarantees
+    // which is destroyed first. Here `bridge` is destroyed deliberately
+    // *before* `model`, while `model` (and the `SessionController` it owns)
+    // is still alive and holding an open session against it.
+    // `~ObjectBrowserModel()` then runs `closeConnection()` ->
+    // `performClose()` -> `SessionController::closeSession()`, which used to
+    // dereference `m_bridge` as a plain, already-dangling `Bridge *` -- the
+    // exact call the ASan report pointed at (`SessionController.cpp`,
+    // `closeSession()`, called from `ObjectBrowserModel::closeConnection()`,
+    // called from `~ObjectBrowserModel()`). `QPointer<Bridge>` is what must
+    // turn that into a no-op instead of a use-after-free.
+    auto *bridge = new Bridge();
+    QVERIFY(bridge->isValid());
+
+    {
+        ObjectBrowserModel model;
+        QAbstractItemModelTester tester(&model,
+                                        QAbstractItemModelTester::FailureReportingMode::Fatal);
+        model.setBridge(bridge);
+        model.expand(model.index(0, 0)); // opens the model's own metadata session
+
+        // Wait for the session to actually finish opening: `closeConnection()`
+        // defers via `m_closePending` -- never reaching `SessionController::
+        // closeSession()` at all -- until `m_sessionReady` is true, so
+        // destroying `bridge` any earlier would exercise nothing.
+        QVERIFY(spinUntil([&model] { return model.m_sessionReady; }, 5000));
+
+        delete bridge; // exactly what QQmlApplicationEngine teardown can do first
+
+        // `model` (and `tester`) are destroyed right here, with its
+        // `SessionController` now pointing at a `Bridge` that no longer
+        // exists. Must not crash / access-violate.
+    }
+
+    QTest::qWait(200);
 }
 
 QTEST_GUILESS_MAIN(tst_ObjectBrowserModel)
