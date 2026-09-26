@@ -100,8 +100,8 @@ impl Wake {
     /// Always, for a caller built against ABI 3.2 or later. For an older one,
     /// the kinds its header predates are never delivered (`introduced_in_3_2`),
     /// so a wake whose only news is one of them would be a wake with nothing
-    /// to take — which a 3.1 caller had never seen, and some assume cannot
-    /// happen. Such events are taken off the queue here and discarded, and the
+    /// to take, every time — where a caller otherwise sees one only when a
+    /// push races its drain or this lock is contended. Such events are taken off the queue here and discarded, and the
     /// first event that caller can see is parked in `HubQueue::front`, so the
     /// queue's empty → non-empty edge still fires for the next one.
     ///
@@ -609,7 +609,10 @@ pub unsafe extern "C" fn reldex_hub_pending_events(hub: *const ReldexHub) -> usi
 /// `FETCHED_SEGMENT`) are taken off the queue and discarded rather than
 /// delivered — none owns anything or answers a request such a caller can
 /// make — and the waker is not called for a wake whose only news is one of
-/// them. A 3.1 caller therefore sees exactly 3.1's event kinds.
+/// them, whenever that can be checked without waiting. A 3.1 caller therefore
+/// sees exactly 3.1's event kinds, and a wake with nothing to take at most
+/// rarely — as any caller can when a push races its drain. Drain until empty;
+/// never assume a wake means an event.
 ///
 /// Returns `true` when `out` was filled. The caller then **owns** `out->error`,
 /// `out->batch` and `out->server_output_lines` when they are non-null. Drain in

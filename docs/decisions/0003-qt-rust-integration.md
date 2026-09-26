@@ -980,10 +980,14 @@ All additive (a symbol, a trailing field, or an enum value; A26's rule):
   3.1 smoke harness does, one request at a time — would take `EXECUTING` instead. The caller's
   `struct_size` says which header it was built against (3.1's `ReldexEvent` is 152 bytes, 3.2's
   168), so below 3.2's size `reldex_hub_next_event` discards the three 3.2 kinds instead of
-  delivering them. The waker is not called for a wake whose only news is one of them: it
-  `try_lock`s the hub's queue, discards them, and parks the first visible event in front of the
-  queue, so the next push still raises its edge. It never waits for the lock, and lets the wake
-  through when it cannot take it. Result: origin/main's 3.1 `smoke.c` passes **457/458** against
+  delivering them. The waker is not called for a wake whose only news is one of them when it can
+  tell without waiting: it `try_lock`s the hub's queue, discards them, and parks the first visible
+  event in front of the queue, so the next push still raises its edge. It never waits for the
+  lock, and lets the wake through when it cannot take it. So a wake with nothing to take reaches
+  such a caller **at most rarely**, not never — exactly as one can reach any caller when a push
+  races its drain or the lock is contended (the re-review counted 36 empty drains of 3,327 at
+  3.1's `struct_size`, 13 of 3,222 at 3.2's). A caller drains until empty and never assumes a wake
+  means an event (D5). Result: origin/main's 3.1 `smoke.c` passes **457/458** against
   this library. The one failure asserts `returned struct_size == sizeof(ReldexEvent)` for a
   caller that declared *more* than its header's size — equality with the older header's size,
   which any minor that appends a field breaks (3.0 → 3.1 did, 112 → 152). The library reports

@@ -51,6 +51,7 @@
 
 #include <inttypes.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -251,6 +252,54 @@ static bool take_sized(ReldexHub *hub, ReldexEvent *out, uint32_t struct_size, b
             return false;
         }
     }
+}
+
+/* A ReldexEvent as a newer, larger header might build it: this header's
+ * struct followed by bytes a later minor could append. Declaring the whole
+ * buffer's size is then honest -- the library may write up to that many
+ * bytes -- which a plain ReldexEvent claiming `sizeof + 64` is not. */
+typedef struct SmokePaddedEvent {
+    ReldexEvent event;
+    unsigned char pad[64];
+} SmokePaddedEvent;
+
+#define SMOKE_PAD_GUARD 0xA5u
+
+/* take_sized() for a SmokePaddedEvent, declaring its full size, skipping
+ * progress. The pad is filled with SMOKE_PAD_GUARD before every call so the
+ * caller can see which of its bytes the library wrote. */
+static bool take_padded(ReldexHub *hub, SmokePaddedEvent *out)
+{
+    for (;;) {
+        g_wake_flag = 0;
+        memset(&out->event, 0, sizeof(out->event));
+        memset(out->pad, SMOKE_PAD_GUARD, sizeof(out->pad));
+        out->event.struct_size = (uint32_t)sizeof(*out);
+        if (reldex_hub_next_event(hub, &out->event)) {
+            if (is_progress(out->event.kind)) {
+                g_progress_seen += 1;
+                continue;
+            }
+            return true;
+        }
+        if (!wait_for_wake()) {
+            return false;
+        }
+    }
+}
+
+/* True when every pad byte at or past `valid` (a byte offset from the start
+ * of the buffer) still holds SMOKE_PAD_GUARD: the library wrote nothing
+ * beyond what it reported valid. */
+static bool pad_untouched_past(const SmokePaddedEvent *buffer, uint32_t valid)
+{
+    const unsigned char *bytes = (const unsigned char *)buffer;
+    for (size_t i = offsetof(SmokePaddedEvent, pad); i < sizeof(*buffer); ++i) {
+        if (i >= valid && bytes[i] != SMOKE_PAD_GUARD) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* The next reply, TERMINAL, SERVER_OUTPUT or unknown kind -- skipping
@@ -1693,26 +1742,30 @@ int main(void)
         reldex_error_free(broken_error);
     }
 
-    /* 10c. A larger, zero-padded ReldexEvent (as a newer header might
-     * build): the library must still fill it correctly and report back
-     * how much of it is actually valid via struct_size. */
+    /* 10c. A larger ReldexEvent (as a newer header might build), backed by
+     * a real buffer of the size it declares: the library must still fill it
+     * correctly, report back how much of it is valid via struct_size, and
+     * write nothing past that. */
     uint64_t execute_b_request = next_request_id();
     g_wake_flag = 0;
     status = reldex_session_execute(hub, session_b, execute_b_request, generated_sql, 0);
     smoke_require(status == RELDEX_STATUS_OK, "reldex_session_execute(GENERATED_QUERY) is accepted on session B");
-    ReldexEvent large_event;
+    SmokePaddedEvent large_buffer;
     /* Claims to be from a newer, larger header. EXECUTING comes first and is
      * skipped; the reply after it lands in the same oversized struct. */
-    took = take_sized(hub, &large_event, (uint32_t)(sizeof(large_event) + 64), true);
-    smoke_require(took, "an oversized (zero-padded) ReldexEvent is still accepted");
+    took = take_padded(hub, &large_buffer);
+    smoke_require(took, "an oversized (padded) ReldexEvent is still accepted");
+    ReldexEvent large_event = large_buffer.event;
     /* At least this header's size, and never more than was declared: a
      * library from a later minor may report more of the struct valid than
      * this header knows about (D7), so `==` would tie the check to one
      * version. */
     smoke_check(
         large_event.struct_size >= (uint32_t)sizeof(ReldexEvent)
-            && large_event.struct_size <= (uint32_t)(sizeof(large_event) + 64),
+            && large_event.struct_size <= (uint32_t)sizeof(large_buffer),
         "the library reports back how much of an oversized struct is valid");
+    smoke_check(pad_untouched_past(&large_buffer, large_event.struct_size),
+        "the library writes nothing past the size it reports valid");
     smoke_check(large_event.request == execute_b_request, "the oversized struct's request id is correct");
     smoke_check(large_event.kind == RELDEX_EVENT_KIND_EXECUTED, "the oversized struct's kind is correct");
     smoke_check(large_event.error == NULL, "session B's query executed without error");

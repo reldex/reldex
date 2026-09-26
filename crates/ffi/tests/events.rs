@@ -583,8 +583,10 @@ fn exactly_one_event_carries_each_request_id() {
 
 /// A caller built against a 3.1 header declares 3.1's smaller `struct_size`,
 /// and gets 3.1's event stream: no kind its header predates, and no wake whose
-/// only news is one — so "wait for the wake, take the reply" still works, as
-/// origin/main's own `smoke.c` does.
+/// only news is one while nothing else holds the hub's queue — so "wait for the
+/// wake, take the reply" works for a caller that submits one request at a
+/// time, as origin/main's own `smoke.c` does. (Under contention such a wake is
+/// let through; a caller drains until empty.)
 #[test]
 fn a_caller_built_against_3_1_is_never_given_a_3_2_kind_nor_woken_for_one() {
     let harness = Harness::new();

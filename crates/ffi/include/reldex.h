@@ -4247,7 +4247,10 @@ size_t reldex_hub_pending_events(const struct ReldexHub *hub);
  * `FETCHED_SEGMENT`) are taken off the queue and discarded rather than
  * delivered — none owns anything or answers a request such a caller can
  * make — and the waker is not called for a wake whose only news is one of
- * them. A 3.1 caller therefore sees exactly 3.1's event kinds.
+ * them, whenever that can be checked without waiting. A 3.1 caller therefore
+ * sees exactly 3.1's event kinds, and a wake with nothing to take at most
+ * rarely — as any caller can when a push races its drain. Drain until empty;
+ * never assume a wake means an event.
  *
  * Returns `true` when `out` was filled. The caller then **owns** `out->error`,
  * `out->batch` and `out->server_output_lines` when they are non-null. Drain in

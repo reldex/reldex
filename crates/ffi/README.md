@@ -101,8 +101,11 @@ A29, A32–A36). What a caller can rely on:
   id in `request` — the 3.1 contract, unchanged — and every other event has `0`.
 - **A caller is never given a kind its header predates.** `reldex_hub_next_event` reads the
   caller's `struct_size`: below 3.2's `ReldexEvent` size, `EXECUTING`, `TRANSACTION_STATE` and
-  `FETCHED_SEGMENT` are discarded, not delivered, and no wake is raised for them alone. A 3.1
-  adapter sees 3.1's kinds and nothing else; origin/main's 3.1 `smoke.c`, built against the 3.1
+  `FETCHED_SEGMENT` are discarded, not delivered, and a wake whose only news is one of them is
+  suppressed whenever the library can check without waiting. So such a caller is woken with
+  nothing to take at most rarely — as any caller can be when a push races its drain (the review
+  counted 36 empty drains of 3,327 at 3.1's size, 13 of 3,222 at 3.2's); a caller drains until
+  empty and never assumes a wake means an event. A 3.1 adapter sees 3.1's kinds and nothing else; origin/main's 3.1 `smoke.c`, built against the 3.1
   header, passes 457/458 against this library. The one check it fails asserts that the library's
   `sizeof(ReldexEvent)` *equals* the 3.1 header's, which no minor that appends a field can satisfy
   (3.0 → 3.1 grew it from 112 to 152 bytes; 3.2 to 168); the 3.2 harness checks `>=` instead.
