@@ -453,6 +453,52 @@ noexcept trampoline verified by a `static_assert` against
 reachable from QML with no further wiring. One workspace per `Bridge`,
 matching one hub per `Bridge`.
 
+### Opening the workspace: never automatic
+
+`ConnectionManager`'s constructor does not open the workspace — it only
+allocates its `ProfileModel` and returns. `Q_INVOKABLE bool open()` is the
+only thing that starts the workspace's service thread, and it is idempotent
+(a call while already open or opening is a no-op returning `true`). The
+app's own startup path calls it once, explicitly, from `Main.qml`:
+
+```qml
+Bridge {
+    id: bridge
+    Component.onCompleted: connections.open()
+}
+```
+
+This is a fix for a real bug found in review (M3.2 fix round, 2026-09-26):
+an earlier version of this class opened the workspace eagerly from its own
+constructor, which meant *every* test that merely constructed a `Bridge` —
+`tst_bridge`, `tst_resultmodel`, `tst_teardown` (12,000 `Bridge`
+constructions in its K5 loop), and `tst_coreinfo`/its DPI variants (which
+load the real `Main.qml`) — silently opened the developer's real,
+on-disk, default workspace store, because none of them had any reason to
+guard against a side effect they never asked for. The fix has three layers:
+
+1. **Lazy, explicit `open()`** (above) — nothing opens a workspace by
+   accident just by existing.
+2. **A harness-level default.** `ui/tests/AdapterTestSupport.h` defines a
+   namespace-scope `inline const` object whose constructor runs before any
+   test's `main()` (including `QTEST_MAIN`/`QTEST_GUILESS_MAIN`'s generated
+   one) and sets `RELDEX_WORKSPACE_IN_MEMORY=1` and
+   `RELDEX_WORKSPACE_MEMORY_CREDENTIAL_STORE=1` in the process environment.
+   Every UI test binary includes that header, so even `tst_coreinfo` loading
+   the real `Main.qml` (which now calls `connections.open()`) stays
+   in-memory — proved end to end by that test passing with the real store's
+   mtime unchanged.
+3. **A CI-detectable guard.** `ui/build.sh --test` snapshots the default
+   store's existence/mtime before `ctest` runs and compares after: absent
+   before and after is the normal CI-runner case; present before with an
+   unchanged mtime is a developer-machine skip (nothing there is ever
+   deleted); either the store being newly created or an existing one's mtime
+   changing fails the build loudly.
+
+A developer running the actual `Reldex` app (not a test) still gets the real
+on-disk store exactly as before — only the *test* harness forces in-memory;
+`Main.qml`'s `Component.onCompleted: connections.open()` is unconditional.
+
 ### `ProfileModel` — what a QML list is allowed to see
 
 A plain `QAbstractListModel`: name, environment (plus its display label),
@@ -495,13 +541,25 @@ id in a `QHash`:
   `credentialWarning` signal, not a save failure). Any other credential-delete
   failure still lets the profile save/delete proceed — the flag still flips
   and the leftover is reported as a warning, left for M2.14's sweep.
-- **stored password refused at connect time**: `handleHubEvent()` recognizes a
-  `RELDEX_ERROR_KIND_AUTHENTICATION` failure during test-connect against a
-  `CredentialStore` profile and reports it through `testConnectFailed`'s
-  fourth argument (`authFailureWithStoredPassword = true`) instead of
-  retrying the stored password automatically — ADR-0007 forbids that; the
-  dialog shows "stored password refused, you will be prompted; update it?"
-  and leaves the decision to the user.
+- **stored password refused at connect time**: when `testConnect()` is called
+  with no typed password, it asks `reldex_workspace_resolve_password` where
+  one should come from — ADR-0007 S3's single source of truth — rather than
+  trusting the profile's own `passwordStorage` flag locally (that flag can be
+  stale, e.g. a `credential_put` that failed after create leaves it at
+  `PromptEachTime` even though a stale store entry might still exist). Only
+  when `resolve_password` itself resolves `FromStore` does
+  `m_testConnectUsedStoredPassword` become true; a typed password never
+  touches the credential store and never sets it. `handleHubEvent()`'s
+  `RELDEX_ERROR_KIND_AUTHENTICATION` check is gated on that flag
+  (`ConnectionManager::isAuthFailureAgainstStoredPassword()`, a pure static
+  function taking already-decoded inputs so it stays directly unit-testable)
+  before reporting `testConnectFailed`'s fourth argument
+  (`authFailureWithStoredPassword = true`) instead of retrying the stored
+  password automatically — ADR-0007 forbids that; the dialog shows "stored
+  password refused, you will be prompted; update it?" and leaves the
+  decision to the user. Fixed in the M3.2 fix round (2026-09-26): the first
+  version of this check set the flag on *any* authentication failure,
+  regardless of whether `testConnect()` had used a stored password at all.
 
 ### Test-connect uses the existing hub, not a second one
 
@@ -525,7 +583,7 @@ as an orphan by `Bridge`, never mistaken for a second live reply.
 | --- | --- | --- |
 | `CONFIGURATION` | `error.configuration` | every `ProfileError` and `ConnectError`, **including the credential-pattern refusal** — see "FFI gaps found" below for why this is one key rather than several |
 | `CONNECTION` | `error.connection` | |
-| `AUTHENTICATION` | `error.authentication` | against a `CredentialStore` profile during test-connect, also sets `authFailureWithStoredPassword = true` |
+| `AUTHENTICATION` | `error.authentication` | during test-connect, also sets `authFailureWithStoredPassword = true` when `resolve_password` had resolved the password `FromStore` (never for a typed password) |
 | `NETWORK_LOST` | `error.networkLost` | |
 | `TIMEOUT` | `error.timeout` | |
 | `CANCELLED` | `error.cancelled` | |
@@ -561,19 +619,41 @@ lists profiles inline above it, via `bridge.connections.profiles`). The
 dialog is plain `Row`/`Column` layout, not `QtQuick.Layouts` — no file in this
 codebase used that module yet and `ui/CMakeLists.txt`'s `find_package(Qt6 ...
 COMPONENTS ...)` does not declare it, so this stays with the app's existing
-layout idiom rather than introducing an undeclared dependency. It covers: a
-profile list; New/Edit/Delete with a confirm dialog; an environment picker
-(the "treat as production" toggle is enabled only for `Custom`, matching
-ADR-0006's rule that every other environment kind fixes its own production
-flag); an endpoint form switched by kind (Easy Connect / host+service /
-host+SID / full connect descriptor); username; a password field used only for
-test-connect or for "save to credential store"; "prompt each time" as the
+layout idiom rather than introducing an undeclared dependency (`QtQuick.Layouts`
+is reconsidered at M3.6). It covers: a profile list; New/Edit/Delete with a
+confirm dialog; an environment picker (the "treat as production" toggle is
+enabled only for `Custom`, matching ADR-0006's rule that every other
+environment kind fixes its own production flag); an endpoint form switched by
+kind (Easy Connect / host+service / host+SID / full connect descriptor);
+username; a password field used only for test-connect or for "save to
+credential store" (cleared as soon as either has read it, rather than kept in
+the dialog's own state any longer than needed); a session-role picker
+(Normal/SYSDBA/SYSOPER, `ReldexSessionRoleKind`); "prompt each time" as the
 default and the **only** option when `canStoreCredential` is false
 (`credentialStoreKind == RELDEX_CREDENTIAL_STORE_KIND_NONE`); a Test Connect
 action reporting success or the typed error, including the
-stored-password-refused prompt described above; Save/Close. TCPS is M3.5's,
-out of scope here — the transport picker is present but its non-default
-entries are disabled, with a note saying why, rather than hidden.
+stored-password-refused prompt described above; Save/Close (also reachable
+with Enter/Return, unless the delete-confirmation dialog is the one open).
+
+**What this dialog does *not* expose** (corrected in the M3.2 fix round,
+2026-09-26, after a review found the previous version of this paragraph
+claimed "a disabled transport picker with a note" — that did not match what
+was actually shipped): there is no transport, CA-directory, or
+certificate-pin control at all. Every profile is created with
+`transport: Plain` and an empty `caDirectory`, silently; the dialog shows a
+short caption next to the role picker stating that TCPS, a configurable CA
+and certificate pinning are not yet available. That work — TCPS, a
+configurable CA and the certificate-pin/DN guard — is **M3.5** (Opus).
+
+The dialog `Popup` sets `parent: Overlay.overlay` explicitly. Without it, a
+`Popup` declared inline (as this one is, inside `Sidebar.qml`) takes its
+*declaring* item as `parent` for its own `width`/`x`/`y` centering math — the
+240px-wide sidebar pane, not the window — which rendered the whole dialog
+~200px wide with every field inside effectively collapsed to zero width. This
+was caught by the offscreen/DPI test added in the same fix round
+(`connectionManagerDialogRendersAtCurrentScaleFactor`, `tst_coreinfo.cpp`,
+registered at the default 1x and at 2x in `ui/tests/CMakeLists.txt`) — there
+had been no rendering/geometry coverage of this dialog before.
 
 ### Environment variables (workspace)
 
@@ -581,19 +661,28 @@ entries are disabled, with a note saying why, rather than hidden.
 | --- | --- | --- |
 | `RELDEX_WORKSPACE_IN_MEMORY` | off | `1` opens an in-memory store (no file, no directory) instead of the platform default path — what every offscreen test but one uses |
 | `RELDEX_WORKSPACE_MEMORY_CREDENTIAL_STORE` | off | `1` forces `MemoryCredentialStore` instead of the platform credential store; implied by `RELDEX_WORKSPACE_IN_MEMORY=1` |
-| `RELDEX_WORKSPACE_PATH` | platform default (ADR-0006 P5) | overrides the SQLite file path; still goes through `ensureStoreDirectoryReady()` below |
+| `RELDEX_WORKSPACE_PATH` | platform default (ADR-0006 P5) | overrides the SQLite file path; directory/file creation with ADR-0006 P5's permissions happens inside `reldex_workspace_open()`'s own service thread (`Store::open_creating`), never in the adapter |
 
-### FFI gaps found (not fixed here — `crates/ffi` was out of scope for this task)
+### FFI gaps found
 
-- **`reldex_workspace_open` does not create the store's directory or apply
-  Unix permissions** the way `Store::open_default()`/`Store::open_in_directory()`
-  do (confirmed by reading `crates/workspace/src/store/paths.rs` and
-  `store/mod.rs`: the 0700-directory/0600-file logic lives only in those two
-  functions, not in plain `Store::open(path)`, which is what the FFI calls).
-  `ConnectionManager::ensureStoreDirectoryReady()` reimplements ADR-0006 P5's
-  directory/file/permission rule in the adapter before calling
-  `reldex_workspace_open`. A future FFI revision could fold this into
-  `reldex_workspace_open` itself so every caller gets it for free.
+**Fixed since the first version of this class** (M3.2 fix round, 2026-09-26):
+`reldex_workspace_open` did not create the store's directory or apply Unix
+permissions the way `Store::open_default()`/`Store::open_in_directory()` do
+(confirmed by reading `crates/workspace/src/store/paths.rs` and
+`store/mod.rs`: the 0700-directory/0600-file logic lived only in those two
+functions, not in plain `Store::open(path)`, which is what the FFI called).
+`ConnectionManager::ensureStoreDirectoryReady()` used to reimplement
+ADR-0006 P5's directory/file/permission rule in the adapter, on whichever
+thread called `open()` — disk I/O that had no business running on the GUI
+thread. Closed by adding `Store::open_creating()` to `crates/workspace`
+(creates the parent directory and the file itself, owner-only on Unix, then
+delegates to `Store::open_with`) and swapping `service_main`'s call site in
+`crates/ffi/src/workspace.rs` to use it — additive only, the ABI signature of
+`reldex_workspace_open` is unchanged (`crates/ffi/gen-header.sh --check`
+stays clean). `ensureStoreDirectoryReady()` no longer exists.
+
+Not fixed here — `crates/ffi` was otherwise out of scope for this task:
+
 - **`ProfileError` has no per-variant numeric sub-code across the ABI**
   (unlike `CredentialError`, which does), so every profile/connect-param
   validation failure — including the credential-pattern refusal — collapses
@@ -602,7 +691,7 @@ entries are disabled, with a note saying why, rather than hidden.
   no raw endpoint or password text, per `crates/workspace/src/profile.rs`'s
   `Display` impls), but a future caller wanting to react differently to, say,
   "credential pattern refused" versus "environment/production mismatch" has
-  no numeric code to switch on.
+  no numeric code to switch on. Deferred to M2.15.
 - **The hub can only open `RELDEX_DRIVER_KIND_MOCK` sessions in this build,
   and the mock has no configurable open/ping failure**
   (`ReldexMockScenarioConfig` has no such field). Test-connect's "typed
@@ -1244,11 +1333,12 @@ module (`Qt6Charts`, `Qt6WebEngineCore`, etc.) is present.
 - **`ProfileError` has no per-variant numeric sub-code across the ABI**
   (M3.2). Every profile/connect-param validation failure, including the
   credential-pattern refusal, surfaces under one `error.configuration`
-  message key. See "Connection manager (M3.2)" → "FFI gaps found".
-- **`reldex_workspace_open` does not create its store directory or apply Unix
-  permissions itself** (M3.2) — `ConnectionManager::ensureStoreDirectoryReady()`
-  reimplements ADR-0006 P5's rule in the adapter. See "Connection manager
-  (M3.2)" → "FFI gaps found".
+  message key. Deferred to M2.15. See "Connection manager (M3.2)" → "FFI gaps
+  found".
+- **The connection dialog has no transport/CA/certificate-pin controls**
+  (M3.2; M3.5, Opus, adds them). Every profile is created with
+  `transport: Plain` and an empty `caDirectory`. See "Connection manager
+  (M3.2)" → "QML: `ConnectionManagerDialog.qml`".
 - **LOBs do not cross the boundary yet** (ADR-0003 A7). A LOB column reports
   its kind and the bulk formatter renders it as the "taken" text; there is no
   handle to read from. That is M2.11.
