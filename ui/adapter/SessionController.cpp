@@ -396,9 +396,20 @@ void SessionController::handleEvent(const ReldexEvent &raw, reldex::BatchHandle 
 {
     // "Exactly one reply per accepted request" is a library guarantee, so it
     // is asserted in debug rather than defended against (ADR-0003 A5 rule 5).
+    //
+    // `request == 0` marks an unsolicited event this session never asked
+    // for -- `TERMINAL` and `SERVER_OUTPUT` (ADR-0003 A28), queued the same
+    // way a request-less event always has been. Request ids here start at 1
+    // (m_nextRequestId's initializer above), so 0 is never registered in
+    // m_outstanding; without this guard the assert below fired on every
+    // close/failed-open that actually ends a session. `Q_ASSERT_X` compiles
+    // to nothing under this project's default RelWithDebInfo build
+    // (ui/build.sh), which is why nothing caught this until a Debug build
+    // was tried.
+    const bool unsolicited = raw.request == 0;
     const auto entry = m_outstanding.find(raw.request);
     const bool known = entry != m_outstanding.end();
-    Q_ASSERT_X(known, "SessionController::handleEvent",
+    Q_ASSERT_X(unsolicited || known, "SessionController::handleEvent",
                "an event arrived for a request that was never accepted, or was already replied to");
     if (known) {
         Q_ASSERT_X(entry.value() == raw.kind, "SessionController::handleEvent",
