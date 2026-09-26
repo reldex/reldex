@@ -219,7 +219,10 @@ S14 shape, 22 ms for 5 texts + 2 dates, and 23 s for 4 × `VARCHAR2(4000)`.
   bound errs toward more, smaller round trips; M5.6 weighs that against network latency.
   **M5.6 measured it (2026-09-26): 192 KiB**, now the setting `results.round_trip_bytes` and
   `db-core`'s `DEFAULT_ROUND_TRIP_BYTES`, with the owner's sign-off pending ("As measured:
-  M5.6").
+  M5.6"). **A trap for Stage B:** `StatementSettings::apply` (`crates/workspace/src/connect.rs`)
+  already sends `results.fetch_rows` unconditionally as the wire array size; it is unused on the
+  product path today, and Stage B must bound the wire array by this budget and the row's width,
+  not by wiring that method in as it stands ("As measured: M5.6", "The wire array").
 - **Applying it needs a driver change.** `oracle-thin` sets the array size at `execute`, before
   the describe, and `oracledb`'s public `Cursor` has no setter. Its fetch message does read the
   size from the statement's options on every fetch (`messages/fetch.rs`), so a setter is a small

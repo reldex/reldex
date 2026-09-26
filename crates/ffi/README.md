@@ -91,12 +91,14 @@ so a caller does not assume `max_rows` tunes round-trip count.
 
 Relatedly, M5.2 (landed on `main` after M2.11's branch point) added three settings to
 `reldex-workspace`'s registry — `SettingId::ResultsMaxRows`/`ResultsMaxBytes`/
-`ResultsCloseCursorAtLimit` — that this crate has not been extended to expose: they resolve on the
-Rust side but `ReldexSettingId::from_setting_id` currently maps all three to `Unknown`, so
+`ResultsCloseCursorAtLimit` — that this crate has not been extended to expose, and M5.6 added a
+fourth the same way, `SettingId::ResultsRoundTripBytes`: they resolve on the Rust side but
+`ReldexSettingId::from_setting_id` currently maps all four to `Unknown`, so
 `reldex_workspace_resolve_setting`/`_set_setting`/`_clear_setting` cannot name them yet. Pinned as
 the current, deliberate answer by `every_setting_id_is_pinned_to_its_numeric_abi_id`
-(`workspace.rs`), not a bug for this task to fix — exposing them is part of the same M5.2 Stage B
-follow-up as the fetch-size hint above.
+(`workspace.rs`), not a bug for this task to fix — exposing them, including assigning
+`ResultsRoundTripBytes` a numeric id, is part of the same M5.2 Stage B follow-up (M2.15) as the
+fetch-size hint above.
 
 ## Testing this crate without a GUI
 

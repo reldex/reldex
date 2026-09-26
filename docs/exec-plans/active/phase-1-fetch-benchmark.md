@@ -82,13 +82,19 @@ Full list: `phase-1-fetch-benchmark-data/environment.csv`.
 - **Machine state.** The machine was shared, and another worker was building in its own
   worktree. Its `cargo` processes were present throughout. At the start of 77 of the 375 matrix
   runs at least one build tool (`rustc`, `cl`, `link`, `clippy-driver`, `ninja`) was running,
-  mostly a single `rustc`; **9 runs started during a heavy build** (6–17 compiler processes), all
-  on the 10 and 40 ms links: `text5date2` at 100 and 250 rows (run 3) at 10 ms; `numbers10` at
-  250, 1,000 and 2,000 rows and `text5date2` at 100, 250 and 5,000 rows at 40 ms (`runs.csv`
-  `machine_state`). They explain most of the CoVs above 10%; each is one run of three, so the
-  medians absorb them. The wait for quiet before each group gave up after 300 s once (the 40 ms
-  `wide4k` group; `groups.csv`). A non-build desktop process used about 2.2 cores continuously.
-  CPU load was 32–63% at the start of each group.
+  mostly a single `rustc`; **9 runs started during a heavy build** (6–17 compiler processes), on
+  8 distinct link × shape × size cells, all on the 10 and 40 ms links: `text5date2` at 100 and
+  250 rows (run 3) at 10 ms; `numbers10` at 250, 1,000 and 2,000 rows and `text5date2` at 100,
+  250 and 5,000 rows at 40 ms (`runs.csv` `machine_state`) — `text5date2` at 5,000 rows at 40 ms
+  was hit twice (runs 1 and 3), the only cell with two of its three runs contaminated. They
+  explain most of the CoVs above 10%. For 7 of the 8 cells one run of three is contaminated and
+  the median is one of the two clean runs. **Not for `rtt40`/`text5date2`/5,000 rows:** its
+  recorded median (915.7 ms) is one of the two contaminated runs, not the single clean one
+  (697.9 ms, run 2) — the median does not absorb the contamination there. That cell is on the
+  40 ms link, outside the loopback/10 ms basis the 192 KiB pick rests on ("Why 192 KiB", above),
+  so it does not change the default. The wait for quiet before each group gave up after 300 s
+  once (the 40 ms `wide4k` group; `groups.csv`). A non-build desktop process used about 2.2 cores
+  continuously. CPU load was 32–63% at the start of each group.
 - **When.** The matrix ran 2026-09-26 11:27–12:22 (+07:00) at commit `8047545`; the CLOB and
   bandwidth supplements ran 12:22–12:43 at `1a4720b`, which changes no fetch path.
 
@@ -455,6 +461,11 @@ at 10 ms, whatever the budget.
 
 - **160 and 192 KiB tie on the worse link** (89% and 88%). 192 KiB has the better geometric mean
   (92.4% against 90.5%) and serves wide rows better (56% against 50% at 10 ms), so it is chosen.
+- **For the owner's sign-off: 160 and 192 KiB are both defensible.** By rule 1 alone they are a
+  tie (within the runs' CoV); 192 is picked on the secondary criteria above, favoring the harder
+  link (a sum of the two shares, 185 against 160 KiB's 181, moves the same way). 256 KiB is not
+  tied with either — it gives up a clear 8 points of loopback (80% against 88%) for at most
+  1 point at 10 ms — so it is not an equally defensible alternative.
 - **The ceiling holds with room.** At 192 KiB the slowest round trip is 10.9 ms on loopback and
   21.2 ms at 10 ms. It would first bind at about 1 MiB (16 KB rows: 50.3 ms on loopback).
 - **M5.2's 256 KiB placeholder** was close: 80% / 98%. It gave up 8 points of loopback for 1 point

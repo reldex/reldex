@@ -5491,12 +5491,15 @@ mod tests {
         // one it does not yet. M5.2 (landed on `main` after this task's
         // branch point) added three result-store settings --
         // `ResultsMaxRows`/`ResultsMaxBytes`/`ResultsCloseCursorAtLimit` --
+        // and M5.6 added a fourth the same way, `ResultsRoundTripBytes` --
         // that `crates/ffi` has not been extended to expose (M2.11's review
         // round 2 lead decision: the fetch-hint/result-store FFI surface is
         // M5.2 Stage B's own follow-up, not this task's -- see
         // `crates/ffi/README.md`'s limitations section). `from_setting_id`'s
         // `#[non_exhaustive]` catch-all correctly maps each of them to
-        // `Unknown` today; this test pins that as the current, deliberate
+        // `Unknown` today, `ResultsRoundTripBytes` included, until Stage B
+        // (M2.15) assigns it a numeric id; this test pins that as the current,
+        // deliberate
         // answer rather than letting it drift unnoticed.
         let pinned = [
             (
