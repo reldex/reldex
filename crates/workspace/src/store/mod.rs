@@ -277,6 +277,47 @@ impl Store {
         Self::open_with(path, options)
     }
 
+    /// As [`Store::open`], but first creates `path`'s parent directory and
+    /// the store file itself if either is missing -- owner-only on Unix,
+    /// exactly like [`Store::open_default`] does for its own directory
+    /// (module documentation). This is the caller-supplied-path counterpart
+    /// to [`Store::open_default`]/[`Store::open_in_directory`], for a caller
+    /// that (unlike them) does not fix the file name: `reldex-ffi`'s
+    /// `reldex_workspace_open` takes a full path from across the ABI (an
+    /// explicit override, or the C++ adapter's own copy of the ADR-0006 P5
+    /// platform-default-path rule) and used to call [`Store::open`] directly,
+    /// which does not create anything -- silently falling back to
+    /// [`Store::open_in_memory`] whenever the directory happened not to
+    /// exist yet, and otherwise leaving directory/file creation (with its
+    /// permissions) to be reimplemented on the C++ side of the boundary, on
+    /// whichever thread called it. Doing it here instead means every ABI
+    /// caller gets ADR-0006 P5 for free, and on the right thread: this runs
+    /// wherever the caller calls it, which for `reldex_workspace_open` is
+    /// the workspace's own service thread (`service_main`), never a UI
+    /// thread.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::CreateDirectory`], [`StoreError::CannotOpen`] if the
+    /// file cannot be created, or anything [`Store::open`] returns.
+    pub fn open_creating(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        if let Some(directory) = path
+            .parent()
+            .filter(|directory| !directory.as_os_str().is_empty())
+        {
+            private::create_directory(directory).map_err(|source| StoreError::CreateDirectory {
+                path: directory.to_path_buf(),
+                source,
+            })?;
+        }
+        private::create_file(path).map_err(|error| StoreError::CannotOpen {
+            path: path.to_path_buf(),
+            detail: error.to_string(),
+        })?;
+        Self::open_with(path, StoreOptions::default())
+    }
+
     /// A private, in-memory store, gone when dropped. For tests and for a
     /// session that must not touch disk.
     ///

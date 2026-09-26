@@ -2999,11 +2999,20 @@ fn service_main(
     workspace: &ReldexWorkspace,
     commands: mpsc::Receiver<WorkspaceCommand>,
 ) {
+    // `open_creating`, not `open`: creates the parent directory and the file
+    // itself (owner-only on Unix) if either is missing, exactly what
+    // `Store::open_default` does for the platform-default path -- the fix
+    // for a real bug, not a style choice. `open` alone does neither, so the
+    // C++ adapter used to reimplement this rule itself before calling here
+    // (`ConnectionManager::ensureStoreDirectoryReady`, removed); doing it
+    // here instead means it happens on this service thread, never a UI
+    // thread (AGENTS.md; ADR-0006 P6 counts SQLite as I/O), and every ABI
+    // caller gets it for free.
     let opened = if in_memory {
         Store::open_in_memory()
     } else {
         match path {
-            Some(path) => Store::open(path),
+            Some(path) => Store::open_creating(path),
             None => Store::open_in_memory(),
         }
     };
