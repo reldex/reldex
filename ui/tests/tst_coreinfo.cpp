@@ -16,6 +16,7 @@
 #include <QtQuick/QQuickWindow>
 
 #include <AppSettings.h>
+#include <ObjectBrowserModel.h>
 #include <reldex.h>
 
 // M1.5 acceptance criteria (docs/exec-plans/active/phase-1.md, row M1.5):
@@ -54,6 +55,7 @@ private slots:
     void appShellThaiSampleTextIsNotZeroWidth();
     void appShellMainRegionsHaveAccessibleNames();
     void appShellRendersAtCurrentScaleFactor();
+    void objectBrowserTreeKeyboardNavigationExpandsAndActivates();
 };
 
 void TstCoreInfo::initTestCase()
@@ -382,6 +384,71 @@ void TstCoreInfo::appShellRendersAtCurrentScaleFactor()
         qInfo() << "DPI grab" << path << grab.size() << "devicePixelRatio" << dpr;
         QVERIFY2(grab.save(path), qPrintable(path));
     }
+}
+
+void TstCoreInfo::objectBrowserTreeKeyboardNavigationExpandsAndActivates()
+{
+    // M6.1 minimal keyboard wiring (should-fix from the PR #47 review; the
+    // rest -- Narrator verification, any polish -- is M6.4's, see
+    // `ui/README.md` "Object browser (M6.1)"). Real synthetic key events
+    // (not `QMetaObject::invokeMethod()` on the QML function directly, unlike
+    // `appShellSidebarAndOutputPaneCollapseAndExpand()`'s Ctrl+B/J check):
+    // those are `Shortcut` items, which need the *window* to be the OS-active
+    // one and were found not reliable enough across CI platforms for that;
+    // `Keys.onPressed`/`TreeView`'s own key handling instead need only the
+    // *item* to have Qt Quick's internal active focus, which
+    // `qWaitForWindowActive()` plus `forceActiveFocus()` makes deterministic
+    // offscreen.
+    QQmlApplicationEngine engine;
+    engine.loadFromModule("Reldex.App", "Main");
+    QObject *root = engine.rootObjects().constFirst();
+    QVERIFY(root != nullptr);
+    auto *window = qobject_cast<QQuickWindow *>(root);
+    QVERIFY(window != nullptr);
+    QVERIFY(QTest::qWaitForWindowActive(window));
+
+    auto *tree = root->findChild<QQuickItem *>(QStringLiteral("objectBrowserTree"));
+    QVERIFY(tree != nullptr);
+    auto *browserModel = root->findChild<ObjectBrowserModel *>(QStringLiteral("objectBrowserModel"));
+    QVERIFY(browserModel != nullptr);
+    auto *refreshButton = root->findChild<QQuickItem *>(QStringLiteral("objectBrowserRefreshButton"));
+    QVERIFY(refreshButton != nullptr);
+
+    tree->forceActiveFocus();
+    QVERIFY(tree->hasActiveFocus());
+    // Nothing activated yet: the Refresh button (enabled: root.activeIndex
+    // !== null) proves it, without reaching into ObjectBrowserPanel.qml's
+    // own `root.activeIndex` from C++.
+    QVERIFY(!refreshButton->property("enabled").toBool());
+
+    // Down: TreeView's own built-in key handling (enabled by the
+    // `selectionModel` this task added) moves the current row onto row 0
+    // (the always-present "Connection" node -- expandable immediately, per
+    // `hasChildren()`, before anything has been fetched).
+    QTest::keyClick(window, Qt::Key_Down);
+    const QModelIndex connection = browserModel->index(0, 0);
+    QCOMPARE(browserModel->rowCount(connection), 0); // not expanded yet
+
+    // Right: TreeView's built-in expand-on-Right fires `onExpanded`, which
+    // calls the same `browserModel.expand()` a click on the disclosure arrow
+    // would -- observable here as the Connection row starting to load (it
+    // cannot succeed against any driver this build can open, see
+    // `ObjectBrowserModel.h`'s top-of-file doc comment, so "settles into
+    // HasErrorRole" is what "the fetch really ran" looks like from outside).
+    QTest::keyClick(window, Qt::Key_Right);
+    QVERIFY(adapter_test::spinUntil(
+            [&] { return browserModel->data(connection, ObjectBrowserModel::HasErrorRole).toBool(); },
+            30000));
+
+    // Return: this panel's own activation path (`root.activateModelIndex()`),
+    // reached through `Keys.onReturnPressed` on `tree` -- the same call the
+    // `TapHandler` on a delegate makes. `root.activeIndex` becoming non-null
+    // is what enables the Refresh button and the columns pane, so it is
+    // externally observable without reaching into the QML file's own
+    // property.
+    QTest::keyClick(window, Qt::Key_Return);
+    QCoreApplication::processEvents();
+    QVERIFY(refreshButton->property("enabled").toBool());
 }
 
 QTEST_MAIN(TstCoreInfo)

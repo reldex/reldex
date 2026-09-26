@@ -146,6 +146,7 @@ endfunction()
 reldex_add_adapter_test(tst_bridge)
 reldex_add_adapter_test(tst_resultmodel)
 reldex_add_adapter_test(tst_teardown)
+reldex_add_adapter_test(tst_objectbrowsermodel)
 
 # K5 is 10,000 teardown iterations plus 2,000 connect-teardown iterations; the
 # default CTest timeout of 1500 s is generous but this is the one test that

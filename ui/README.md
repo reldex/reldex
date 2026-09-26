@@ -426,6 +426,303 @@ Two rules follow for anything a drain can reach, and both are stated in
   event loop, which is after the drain has finished. Also covered by
   `tst_bridge`, with fetches still in flight at the moment of destruction.
 
+## Object browser (M6.1)
+
+`ObjectBrowserModel` (`ui/adapter/ObjectBrowserModel.{h,cpp}`) is a lazy
+`QAbstractItemModel` tree over `SPEC.md` §16: connection → schema → the 9
+object groups (Tables, Views, Packages, Package Bodies, Procedures,
+Functions, Triggers, Sequences, Synonyms) → objects → (for a table or view) a
+`Columns` node listing position/name/type/nullable. `ObjectBrowserPanel.qml`
+(wired into `Sidebar.qml`, which now takes a `bridge` property set by
+`Main.qml`'s single `Bridge` instance) renders it with a plain Qt Quick
+`TreeView`/`TreeViewDelegate`, a debounced server-side filter box, a row-cap
+line, a Refresh button, and a read-only columns pane below the tree.
+
+### Session ownership
+
+The model owns its **own** `SessionController`, constructed lazily the first
+time anything is expanded and closed by `closeConnection()` (called on
+`bridge` change and from the destructor). It is never the worksheet's session
+(ADR-0002) — `tst_objectbrowsermodel.cpp`'s
+`ownMetadataSessionIsCountedSeparatelyFromAWorksheetSession` opens a
+worksheet session via `Bridge::session()` and the browser's own session side
+by side and asserts `reldex_hub_session_count()` reaches the baseline **+2**
+(two distinct session ids, one hub). Closing the browser's session is proven
+through `SessionController`'s own state machine and `sessionClosed` signal
+(`Closing` → `Closed`, outcome `RELDEX_CLOSE_OUTCOME_CLOSED`, not left open)
+rather than through the count dropping back to **+1** — see "A fourth gap"
+below for why that count cannot be used as the close proof here. This
+reuses `SessionController` itself (not a parallel hand-rolled FFI client) —
+`Bridge::registerSession()`/`unregisterSession()` already route events to any
+number of controllers by session id, so a second, independent controller
+registered against the same hub was the thin option (`AGENTS.md`: keep the
+adapter thin). One statement runs at a time on this session (a small FIFO
+queues further expand/refresh requests), which matches a real session's own
+semantics rather than adding artificial concurrency the driver contract does
+not offer.
+
+### The FFI gap this class works around (read before assuming a fetch works)
+
+As of M2.11 (ABI 3.1, `origin/main` `5434f5c`), a fetch on this session
+**cannot succeed against any driver this build can open**, for three
+independent, stacked reasons:
+
+1. `reldex_session_execute()` takes a bare SQL string with no way to attach
+   bind values (`crates/ffi/src/session.rs`, the doc comment directly above
+   `reldex_session_execute`: "Binds are not exported yet (M2.11)"). Every
+   metadata statement has mandatory binds — schema, table, the name filter,
+   the limit (`crates/db-driver-api/src/metadata.rs` module docs) — so a
+   `PreparedMetadataQuery`'s binds can never reach the statement this class
+   is able to submit. `crates/ffi/src/metadata.rs`'s own module doc says the
+   same thing from the other side: this family "is not yet end-to-end
+   runnable through this header."
+2. Independently, `reldex_hub_open_session()` can only open the mock
+   driver's fixed `S14` scenario — `ReldexMockScenario` in `reldex.h` has no
+   other value, and `crates/ffi/src/mock.rs`'s `build_driver()` (the only
+   place a mock `Scenario` is built for an FFI-opened session) never calls
+   `reldex_driver_mock::metadata::MetadataFixture`. So even a bind-carrying
+   `execute()` would have nothing to answer it: S14's scenario only knows
+   `ReldexMockStatement`'s own statements.
+3. `ReldexDriverKind` (`reldex.h`) has **no non-mock value at all** yet —
+   "the only driver a build with the `mock-driver` feature can open" — so
+   this is not a missing wiring step in `SessionController::open()` (which
+   already only ever requested `RELDEX_DRIVER_KIND_MOCK`, unchanged by this
+   task); there is no Oracle session to open from this FFI yet, mock feature
+   or not.
+
+`ObjectBrowserModel` still calls the real pipeline for real: `expand()` opens
+its own session, calls `reldex_metadata_prepare`, reads the SQL text and
+column contract, and submits that SQL on the session exactly the way a
+working build would. Today that submission always comes back a typed,
+generic error (`ErrorKind::Other`, "no scripted response for statement …",
+from the mock's `Scenario::find_action` finding nothing) — never a crash,
+never invented rows, never a raw driver string shown to the user. Once (1)
+and (2) close (both are `crates/ffi` changes, out of this task's scope —
+`crates/**` is another worker's territory this task was told not to touch),
+this class needs **no shape change** to start returning real rows: the
+prepare → execute → fetch → classify pipeline is already the real one.
+
+`reldex_metadata_prepare`/`reldex_metadata_query_reclassify_error` are **not**
+part of the gap — they are real, working FFI calls with no session involved,
+and `tst_objectbrowsermodel.cpp`'s
+`theRealClassifierTurnsAnAmbiguousOracleCodeIntoPermission` exercises them
+directly: building a request, preparing it, and confirming the classifier
+turns a synthetic ORA-00942 into `RELDEX_ERROR_KIND_PERMISSION` while leaving
+an already-`Permission` code (ORA-01031) alone.
+
+### A fourth gap, found while testing this task's own session close
+
+`reldex_hub_session_count()`'s doc comment in `reldex.h` says a session's
+entry is released "when the pump exits, which for a normally closed session
+is promptly". It is not, for **any** session, not only a second concurrent
+one: `crates/ffi/src/session.rs`'s `reldex_hub_open_session` inserts into
+`hub.sessions` (~line 625), but nothing removes that entry when a session
+closes normally — its pump thread (`pump_main`) never touches `hub.sessions`,
+and the crate's only removal sites are `reldex_hub_destroy`'s full drain
+(`crates/ffi/src/hub.rs` ~line 268, tears down the whole hub) and the
+failed-thread-spawn error path (`session.rs` ~line 640). Confirmed directly
+against the FFI, bypassing this adapter and this task's code entirely, with a
+throwaway Rust test added temporarily under `crates/ffi/tests/` and removed
+before this branch was pushed (not part of this PR's diff, `crates/**` is out
+of this task's scope): opening one session on an otherwise-empty hub,
+closing it, and draining both its `SESSION_CLOSED` reply and its unsolicited
+`TERMINAL` event (both arrive correctly and in the right order) still leaves
+`reldex_hub_session_count()` unchanged, even after polling for 5 more
+seconds. The same held with a second session left open alongside it, in
+either close order.
+
+This is what first looked like a bug in this task's own session-close code —
+`tst_objectbrowsermodel.cpp`'s teardown test hung for the full 60-second
+`spinUntil` guard waiting for the count to drop. It is not this task's bug:
+the adapter's close protocol (submit `reldex_session_close`, receive
+`SESSION_CLOSED`, receive the unsolicited `TERMINAL`) completes correctly and
+promptly every time; the hub's own bookkeeping simply never reflects it on a
+live hub. `tst_objectbrowsermodel.cpp`'s close test was rewritten to assert
+what the FFI actually delivers (state transitions and the `sessionClosed`
+signal) instead of the count, with a comment pointing here. Flagging this for
+whoever owns `crates/ffi`/`crates/db-core` next: any other code relying on
+`reldex_hub_session_count()` or `reldex_live_counts().sessions` reflecting an
+individual session's close on a hub that is not being destroyed — not just
+this task's — would hang or misreport the same way.
+
+### A related, non-FFI gap: the row cap has no setting yet
+
+`ObjectBrowserModel::rowCap` (`SPEC.md` §16's server-side row cap for a
+`Schemas`/`ObjectsOfKind` fetch) defaults to a hardcoded `500` and is a plain
+in-memory `Q_PROPERTY`, not backed by `reldex-workspace`'s settings registry —
+tracked by a `TODO(M2.9 wiring)` on the property's own doc comment. When that
+wiring happens it needs a **new** `SettingId` (something like
+`MetadataRowCap`): the two existing row/size settings the FFI already exposes
+are for query *results*, not metadata *lists* —
+`SettingId::ResultsMaxRows`/`ResultsMaxBytes` cap what a worksheet's result
+grid holds, and `SettingId::FetchRows` is the per-round-trip fetch-array-size
+hint (`crates/ffi/README.md` "Known limitation: the fetch-size hint..."); none
+of the three means "how many schemas/objects to list before truncating." Not
+added in this task: out of scope per the review brief that raised it.
+
+### Error table
+
+`ObjectBrowserModel::describeError()` (private, exercised via
+`tst_objectbrowsermodel.cpp`'s friend access) maps every `ReldexErrorKind` to
+one of a small, fixed set of safe, translated strings — never the raw driver
+message or native code:
+
+| `ReldexErrorKind` | Message shown |
+| --- | --- |
+| `PERMISSION` | "You do not have permission to view this." |
+| `CONNECTION`, `NETWORK_LOST` | "The connection was lost." |
+| `TIMEOUT` | "The request timed out." |
+| `CANCELLED` | "The request was cancelled." |
+| `AUTHENTICATION` | "Authentication failed." |
+| `CONFIGURATION` | "The connection is not configured correctly." |
+| `UNSUPPORTED` | "This is not supported yet." |
+| everything else (`SYNTAX`, `CONSTRAINT`, `TRANSACTION`, `RESOURCE`, `DATA_CONVERSION`, `DRIVER_INTERNAL`, `OTHER`, `UNKNOWN`) | "This could not be loaded." |
+
+A permission failure is reached by running the query's own classifier
+(`reldex_metadata_query_reclassify_error`) on the raw error before mapping
+it, so an Oracle ORA-00942/ORA-01039 against a metadata statement reads as
+the permission message, not a generic one — proven by the classifier test
+above; not provable end-to-end until the gap above closes, since no error
+(permission-shaped or otherwise) can currently reach this class from a real
+fetch failure other than the mock's "no scripted response".
+
+### Tests
+
+`ui/tests/tst_objectbrowsermodel.cpp` (offscreen, `QTEST_GUILESS_MAIN`, no
+QML engine needed — `ObjectBrowserModel` is plain `QObject`/`QAbstractItemModel`
+C++):
+
+- own session vs. a worksheet session, counted separately, closing
+  independently (real FFI, described above);
+- a real expand-through-execute round trip against the only openable mock
+  scenario fails safely with a generic typed message, and a retry after that
+  failure is not stuck (real FFI);
+- the real metadata classifier turning an ambiguous Oracle code into
+  `Permission` (real FFI);
+- the 9 `SPEC.md` §16 groups, in order, with the right
+  `ReldexMetadataObjectKind` each (friend access to `populateStaticGroups()`,
+  since a schema node is otherwise unreachable — see the gap above);
+- building `Object`/`Column` tree children from `ObjectsOfKind`/`ColumnsOf`-
+  shaped rows, including the non-`VALID` status becoming a visible secondary
+  label (friend access to `applyRows()`);
+- the truncation indicator and its "N shown, more available" text when a
+  fetch's row count exceeds the row cap (friend access to `applyRows()`);
+- `setFilter()` is a no-op on a `ColumnsNode` (and every other kind besides
+  `Connection`/`Group`) — `ColumnsOf` has no name filter by contract
+  (`MetadataRequest::with_name_filter` panics on it);
+- `aFilterChangeWhileTheFirstFetchIsInFlightSupersedesRatherThanBeingDropped()`
+  (review follow-up, real FFI, under `QAbstractItemModelTester`): regression
+  test for a bug found in independent review of this PR —
+  `expand(force = true)`/`setFilter()` used to be silently dropped by
+  `if (node->loading) return;` whenever a fetch for the same node was already
+  outstanding, so the node settled on the FIRST (by then stale) fetch while
+  `filterFor()` reported the SECOND, never-queried filter text. Fixed by
+  letting `force` supersede an in-flight fetch (bump the node's generation,
+  queue a fresh fetch, discard the superseded reply via a new
+  `m_activeGeneration` captured at submission time — see
+  `ObjectBrowserModel.h`'s doc comments on `expand()`/`m_activeGeneration` for
+  the mechanism). This test injects a second `setFilter()` the instant the
+  first fetch reaches `SessionController::Executing`, and asserts a second
+  fetch really was submitted and `filterFor()` agrees with the settled state;
+- `destroyingTheModelWhileAFetchIsInFlightDoesNotCrash()` (review follow-up,
+  under `QAbstractItemModelTester`): destroys the model with a fetch/session-
+  open genuinely outstanding, no wait first — the shape an ASan run
+  (`qt-asan` CI job) would catch a use-after-free in.
+
+Also covered by the existing `tst_coreinfo.cpp` QML suite as a side effect:
+every `appShellXxx` test that loads `Main.qml` now also loads `Sidebar.qml` →
+`ObjectBrowserPanel.qml` → `ObjectBrowserModel`/`TreeView` offscreen, and
+that suite fails on any QML warning — so a binding error or missing role in
+the new QML surface fails the existing shell tests, not just a dedicated one.
+`objectBrowserTreeKeyboardNavigationExpandsAndActivates()` (review follow-up)
+additionally drives the tree with real synthetic key events — see "Hand-off"
+below (M6.4) for what that covers and what is still owed.
+
+### The "no freeze" measurement
+
+`docs/exec-plans/active/phase-1.md` row M6.1 asks for a frame-time/UI-thread-
+stall measurement while expanding and filtering a schema with ≥5,000
+objects, against the Oracle test container, using the S15 method.
+
+**Not measured against the container, and not because it was down.** Even
+with `reldex-oracle19c` healthy, this build cannot run a single metadata
+query against it: `ReldexDriverKind` has no Oracle value (gap 3 above), so
+there is no session to open in the first place — this is a `crates/ffi` gap,
+not a container or measurement-methodology problem. See `phase-1.md` row
+M6.1's "as implemented" note for the container's actual state on the day
+this was written.
+
+**Measured instead: the mock-fed, in-process case**, which exercises the
+real risk this acceptance line cares about — laying out a large children set
+on the model side — without needing a real driver. Method:
+`tst_objectbrowsermodel.cpp`'s opt-in
+`applyingFiveThousandObjectsDoesNotBlockTheUiThreadForLong` (set
+`RELDEX_UI_SANITY_OBJECTS=1` to run it, same pattern as
+`tst_resultmodel`'s 1,000,000-row sanity test) calls
+`ObjectBrowserModel::applyRows()` directly — the same private,
+synchronous-on-the-calling-thread code path `onMetadataResultComplete()`
+calls from `Bridge::dispatch()`, itself called from the waker-triggered
+`drain()` slot, i.e. the real UI thread in actual use — with 5,000 synthetic
+`Object` rows with distinct names/statuses/dates ("expand"), then again with
+those rows narrowed to 100 ("filter"), timed with `QElapsedTimer`, 3 runs per
+process, 3 separate process invocations (9 samples total). Recorded 2026-09-26
+on the machine this task was implemented on (AMD Ryzen 7 5700G, ~63 GB RAM,
+Windows 11, RelWithDebInfo build, no other load):
+
+| Invocation | Run | expand 5,000 rows | filter to 100 rows |
+| --- | --- | --- | --- |
+| 1 | 1 | 2 ms | 1 ms |
+| 1 | 2 | 1 ms | 0 ms |
+| 1 | 3 | 1 ms | 0 ms |
+| 2 | 1 | 1 ms | 0 ms |
+| 2 | 2 | 1 ms | 0 ms |
+| 2 | 3 | 1 ms | 0 ms |
+| 3 | 1 | 3 ms | 1 ms |
+| 3 | 2 | 2 ms | 1 ms |
+| 3 | 3 | 2 ms | 1 ms |
+
+Every sample is 0–3 ms, far under any perceptible-stall threshold; the test's
+own gate (`QVERIFY2(... < 1000)`) is deliberately loose — it catches a gross
+regression (an accidental O(n²) path), not a tight budget, since the number
+that matters is recorded here rather than enforced per-commit. This measures
+the model's own tree-building cost only, not a real fetch/decode/paint cycle
+against a live driver — the real-driver half above is what closes that gap.
+The checkbox for "no freeze with a large schema (measured)" is left for the
+lead pending the real-driver half above.
+
+### Hand-off
+
+- **M2.15** (or whichever task adds bind support to `reldex_session_execute`
+  and an Oracle `ReldexDriverKind`) is what turns this class's already-real
+  pipeline into one that returns actual rows; no shape change needed here.
+- **M6.3** (i18n): every user-facing string in `ObjectBrowserModel.cpp`/
+  `ObjectBrowserPanel.qml` already goes through `tr()`/`qsTr()`, including the
+  9 group labels (`QT_TR_NOOP`) — ready for a `.ts` catalogue with no further
+  source changes expected.
+- **M6.4** (accessibility): the tree has `Accessible.role: Accessible.Tree`
+  and a per-row `Accessible.name`; the filter field, refresh button and
+  columns list all have explicit accessible names. Minimal keyboard wiring is
+  in place (review follow-up, not the original M6.1 pass): `tree` is
+  `focus: true`/`activeFocusOnTab: true` and carries an `ItemSelectionModel`,
+  which is what turns on `TreeView`'s own built-in Up/Down (move current row),
+  Left/Right (collapse/expand), and Space (toggle) key handling; `Return`/
+  `Enter` run this panel's own `activateModelIndex()` — the same path a tap
+  on a delegate takes — via `Keys.onReturnPressed`/`Keys.onEnterPressed` on
+  `tree`. Covered by `tst_coreinfo.cpp`'s
+  `objectBrowserTreeKeyboardNavigationExpandsAndActivates()` with real
+  synthetic key events (`QTest::keyClick`), not `QMetaObject::invokeMethod()`
+  on the QML function directly — unlike the Ctrl+B/Ctrl+J shortcut check
+  above, `Keys.onPressed` only needs the *item* to hold Qt Quick's internal
+  active focus (`forceActiveFocus()` + `qWaitForWindowActive()`), not the
+  *window* to be the OS-active one, which is what made a real key event
+  unreliable enough to avoid for a `Shortcut` item. Still owed to M6.4:
+  Narrator/screen-reader verification (its own acceptance line), and any
+  further keyboard polish (Home/End, type-ahead, a visible focus/current-row
+  indicator) — none of that was in scope for this minimal pass.
+- **M6.6** (packaging): no new third-party dependency; `TreeView`/`TreeViewDelegate`
+  come from `QtQuick`/`QtQuick.Controls`, already linked/deployed for the
+  rest of the shell.
+
 ## Instrumentation, and how M1.8 runs the S15 measurement
 
 `ui/adapter/Metrics.{h,cpp}` holds every hook, compiled in and **off by
@@ -1041,10 +1338,12 @@ module (`Qt6Charts`, `Qt6WebEngineCore`, etc.) is present.
   sequencing obligation A10 describes, and nothing in M1.6 needs it. The
   `cancel_kind` an `OPENED` event reports is stored (`cancelKind()`) and
   otherwise unused.
-- **One session per `Bridge`.** The routing table is a
-  `QHash<sessionId, QPointer<SessionController>>` and handles any number, but
-  the `Bridge` creates exactly one controller, because the spike needs one.
-  Several worksheets are M3.
+- **`Bridge` creates exactly one built-in `SessionController`** (`bridge.session()`), because the
+  spike needed one; several worksheets sharing a `Bridge` are M3/M4. The
+  routing table itself (`QHash<sessionId, QPointer<SessionController>>`)
+  already handles any number of controllers registered against one hub — M6.1
+  relies on exactly this to give the object browser its own `SessionController`
+  and its own session, separate from `bridge.session()`.
 - **No AddressSanitizer on this machine** — see the section above for exactly
   why, and what stands in for it.
 - **The offscreen platform plugin warns about missing fonts**
