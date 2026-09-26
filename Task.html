@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-26T02:17:00+07:00",
+  "updatedAt": "2026-09-26T11:25:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1231,8 +1231,8 @@
               "status": "done"
             },
             {
-              "title": "M2.11 FFI surface for M2.5–M2.10 + regenerate and verify header (sonnet)",
-              "status": "todo"
+              "title": "M2.11 FFI surface for M2.5–M2.10 + regenerate and verify header (sonnet) —  — done 2026-09-26: ABI 3.0 → 3.1, additive (62 functions added, 0 changed, 0 removed) — session events incl. server output (invalid_utf8_lines) and transaction_possibly_lost, server-output control, statement splitting, metadata prepare, settings/profiles/store on an FFI-owned service thread (numeric setting ids with provenance; real Oracle DriverBinding), credentials (numeric ReldexCredentialError/store kind; a password only ever crosses *in*, via reldex_secret_from_utf8), history/worksheets/layout; C smoke harness 458 checks on 3 OS, ASan/LSan clean; cbindgen enum-allowlist guard test; independently reviewed twice (2 must-fix: credential enums landed; the pump switch split honestly into M2.15)",
+              "status": "done"
             },
             {
               "title": "M2.12 Server output framing over RAW/LENGTHB with per-line UTF-8 decoding, so one invalid line loses only itself (sonnet; M2.7 review follow-up) —  — done 2026-09-25: RAW framing — SYS.UTL_I18N.STRING_TO_RAW plus a 5-digit byte-length prefix per line in LONG RAW OUT binds, per-frame UTF-8 decoding in Rust, invalid bytes replaced by U+FFFD and counted in invalid_utf8_lines on the ServerOutput event and the completion log (mock can script it); independently reviewed (1 must-fix landed: the count had been dropped in db-core); live 6/6 + 9/9, 32,767-byte lines byte-exact, 120k fuzz inputs, no perf regression",
@@ -1248,6 +1248,11 @@
               "title": "M2.14 Credential orphan sweep: delete Reldex/profile/* Credential Manager entries whose profile no longer exists, at startup and after a profile delete; never outside the namespace (sonnet; M2.10 review follow-up; after M3.3)",
               "status": "todo",
               "note": "Planned from the M2.10 review: Credential Manager can revive a deleted entry when another writer races us, and an entry written by another tool under our name is refused as malformed; the sweep removes both kinds."
+            },
+            {
+              "title": "M2.15 ★ FFI pump switch to the M2.5 event queue: real Terminal on a loss mid-statement, abandon relayed through the real SessionRegistry, EXECUTING/TRANSACTION_STATE events, server output before the reply (opus, review mandatory; M2.11 review round 2 must-fix 2; after M2.11)",
+              "status": "todo",
+              "note": "Split out of M2.11 by its review: the FFI still runs the interim per-session pump thread, so today a session lost mid-statement gets no TERMINAL until the user closes it, there is no abandon, no EXECUTING or TRANSACTION_STATE events, and server output arrives only after a statement finishes. M3.3/M3.7/M4.x wait for this."
             }
           ]
         },
@@ -1708,6 +1713,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-26",
+      "text": "M2.11 done: the C boundary now exposes everything the core gained since M2.5 — events, server output, statement splitting, metadata, settings and profiles with their provenance, credentials, history and worksheets — as ABI 3.1, purely additive (62 new functions, nothing changed or removed), exercised by a 458-check smoke harness on all three platforms with sanitizers clean. The review caught two real gaps: credential errors were collapsed into one code (now numeric enums with native codes), and the switch from the interim per-session pump thread to the real event queue had been skipped with a wrong reason — that work is now its own task, M2.15, and the interim limits (no TERMINAL on a mid-statement loss until close, no abandon, no EXECUTING/TRANSACTION_STATE, server output only after the statement) are written down for the UI tasks. Also fixed on the way: a silent cbindgen enum omission now has a guard test, and a Debug-build assert in the Qt adapter on session close."
+    },
     {
       "date": "2026-09-26",
       "text": "M5.2 Stage A done: the core now keeps query results the way ADR-0004 decided — compact column segments (a ten-number row costs 118 bytes, measured within 0.7% of the ADR's table, and reading never allocates), the grid asks for rows and the core keeps one batch ahead, row and byte caps carry their source, and every transaction end ends an open result deterministically (typed COMMIT proven on the real database). Independent review found no must-fix; its follow-ups landed: a session lost mid-fetch marks LOB cells as ended with the session, the parked-LOB map gives memory back, and two honest limitations are recorded — a failed DDL or a failed COMMIT still ends the transaction on Oracle without ending the result (a question for the owner), and the product keeps the driver's 100-row wire array on 19c until the upstream O(packets²) cost is addressed. The FFI half (Stage B) follows the M2.11 surface and the M2.15 pump switch."
