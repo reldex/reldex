@@ -13,10 +13,16 @@
 // FFI-error-to-message-key mapping all live here.
 //
 // Scope, deliberately: this class is a `ProfileModel` (list) plus
-// create/update/delete/test-connect. It does not resolve settings, does not
-// touch history or worksheets, and does not implement the real connect flow
-// (M3.3 owns "Connecting..."/cancel/bounded timeout) -- test-connect below is
-// a throwaway probe with its own transient session, never the worksheet's.
+// create/update/delete/test-connect, plus -- since M3.3 -- the *workspace
+// half* of the real connect flow: `prepareConnect()` (connect parameters
+// joined to `resolve_password` on the service thread), `saveConnectPassword()`
+// (ADR-0007's write order, after a successful connect) and the "a stored
+// password was refused" memory. The session half ("Connecting...", cancel,
+// the bounded timeout, the worksheet's stable session) is
+// `SessionController`'s. It does not resolve settings (the connect limit
+// arrives already resolved inside the prepared parameters), does not touch
+// history or worksheets, and test-connect below is still a throwaway probe
+// with its own transient session, never the worksheet's.
 //
 // Opening: `open()` is explicit, never automatic. The workspace's service
 // thread is NOT started from this class's constructor -- `Bridge` still
@@ -36,13 +42,15 @@
 //
 // FFI gaps this class works around, documented in the M3.2 hand-off (see
 // ui/README.md "Connection manager (M3.2)"):
-//  * `reldex_hub_open_session` accepts only `RELDEX_DRIVER_KIND_MOCK` in this
-//    build, and (until ABI 3.2) the mock could not be configured to fail its
-//    open or a ping -- so `testConnect()` proves the pipeline (build params -> open -> ping ->
-//    close) rather than a real socket to the target database. A profile's own
-//    typed failures (an invalid profile, a missing password) are still real,
-//    caught entirely by `reldex_workspace_build_connect_params` before any
-//    session is opened.
+//  * `testConnect()` still opens the mock driver: it proves the pipeline
+//    (build params -> open -> ping -> close) rather than a real socket to
+//    the target database. ABI 3.3 (M3.3) closed the FFI side of this --
+//    `reldex_workspace_prepare_connect` plus `RELDEX_DRIVER_KIND_ORACLE` is
+//    what the worksheet's connect uses -- and moving test-connect onto the
+//    same path is a follow-up recorded in ui/README.md "Connect flow (M3.3)".
+//    A profile's own typed failures (an invalid profile, a missing
+//    password) are still real, caught entirely by
+//    `reldex_workspace_build_connect_params` before any session is opened.
 //  * `ProfileError` (unlike `CredentialError`) crosses the ABI folded into
 //    `RELDEX_ERROR_KIND_CONFIGURATION` with no numeric sub-code -- including
 //    the credential-pattern refusal. Its `Display` text is safe by
@@ -72,6 +80,7 @@
 #include <QHash>
 #include <QObject>
 #include <QPointer>
+#include <QSet>
 #include <QString>
 #include <QVariantMap>
 #include <QtQml/qqmlregistration.h>
@@ -79,6 +88,7 @@
 #include <functional>
 
 class Bridge;
+class SessionController;
 
 class ConnectionManager : public QObject
 {
@@ -246,6 +256,46 @@ public:
         return errorKind == RELDEX_ERROR_KIND_AUTHENTICATION && usedStoredPassword;
     }
 
+    // --- M3.3: the workspace half of the connect flow. C++ only: QML reaches
+    // the connect flow through `SessionController`, never through these. ---
+
+    /// Submits `reldex_workspace_prepare_connect` for `profileId` (16 raw
+    /// bytes), with `typed` -- a password the user just typed, or null to
+    /// ask the credential store (`resolve_password`, ADR-0007 S3). `typed`
+    /// is not consumed. The reply is handed to
+    /// `sink->handleConnectPrepared()` synchronously, inside this class's
+    /// drain; the `ReldexConnectSummary` it carries (password included) is
+    /// released straight after that returns, so the sink must use it there
+    /// and then (`reldex_hub_open_session` copies it). Returns false, with
+    /// this class's error set, if the request could not be submitted.
+    bool prepareConnect(const QByteArray &profileId, const ReldexSecret *typed,
+                        SessionController *sink);
+    /// Drops `sink`'s pending prepare, if any: its reply is released unread
+    /// (a cancelled connect adopts nothing late).
+    void forgetConnectPrepare(SessionController *sink);
+    /// ADR-0007, after a successful connect with a typed password the user
+    /// asked to save: `credential_put` first (the password is read from
+    /// `password` for the call only), then the profile's flag moves to
+    /// `CredentialStore` only if that succeeded -- M3.2's own
+    /// `UpdateAwaitingCredentialPut` step, reused. A successful put also
+    /// clears `storedPasswordWasRefused()`. The outcome arrives as
+    /// `profileSaved` or `credentialWarning`, as for an edit.
+    bool saveConnectPassword(const QByteArray &profileId, const ReldexSecret *password);
+    /// ADR-0007: "if the database refuses a `FromStore` password, the next
+    /// connect prompts and the UI offers to update the saved password" --
+    /// and a stored password is never retried automatically, since every
+    /// attempt counts towards the account's failed-login limit. Kept for
+    /// this process only: a restart retries the stored password once more,
+    /// which is one attempt, never a loop.
+    [[nodiscard]] bool storedPasswordWasRefused(const QByteArray &profileId) const
+    {
+        return m_refusedStoredPasswords.contains(profileId);
+    }
+    void markStoredPasswordRefused(const QByteArray &profileId)
+    {
+        m_refusedStoredPasswords.insert(profileId);
+    }
+
 Q_SIGNALS:
     void validChanged();
     void readyChanged();
@@ -385,8 +435,15 @@ private:
     void handleHubEvent(const ReldexEvent &raw, reldex::BatchHandle batch, reldex::ErrorHandle error);
     void finishTestConnect();
 
+    [[nodiscard]] static ProfileFields fieldsFromRow(const ProfileModel::Row &row);
+    void handleConnectPrepared(const ReldexWorkspaceReply &reply);
+
     friend void reldexConnectionManagerWakeImpl(void *userData) noexcept;
     friend class Bridge;
+    // M3.3: `tst_connectflow.cpp` sets a profile-level connect limit through
+    // `m_workspace` directly (there is no settings UI yet, M3.6), to drive
+    // the real settings -> prepared parameters -> timeout path.
+    friend class TstConnectFlow;
     // M3.2 fix round 3 (2026-09-26): `tst_connectionmanager.cpp`'s
     // `destroyingBridgeAfterTheTestConnectSessionIsRegisteredDoesNotCrash()`
     // spins on `m_testConnectSessionId` directly (same pattern as
@@ -444,6 +501,13 @@ private:
     quint64 m_testConnectPingRequest = 0;
     quint64 m_testConnectCloseRequest = 0;
     QString m_testConnectSummary;
+
+    // --- M3.3 connect flow ------------------------------------------------
+    /// Request id -> the `SessionController` its `CONNECT_PREPARED` reply
+    /// goes to. A `QPointer`: a sink destroyed first just drops the reply.
+    QHash<quint64, QPointer<SessionController>> m_connectPrepares;
+    /// Profiles whose stored password the database refused this run.
+    QSet<QByteArray> m_refusedStoredPasswords;
 
     QAtomicInt m_drainPosted { 0 };
     bool m_draining = false;

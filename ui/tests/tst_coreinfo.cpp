@@ -3,6 +3,7 @@
 #include <QAccessible>
 #include <QAccessibleInterface>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QGuiApplication>
 #include <QImage>
 #include <QQmlApplicationEngine>
@@ -16,6 +17,7 @@
 #include <QtQuick/QQuickWindow>
 
 #include <AppSettings.h>
+#include <ConnectionManager.h>
 #include <ObjectBrowserModel.h>
 #include <reldex.h>
 
@@ -65,6 +67,14 @@ private slots:
     void productionIndicatorFollowsTheFlagNotTheEnvironment();
     void productionIndicatorPassesGreyscaleCheck();
     void productionIndicatorRendersAtCurrentScaleFactor();
+
+    // M3.3: the worksheet connect flow through the shell -- the sidebar's
+    // Connect button, the password prompt, the status bar and the production
+    // indicator. The first runs everywhere with the mock driver; the second
+    // is the same flow against the real Oracle test database, skipped unless
+    // its environment is set (ui/README.md "Connect flow (M3.3)").
+    void connectFlowThroughTheShellWithTheMockDriver();
+    void connectFlowAgainstTheRealDatabase();
 };
 
 void TstCoreInfo::initTestCase()
@@ -799,6 +809,316 @@ void TstCoreInfo::productionIndicatorRendersAtCurrentScaleFactor()
     }
 
     session->setActiveProfileIsProduction(false);
+}
+
+namespace {
+
+/// The shell's `Bridge`, once its connection manager is ready.
+Bridge *readyBridge(QObject *root)
+{
+    auto *bridge = root->findChild<Bridge *>(QStringLiteral("bridge"));
+    if (bridge == nullptr || bridge->connections() == nullptr) {
+        return nullptr;
+    }
+    ConnectionManager *manager = bridge->connections();
+    if (!adapter_test::spinUntil([manager] { return manager->isReady(); })) {
+        return nullptr;
+    }
+    return bridge;
+}
+
+QVariantMap shellProfile(const QString &name, const QString &host, int port,
+                         const QString &service, const QString &user, bool production)
+{
+    return QVariantMap {
+        { QStringLiteral("name"), name },
+        { QStringLiteral("environment"),
+          production ? RELDEX_ENVIRONMENT_KIND_PRODUCTION : RELDEX_ENVIRONMENT_KIND_TEST },
+        { QStringLiteral("environmentLabel"), QString() },
+        { QStringLiteral("treatAsProduction"), production },
+        { QStringLiteral("endpointKind"), RELDEX_ENDPOINT_KIND_HOST_PORT },
+        { QStringLiteral("host"), host },
+        { QStringLiteral("port"), port },
+        { QStringLiteral("serviceTargetKind"), RELDEX_SERVICE_TARGET_KIND_SERVICE_NAME },
+        { QStringLiteral("serviceNameOrSid"), service },
+        { QStringLiteral("connectString"), QString() },
+        { QStringLiteral("username"), user },
+        { QStringLiteral("authKind"), RELDEX_AUTH_KIND_PASSWORD },
+        { QStringLiteral("passwordStorage"), RELDEX_PASSWORD_STORAGE_KIND_PROMPT_EACH_TIME },
+        { QStringLiteral("password"), QString() },
+        { QStringLiteral("sessionRole"), RELDEX_SESSION_ROLE_KIND_NORMAL },
+        { QStringLiteral("transport"), RELDEX_TRANSPORT_KIND_PLAIN },
+        { QStringLiteral("caDirectory"), QString() },
+        { QStringLiteral("allowUnenforcedCertificatePin"), false },
+    };
+}
+
+/// Creates a profile through the shell's connection manager; returns its id.
+QString createShellProfile(ConnectionManager *manager, const QVariantMap &fields)
+{
+    QSignalSpy saved(manager, &ConnectionManager::profileSaved);
+    if (!manager->createProfile(fields)
+        || !adapter_test::spinUntil([&saved] { return saved.count() >= 1; })) {
+        return {};
+    }
+    return saved.constFirst().at(0).toString();
+}
+
+/// Clicks a QML button the way a user's click ends up: its `clicked` signal.
+bool clickItem(QObject *button)
+{
+    return button != nullptr && button->property("visible").toBool()
+            && button->property("enabled").toBool()
+            && QMetaObject::invokeMethod(button, "clicked");
+}
+
+QString statusText(QQuickItem *rootItem)
+{
+    QQuickItem *text = adapter_test::findVisualChild(rootItem, QStringLiteral("sessionStateText"));
+    return text != nullptr ? text->property("text").toString() : QString();
+}
+
+/// Types `password` into the prompt and presses its Connect button, the way
+/// the user does. Returns false if the prompt was not showing. With
+/// `pressUs`, reports how long the press itself kept this (the UI) thread,
+/// in microseconds.
+bool answerPasswordPrompt(QObject *root, const QString &password, qint64 *pressUs = nullptr)
+{
+    QObject *dialog = root->findChild<QObject *>(QStringLiteral("connectPasswordDialog"));
+    QObject *field = root->findChild<QObject *>(QStringLiteral("connectPasswordField"));
+    QObject *submit = root->findChild<QObject *>(QStringLiteral("connectPasswordSubmit"));
+    if (dialog == nullptr || field == nullptr || submit == nullptr
+        || !adapter_test::spinUntil([dialog] { return dialog->property("opened").toBool(); })) {
+        return false;
+    }
+    field->setProperty("text", password);
+    QElapsedTimer press;
+    press.start();
+    const bool pressed = QMetaObject::invokeMethod(submit, "clicked");
+    if (pressUs != nullptr) {
+        *pressUs = press.nsecsElapsed() / 1000;
+    }
+    return pressed;
+}
+
+qint64 median(QList<qint64> samples)
+{
+    std::sort(samples.begin(), samples.end());
+    return samples.isEmpty() ? -1 : samples.at(samples.size() / 2);
+}
+
+} // namespace
+
+void TstCoreInfo::connectFlowThroughTheShellWithTheMockDriver()
+{
+    QQmlApplicationEngine engine;
+    QList<QQmlError> warnings;
+    connect(&engine, &QQmlEngine::warnings, &engine,
+            [&warnings](const QList<QQmlError> &reported) { warnings += reported; });
+    engine.loadFromModule("Reldex.App", "Main");
+    QObject *root = engine.rootObjects().constFirst();
+    auto *window = qobject_cast<QQuickWindow *>(root);
+    QVERIFY(window != nullptr);
+    QQuickItem *rootItem = window->contentItem();
+    Bridge *bridge = readyBridge(root);
+    QVERIFY(bridge != nullptr);
+    SessionController *session = bridge->session();
+    session->setConnectDriverForTesting(RELDEX_DRIVER_KIND_MOCK);
+    session->setMockRows(1);
+
+    QCOMPARE(statusText(rootItem), QStringLiteral("Not connected"));
+    const QString name = QStringLiteral("Orders (prod)");
+    QVERIFY(!createShellProfile(bridge->connections(),
+                                shellProfile(name, QStringLiteral("db.example.invalid"), 1521,
+                                             QStringLiteral("ORCL"), QStringLiteral("app"), true))
+                     .isEmpty());
+
+    // The sidebar row's Connect button.
+    QQuickItem *connectButton = nullptr;
+    QVERIFY(adapter_test::spinUntil([&] {
+        connectButton = adapter_test::findVisualChild(rootItem, QStringLiteral("connectButton_0"));
+        return connectButton != nullptr;
+    }));
+    QVERIFY(clickItem(connectButton));
+    QVERIFY(adapter_test::spinUntil(
+            [session] { return session->connectState() == SessionController::AwaitingPassword; }));
+    QVERIFY(statusText(rootItem).contains(QStringLiteral("Password needed")));
+    QVERIFY(!connectButton->property("enabled").toBool()); // one connect at a time
+    auto *indicator = adapter_test::findVisualChild(rootItem,
+                                                    QStringLiteral("productionIndicatorStatusBar"));
+    QVERIFY(indicator != nullptr);
+    QVERIFY(!indicator->isVisible()); // not until the session is open
+
+    QVERIFY(answerPasswordPrompt(root, QStringLiteral("typed-in-the-shell")));
+    QObject *field = root->findChild<QObject *>(QStringLiteral("connectPasswordField"));
+    QCOMPARE(field->property("text").toString(), QString()); // cleared at once
+    QVERIFY(adapter_test::spinUntil(
+            [session] { return session->connectState() == SessionController::Connected; }));
+    QVERIFY(adapter_test::spinUntil([&] {
+        return statusText(rootItem) == QStringLiteral("Connected to %1").arg(name);
+    }));
+    QVERIFY(indicator->isVisible());
+    QObject *dialog = root->findChild<QObject *>(QStringLiteral("connectPasswordDialog"));
+    QVERIFY(adapter_test::spinUntil([dialog] { return !dialog->property("opened").toBool(); }));
+
+    // One statement, and its outcome in the status bar.
+    QVERIFY(session->executeMockStatement(RELDEX_MOCK_STATEMENT_GENERATED_QUERY));
+    QVERIFY(adapter_test::spinUntil(
+            [session] { return session->state() == SessionController::ResultComplete; }));
+    QVERIFY(adapter_test::spinUntil([&] {
+        return statusText(rootItem) == QStringLiteral("Connected to %1 · 1 row(s)").arg(name);
+    }));
+
+    // Disconnect from the status bar.
+    QQuickItem *disconnect = adapter_test::findVisualChild(rootItem, QStringLiteral("disconnectButton"));
+    QVERIFY(clickItem(disconnect));
+    QVERIFY(adapter_test::spinUntil(
+            [session] { return session->connectState() == SessionController::NotConnected; }));
+    QVERIFY(adapter_test::spinUntil([&] { return !indicator->isVisible(); }));
+    QCOMPARE(statusText(rootItem), QStringLiteral("Not connected"));
+    QVERIFY(connectButton->property("enabled").toBool());
+
+    // Cancel from the status bar while the connect is parked.
+    session->setMockBlockConnect(true);
+    QVERIFY(clickItem(connectButton));
+    QVERIFY(answerPasswordPrompt(root, QStringLiteral("typed-again")));
+    QVERIFY(adapter_test::spinUntil(
+            [session] { return session->connectState() == SessionController::Connecting; }));
+    QVERIFY(statusText(rootItem).startsWith(QStringLiteral("Connecting to %1").arg(name)));
+    QQuickItem *cancel = adapter_test::findVisualChild(rootItem, QStringLiteral("cancelConnectButton"));
+    QVERIFY(clickItem(cancel));
+    QCOMPARE(session->connectState(), SessionController::Cancelled);
+    QVERIFY(adapter_test::spinUntil([&] {
+        return statusText(rootItem) == QStringLiteral("Connecting to %1 was cancelled").arg(name);
+    }));
+    QVERIFY(!indicator->isVisible());
+
+    QString warningText;
+    for (const QQmlError &warning : std::as_const(warnings)) {
+        warningText += warning.toString() + QLatin1Char('\n');
+    }
+    QVERIFY2(warnings.isEmpty(), qPrintable(warningText));
+}
+
+void TstCoreInfo::connectFlowAgainstTheRealDatabase()
+{
+    // Skipped unless the Oracle test database's environment is set -- by
+    // `RELDEX_IT_EXEC=<this binary> bash tools/oracle-test-db/run-it.sh
+    // connectFlowAgainstTheRealDatabase`, which loads tools/oracle-test-db/.env
+    // without printing it. No credential is printed here either.
+    const QString dsn = qEnvironmentVariable("RELDEX_TEST_ORACLE_DSN");
+    const QString user = qEnvironmentVariable("RELDEX_TEST_ORACLE_USER");
+    const QString password = qEnvironmentVariable("RELDEX_TEST_ORACLE_PASSWORD");
+    if (dsn.isEmpty() || user.isEmpty() || password.isEmpty()) {
+        QSKIP("RELDEX_TEST_ORACLE_DSN/_USER/_PASSWORD are not set; run through "
+              "tools/oracle-test-db/run-it.sh with RELDEX_IT_EXEC (ui/README.md, "
+              "\"Connect flow (M3.3)\")");
+    }
+    // host:port/service, the form run-it.sh exports.
+    const qsizetype slash = dsn.indexOf(QLatin1Char('/'));
+    const qsizetype colon = dsn.lastIndexOf(QLatin1Char(':'), slash);
+    QVERIFY(slash > 0 && colon > 0);
+    const QString host = dsn.left(colon);
+    const int port = dsn.mid(colon + 1, slash - colon - 1).toInt();
+    const QString service = dsn.mid(slash + 1);
+
+    QQmlApplicationEngine engine;
+    QList<QQmlError> warnings;
+    connect(&engine, &QQmlEngine::warnings, &engine,
+            [&warnings](const QList<QQmlError> &reported) { warnings += reported; });
+    engine.loadFromModule("Reldex.App", "Main");
+    QObject *root = engine.rootObjects().constFirst();
+    auto *window = qobject_cast<QQuickWindow *>(root);
+    QVERIFY(window != nullptr);
+    QQuickItem *rootItem = window->contentItem();
+    Bridge *bridge = readyBridge(root);
+    QVERIFY(bridge != nullptr);
+    SessionController *session = bridge->session();
+
+    const QString name = QStringLiteral("Reldex test database");
+    QVERIFY(!createShellProfile(bridge->connections(),
+                                shellProfile(name, host, port, service, user, false))
+                     .isEmpty());
+    QQuickItem *connectButton = nullptr;
+    QVERIFY(adapter_test::spinUntil([&] {
+        connectButton = adapter_test::findVisualChild(rootItem, QStringLiteral("connectButton_0"));
+        return connectButton != nullptr;
+    }));
+
+    // A wrong password: Authentication, the vendor's code, no retry.
+    QVERIFY(clickItem(connectButton));
+    QVERIFY(answerPasswordPrompt(root, QStringLiteral("Wrong_password_m33_ui")));
+    QVERIFY(adapter_test::spinUntil(
+            [session] { return session->connectState() == SessionController::ConnectFailed; }));
+    QCOMPARE(session->errorKind(), static_cast<int>(RELDEX_ERROR_KIND_AUTHENTICATION));
+    QCOMPARE(session->errorNativeCode(), 1017);
+    QVERIFY2(statusText(rootItem).contains(QStringLiteral("1017")), qPrintable(statusText(rootItem)));
+
+    // Connect, run one statement, disconnect -- five times, measured.
+    QList<qint64> connectMs;
+    QList<qint64> firstReplyMs;
+    QList<qint64> callUs;
+    for (int run = 0; run < 5; ++run) {
+        QElapsedTimer click;
+        click.start();
+        QVERIFY(clickItem(connectButton));
+        const qint64 clickUs = click.nsecsElapsed() / 1000;
+        qint64 pressUs = 0;
+        QVERIFY(answerPasswordPrompt(root, password, &pressUs));
+        callUs.append(std::max(clickUs, pressUs));
+        QVERIFY(adapter_test::spinUntil([session] {
+            return session->connectState() == SessionController::Connected
+                    || session->connectState() == SessionController::ConnectFailed;
+        }));
+        QVERIFY2(session->connectState() == SessionController::Connected,
+                 qPrintable(session->errorMessage()));
+        QVERIFY(statusText(rootItem) == QStringLiteral("Connected to %1").arg(name));
+        connectMs.append(session->lastConnectMs());
+
+        QElapsedTimer executing;
+        executing.start();
+        QVERIFY(session->execute(QStringLiteral("select 1 from dual")));
+        QVERIFY(adapter_test::spinUntil([session] {
+            return session->state() == SessionController::ResultComplete
+                    || session->state() == SessionController::Failed;
+        }));
+        firstReplyMs.append(executing.elapsed());
+        QCOMPARE(session->state(), SessionController::ResultComplete);
+        QCOMPARE(session->rowsFetched(), qint64 { 1 });
+        QVERIFY(adapter_test::spinUntil([&] {
+            return statusText(rootItem) == QStringLiteral("Connected to %1 · 1 row(s)").arg(name);
+        }));
+
+        // The thin driver cannot rule a transaction out after a SELECT, so
+        // Disconnect asks first; the user rolls back.
+        QVERIFY(session->transactionPossiblyActive());
+        QQuickItem *disconnect =
+                adapter_test::findVisualChild(rootItem, QStringLiteral("disconnectButton"));
+        QVERIFY(clickItem(disconnect));
+        QObject *confirm = root->findChild<QObject *>(QStringLiteral("disconnectConfirmDialog"));
+        QVERIFY(adapter_test::spinUntil([confirm] { return confirm->property("opened").toBool(); }));
+        QVERIFY(QMetaObject::invokeMethod(
+                root->findChild<QObject *>(QStringLiteral("disconnectRollback")), "clicked"));
+        QVERIFY(adapter_test::spinUntil(
+                [session] { return session->connectState() == SessionController::NotConnected; }));
+        QVERIFY(!session->transactionPossiblyLost());
+    }
+    qInfo("M3.3 shell against the test database, n=5: connect (open -> OPENED) p50 %lld ms "
+          "[%s]; select 1 from dual (execute -> result complete) p50 %lld ms [%s]; "
+          "longest UI-thread call (clicking Connect, or pressing Connect in the prompt) p50 %lld us",
+          median(connectMs),
+          qPrintable([&] { QStringList t; for (qint64 v : connectMs) t << QString::number(v); return t.join(QLatin1Char(' ')); }()),
+          median(firstReplyMs),
+          qPrintable([&] { QStringList t; for (qint64 v : firstReplyMs) t << QString::number(v); return t.join(QLatin1Char(' ')); }()),
+          median(callUs));
+    // The UI thread only submits; the network wait happens elsewhere.
+    QVERIFY(median(callUs) / 1000 < median(connectMs));
+
+    QString warningText;
+    for (const QQmlError &warning : std::as_const(warnings)) {
+        warningText += warning.toString() + QLatin1Char('\n');
+    }
+    QVERIFY2(warnings.isEmpty(), qPrintable(warningText));
 }
 
 QTEST_MAIN(TstCoreInfo)

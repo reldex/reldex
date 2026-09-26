@@ -27,6 +27,10 @@ Rectangle {
     // `ConnectionManager`, so this file (and a test that loads it standalone)
     // does not need to import `Reldex.Adapter` just to name the type.
     property var connectionManager: null
+    /// M3.3: the worksheet's `SessionController` (set by Main.qml); each
+    /// row's Connect button connects it. The adapter decides whether a
+    /// connect may start (`canConnect`).
+    property var session: null
 
     color: Theme.tokens.surface
     border.color: Theme.tokens.border
@@ -111,6 +115,7 @@ Rectangle {
                 id: connectionDelegate
 
                 required property int index
+                required property string profileId
                 required property string name
                 required property bool treatAsProduction
                 required property string endpointSummary
@@ -120,6 +125,22 @@ Rectangle {
                 onClicked: {
                     connectionManagerDialog.loadRow(index)
                     connectionManagerDialog.open()
+                }
+
+                // M3.3: connect this worksheet to the row's profile.
+                ToolButton {
+                    objectName: "connectButton_" + connectionDelegate.index
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.rightMargin: 2
+                    implicitHeight: 22
+                    text: qsTr("Connect")
+                    font.pixelSize: 10
+                    palette.buttonText: Theme.tokens.accent
+                    visible: sidebar.session !== null
+                    enabled: sidebar.session !== null && sidebar.session.canConnect
+                    Accessible.name: qsTr("Connect to %1").arg(connectionDelegate.name)
+                    onClicked: sidebar.session.connectProfile(connectionDelegate.profileId)
                 }
 
                 contentItem: Column {

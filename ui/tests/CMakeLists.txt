@@ -174,6 +174,12 @@ reldex_add_adapter_test(tst_teardown)
 # developer's own); every other one is in-memory (RELDEX_WORKSPACE_IN_MEMORY).
 reldex_add_adapter_test(tst_connectionmanager)
 reldex_add_adapter_test(tst_objectbrowsermodel)
+# M3.3: the worksheet connect flow (SessionController + ConnectionManager)
+# against the real workspace and prepare step, with the mock driver standing
+# in for the database. The real-database half is tst_coreinfo's
+# connectFlowAgainstTheRealDatabase (skipped unless the test database's
+# environment is set; see ui/README.md "Connect flow (M3.3)").
+reldex_add_adapter_test(tst_connectflow)
 
 # K5 is 10,000 teardown iterations plus 2,000 connect-teardown iterations; the
 # default CTest timeout of 1500 s is generous but this is the one test that
