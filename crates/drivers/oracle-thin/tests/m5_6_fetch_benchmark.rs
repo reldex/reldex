@@ -60,7 +60,9 @@
 //! (default `numbers10,text5date2,wide4k`; also `clob`), `RELDEX_M56_RUNS`
 //! (default 3), `RELDEX_M56_SIZES` (rows per round trip for every shape,
 //! overriding each shape's list), `RELDEX_M56_CAP_MS` (default 10,000),
-//! `RELDEX_M56_EXTRAS` (default `prefetch,sdu`; `none` for neither).
+//! `RELDEX_M56_EXTRAS` (default `prefetch,sdu`; `none` for neither),
+//! `RELDEX_M56_QUIET_WAIT_S` (default 0: before each link × shape group, wait
+//! up to this long for other builds on the machine to finish).
 //!
 //! Output, all CSV: `runs.csv` (one row per run), `cells.csv` (median and
 //! coefficient of variation per link × shape × size), `fit.csv` (per-fetch
@@ -107,6 +109,8 @@ const MIN_FETCHES: usize = 5;
 const PINGS: usize = 7;
 /// Repetitions inside one prefetch child.
 const PREFETCH_REPS: usize = 5;
+/// How long one child may run before the parent kills it.
+const CHILD_LIMIT: Duration = Duration::from_secs(300);
 
 /// One row shape: a statement whose every column value differs from the
 /// previous row's, and the rows per round trip measured for it.
@@ -674,6 +678,22 @@ fn run_child(spec: &str, dsn: &str, relay: Option<&Relay>) -> ChildRun {
         let _ = stderr.read_to_string(&mut text);
         text
     });
+    // A watchdog, so one stuck child (a lost mark, a hung connect) costs
+    // CHILD_LIMIT rather than the whole matrix. It kills by process id; the
+    // child's result is then recorded as failed.
+    let (finished, watch) = std::sync::mpsc::channel::<()>();
+    let pid = child.id();
+    let watchdog = thread::spawn(move || {
+        if watch.recv_timeout(CHILD_LIMIT).is_err() {
+            let _ = if cfg!(windows) {
+                Command::new("taskkill")
+                    .args(["/F", "/PID", &pid.to_string()])
+                    .output()
+            } else {
+                Command::new("kill").args(["-9", &pid.to_string()]).output()
+            };
+        }
+    });
 
     let mut fields = BTreeMap::new();
     let mut lines = Vec::new();
@@ -684,6 +704,12 @@ fn run_child(spec: &str, dsn: &str, relay: Option<&Relay>) -> ChildRun {
         let Ok(line) = line else { break };
         transcript.push_str(&line);
         transcript.push('\n');
+        // libtest prints `test <name> ... ` without a newline before the
+        // test's own output, so the child's first line arrives after it.
+        let Some(at) = line.find("M56 ") else {
+            continue;
+        };
+        let line = line[at..].to_owned();
         if let Some(label) = line.strip_prefix("M56 MARK ") {
             let now = relay.and_then(Relay::latest).map(|stats| stats.snapshot());
             match label.trim() {
@@ -703,6 +729,8 @@ fn run_child(spec: &str, dsn: &str, relay: Option<&Relay>) -> ChildRun {
     }
     drop(stdin);
     let status = child.wait().expect("wait for the child");
+    let _ = finished.send(());
+    let _ = watchdog.join();
     transcript.push_str(&errors.join().unwrap_or_default());
     ChildRun {
         ok: status.success(),
@@ -912,6 +940,27 @@ fn list(variable: &str, default: &str) -> Vec<String> {
         .collect()
 }
 
+/// Waits, up to `limit`, until no compiler or linker is running (another
+/// worker's build), and returns how long it waited. The machine is shared;
+/// this reduces the noise, `groups.csv` and every run's `machine_state`
+/// record what was left of it.
+fn wait_for_quiet(limit: Duration) -> Duration {
+    let started = Instant::now();
+    while started.elapsed() < limit {
+        let state = machine_state();
+        let busy = state.split_whitespace().any(|pair| {
+            pair.split_once('=').is_some_and(|(name, count)| {
+                matches!(name, "rustc" | "cl" | "link" | "clippy-driver" | "ninja") && count != "0"
+            })
+        });
+        if !busy {
+            break;
+        }
+        thread::sleep(Duration::from_secs(5));
+    }
+    started.elapsed()
+}
+
 /// The connect string for a link: the relay's port, or the listener itself.
 fn dsn_for(relay: Option<&Relay>) -> String {
     relay.map_or_else(
@@ -949,6 +998,9 @@ fn m5_6_fetch_benchmark_matrix() {
             .collect()
     });
     let extras = list("RELDEX_M56_EXTRAS", "prefetch,sdu");
+    let quiet_wait = Duration::from_secs(
+        optional("RELDEX_M56_QUIET_WAIT_S").map_or(0, |value| value.parse().expect("seconds")),
+    );
     let upstream = dsn_address();
 
     let mut runs_csv = Csv::create(&out.join("runs.csv"), RunRecord::HEADER);
@@ -960,7 +1012,7 @@ fn m5_6_fetch_benchmark_matrix() {
     );
     let mut groups_csv = Csv::create(
         &out.join("groups.csv"),
-        "link,shape,started_epoch_s,cpu_load_percent,machine_state",
+        "link,shape,started_epoch_s,cpu_load_percent,waited_for_quiet_s,machine_state",
     );
     let mut records: Vec<RunRecord> = Vec::new();
     let mut failures = Vec::new();
@@ -971,12 +1023,14 @@ fn m5_6_fetch_benchmark_matrix() {
             .map(|model| Relay::start(upstream.as_str(), model).expect("start the relay"));
         let dsn = dsn_for(relay.as_ref());
         for shape in &shapes {
+            let waited = wait_for_quiet(quiet_wait);
             let load = cpu_load_percent().map_or_else(String::new, |load| load.to_string());
             groups_csv.row(&format!(
-                "{},{},{},{load},{}",
+                "{},{},{},{load},{},{}",
                 link.name,
                 shape.name,
                 now_epoch(),
+                waited.as_secs(),
                 machine_state()
             ));
             let warm = run_child(
