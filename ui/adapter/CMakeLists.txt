@@ -25,6 +25,8 @@ qt_add_qml_module(reldex_adapter
         SessionController.cpp
         ResultTableModel.h
         ResultTableModel.cpp
+        ObjectBrowserModel.h
+        ObjectBrowserModel.cpp
         ScrollDriver.h
         ScrollDriver.cpp
         ProfileModel.h

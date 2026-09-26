@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-26T18:43:00+07:00",
+  "updatedAt": "2026-09-26T19:22:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1375,8 +1375,8 @@
           "title": "M6 — Browse, prove, package",
           "tasks": [
             {
-              "title": "M6.1 Object browser: lazy tree over the 9 SPEC.md §16 groups, server-side filter, row cap, columns of a selected table (sonnet)",
-              "status": "todo"
+              "title": "M6.1 Object browser: lazy tree over the 9 SPEC.md §16 groups, server-side filter, row cap, columns of a selected table (sonnet) — UI half done 2026-09-26 (PR #47): lazy model + panel over the mock driver, own metadata session, filter only ever a bind, review-found refresh/filter race fixed (newest request supersedes), keyboard navigation; real-DB half (permission message, large-schema measurement, row cap as a new SettingId) after M3.3",
+              "status": "in_progress"
             },
             {
               "title": "M6.2 Workspace persistence: open worksheets, text, layout, active profile — non-transactional state only (sonnet) —  — store side done 2026-09-25: worksheet, worksheet_setting (real FK, cascade — closes the ADR-0006 keyed-alone gap) and single-row layout tables; non-transactional state only (no session, connection or transaction column exists); Debug redacts text; shell half (restore on start) pending M2.11/M3.x",
@@ -1713,6 +1713,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-26",
+      "text": "M6.1 object browser UI half merged (PR #47): lazy tree model and panel over the mock driver with its own metadata session; the review found and the fix round removed a race where a refresh or filter change during an in-flight fetch was silently dropped; keyboard navigation wired; the real-database half (permission message, large-schema measurement, row cap as a setting) waits for M3.3."
+    },
     {
       "date": "2026-09-26",
       "text": "M5.6 fetch benchmark done and merged (PR #46): 375 runs on Oracle 19c across three row shapes and three links confirm the upstream O(packets²) re-parse on the wire; recommended budget 192 KiB per round trip (160 KiB ties within noise, 256 KiB is measurably worse at loopback). New setting results.round_trip_bytes lands in the registry; changing the shipped wire array remains an owner sign-off (ADR-0004 point (a))."
