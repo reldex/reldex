@@ -711,11 +711,16 @@ Not fixed here — `crates/ffi` was otherwise out of scope for this task:
 
 ### Hand-off
 
-- **M3.4** (production indicator): read `treatAsProduction` off
-  `ProfileModel`'s role/`get()` map for the active worksheet's profile — it
-  is already validated against ADR-0006's environment rules by the time it
-  reaches the model (`Custom` is the only environment where the adapter lets
-  it vary; every other environment kind fixes it).
+- **M3.4** (production indicator) — **done**, see "Production indicator
+  (M3.4)" below. Deviates from the plan this bullet used to describe (reading
+  `treatAsProduction` off `ProfileModel`'s role/`get()` map by looking the
+  active profile up by id): that would have made a QML binding responsible
+  for joining two adapter objects (`SessionController`'s active profile id
+  and `ProfileModel`'s rows) to decide something ("is this production"), one
+  step past "display what the adapter decided" and into a lookup QML would
+  own itself. `SessionController.activeProfileIsProduction` is a direct bool instead
+  -- still exactly `Profile::treat_as_production()`, just handed across
+  already resolved.
 - **M3.6** (settings UI): `ConnectionManager` and `ProfileModel` are reached
   the same way a settings page would reach them — `bridge.connections`,
   `bridge.connections.profiles` — no additional wiring needed. The
@@ -725,6 +730,126 @@ Not fixed here — `crates/ffi` was otherwise out of scope for this task:
   that touches the credential store; see "write-order/clearing" above for the
   two rules it encodes (put-then-flip; `NotFound`/`Unavailable`-count-as-done,
   with the `Unavailable` gap called out above).
+
+## Production indicator (M3.4)
+
+`SPEC.md` §17: "Production should have a persistent visual indicator";
+`docs/exec-plans/active/phase-1.md` row M3.4: "persistent, not colour-only
+(icon + text + tab badge)". Two new pieces on top of M3.1's shell and M3.2's
+connection manager:
+
+- **`SessionController::activeProfileIsProduction`** (`ui/adapter/
+  SessionController.h`/`.cpp`) — a plain `Q_PROPERTY(bool ...)`, default
+  `false`, with a setter and a `NOTIFY` signal, following the same shape as
+  `runOnOpen`/`autoFetch` on the same class. It is `Profile::
+  treat_as_production()` (ADR-0006 P3) carried across the adapter boundary
+  once whatever binds a worksheet's session to a profile has resolved it --
+  never the `ReldexEnvironmentKind` enum, and never computed in QML. **Nothing
+  sets it yet**: M3.3 (the connect flow) is the class that will call
+  `setActiveProfileIsProduction()` once a worksheet's session is actually
+  bound to a profile, most likely from whatever already has the profile row
+  in hand to build `connection_params` in the first place (P4) -- see
+  "Hand-off" above for why this replaced the originally-planned "look
+  `treatAsProduction` up in `ProfileModel` by id from QML" approach. Until
+  M3.3 lands, the property simply always reads `false`, so every location
+  below is exercised in tests by calling the setter directly (`ui/tests/
+  tst_coreinfo.cpp`'s `productionIndicator*` tests), not by a real connect.
+- **`ui/app/ProductionIndicator.qml`** — a small reusable `Row`: a Unicode
+  warning-triangle glyph (`⚠`, not a raster asset, matching this shell's
+  existing icon convention) plus a text label, both coloured with
+  `Theme.tokens.warning` (a theme token, no hex literal in this file), and
+  both driven by an `active` property with no default binding of their own
+  (a caller always supplies it). `compact` swaps the full "PRODUCTION" label
+  and larger glyph for a smaller glyph and "PROD", used only for the tab
+  badge below. `Accessible.role: Accessible.StaticText` and an
+  `Accessible.name` ("Production environment") are set once on the root --
+  it takes no keyboard focus, so a Name is the whole of its accessibility
+  surface, matching the read-only regions already in this shell (`Sidebar`,
+  `StatusBar`, etc.). Reused at all three places a statement can be run
+  today:
+  - **the status bar** (`StatusBar.qml`) — replaces the M3.1 placeholder
+    `Item { objectName: "productionIndicatorSlot" }` outright, in the same
+    spot;
+  - **a worksheet-header strip** (`WorksheetArea.qml`, `objectName:
+    "worksheetHeader"`) — a `Rectangle` above the editor/result `SplitView`
+    whose `height` is `0` unless the indicator is active, so it costs no
+    layout space in the common (non-production) case;
+  - **each worksheet's own tab** (`WorksheetArea.qml`'s `TabBar` `Repeater`
+    delegate) — a `compact` instance anchored to the delegate's top-right
+    corner, overlaid on top of Basic's own `TabButton` rendering rather than
+    folded into its `text`, so it keeps its own colour/size independent of
+    the palette roles that `TabButton` itself reads (see "App shell (M3.1)"
+    "Tab bar contrast").
+
+  `Main.qml` is the one place that reads `bridge.session.activeProfileIsProduction`
+  (guarded against `bridge.session` being null, the same as `Bridge::Bridge()`'s
+  failure path can leave it) and passes the result down as a plain
+  `productionActive: bool` property on both `StatusBar` and `WorksheetArea` --
+  neither of those files reaches into `bridge` itself, keeping the "no
+  business rule in QML" boundary at exactly one place.
+
+  Today every worksheet tab shares the single `SessionController` `Bridge`
+  owns (M4.9 is what gives each tab its own session), so `productionActive`
+  applies identically to every tab's badge and to the worksheet header --
+  there is no per-tab distinction to make yet.
+
+**Never colour alone.** Every one of the three placements is icon (a
+triangle glyph, a distinct shape before any colour is applied) plus a text
+label ("PRODUCTION"/"PROD"); `visible` is the only thing that changes when
+`active` is `false` -- there is no colour-only state anywhere in this
+component. `ui/tests/tst_coreinfo.cpp`'s `productionIndicatorPassesGreyscaleCheck()`
+grabs the rendered window with the indicator active, desaturates the image
+(`QImage::convertToFormat(QImage::Format_Grayscale8)`), and asserts the
+glyph/label pixels are still substantially darker than the surrounding
+`surfaceAlt`/`background` in the greyscale image -- a luminance-contrast
+assertion, not a pixel-diff, per the task brief.
+
+### Tests
+
+`ui/tests/tst_coreinfo.cpp` (all load `Main.qml` offscreen, the same pattern
+as the app-shell tests above):
+
+- `productionIndicatorHiddenByDefault` -- nothing sets
+  `activeProfileIsProduction`, so all three locations are absent
+  (`!visible`) and take no layout space (worksheet header `height == 0`).
+- `productionIndicatorVisibleInAllThreePlacesWhenActive` -- calls
+  `session->setActiveProfileIsProduction(true)` and checks the status bar,
+  worksheet header and tab badge instances are all visible, each with a
+  nonzero-width icon glyph and label `Text`.
+- `productionIndicatorFollowsTheFlagNotTheEnvironment` -- toggles the same
+  boolean true/false twice in a row (standing in for a `Custom` profile with
+  `treat_as_production` on, then off -- the adapter never tells QML which
+  environment it was, so from this layer the two cases are indistinguishable
+  by construction) and checks the indicator tracks the flag exactly, with no
+  hidden dependency on which environment produced it.
+- `productionIndicatorPassesGreyscaleCheck` -- as described above.
+- DPI: `productionIndicatorRendersAtCurrentScaleFactor`, registered in
+  `ui/tests/CMakeLists.txt` at the default 1x (as part of the plain
+  `tst_coreinfo` entry) and once more at `QT_SCALE_FACTOR=2`, mirroring
+  `appShellRendersAtCurrentScaleFactor`/
+  `connectionManagerDialogRendersAtCurrentScaleFactor` above -- asserts every
+  placement's width/height stay positive at both scale factors.
+
+### Hand-off
+
+- **M3.3** (connect flow): call
+  `bridge.session.setActiveProfileIsProduction(...)` with the connecting
+  profile's `treatAsProduction` (from the `ProfileModel` row, or the FFI
+  profile view it already has in hand to build `connection_params`) once the
+  session actually opens against a profile, and set it back to `false` on
+  close/disconnect. No other file needs to change for the indicator to start
+  reflecting real connections.
+- **M4.9** ("N sessions, per-tab state"): once each tab has its own
+  `SessionController`, `productionActive` moves from one shared
+  `WorksheetArea`-level property to a per-tab value read off each tab's own
+  controller; the tab-badge `ProductionIndicator` instance itself does not
+  need to change, only what feeds its `active` property.
+- **M6.4** (accessibility baseline): this section's greyscale check is a
+  contrast/presence assertion, not the full WCAG contrast-ratio computation
+  "App shell (M3.1)" records for the tab bar and the border token -- M6.4 is
+  where a numeric ratio for `Theme.tokens.warning` against `surfaceAlt`/
+  `background`, in both light and dark, would belong if that project-wide
+  pass wants one.
 
 ## Object browser (M6.1)
 

@@ -712,6 +712,15 @@ void SessionController::setMockServerOutputSupported(bool supported)
     Q_EMIT mockServerOutputSupportedChanged();
 }
 
+void SessionController::setActiveProfileIsProduction(bool production)
+{
+    if (production == m_activeProfileIsProduction) {
+        return;
+    }
+    m_activeProfileIsProduction = production;
+    Q_EMIT activeProfileIsProductionChanged();
+}
+
 void SessionController::setMockRows(qint64 rows)
 {
     if (rows == m_mockRows) {
