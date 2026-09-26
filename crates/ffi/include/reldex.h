@@ -2510,6 +2510,14 @@ typedef struct ReldexLiveCounts {
    * history pages, and worksheets and worksheet lists.
    */
   size_t misc_objects;
+  /**
+   * Result column-description sets this library holds (ABI 3.2): one per
+   * open result, shared by its batches and kept alive by any the caller
+   * still holds, plus a **lost** session's until the caller next names
+   * that session in `reldex_session_close`, `reldex_session_close_result`
+   * or `reldex_session_abandon`, or destroys the hub.
+   */
+  size_t column_sets;
 } ReldexLiveCounts;
 
 /**
@@ -4545,8 +4553,13 @@ size_t reldex_session_result_column_count(struct ReldexHub *hub,
  * statement that fails, a fetch that fails, a cancel, and a session *lost*
  * mid-statement all leave the strings readable, because the caller — who may
  * still be holding the pointers — did nothing to say otherwise. A lost
- * session's descriptions are kept until the hub is destroyed, even after its
- * `TERMINAL` has been drained.
+ * session's descriptions are kept even after its `TERMINAL` has been
+ * drained: until the caller next names that session in
+ * `reldex_session_close`, `reldex_session_close_result` or
+ * `reldex_session_abandon` (each then reports `RELDEX_STATUS_NOT_FOUND`, and
+ * frees them), or destroys the hub. ABI 4.0 (M5.2 Stage B) will shorten
+ * this: a lost session's descriptions valid only until its `TERMINAL` is
+ * drained (ADR-0003 A39).
  *
  * Note what that does **not** promise. On a lost session the result itself is
  * gone — nothing can be fetched from it — and once its `TERMINAL` has been

@@ -212,10 +212,12 @@ pub struct ReldexHub {
     pending: Mutex<IdMap<Pending>>,
     next_request: AtomicU64,
     /// Column descriptions of results that were open when their session was
-    /// **lost** — nothing the caller did ended their documented lifetime, so
-    /// they are freed only by [`reldex_hub_destroy`]; see
+    /// **lost**, by session id — nothing the caller did ended their
+    /// documented lifetime when the session went, so they are freed when the
+    /// caller next names that session in a close, a result close or an
+    /// abandon, or by [`reldex_hub_destroy`]; see
     /// [`crate::reldex_session_result_column`].
-    orphaned_columns: Mutex<Vec<Arc<ResultColumns>>>,
+    orphaned_columns: Mutex<IdMap<Vec<Arc<ResultColumns>>>>,
     _live: LiveHub,
 }
 
@@ -268,7 +270,7 @@ impl ReldexHub {
             sessions: Mutex::new(IdMap::default()),
             pending: Mutex::new(IdMap::default()),
             next_request: AtomicU64::new(1),
-            orphaned_columns: Mutex::new(Vec::new()),
+            orphaned_columns: Mutex::new(IdMap::default()),
             _live: LiveHub::new(),
         }
     }
@@ -320,11 +322,22 @@ impl ReldexHub {
         lock(&self.queue).next()
     }
 
-    /// Keeps a lost session's column descriptions until the hub goes away.
-    pub(crate) fn orphan_columns(&self, columns: Vec<Arc<ResultColumns>>) {
+    /// Keeps a lost session's column descriptions until the caller names the
+    /// session again in a call that ends them, or the hub goes away.
+    pub(crate) fn orphan_columns(&self, session: u64, columns: Vec<Arc<ResultColumns>>) {
         if !columns.is_empty() {
-            lock(&self.orphaned_columns).extend(columns);
+            lock(&self.orphaned_columns)
+                .entry(session)
+                .or_default()
+                .extend(columns);
         }
+    }
+
+    /// Frees what [`Self::orphan_columns`] kept for `session`, on this thread
+    /// and outside the lock.
+    pub(crate) fn release_orphans(&self, session: u64) {
+        let released = lock(&self.orphaned_columns).remove(&session);
+        drop(released);
     }
 
     fn set_waker(self: &Arc<Self>, func: ReldexWakeFn, user_data: *mut c_void) {

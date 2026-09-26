@@ -935,7 +935,7 @@ per request, and nothing polls.
   `reldex_hub_session_count()` and `reldex_live_counts().sessions` never came back down after a
   close. Both are now exact, and tested for a clean close, a lost session and a failed open.
 - A lost session's column descriptions can still be named by a batch the caller holds, so they are
-  kept (orphaned) until the hub is destroyed rather than freed at `TERMINAL`. A closed session's are
+  kept (orphaned) past `TERMINAL` rather than freed there — bounded by A39. A closed session's are
   freed at `TERMINAL`: the close was the caller's promise that nothing names them any more (A20).
 - `reldex_hub_destroy` unregisters the waker, abandons every open session through the registry
   (never commits, never waits), drops the queue with whatever it holds, and frees the hub before it
@@ -1077,3 +1077,23 @@ why: `Bridge::checkAbiVersion` returns `Bridge::StartError::AbiMinorTooOld` (maj
 `AbiMajorMismatch`), tested with synthetic versions in `tst_bridge`. A newer minor is accepted: it
 only adds. This keeps D7's promise in the direction it can be kept — an old adapter on a new library
 — and refuses the direction that cannot.
+
+### A39 — a lost session's column descriptions are bounded by the caller's next close (M2.15 review)
+
+A20 lets the caller keep reading a result's column names until it submits a close, and a session
+lost mid-statement is not the caller's doing — so A33 kept those descriptions past the session's
+`TERMINAL`. As first written they then lived until the hub was destroyed: a few KB per lost session
+with open results, growing for as long as the application ran.
+
+They are now kept per session and freed the next time the caller names that retired session in
+`reldex_session_close`, `reldex_session_close_result` or `reldex_session_abandon` — the calls that
+say "I am done with it". Each still reports `RELDEX_STATUS_NOT_FOUND`, because the session is gone;
+the call is simply also the point at which nothing can be holding the names any more by the caller's
+own account. Hub destroy still frees whatever is left. `reldex_live_counts` gained a `column_sets`
+field (additive, 3.2) so a leak check sees them, and
+`a_lost_sessions_column_descriptions_go_when_the_caller_names_it_again` (`live_counts.rs`) proves
+the count returns to baseline for each of the three calls.
+
+**ABI 4.0 (M5.2 Stage B) will shorten this:** a lost session's descriptions will be valid only until
+its `TERMINAL` is drained, the same point at which its id stops being found. That is a change to
+A20's documented lifetime, so it waits for the major version that ADR-0004 already reserves.

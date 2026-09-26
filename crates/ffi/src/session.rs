@@ -493,6 +493,36 @@ pub(crate) unsafe fn with_session(
     }
 }
 
+/// [`with_session`], for the three calls that end what a session's column
+/// descriptions are for: `reldex_session_close`, `reldex_session_close_result`
+/// and `reldex_session_abandon`.
+///
+/// Naming a session whose `TERMINAL` has been drained is still
+/// `RELDEX_STATUS_NOT_FOUND`. It is also the caller saying it is done with
+/// that session, so the descriptions a **loss** kept past the `TERMINAL`
+/// (see [`crate::reldex_session_result_column`]) are freed then, on this
+/// thread — bounded by the caller's next close rather than by the hub's
+/// lifetime.
+///
+/// # Safety
+///
+/// As [`with_session`].
+unsafe fn with_session_ending(
+    hub: *mut ReldexHub,
+    session: ReldexSessionId,
+    body: impl FnOnce(&ReldexHub, &Arc<SessionEntry>) -> ReldexStatus,
+) -> ReldexStatus {
+    // SAFETY: delegated to this function's contract.
+    let status = unsafe { with_session(hub, session, body) };
+    if status == ReldexStatus::NotFound {
+        // SAFETY: as above; a null or unaligned hub was already refused, and
+        // `with_hub` refuses it again rather than dereferencing it.
+        let _: Option<()> =
+            unsafe { with_hub(hub.cast_const(), |hub| hub.release_orphans(session)) };
+    }
+    status
+}
+
 /// Turns one `db-core` event into the event the caller drains.
 ///
 /// Runs on the caller's thread, inside `reldex_hub_next_event`, with no lock
@@ -730,8 +760,9 @@ fn retire(hub: &ReldexHub, id: SessionId) -> bool {
         drop(ended.columns);
     } else {
         // Nothing the caller did ended these descriptions' documented
-        // lifetime, so they stay readable until the hub is destroyed.
-        hub.orphan_columns(ended.columns);
+        // lifetime, so they stay readable until the caller next names this
+        // session to end them (`with_session_ending`) or destroys the hub.
+        hub.orphan_columns(id.get(), ended.columns);
     }
     ended.abandoned
 }
@@ -1034,8 +1065,13 @@ pub unsafe extern "C" fn reldex_session_result_column_count(
 /// statement that fails, a fetch that fails, a cancel, and a session *lost*
 /// mid-statement all leave the strings readable, because the caller — who may
 /// still be holding the pointers — did nothing to say otherwise. A lost
-/// session's descriptions are kept until the hub is destroyed, even after its
-/// `TERMINAL` has been drained.
+/// session's descriptions are kept even after its `TERMINAL` has been
+/// drained: until the caller next names that session in
+/// `reldex_session_close`, `reldex_session_close_result` or
+/// `reldex_session_abandon` (each then reports `RELDEX_STATUS_NOT_FOUND`, and
+/// frees them), or destroys the hub. ABI 4.0 (M5.2 Stage B) will shorten
+/// this: a lost session's descriptions valid only until its `TERMINAL` is
+/// drained (ADR-0003 A39).
 ///
 /// Note what that does **not** promise. On a lost session the result itself is
 /// gone — nothing can be fetched from it — and once its `TERMINAL` has been
@@ -1129,7 +1165,7 @@ pub unsafe extern "C" fn reldex_session_close_result(
     entry(|| {
         // SAFETY: delegated to this function's contract for `hub`.
         unsafe {
-            with_session(hub, session, |hub, entry| {
+            with_session_ending(hub, session, |hub, entry| {
                 if entry.handle(&hub.registry).is_none() {
                     return refused("close_result");
                 }
@@ -1182,7 +1218,7 @@ pub unsafe extern "C" fn reldex_session_close(
         };
         // SAFETY: delegated to this function's contract for `hub`.
         unsafe {
-            with_session(hub, session, |hub, entry| {
+            with_session_ending(hub, session, |hub, entry| {
                 let status =
                     entry.submit(hub, "close", Pending::caller(request), |session, core| {
                         session.submit_close(core, disposition)
@@ -1234,7 +1270,7 @@ pub unsafe extern "C" fn reldex_session_abandon(
         }
         // SAFETY: delegated to this function's contract for `hub`.
         unsafe {
-            with_session(hub, session, |hub, entry| {
+            with_session_ending(hub, session, |hub, entry| {
                 let (outcome, lost) = entry.abandon(&hub.registry);
                 if !out_outcome.is_null() {
                     // SAFETY: checked non-null and aligned above.

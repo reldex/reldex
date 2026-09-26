@@ -392,8 +392,15 @@ pub(crate) struct ResultColumns {
     columns: Box<[ColumnDescription]>,
 }
 
+impl Drop for ResultColumns {
+    fn drop(&mut self) {
+        crate::counters::destroyed(crate::counters::Kind::ColumnSet);
+    }
+}
+
 impl ResultColumns {
     pub(crate) fn new(metadata: Vec<ColumnMetadata>) -> Arc<Self> {
+        crate::counters::created(crate::counters::Kind::ColumnSet);
         Arc::new(Self {
             columns: metadata
                 .into_iter()

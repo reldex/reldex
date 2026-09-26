@@ -60,6 +60,10 @@ static ARENAS: AtomicUsize = AtomicUsize::new(0);
 /// family that turns out to need its own count can move to a dedicated field
 /// later (additive, per D7).
 static MISC_OBJECTS: AtomicUsize = AtomicUsize::new(0);
+/// Result column-description sets (ABI 3.2): held for the caller, not handed
+/// out, but memory a leak check should see — in particular a lost session's,
+/// which are kept past its `TERMINAL` (ADR-0003 A39).
+static COLUMN_SETS: AtomicUsize = AtomicUsize::new(0);
 
 /// Which counter an object belongs to.
 #[derive(Clone, Copy)]
@@ -73,6 +77,8 @@ pub(crate) enum Kind {
     ServerOutputLines,
     /// See [`MISC_OBJECTS`].
     WorkspaceObject,
+    /// See [`COLUMN_SETS`].
+    ColumnSet,
 }
 
 impl Kind {
@@ -84,6 +90,7 @@ impl Kind {
             Self::Error => &ERRORS,
             Self::Arena => &ARENAS,
             Self::ServerOutputLines | Self::WorkspaceObject => &MISC_OBJECTS,
+            Self::ColumnSet => &COLUMN_SETS,
         }
     }
 }
@@ -147,6 +154,7 @@ pub unsafe extern "C" fn reldex_live_counts(out: *mut ReldexLiveCounts) -> Relde
             errors: ERRORS.load(Ordering::Relaxed),
             arenas: ARENAS.load(Ordering::Relaxed),
             misc_objects: MISC_OBJECTS.load(Ordering::Relaxed),
+            column_sets: COLUMN_SETS.load(Ordering::Relaxed),
         };
         // SAFETY: delegated to this function's contract for `out`.
         if unsafe { write_out_struct(out, counts) } {
@@ -185,6 +193,12 @@ pub struct ReldexLiveCounts {
     /// output line sets, metadata queries, profiles and profile lists,
     /// history pages, and worksheets and worksheet lists.
     pub misc_objects: usize,
+    /// Result column-description sets this library holds (ABI 3.2): one per
+    /// open result, shared by its batches and kept alive by any the caller
+    /// still holds, plus a **lost** session's until the caller next names
+    /// that session in `reldex_session_close`, `reldex_session_close_result`
+    /// or `reldex_session_abandon`, or destroys the hub.
+    pub column_sets: usize,
 }
 
 // SAFETY: `#[repr(C)]`, `struct_size` first, every other field a `usize` —
@@ -212,6 +226,7 @@ impl Default for ReldexLiveCounts {
             errors: 0,
             arenas: 0,
             misc_objects: 0,
+            column_sets: 0,
         }
     }
 }

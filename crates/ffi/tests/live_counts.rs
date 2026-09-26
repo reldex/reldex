@@ -336,6 +336,66 @@ fn a_failed_open_stops_counting_once_its_terminal_is_drained() {
     settles_back_to(baseline, "a failed open to release everything");
 }
 
+/// A lost session's column descriptions outlive its `TERMINAL` — the caller
+/// may still hold pointers into them — but not the hub: the caller's next
+/// close, result close or abandon naming that session frees them (and still
+/// reports `NOT_FOUND`). Before, they piled up until the hub was destroyed.
+#[test]
+fn a_lost_sessions_column_descriptions_go_when_the_caller_names_it_again() {
+    let _guard = exclusively();
+    forget_last_error();
+    let baseline = counts();
+    let harness = Harness::new();
+
+    for how in ["close", "close_result", "abandon"] {
+        let session = harness.open(config());
+        assert_eq!(
+            harness.execute(session, 2, ReldexMockStatement::GeneratedQuery),
+            ReldexStatus::Ok
+        );
+        let executed = harness.next_event();
+        assert_eq!(executed.kind, ReldexEventKind::Executed as i32);
+        let result = executed.result;
+        assert_eq!(
+            counts().column_sets,
+            baseline.column_sets + 1,
+            "{how}: open"
+        );
+
+        assert_eq!(
+            harness.execute(session, 3, ReldexMockStatement::LoseSession),
+            ReldexStatus::Ok
+        );
+        let failed = harness.next_event();
+        assert_eq!(failed.kind, ReldexEventKind::Executed as i32);
+        drop(take_error(&failed));
+        let terminal = harness.next_event();
+        assert_eq!(terminal.kind, ReldexEventKind::Terminal as i32);
+        drop(take_error(&terminal));
+        assert_eq!(counts().sessions, baseline.sessions, "{how}: retired");
+        assert_eq!(
+            counts().column_sets,
+            baseline.column_sets + 1,
+            "{how}: kept past TERMINAL for pointers the caller may hold"
+        );
+
+        let status = match how {
+            "close" => harness.close(session, 4, ReldexCloseDisposition::Rollback),
+            "close_result" => harness.close_result(session, 4, result),
+            _ => harness.abandon(session).0,
+        };
+        assert_eq!(status, ReldexStatus::NotFound, "{how}: still not found");
+        forget_last_error();
+        assert_eq!(
+            counts().column_sets,
+            baseline.column_sets,
+            "{how}: freed when the caller named the session again"
+        );
+    }
+    drop(harness);
+    settles_back_to(baseline, "the hub to release everything");
+}
+
 /// A workspace profile shaped enough for `reldex_workspace_credential_put`/
 /// `reldex_workspace_resolve_password` to accept it -- the fields the
 /// credential path itself reads, not a realistic connection.

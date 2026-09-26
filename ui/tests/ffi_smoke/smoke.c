@@ -2097,7 +2097,8 @@ int main(void)
                || final_counts.batches != baseline.batches
                || final_counts.errors != baseline.errors
                || final_counts.arenas != baseline.arenas
-               || final_counts.misc_objects != baseline.misc_objects) {
+               || final_counts.misc_objects != baseline.misc_objects
+               || final_counts.column_sets != baseline.column_sets) {
             double elapsed = smoke_now_seconds() - counts_started;
             if (elapsed > HANG_GUARD_SECONDS) {
                 break;
@@ -2118,6 +2119,9 @@ int main(void)
             final_counts.misc_objects == baseline.misc_objects,
             "no M2.11 object (metadata query, profile/history/worksheet list, secret, "
             "connect summary or workspace handle) is left alive before the workspace section");
+        smoke_check(
+            final_counts.column_sets == baseline.column_sets,
+            "no result column-description set is left alive, a lost session's included");
     }
 
     /* 15. Settings, profiles, credentials, history, worksheets and layout
