@@ -162,9 +162,15 @@ default_store_path() {
 }
 
 store_mtime() {
-    # GNU stat (Linux, MSYS/Git Bash's coreutils) first, BSD stat (macOS)
-    # second; either failing (e.g. the path does not exist) is not fatal.
-    stat -c '%Y' "$1" 2>/dev/null || stat -f '%m' "$1" 2>/dev/null || true
+    # Nanosecond mtime plus size, not whole-second mtime alone (should-fix,
+    # M3.2 round-2 review, 2026-09-26): a write-and-restore within the same
+    # second -- plausible for a small SQLite file rewritten quickly -- must
+    # still be caught. GNU stat (Linux, MSYS/Git Bash's coreutils) supports
+    # sub-second precision via `%.9Y`; BSD/macOS `stat -f` has no such field,
+    # so that fallback is whole-second mtime plus size only -- still strictly
+    # more sensitive than mtime alone, and still safely falls through to
+    # "not fatal" if the path does not exist.
+    stat -c '%.9Y %s' "$1" 2>/dev/null || stat -f '%m %z' "$1" 2>/dev/null || true
 }
 
 if [ "${RUN_TESTS}" -eq 1 ]; then
