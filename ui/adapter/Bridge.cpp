@@ -16,7 +16,9 @@
 /// `extern "C"` entry point below stays three lines long.
 void reldexBridgeWakeImpl(void *userData) noexcept
 {
-    // Runs on a Reldex pump thread, never on the Qt thread.
+    // Runs on a Reldex session's worker thread (or, rarely, inside a
+    // reldex_* call on the Qt thread that made the queue non-empty) -- either
+    // way it only posts.
     //
     // reldex.h, "THE WAKER": must not block, must not call ANY reldex_*
     // function on any hub, and must not let a C++ exception escape -- that
@@ -96,6 +98,19 @@ bool Bridge::checkThread(const char *what) const
     return false;
 }
 
+Bridge::StartError Bridge::checkAbiVersion(quint32 libraryVersion) noexcept
+{
+    const quint32 major = libraryVersion >> 16;
+    const quint32 minor = libraryVersion & 0xFFFFu;
+    if (major != static_cast<quint32>(RELDEX_ABI_VERSION_MAJOR)) {
+        return StartError::AbiMajorMismatch;
+    }
+    if (minor < static_cast<quint32>(RELDEX_ABI_VERSION_MINOR)) {
+        return StartError::AbiMinorTooOld;
+    }
+    return StartError::None;
+}
+
 Bridge::Bridge(QObject *parent)
     : QObject(parent)
 {
@@ -112,11 +127,16 @@ Bridge::Bridge(QObject *parent)
     m_scrollDriver = new ScrollDriver(this, this);
 
     const quint32 abi = reldex_abi_version();
-    if ((abi >> 16) != static_cast<quint32>(RELDEX_ABI_VERSION_MAJOR)) {
+    m_startError = checkAbiVersion(abi);
+    if (m_startError != StartError::None) {
         // ADR-0003 D7: refuse to start, do not guess. `valid` stays false and
         // every operation on this Bridge is a no-op.
-        qCritical("reldex-ffi ABI major %u does not match the header's %u; refusing to start",
-                  abi >> 16, static_cast<quint32>(RELDEX_ABI_VERSION_MAJOR));
+        qCritical("reldex-ffi ABI %u.%u cannot serve this adapter's header %u.%u (%s); "
+                  "refusing to start",
+                  abi >> 16, abi & 0xFFFFu, static_cast<quint32>(RELDEX_ABI_VERSION_MAJOR),
+                  static_cast<quint32>(RELDEX_ABI_VERSION_MINOR),
+                  m_startError == StartError::AbiMajorMismatch ? "major differs"
+                                                               : "library minor is older");
         return;
     }
 
@@ -130,6 +150,7 @@ Bridge::Bridge(QObject *parent)
     reldex::HubHandle hub(reldex_hub_create());
     if (!hub) {
         qCritical("reldex_hub_create() failed; this Bridge reports itself invalid");
+        m_startError = StartError::HubCreateFailed;
         delete m_session;
         m_session = nullptr;
         return;
@@ -145,6 +166,7 @@ Bridge::Bridge(QObject *parent)
         qCritical("reldex_hub_set_waker() failed with status %d; this Bridge reports itself "
                   "invalid rather than never delivering an event",
                   static_cast<int>(status));
+        m_startError = StartError::WakerRegistrationFailed;
         delete m_session;
         m_session = nullptr;
         hub.reset(); // destroys the hub; no waker was registered
@@ -396,6 +418,10 @@ void Bridge::dispatch(ReldexEvent &raw)
     raw.batch = nullptr;
     reldex::ErrorHandle error(raw.error);
     raw.error = nullptr;
+    // ABI 3.2: `SERVER_OUTPUT` owns its lines. Nothing here shows output yet
+    // (the output pane is M3.x's), so they are released with this handle.
+    reldex::LinesHandle lines(raw.server_output_lines);
+    raw.server_output_lines = nullptr;
 
     m_metrics->markFirstEvent();
 
@@ -418,6 +444,7 @@ void Bridge::drainAndRelease()
     while (reldex_hub_next_event(m_hub.get(), &raw)) {
         reldex::BatchHandle batch(raw.batch);
         reldex::ErrorHandle error(raw.error);
+        reldex::LinesHandle lines(raw.server_output_lines);
         raw = reldex::makeEvent();
     }
 }

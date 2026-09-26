@@ -95,23 +95,11 @@ void tst_ObjectBrowserModel::theRootHasOneConnectionNodeOnceABridgeIsSet()
 
 void tst_ObjectBrowserModel::ownMetadataSessionIsCountedSeparatelyFromAWorksheetSession()
 {
-    // `reldex_hub_session_count()`'s own doc comment (reldex.h) says a
-    // session's entry is released "when the pump exits, which for a normally
-    // closed session is promptly". It is not: `crates/ffi/src/session.rs`'s
-    // `reldex_hub_open_session` inserts into `hub.sessions` (~line 625) but
-    // nothing removes that entry on a normal close -- the pump thread
-    // (`pump_main`) never touches `hub.sessions`, and the only removal site
-    // besides `reldex_hub_destroy`'s full drain (`hub.rs` ~line 268) is the
-    // failed-thread-spawn error path (~line 640). Verified directly against
-    // the FFI (bypassing this adapter entirely) with a throwaway Rust test:
-    // opening a session, closing it, and draining both its `SESSION_CLOSED`
-    // *and* its unsolicited `TERMINAL` reply still leaves
-    // `reldex_hub_session_count()` unchanged, even for the hub's *only*
-    // session, even after polling for 5 more seconds. So this checks what the
-    // FFI actually delivers -- the session opens as a distinct id and the
-    // close protocol completes correctly -- rather than a count this build's
-    // FFI does not decrement. See `ui/README.md`'s M6.1 section for the
-    // write-up to hand to whoever owns `crates/ffi`/`crates/db-core`.
+    // Since M2.15 (ADR-0003 A33) a session stops counting in
+    // `reldex_hub_session_count()` the moment its `TERMINAL` is drained. M6.1
+    // found it never did before (the interim pump never removed the entry;
+    // see `ui/README.md`), so this asserts the count both ways: up by one
+    // per session opened, down by one per session closed.
     Bridge bridge;
     QVERIFY(bridge.isValid());
     const qint64 baseline = static_cast<qint64>(reldex_hub_session_count(bridge.hub()));
@@ -131,10 +119,9 @@ void tst_ObjectBrowserModel::ownMetadataSessionIsCountedSeparatelyFromAWorksheet
     QVERIFY(model.sessionId() != worksheet->sessionId());
     QCOMPARE(static_cast<qint64>(reldex_hub_session_count(bridge.hub())), baseline + 2);
 
-    // Collapsing/disconnecting the browser closes only its own session. Prove
-    // that through the SessionController's own state machine and its
-    // `sessionClosed` signal -- both accurate, per the tracing behind the
-    // comment above -- not through the hub's session count.
+    // Collapsing/disconnecting the browser closes only its own session:
+    // through the SessionController's own state machine, its
+    // `sessionClosed` signal, and the hub's count.
     QSignalSpy closedSpy(model.m_metadataSession, &SessionController::sessionClosed);
     model.closeConnection();
     QVERIFY(spinUntil([&closedSpy] { return closedSpy.count() == 1; }));
@@ -143,12 +130,18 @@ void tst_ObjectBrowserModel::ownMetadataSessionIsCountedSeparatelyFromAWorksheet
     QCOMPARE(closedSpy.constFirst().at(1).toBool(), false); // not left open
     QVERIFY(spinUntil([&model] { return model.m_metadataSession == nullptr; }));
     QVERIFY(!model.isSessionOpen());
+    QVERIFY(spinUntil([&bridge, baseline] {
+        return static_cast<qint64>(reldex_hub_session_count(bridge.hub())) == baseline + 1;
+    }));
 
     // The worksheet's session is untouched by any of the above.
     QCOMPARE(worksheet->sessionId() != 0, true);
     QCOMPARE(worksheet->state(), SessionController::Ready);
     QVERIFY(worksheet->closeSession());
     QVERIFY(spinUntil([worksheet] { return worksheet->state() == SessionController::Closed; }));
+    QVERIFY(spinUntil([&bridge, baseline] {
+        return static_cast<qint64>(reldex_hub_session_count(bridge.hub())) == baseline;
+    }));
 }
 
 void tst_ObjectBrowserModel::expandingFailsSafelyAgainstTheOnlyMockSceneThisBuildCanOpen()

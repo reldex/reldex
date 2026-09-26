@@ -355,7 +355,7 @@ void ScrollDriver::beginPhases()
     if (needsOther) {
         // Opened now, so the phase that blocks it is not also timing a session
         // open. A second Bridge is a second hub, a second waker and a second
-        // pump thread -- which is exactly what K6 asks about.
+        // session worker -- which is exactly what K6 asks about.
         m_otherBridge = new Bridge(this);
         if (m_otherBridge->isValid()) {
             m_otherBridge->session()->setMockBlockDurationMs(m_blockMs);

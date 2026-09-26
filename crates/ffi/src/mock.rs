@@ -62,12 +62,11 @@ pub enum ReldexMockStatement {
     /// disposition must come back as `DECISION_REQUIRED` rather than
     /// committing anything (`SPEC.md` §10).
     Dml = 5,
-    /// Panics inside the session's own **pump thread**, which no
-    /// `catch_unwind` on an `extern "C"` body can reach. The pump contains it,
-    /// marks the session lost, and answers this request *and everything queued
-    /// behind it* with one failure event each.
-    ///
-    /// Mock-only, and compiled in only with the `mock-driver` feature.
+    /// Retired with the interim per-session pump thread it used to panic
+    /// (M2.15): there is no thread of this library's left between a session
+    /// and the queue. Kept, because an enum value is never reused, and now
+    /// the same contained **driver** panic as [`Self::Panicking`] — the
+    /// session is lost and its `TERMINAL` follows the failed `EXECUTED`.
     PumpPanic = 6,
     /// A result set with the S14 columns and **no rows**.
     ///
@@ -80,6 +79,31 @@ pub enum ReldexMockStatement {
     /// [`ReldexMockScenarioConfig::rows`] `= 0`, which keeps its documented
     /// meaning of "1,000".
     EmptyQuery = 7,
+    /// A procedure call that prints three lines of server output, the last
+    /// one reported as having arrived as invalid UTF-8 (ABI 3.2). The lines
+    /// are buffered only once `reldex_session_set_server_output` has turned
+    /// output on, and arrive as `SERVER_OUTPUT` ahead of the call's
+    /// `EXECUTED`. It opens no transaction.
+    ServerOutput = 8,
+    /// Loses the connection mid-statement: fails with `ORA-03113` and the
+    /// session is **lost**, so its `TERMINAL` follows at once, without a
+    /// close (ABI 3.2).
+    LoseSession = 9,
+}
+
+/// A failure the mock world can script for every connect or every ping
+/// (ABI 3.2), each with the native code a real server would report.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReldexMockFailure {
+    /// No failure: the call succeeds.
+    None = 0,
+    /// `ORA-01017`, an authentication failure.
+    Authentication = 1,
+    /// `ORA-12541`, nothing listening at the endpoint.
+    Unreachable = 2,
+    /// `ORA-03113`, the connection lost.
+    Lost = 3,
 }
 
 /// How a mock session's scripted world is parameterised.
@@ -108,9 +132,26 @@ pub struct ReldexMockScenarioConfig {
     /// `0` means "until [`reldex_mock_release_block`] or a cancel", which is
     /// what a deterministic test wants.
     pub block_duration_ms: u64,
+    /// A [`ReldexMockFailure`] every connect fails with (ABI 3.2): the open's
+    /// `OPENED` carries that error and its `TERMINAL` follows. `0`, none.
+    pub connect_failure: i32,
+    /// A [`ReldexMockFailure`] every `reldex_session_ping` fails with (ABI
+    /// 3.2). `RELDEX_MOCK_FAILURE_LOST` also loses the session. `0`, none.
+    pub ping_failure: i32,
+    /// Parks every connect until [`reldex_mock_release_block`] (ABI 3.2), so
+    /// a caller can act on a session that is still connecting — abandon it,
+    /// or destroy the hub — deterministically.
+    pub block_connect: bool,
+    /// Advertises the `server_output` capability (ABI 3.2), so
+    /// `reldex_session_set_server_output` is accepted and
+    /// `RELDEX_MOCK_STATEMENT_SERVER_OUTPUT` prints. Off by default, exactly
+    /// as in 3.1, where the world did not advertise it and setting output was
+    /// refused — a 3.1 caller, whose struct ends before this field, keeps that.
+    pub server_output: bool,
 }
 
-// SAFETY: `#[repr(C)]`, `struct_size` first, all integers, valid when zeroed.
+// SAFETY: `#[repr(C)]`, `struct_size` first, integers and one `bool`, all
+// valid when zeroed.
 unsafe impl CStruct for ReldexMockScenarioConfig {
     // Everything past `struct_size` has a documented zero default, so an
     // older caller that supplies only the size gets the default world.
@@ -129,6 +170,10 @@ impl Default for ReldexMockScenarioConfig {
             per_fetch_latency_us: 0,
             first_batch_latency_us: 0,
             block_duration_ms: 0,
+            connect_failure: ReldexMockFailure::None as i32,
+            ping_failure: ReldexMockFailure::None as i32,
+            block_connect: false,
+            server_output: false,
         }
     }
 }
@@ -154,6 +199,10 @@ pub extern "C" fn reldex_mock_statement(kind: i32) -> ReldexStr {
             statements::DML
         } else if kind == ReldexMockStatement::PumpPanic as i32 {
             statements::PUMP_PANIC
+        } else if kind == ReldexMockStatement::ServerOutput as i32 {
+            statements::SERVER_OUTPUT
+        } else if kind == ReldexMockStatement::LoseSession as i32 {
+            statements::LOSE_SESSION
         } else {
             return ReldexStr::empty();
         };
@@ -171,32 +220,31 @@ pub(crate) mod statements {
     pub(crate) const FAILING: &str = "SELECT * FROM reldex_missing\0";
     pub(crate) const PANICKING: &str = "SELECT reldex_panic FROM dual\0";
     pub(crate) const DML: &str = "UPDATE reldex_rows SET n = n + 1\0";
-    /// Reserved: makes the session's **pump thread** panic, which is the only
-    /// way to test that the pump's containment answers the requests behind it
-    /// (ADR-0003 D2). It never reaches a driver, and it is compiled only with
-    /// the `mock-driver` feature, so no production build can be made to panic
-    /// by statement text.
+    /// A second driver panic, kept for the retired pump-panic statement.
     pub(crate) const PUMP_PANIC: &str = "BEGIN reldex_pump_panic; END;\0";
+    pub(crate) const SERVER_OUTPUT: &str = "CALL reldex_put_line()\0";
+    pub(crate) const LOSE_SESSION: &str = "SELECT reldex_lost FROM dual\0";
 
     /// The text without its trailing NUL, for Rust callers.
     ///
-    /// Only the scenario builder and the pump-panic check need this, and both
-    /// are feature-gated; the exported `reldex_mock_statement` reports the
-    /// same text as a length and a pointer instead.
+    /// Only the scenario builder needs this, and it is feature-gated; the
+    /// exported `reldex_mock_statement` reports the same text as a length and
+    /// a pointer instead.
     #[cfg(feature = "mock-driver")]
     pub(crate) fn text(statement: &'static str) -> &'static str {
         statement.trim_end_matches('\0')
     }
 }
 
-/// Releases a session's blocked statement, if the mock world it runs in has
-/// one parked.
+/// Releases a session's blocked statement — and, with
+/// [`ReldexMockScenarioConfig::block_connect`], its parked connect — if the
+/// mock world it runs in has one.
 ///
 /// Mock-only, and the reason [`ReldexMockScenarioConfig::block_duration_ms`]
 /// may be zero: a test (or spike S15's "a blocked session must not stall the
 /// UI" step) blocks a session indefinitely and releases it at a moment of its
-/// choosing, with no sleep anywhere. Idempotent, and safe whether or not
-/// anything is currently blocked.
+/// choosing, with no sleep anywhere. Idempotent, safe whether or not anything
+/// is currently blocked, and permanent: a released gate never blocks again.
 ///
 /// # Safety
 ///
@@ -208,16 +256,18 @@ pub unsafe extern "C" fn reldex_mock_release_block(
 ) -> ReldexStatus {
     entry(|| {
         // SAFETY: delegated to this function's contract for `hub`.
-        unsafe { crate::session::with_session(hub, session, |entry| entry.release_block()) }
+        unsafe { crate::session::with_session(hub, session, |_hub, entry| entry.release_block()) }
     })
 }
 
-/// What [`build_driver`] hands back: the driver and parameters a session pump
-/// will open with, plus the handle that releases a blocked statement.
+/// What [`build_driver`] hands back: the driver and parameters a session
+/// will open with, plus the handles that release a blocked statement and a
+/// parked connect.
 pub(crate) struct DriverChoice {
     pub(crate) driver: Arc<dyn reldex_db_core::DatabaseDriver>,
     pub(crate) params: reldex_db_core::ConnectionParams,
     pub(crate) block: Option<BlockControl>,
+    pub(crate) connect_block: Option<BlockControl>,
 }
 
 /// The mock's block gate, or a stand-in when no mock is linked, so the rest of
@@ -244,7 +294,7 @@ pub(crate) fn build_driver(options: &ReldexOpenOptions) -> Result<DriverChoice, 
     use std::time::Duration;
 
     use reldex_db_driver_api::{
-        CancelKind, Capabilities, Credentials, Endpoint, ErrorKind, SqlPosition,
+        CancelKind, Capabilities, Credentials, Endpoint, ErrorKind, SqlPosition, StatementKind,
     };
     use reldex_driver_mock::{
         Action, BlockGate, BlockSpec, GeneratedQuerySpec, MockDriver, Scenario, ScriptedError,
@@ -268,7 +318,8 @@ pub(crate) fn build_driver(options: &ReldexOpenOptions) -> Result<DriverChoice, 
             .with_savepoints(true)
             .with_exact_transaction_state(true)
             .with_lob_streaming(true)
-            .with_error_position(true),
+            .with_error_position(true)
+            .with_server_output(config.server_output),
     );
 
     let rows = if config.rows == 0 { 1_000 } else { config.rows };
@@ -320,10 +371,46 @@ pub(crate) fn build_driver(options: &ReldexOpenOptions) -> Result<DriverChoice, 
                 .with_position(SqlPosition::at_line_column(1, 15)),
         ),
     );
+    for panicking in [statements::PANICKING, statements::PUMP_PANIC] {
+        scenario.on_sql(
+            statements::text(panicking),
+            Action::Panic("reldex-ffi mock scenario: a deliberate driver panic".to_owned()),
+        );
+    }
     scenario.on_sql(
-        statements::text(statements::PANICKING),
-        Action::Panic("reldex-ffi mock scenario: a deliberate driver panic".to_owned()),
+        statements::text(statements::SERVER_OUTPUT),
+        Action::Execute {
+            statement_kind: StatementKind::Other,
+            rows_affected: None,
+            opens_transaction: false,
+        },
     );
+    scenario.on_sql_output_with_invalid_utf8_lines(
+        statements::text(statements::SERVER_OUTPUT),
+        vec![
+            "reldex: first line".to_owned(),
+            String::new(),
+            "reldex: \u{FFFD} arrived as invalid UTF-8".to_owned(),
+        ],
+        1,
+    );
+    if let Some(lost) = scripted_failure(ReldexMockFailure::Lost as i32) {
+        scenario.on_sql(
+            statements::text(statements::LOSE_SESSION),
+            Action::Fail(lost),
+        );
+    }
+    if let Some(error) = scripted_failure(config.connect_failure) {
+        scenario.fail_connect(error);
+    }
+    if let Some(error) = scripted_failure(config.ping_failure) {
+        scenario.fail_ping(error);
+    }
+    let connect_gate = config.block_connect.then(|| {
+        let gate = BlockGate::new();
+        scenario.block_connect(Arc::clone(&gate));
+        gate
+    });
     scenario.on_sql(
         statements::text(statements::DML),
         Action::Dml {
@@ -339,7 +426,34 @@ pub(crate) fn build_driver(options: &ReldexOpenOptions) -> Result<DriverChoice, 
             Credentials::External,
         ),
         block: Some(gate),
+        connect_block: connect_gate,
     })
+}
+
+/// The scripted error for a [`ReldexMockFailure`] value, or `None` for none
+/// (and for a value this build does not know).
+#[cfg(feature = "mock-driver")]
+fn scripted_failure(failure: i32) -> Option<reldex_driver_mock::ScriptedError> {
+    use reldex_db_driver_api::ErrorKind;
+
+    let (kind, code, message) = if failure == ReldexMockFailure::Authentication as i32 {
+        (
+            ErrorKind::Authentication,
+            1017,
+            "ORA-01017: invalid username/password; logon denied",
+        )
+    } else if failure == ReldexMockFailure::Unreachable as i32 {
+        (ErrorKind::Connection, 12541, "ORA-12541: TNS:no listener")
+    } else if failure == ReldexMockFailure::Lost as i32 {
+        (
+            ErrorKind::NetworkLost,
+            3113,
+            "ORA-03113: end-of-file on communication channel",
+        )
+    } else {
+        return None;
+    };
+    Some(reldex_driver_mock::ScriptedError::new(kind, message).with_native(code, message))
 }
 
 /// See the `mock-driver` definition. A build with no driver feature can create

@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-26T20:55:00+07:00",
+  "updatedAt": "2026-09-27T01:25:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1255,8 +1255,8 @@
               "note": "Planned from the M2.10 review: Credential Manager can revive a deleted entry when another writer races us, and an entry written by another tool under our name is refused as malformed; the sweep removes both kinds."
             },
             {
-              "title": "M2.15 ★ FFI pump switch to the M2.5 event queue: real Terminal on a loss mid-statement, abandon relayed through the real SessionRegistry, EXECUTING/TRANSACTION_STATE events, server output before the reply (opus, review mandatory; M2.11 review round 2 must-fix 2; after M2.11)",
-              "status": "todo",
+              "title": "M2.15 ★ FFI pump switch to the M2.5 event queue: real Terminal on a loss mid-statement, abandon relayed through the real SessionRegistry, EXECUTING/TRANSACTION_STATE events, server output before the reply (opus, review mandatory; M2.11 review round 2 must-fix 2; after M2.11) — done 2026-09-27 (PR #48, reviewed twice): the hub owns one M2.5 event queue and the per-session pump thread is gone; real TERMINAL on a loss mid-statement, abandon, EXECUTING and TRANSACTION_STATE events, server output before the reply, hub session count fixed; ABI 3.1→3.2 additive (verified by running the 3.1 smoke harness against the 3.2 library); the boundary's share of a drain rose from ~1% to ~3% while the whole drain stayed within noise (ADR-0003 A37); ReldexProfileError added",
+              "status": "done",
               "note": "Split out of M2.11 by its review: the FFI still runs the interim per-session pump thread, so today a session lost mid-statement gets no TERMINAL until the user closes it, there is no abandon, no EXECUTING or TRANSACTION_STATE events, and server output arrives only after a statement finishes. M3.3/M3.7/M4.x wait for this."
             }
           ]
@@ -1718,6 +1718,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-27",
+      "text": "M2.15 FFI pump switch done and merged (PR #48, two independent review rounds): the interim per-session pump thread is gone; the hub drains one M2.5 event queue on the caller's thread, a session lost mid-statement gets a real TERMINAL, abandon exists, EXECUTING/TRANSACTION_STATE events and server output before the reply are delivered, and the hub session count now decrements. ABI 3.1→3.2 stays additive — the review caught EXECUTING reusing the request id (a 3.1 caller would have broken) and it now travels in a trailing field; the adapter refuses an older library minor. The drain's boundary share rose from ~1% to ~3% of a drain (whole drain unchanged within noise), recorded honestly in ADR-0003 A37 with drain_into as the next step if ever needed. ReldexProfileError gives profile validation failures a numeric code. M3.3 (first real session) is unblocked."
+    },
     {
       "date": "2026-09-26",
       "text": "M3.2 connection manager UI done (PR #45): profiles list/create/edit/delete, environment and treat-as-production, role picker, test-connect that resolves the stored password first. Three review rounds found and fixed real defects: unguarded test binaries wrote the developer's real store (now lazy open, a harness-level in-memory guard and a build.sh store check), store directory creation ran on the UI thread (moved into the FFI service thread), the dialog collapsed at 2× DPI, and destroying Bridge with a test-connect in flight was a use-after-free — the same class of bug fixed the same day in the object browser (PR #47), now recorded as a risk."

@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU64, Ordering};
 
 use reldex_ffi::{
-    ReldexEvent, ReldexHub, ReldexMockScenarioConfig, ReldexMockStatement, ReldexOpenOptions,
-    ReldexStatus, reldex_hub_create, reldex_hub_destroy, reldex_hub_next_event,
+    ReldexEvent, ReldexEventKind, ReldexHub, ReldexMockScenarioConfig, ReldexMockStatement,
+    ReldexOpenOptions, ReldexStatus, reldex_hub_create, reldex_hub_destroy, reldex_hub_next_event,
     reldex_hub_open_session, reldex_hub_pending_events, reldex_hub_set_waker,
     reldex_mock_release_block, reldex_mock_statement, reldex_session_execute,
 };
@@ -49,6 +49,18 @@ fn a_burst_of_completions_produces_exactly_one_wake() {
             ReldexStatus::Ok
         );
     }
+    // Each worker announces that its statement started (`EXECUTING`) before
+    // it blocks. Take those out, so the queue is empty again when the burst
+    // of replies below arrives.
+    support::wait_until("all eight sessions to start their statements", || {
+        // SAFETY: the hub is live.
+        let pending = unsafe { reldex_hub_pending_events(harness.hub()) };
+        pending == sessions.len()
+    });
+    for _ in 0..sessions.len() {
+        let started = harness.poll_event().expect("an EXECUTING event is queued");
+        assert_eq!(started.kind, ReldexEventKind::Executing as i32);
+    }
     let before = harness.signal.wakes();
 
     for session in &sessions {
@@ -61,7 +73,8 @@ fn a_burst_of_completions_produces_exactly_one_wake() {
 
     // Wait for the whole burst to be queued, without taking anything out of
     // the queue: that is what makes the assertion below exact. Bounded by the
-    // hang guard, so a stuck pump fails the test instead of hanging the suite.
+    // hang guard, so a stuck session fails the test instead of hanging the
+    // suite.
     support::wait_until("all eight released sessions to queue their replies", || {
         // SAFETY: the hub is live.
         let pending = unsafe { reldex_hub_pending_events(harness.hub()) };
@@ -84,13 +97,19 @@ fn a_burst_of_completions_produces_exactly_one_wake() {
         harness.execute(sessions[0], 600, ReldexMockStatement::GeneratedQuery),
         ReldexStatus::Ok
     );
-    let event = harness.next_event();
-    assert_eq!(event.request, 600);
+    // `EXECUTING` and `EXECUTED`, both queued before anything is taken out.
+    support::wait_until("the statement's two events to be queued", || {
+        // SAFETY: the hub is live.
+        let pending = unsafe { reldex_hub_pending_events(harness.hub()) };
+        pending == 2
+    });
     assert_eq!(
         harness.signal.wakes(),
         rearmed + 1,
         "a push onto an empty queue wakes exactly once"
     );
+    let event = harness.next_event();
+    assert_eq!(event.request, 600);
 }
 
 #[test]
@@ -134,9 +153,10 @@ fn unregistering_the_waker_under_a_flood_is_safe() {
         );
         let sql = reldex_mock_statement(ReldexMockStatement::GeneratedQuery as i32);
         let flood = 6_u64;
-        // The open always produces one event; each *accepted* execute produces
-        // one more. Counting them here is what lets the drain below finish on
-        // a condition rather than on a spin count.
+        // The open always produces one reply; each *accepted* execute produces
+        // one more (plus an `EXECUTING`, which is progress and not counted).
+        // Counting them here is what lets the drain below finish on a
+        // condition rather than on a spin count.
         let mut expected_replies = 1_u64;
         for request in 2..2 + flood {
             // SAFETY: the hub is live and `sql` is a `'static` string.
@@ -158,7 +178,7 @@ fn unregistering_the_waker_under_a_flood_is_safe() {
         );
         signal.forbid();
 
-        // Let the pumps finish pushing whatever is left; any wake now would be
+        // Let the workers finish pushing whatever is left; any wake now would be
         // a call into an object the adapter is entitled to have freed.
         // Drain until every accepted request has been answered. Counting
         // replies rather than spinning a fixed number of times is what makes
@@ -176,7 +196,9 @@ fn unregistering_the_waker_under_a_flood_is_safe() {
                         // SAFETY: the error came from the event.
                         unsafe { reldex_ffi::reldex_error_free(event.error) };
                     }
-                    drained += 1;
+                    if event.kind != ReldexEventKind::Executing as i32 {
+                        drained += 1;
+                    }
                     event = ReldexEvent::default();
                 }
                 drained >= expected_replies

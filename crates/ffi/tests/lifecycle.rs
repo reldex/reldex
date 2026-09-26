@@ -200,12 +200,14 @@ fn a_close_with_a_possibly_open_transaction_refuses_to_decide_for_the_user() {
     assert_eq!(terminal.kind, ReldexEventKind::Terminal as i32);
     assert!(!terminal.transaction_possibly_lost);
 
-    // Nothing more is accepted, and nothing more is answered.
+    // Nothing more is accepted, and nothing more is answered: draining the
+    // `TERMINAL` retired the session id (ABI 3.2), so it is not found at all.
     assert_eq!(
         harness.execute(session, 5, ReldexMockStatement::GeneratedQuery),
-        ReldexStatus::InvalidState
+        ReldexStatus::NotFound
     );
     assert!(harness.poll_event().is_none());
+    assert_eq!(harness.session_count(), 0);
 }
 
 /// Waits for the next event into a caller-shaped struct, so a test can use a
@@ -248,8 +250,8 @@ fn an_undersized_event_struct_is_refused_without_consuming_the_event() {
         session: 0xFEED_FACE,
         ..ReldexEvent::default()
     };
-    // Give the pump time to produce the event first, so the refusal below is
-    // about the struct and not about an empty queue.
+    // Let the worker produce the event first, so the refusal below is about
+    // the struct and not about an empty queue.
     let mut waited = ReldexEvent::default();
     take_into(&harness, &mut waited);
     assert_eq!(waited.request, 5);

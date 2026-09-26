@@ -18,6 +18,7 @@ use reldex_ffi::{
     reldex_mock_statement, reldex_session_close, reldex_session_close_result,
     reldex_session_commit, reldex_session_execute, reldex_session_fetch, reldex_session_ping,
     reldex_session_rollback, reldex_session_rollback_to_savepoint, reldex_session_savepoint,
+    reldex_session_set_server_output,
 };
 
 /// How long a test waits for an event before calling it a hang.
@@ -271,6 +272,46 @@ impl Harness {
         unsafe { reldex_session_ping(self.hub, session, request) }
     }
 
+    /// Turns server output on (with no buffer limit) or off.
+    pub(crate) fn set_server_output(&self, session: u64, request: u64, on: bool) -> ReldexStatus {
+        let mode = if on {
+            reldex_ffi::ReldexServerOutputMode::EnabledUnlimited
+        } else {
+            reldex_ffi::ReldexServerOutputMode::Disabled
+        };
+        // SAFETY: the hub is live.
+        unsafe { reldex_session_set_server_output(self.hub, session, request, mode as i32, 0) }
+    }
+
+    /// Abandons a session; returns the status, the outcome and the early
+    /// transaction-loss answer.
+    pub(crate) fn abandon(&self, session: u64) -> (ReldexStatus, i32, bool) {
+        let mut outcome = -1_i32;
+        let mut lost = false;
+        // SAFETY: the hub is live; both out pointers are real locals.
+        let status = unsafe {
+            reldex_ffi::reldex_session_abandon(
+                self.hub,
+                session,
+                std::ptr::from_mut(&mut outcome),
+                std::ptr::from_mut(&mut lost),
+            )
+        };
+        (status, outcome, lost)
+    }
+
+    /// Releases the session's parked mock statement or connect.
+    pub(crate) fn release_block(&self, session: u64) -> ReldexStatus {
+        // SAFETY: the hub is live.
+        unsafe { reldex_ffi::reldex_mock_release_block(self.hub, session) }
+    }
+
+    /// How many sessions the hub still holds.
+    pub(crate) fn session_count(&self) -> usize {
+        // SAFETY: the hub is live.
+        unsafe { reldex_ffi::reldex_hub_session_count(self.hub) }
+    }
+
     /// Takes the next event without waiting.
     pub(crate) fn poll_event(&self) -> Option<ReldexEvent> {
         let mut event = ReldexEvent::default();
@@ -280,11 +321,28 @@ impl Harness {
         taken.then_some(event)
     }
 
-    /// Takes the next event, waiting on the waker's condvar until one arrives.
+    /// Takes the next event that is not progress, waiting until one arrives.
+    ///
+    /// `EXECUTING` and `TRANSACTION_STATE` (ABI 3.2) are skipped: they carry
+    /// nothing a caller owns, and most tests are about replies. A test about
+    /// them uses [`Self::next_any_event`].
+    pub(crate) fn next_event(&self) -> ReldexEvent {
+        loop {
+            let event = self.next_any_event();
+            if event.kind != ReldexEventKind::Executing as i32
+                && event.kind != ReldexEventKind::TransactionState as i32
+            {
+                return event;
+            }
+        }
+    }
+
+    /// Takes the next event of any kind, waiting on the waker's condvar until
+    /// one arrives.
     ///
     /// Never sleeps on a fixed interval: it waits to be woken, which is the
     /// same path the adapter uses.
-    pub(crate) fn next_event(&self) -> ReldexEvent {
+    pub(crate) fn next_any_event(&self) -> ReldexEvent {
         let mut seen = self.signal.wakes();
         loop {
             if let Some(event) = self.poll_event() {
@@ -357,10 +415,19 @@ impl ErrorSnapshot {
 
 /// Releases an event's batch, if it has one.
 pub(crate) fn release_batch(event: &ReldexEvent) {
+    release_lines(event);
     if !event.batch.is_null() {
         // SAFETY: the batch came from a fetched event and has not been
         // released.
         unsafe { reldex_batch_release(event.batch) };
+    }
+}
+
+/// Releases an event's server output lines, if it has any.
+pub(crate) fn release_lines(event: &ReldexEvent) {
+    if !event.server_output_lines.is_null() {
+        // SAFETY: the lines came from a drained event and are released once.
+        unsafe { reldex_ffi::reldex_server_output_lines_release(event.server_output_lines) };
     }
 }
 

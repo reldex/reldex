@@ -1,8 +1,15 @@
-//! What a completed request looks like on the way out (ADR-0003 D5).
+//! What an event looks like on the way out (ADR-0003 D5, A35).
 //!
-//! One flat `#[repr(C)]` struct rather than a tagged union: the adapter
-//! switches on `kind` and reads the fields that kind documents. A union would
-//! save a few dozen bytes per event and cost every C++ reader a cast.
+//! Replies to requests, progress (`EXECUTING`) and notifications
+//! (`SERVER_OUTPUT`, `TRANSACTION_STATE`, `TERMINAL`) all cross as one flat
+//! `#[repr(C)]` struct rather than a tagged union: the adapter switches on
+//! `kind` and reads the fields that kind documents. A union would save a few
+//! dozen bytes per event and cost every C++ reader a cast.
+//!
+//! Each one is built by `session::translate` from a `db-core` `SessionEvent`,
+//! on the thread that drains the hub, at the moment it is handed out. The
+//! objects an event owns — its batch, its error, its server-output lines —
+//! are created then too, not when the event was queued (A36).
 
 use reldex_db_core::{CloseError, ExecuteOutcome, StatementKind};
 
@@ -126,31 +133,64 @@ pub enum ReldexEventKind {
     /// `server_output_buffer_bytes` carry the setting **actually in force**,
     /// which a driver may have adjusted.
     ServerOutputConfigured = 7,
-    /// Unsolicited: lines the server produced out of band (M2.7), collected
-    /// after the statement that produced them and delivered before that
-    /// statement's own `Executed`/`Completed`/`SessionClosed` reply. See
-    /// `server_output_lines`, `server_output_dropped` and
-    /// `server_output_invalid_utf8_lines`; `error` carries a failed read.
-    ///
-    /// M2.11 delivers this only on the **completion path**
-    /// (`reldex-db-core`'s `DatabaseSession::take_server_output`, drained
-    /// after every reply while output is on) — never as a fully unsolicited,
-    /// mid-statement event, which needs the event-queue switch task M2.15
-    /// makes (see the crate's module documentation, "What is interim
-    /// here"). A caller sees a session's output attributed to the
-    /// request whose reply immediately follows it, which is correct for
-    /// every case except the two rare mid-statement exceptions
-    /// `docs/exec-plans/active/phase-1-m2-5-event-queue.md` §7.5 documents.
+    /// Unsolicited: lines the server produced out of band (M2.7) —
+    /// `DBMS_OUTPUT` and its kind — read by the session's worker after the
+    /// statement that wrote them and delivered **before that statement's
+    /// `EXECUTED`**, so every `SERVER_OUTPUT` lies between an execute's
+    /// `EXECUTING` and its `EXECUTED` (two documented exceptions land in the
+    /// *next* execute's window: output written during a fetch, and output of
+    /// a statement that failed and left the session needing validation). One
+    /// statement's output may arrive as several events. `request` is `0`.
+    /// See `server_output_lines`, `server_output_dropped` and
+    /// `server_output_invalid_utf8_lines`; a non-null `error` is a read that
+    /// failed, so the output is incomplete and the pane must say why.
     ServerOutput = 8,
-    /// The session ended. Delivered for a connect that failed
-    /// (`RELDEX_EVENT_KIND_OPENED` with an error) and for a
-    /// `reldex_session_close` that actually closed the session — **not**
-    /// for the hub being destroyed while a session's statement cannot be
-    /// interrupted (ADR-0003 A17: the caller has already released its hub
-    /// pointer by then, so nothing could observe it). Read
-    /// `transaction_possibly_lost` (`SPEC.md` §10: never hide a transaction
-    /// loss).
+    /// The session ended. Exactly once per session, unsolicited, carrying no
+    /// request id of its own (`request` is `0`): after a close that actually
+    /// closed, after a connect that failed or was abandoned, and — since ABI
+    /// 3.2 — the moment a session is **lost** mid-statement, without waiting
+    /// for the caller to close it. `session_state` is `LOST` or `CLOSED`;
+    /// `error` is the failure that lost it (native code and cause intact), or
+    /// null for a deliberate end. Read `transaction_possibly_lost` and
+    /// surface it (`SPEC.md` §10: never hide a transaction loss); `abandoned`
+    /// says the session ended because the caller called
+    /// `reldex_session_abandon`; `server_output_dropped` carries output lines
+    /// the session lost that no earlier `SERVER_OUTPUT` reported.
+    ///
+    /// Replies to requests the caller submitted **after** the session ended
+    /// may still follow it — each accepted request gets its one reply — but
+    /// once this event has been drained the session id is retired: every
+    /// later call naming it reports `RELDEX_STATUS_NOT_FOUND`, and it no
+    /// longer counts in `reldex_hub_session_count`. Not delivered for
+    /// sessions still open when the hub is destroyed: by then nothing can
+    /// observe it.
     Terminal = 9,
+    /// Progress, not a reply (ABI 3.2): the worker has **started** the
+    /// statement submitted as `executing_request` — it has left the queue,
+    /// and `deadline_ms`/`has_deadline` echo the limit actually armed on it.
+    /// This is the honest "running, with this limit" state a UI shows on a
+    /// driver that cannot cancel (`SPEC.md` §24.8). The one reply to that
+    /// request is still its `EXECUTED`, which always follows.
+    ///
+    /// `request` is `0`, as on every other kind that answers nothing: exactly
+    /// one event per accepted request carries that request's id, its reply —
+    /// the 3.1 contract, unchanged. Like the other two kinds 3.2 added, it is
+    /// never delivered to a caller whose `struct_size` predates 3.2 (see
+    /// `reldex_hub_next_event`).
+    Executing = 10,
+    /// Unsolicited (ABI 3.2): whether a transaction may be open on this
+    /// session flipped; read `transaction_possibly_active`. Advisory — it
+    /// drives Commit/Rollback affordances without polling, while a close still
+    /// re-decides on the worker. Never dropped: a value not yet drained is
+    /// updated in place to the newest one. `request` is `0`.
+    TransactionState = 11,
+    /// A result store's segment fetch was answered (M5.2 Stage A; ABI 3.2).
+    /// **Not produced by this build** — nothing in this ABI submits a segment
+    /// fetch yet (that is M5.2 Stage B) — and delivered as an opaque
+    /// notification when it is: `request`, `result`/`has_result` when the
+    /// result is one this session reported, `row_count`, and `error`. The
+    /// segment's rows are not reachable through this event.
+    FetchedSegment = 12,
 }
 
 /// Which operation a `RELDEX_EVENT_KIND_COMPLETED` event answers.
@@ -257,7 +297,8 @@ pub enum ReldexCloseOutcome {
     Failed = 5,
 }
 
-/// One reply, filled in by [`crate::reldex_hub_next_event`].
+/// One event, filled in by [`crate::reldex_hub_next_event`]: a request's reply,
+/// `Executing` progress, or one of the unsolicited kinds.
 ///
 /// The caller sets `struct_size` before each call
 /// (`ReldexEvent ev = { .struct_size = sizeof ev };`) and **owns** `error` and
@@ -286,7 +327,12 @@ pub struct ReldexEvent {
     pub kind: i32,
     /// The session this reply belongs to.
     pub session: u64,
-    /// The `request_id` the caller passed to the submitting call.
+    /// The `request_id` the caller passed to the submitting call, on a reply:
+    /// the request it answers. Exactly one event per accepted request carries
+    /// that request's id. `0` on every kind that answers nothing — progress
+    /// (`Executing`, which names its statement in `executing_request`
+    /// instead) and the unsolicited kinds (`ServerOutput`, `TransactionState`,
+    /// `Terminal`).
     pub request: u64,
     /// The result set this event is about, when `has_result`:
     ///
@@ -312,6 +358,12 @@ pub struct ReldexEvent {
     /// `Fetched`: the batch, or null. The caller owns it.
     pub batch: *mut ReldexBatch,
     /// The session's lifecycle as of this event: a [`ReldexSessionState`].
+    ///
+    /// A successful reply reports `USABLE` (the request succeeded, so the
+    /// session was usable when it answered) even if the session was lost
+    /// while the reply waited in the queue; that loss is the `TERMINAL`
+    /// behind it. A failed reply, a progress event and a notification report
+    /// the session's state when the event was taken.
     pub session_state: i32,
     /// `Executed`: a [`ReldexStatementKind`].
     pub statement_kind: i32,
@@ -349,9 +401,10 @@ pub struct ReldexEvent {
     /// force, which the server may have clamped from what was requested.
     pub server_output_buffer_bytes: u64,
     /// `ServerOutput`: how many lines were dropped for this session since the
-    /// previous delivered `ServerOutput`, because the session's completion-path
-    /// log was full (`reldex-db-core`'s `ServerOutputLog::MAX_RETAINED_LINES` /
-    /// `MAX_RETAINED_BYTES`). Zero normally; non-zero means the UI must say
+    /// previous delivered `ServerOutput`, because the session already had the
+    /// most unsolicited events the queue holds for one session waiting
+    /// undrained (256). `Terminal`: lines dropped that no delivered
+    /// `ServerOutput` reported. Zero normally; non-zero means the UI must say
     /// "output truncated".
     pub server_output_dropped: u32,
     /// `ServerOutput`: how many of `server_output_lines` were not valid UTF-8
@@ -368,6 +421,46 @@ pub struct ReldexEvent {
     /// consumer must surface it** (`SPEC.md` §10: never silently commit or
     /// hide transaction loss).
     pub transaction_possibly_lost: bool,
+    /// `Executing` (ABI 3.2): whether `deadline_ms` is meaningful — false
+    /// means the statement runs with no time limit.
+    pub has_deadline: bool,
+    /// `TransactionState` (ABI 3.2): whether a transaction may now be open.
+    /// Conservative: it can be true with nothing open, never false while
+    /// something might be.
+    pub transaction_possibly_active: bool,
+    /// `Terminal` (ABI 3.2): the session ended because the caller called
+    /// `reldex_session_abandon` — so a loss reported by
+    /// `transaction_possibly_lost` is the rollback that abandoning implies,
+    /// not a failure.
+    pub abandoned: bool,
+    /// `Executing` (ABI 3.2): the deadline armed on the statement, in
+    /// milliseconds, when `has_deadline`.
+    pub deadline_ms: u64,
+    /// `Executing` (ABI 3.2): the `request_id` of the execute that started.
+    /// Its `EXECUTED` — the one event that carries this id in `request` — is
+    /// still to come. `0` on every other kind.
+    pub executing_request: u64,
+}
+
+/// How much of [`ReldexEvent`] a caller built against ABI 3.2 or later
+/// declares: everything up to and including `executing_request`. A smaller
+/// `struct_size` comes from an older header, whose caller is never handed a
+/// kind that header predates (see [`introduced_in_3_2`]).
+pub(crate) const EVENT_SIZE_3_2: usize =
+    std::mem::offset_of!(ReldexEvent, executing_request) + size_of::<u64>();
+
+/// Whether `event` translates to a kind ABI 3.2 introduced (`EXECUTING`,
+/// `TRANSACTION_STATE`, `FETCHED_SEGMENT`). None of them owns anything a
+/// caller must release, and none answers a request a pre-3.2 caller can
+/// make, so a caller whose header predates them is simply never given one:
+/// its event stream keeps 3.1's shape (ADR-0003 A26, A35).
+pub(crate) const fn introduced_in_3_2(event: &reldex_db_core::SessionEvent) -> bool {
+    matches!(
+        event,
+        reldex_db_core::SessionEvent::Executing { .. }
+            | reldex_db_core::SessionEvent::TransactionStateChanged { .. }
+            | reldex_db_core::SessionEvent::FetchedSegment { .. }
+    )
 }
 
 // SAFETY: `#[repr(C)]`, `struct_size` first, every field an integer, a `bool`
@@ -411,6 +504,11 @@ impl Default for ReldexEvent {
             server_output_invalid_utf8_lines: 0,
             server_output_lines: std::ptr::null_mut(),
             transaction_possibly_lost: false,
+            has_deadline: false,
+            transaction_possibly_active: false,
+            abandoned: false,
+            deadline_ms: 0,
+            executing_request: 0,
         }
     }
 }
@@ -446,6 +544,10 @@ pub(crate) struct QueuedEvent {
     pub(crate) server_output_invalid_utf8_lines: u32,
     pub(crate) server_output_lines: Option<Box<ReldexServerOutputLines>>,
     pub(crate) transaction_possibly_lost: bool,
+    pub(crate) deadline_ms: Option<u64>,
+    pub(crate) executing_request: u64,
+    pub(crate) transaction_possibly_active: bool,
+    pub(crate) abandoned: bool,
 }
 
 impl QueuedEvent {
@@ -475,6 +577,10 @@ impl QueuedEvent {
             server_output_invalid_utf8_lines: 0,
             server_output_lines: None,
             transaction_possibly_lost: false,
+            deadline_ms: None,
+            executing_request: 0,
+            transaction_possibly_active: false,
+            abandoned: false,
         }
     }
 
@@ -508,24 +614,50 @@ impl QueuedEvent {
         self
     }
 
-    /// `ServerOutput`: the lines collected on the completion path, plus what
-    /// was dropped or failed.
-    pub(crate) fn with_server_output_log(mut self, log: reldex_db_core::ServerOutputLog) -> Self {
-        self.server_output_dropped = log.dropped;
-        self.server_output_invalid_utf8_lines = log.invalid_utf8_lines;
-        if !log.lines.is_empty() {
-            self.server_output_lines = Some(Box::new(ReldexServerOutputLines::new(log.lines)));
+    /// `ServerOutput`: one event's lines, what was dropped ahead of them, and
+    /// a failed read.
+    pub(crate) fn with_server_output(
+        mut self,
+        lines: Vec<Box<str>>,
+        dropped: u32,
+        invalid_utf8_lines: u32,
+        failure: Option<&reldex_db_core::DbError>,
+    ) -> Self {
+        self.server_output_dropped = dropped;
+        self.server_output_invalid_utf8_lines = invalid_utf8_lines;
+        if !lines.is_empty() {
+            self.server_output_lines = Some(Box::new(ReldexServerOutputLines::new(lines)));
         }
-        if let Some(failure) = log.failure {
-            self.error = Some(Box::new(ReldexError::from_db_error(&failure)));
+        if let Some(failure) = failure {
+            self.error = Some(Box::new(ReldexError::from_db_error(failure)));
         }
         self
     }
 
     /// `Terminal`: whether the session ended with a transaction possibly
-    /// still unresolved.
-    pub(crate) const fn with_transaction_possibly_lost(mut self, lost: bool) -> Self {
+    /// still unresolved, and whether the caller abandoned it.
+    pub(crate) const fn with_terminal(mut self, lost: bool, abandoned: bool) -> Self {
         self.transaction_possibly_lost = lost;
+        self.abandoned = abandoned;
+        self
+    }
+
+    /// `Executing`: the deadline armed on the statement.
+    /// `Executing`: the statement that started, and the limit armed on it.
+    pub(crate) fn with_executing(
+        mut self,
+        request: u64,
+        deadline: Option<std::time::Duration>,
+    ) -> Self {
+        self.executing_request = request;
+        self.deadline_ms =
+            deadline.map(|limit| u64::try_from(limit.as_millis()).unwrap_or(u64::MAX));
+        self
+    }
+
+    /// `TransactionState`: the new value.
+    pub(crate) const fn with_transaction_possibly_active(mut self, active: bool) -> Self {
+        self.transaction_possibly_active = active;
         self
     }
 
@@ -623,6 +755,11 @@ impl QueuedEvent {
                 .server_output_lines
                 .map_or(std::ptr::null_mut(), Box::into_raw),
             transaction_possibly_lost: self.transaction_possibly_lost,
+            has_deadline: self.deadline_ms.is_some(),
+            transaction_possibly_active: self.transaction_possibly_active,
+            abandoned: self.abandoned,
+            deadline_ms: self.deadline_ms.unwrap_or(0),
+            executing_request: self.executing_request,
             ..ReldexEvent::default()
         }
     }

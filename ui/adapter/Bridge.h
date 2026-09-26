@@ -6,7 +6,7 @@
 //
 // The three rules it exists to enforce, stated where they are implemented:
 //
-//  * the waker callback runs on a Reldex pump thread and does **exactly one**
+//  * the waker callback runs on a Reldex worker thread and does **exactly one**
 //    thing -- a coalesced queued `invokeMethod` back to this object. It calls
 //    no `reldex_*` function (the library answers `RELDEX_STATUS_REENTRANT`,
 //    A3/A18) and lets no C++ exception escape into Rust (A18);
@@ -66,14 +66,15 @@ class Bridge : public QObject
     Q_OBJECT
     QML_ELEMENT
 
-    /// False when the ABI major version does not match the header this was
-    /// built against, when the hub could not be created, or when the waker
-    /// could not be registered. ADR-0003 D7: the adapter refuses to start on a
-    /// major mismatch rather than guessing -- and a `Bridge` that could not
-    /// register its waker would never drain anything, which shows up as a
-    /// spinner that never stops (the failure `SPEC.md` §2 ranks worst), so it
-    /// reports itself invalid instead.
+    /// False when the library's ABI version cannot serve the header this was
+    /// built against (`startError()` says why), when the hub could not be
+    /// created, or when the waker could not be registered. ADR-0003 D7: the
+    /// adapter refuses to start rather than guessing -- and a `Bridge` that
+    /// could not register its waker would never drain anything, which shows
+    /// up as a spinner that never stops (the failure `SPEC.md` §2 ranks
+    /// worst), so it reports itself invalid instead.
     Q_PROPERTY(bool valid READ isValid CONSTANT)
+    Q_PROPERTY(StartError startError READ startError CONSTANT)
     Q_PROPERTY(SessionController *session READ session CONSTANT)
     Q_PROPERTY(Metrics *metrics READ metrics CONSTANT)
     /// M3.2's connection manager: profile list, create/edit/delete,
@@ -92,10 +93,32 @@ class Bridge : public QObject
                        drainTimeBudgetMsChanged)
 
 public:
+    /// Why a `Bridge` refused to start. `None` on a valid one.
+    enum class StartError {
+        None,
+        /// The library's ABI major differs from the header's: nothing can be
+        /// assumed about any struct or function (D7).
+        AbiMajorMismatch,
+        /// Same major, but the library's minor is **older** than the header's.
+        /// Fields and kinds this adapter was built to read may not exist in
+        /// it, and a field an older library never fills can sit inside its
+        /// struct's tail padding, where `struct_size` cannot say it is absent
+        /// (ADR-0003 A38). A newer minor is fine: it only adds.
+        AbiMinorTooOld,
+        HubCreateFailed,
+        WakerRegistrationFailed,
+    };
+    Q_ENUM(StartError)
+
+    /// The ABI check alone, for a library reporting `libraryVersion`
+    /// (`reldex_abi_version()`'s encoding) against this build's header.
+    [[nodiscard]] static StartError checkAbiVersion(quint32 libraryVersion) noexcept;
+
     explicit Bridge(QObject *parent = nullptr);
     ~Bridge() override;
 
     [[nodiscard]] bool isValid() const noexcept { return m_hub != nullptr; }
+    [[nodiscard]] StartError startError() const noexcept { return m_startError; }
     [[nodiscard]] ReldexHub *hub() const noexcept { return m_hub.get(); }
     [[nodiscard]] SessionController *session() const noexcept { return m_session; }
     [[nodiscard]] Metrics *metrics() const noexcept { return m_metrics; }
@@ -167,13 +190,14 @@ private:
     /// Set last, and only when the hub exists *and* its waker was registered:
     /// `isValid()` is exactly "this Bridge can deliver events".
     reldex::HubHandle m_hub;
+    StartError m_startError = StartError::None;
     SessionController *m_session = nullptr;
     Metrics *m_metrics = nullptr;
     ScrollDriver *m_scrollDriver = nullptr;
     ConnectionManager *m_connections = nullptr;
 
     /// 1 while a drain is posted but has not started. Written from a Reldex
-    /// pump thread (the waker) and from the Qt thread (`drain()`), so it is
+    /// worker thread (the waker) and from the Qt thread (`drain()`), so it is
     /// atomic; it coalesces the waker's post with the drain's own re-post.
     QAtomicInt m_drainPosted { 0 };
 

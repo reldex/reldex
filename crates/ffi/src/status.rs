@@ -61,18 +61,26 @@ thread_local! {
 /// sketched: it costs one thread-local bool read per FFI call — far below the
 /// noise floor of the K4 per-batch budget, and it is what turns the classic
 /// waker deadlock into a reported error.
-pub(crate) struct WakerGuard;
+///
+/// It restores what it found rather than clearing: since M2.15 a wake can run
+/// on the caller's own thread, inside the `reldex_*` call whose submit made
+/// the queue non-empty, so the guard must not assume it is the outermost
+/// thing on the stack.
+pub(crate) struct WakerGuard {
+    previous: bool,
+}
 
 impl WakerGuard {
     pub(crate) fn enter() -> Self {
-        IN_WAKER.with(|flag| flag.set(true));
-        Self
+        Self {
+            previous: IN_WAKER.with(|flag| flag.replace(true)),
+        }
     }
 }
 
 impl Drop for WakerGuard {
     fn drop(&mut self) {
-        IN_WAKER.with(|flag| flag.set(false));
+        IN_WAKER.with(|flag| flag.set(self.previous));
     }
 }
 
@@ -162,6 +170,19 @@ mod tests {
         assert_eq!(entry_value(7_u32, || 1_u32), 7);
         let error = take_last_error().expect("a refused call records why");
         assert!(error.message().contains("waker"), "{}", error.message());
+    }
+
+    #[test]
+    fn a_nested_guard_restores_what_it_found() {
+        // A wake can run on the caller's own thread, inside a call (M2.15).
+        let outer = WakerGuard::enter();
+        {
+            let _inner = WakerGuard::enter();
+        }
+        assert_eq!(entry(|| ReldexStatus::Ok), ReldexStatus::Reentrant);
+        drop(outer);
+        assert_eq!(entry(|| ReldexStatus::Ok), ReldexStatus::Ok);
+        let _ = take_last_error();
     }
 
     #[test]

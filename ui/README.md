@@ -248,7 +248,7 @@ reads them back with the public `QAccessible::queryAccessibleInterface()` API
 Three classes, one job each, in the shape ADR-0003 D1 fixes.
 
 **`Bridge`** owns the `ReldexHub*`. It registers the waker; the callback runs
-on a Reldex pump thread and does exactly one thing — a coalesced
+on a Reldex session's worker thread and does exactly one thing — a coalesced
 `QMetaObject::invokeMethod(bridge, &Bridge::drain, Qt::QueuedConnection)`. It
 calls no `reldex_*` function (the library answers `RELDEX_STATUS_REENTRANT`)
 and lets no C++ exception escape into Rust. `drain()` takes events until the
@@ -691,10 +691,16 @@ Not fixed here — `crates/ffi` was otherwise out of scope for this task:
   no raw endpoint or password text, per `crates/workspace/src/profile.rs`'s
   `Display` impls), but a future caller wanting to react differently to, say,
   "credential pattern refused" versus "environment/production mismatch" has
-  no numeric code to switch on. Deferred to M2.15.
+  no numeric code to switch on. **FFI side fixed in M2.15 (ABI 3.2):** the
+  `CONFIGURATION` error a refused `create_profile`/`update_profile` reply
+  carries now has a `ReldexProfileError` as its `native_code`, one value per
+  `ProfileError` variant. `ConnectionManager` does not map it to finer
+  message keys yet — a follow-up.
 - **The hub can only open `RELDEX_DRIVER_KIND_MOCK` sessions in this build,
   and the mock has no configurable open/ping failure**
-  (`ReldexMockScenarioConfig` has no such field). Test-connect's "typed
+  (`ReldexMockScenarioConfig` had no such field until M2.15, ABI 3.2, added
+  `connect_failure`/`ping_failure`; this section's tests do not use them
+  yet — a follow-up). Test-connect's "typed
   failure" test coverage therefore exercises the
   `build_connect_params`/profile-validation stage (`PasswordRequired`, folded
   to `error.configuration`) rather than a real connect/authentication
@@ -929,40 +935,17 @@ directly: building a request, preparing it, and confirming the classifier
 turns a synthetic ORA-00942 into `RELDEX_ERROR_KIND_PERMISSION` while leaving
 an already-`Permission` code (ORA-01031) alone.
 
-### A fourth gap, found while testing this task's own session close
+### A fourth gap, found while testing this task's own session close — fixed in M2.15
 
-`reldex_hub_session_count()`'s doc comment in `reldex.h` says a session's
-entry is released "when the pump exits, which for a normally closed session
-is promptly". It is not, for **any** session, not only a second concurrent
-one: `crates/ffi/src/session.rs`'s `reldex_hub_open_session` inserts into
-`hub.sessions` (~line 625), but nothing removes that entry when a session
-closes normally — its pump thread (`pump_main`) never touches `hub.sessions`,
-and the crate's only removal sites are `reldex_hub_destroy`'s full drain
-(`crates/ffi/src/hub.rs` ~line 268, tears down the whole hub) and the
-failed-thread-spawn error path (`session.rs` ~line 640). Confirmed directly
-against the FFI, bypassing this adapter and this task's code entirely, with a
-throwaway Rust test added temporarily under `crates/ffi/tests/` and removed
-before this branch was pushed (not part of this PR's diff, `crates/**` is out
-of this task's scope): opening one session on an otherwise-empty hub,
-closing it, and draining both its `SESSION_CLOSED` reply and its unsolicited
-`TERMINAL` event (both arrive correctly and in the right order) still leaves
-`reldex_hub_session_count()` unchanged, even after polling for 5 more
-seconds. The same held with a second session left open alongside it, in
-either close order.
-
-This is what first looked like a bug in this task's own session-close code —
-`tst_objectbrowsermodel.cpp`'s teardown test hung for the full 60-second
-`spinUntil` guard waiting for the count to drop. It is not this task's bug:
-the adapter's close protocol (submit `reldex_session_close`, receive
-`SESSION_CLOSED`, receive the unsolicited `TERMINAL`) completes correctly and
-promptly every time; the hub's own bookkeeping simply never reflects it on a
-live hub. `tst_objectbrowsermodel.cpp`'s close test was rewritten to assert
-what the FFI actually delivers (state transitions and the `sessionClosed`
-signal) instead of the count, with a comment pointing here. Flagging this for
-whoever owns `crates/ffi`/`crates/db-core` next: any other code relying on
-`reldex_hub_session_count()` or `reldex_live_counts().sessions` reflecting an
-individual session's close on a hub that is not being destroyed — not just
-this task's — would hang or misreport the same way.
+M6.1 found that `reldex_hub_session_count()` and `reldex_live_counts().sessions`
+never came down after a session closed normally: the interim per-session pump
+never removed the hub's entry, so only `reldex_hub_destroy` did. M2.15 (ABI 3.2,
+ADR-0003 A33) fixed it: a session stops counting the moment its `TERMINAL` is
+drained, whether it was closed, lost, abandoned or never opened, and its id is
+`NOT_FOUND` from then on. `tst_objectbrowsermodel.cpp`'s
+`ownMetadataSessionIsCountedSeparatelyFromAWorksheetSession` asserts it again: the
+count drops by one when the browser's own session closes, and by one more when
+the worksheet's does.
 
 ### A related, non-FFI gap: the row cap has no setting yet
 
@@ -1361,9 +1344,8 @@ iterations on CI: 6.3 s here, and even an order of magnitude slower on a
 two-core runner leaves the `qt-build` job's 25-minute budget untouched.
 `RELDEX_UI_TEARDOWN_ITERATIONS` / `RELDEX_UI_TEARDOWN_CONNECT_ITERATIONS` are
 the lever if the first real Linux/macOS run says otherwise. The live-count
-waits in that test use a 300-second hang guard for the same reason — it waits
-for up to 10,000 pump threads to finish (A17), and that is a hang guard, not a
-latency bound.
+waits in that test use a 300-second hang guard for the same reason — a hang
+guard, not a latency bound.
 
 **Reading a test's own output on this machine:** a Qt test binary's stdout does
 not reach a redirected file or a pipe from Git Bash or PowerShell here (the
@@ -1546,12 +1528,15 @@ return to it: the 10,000-iteration flood, the connect-window variant, the
 `deleteLater()`-mid-drain teardown, the error path, and the mid-stream result
 reset. Two details the header is explicit about and the tests follow:
 
-- it is always a **wait**, never an immediate compare, because A17 says
-  `reldex_hub_destroy` does not join the session pump threads;
+- it is always a **wait**, never an immediate compare. Since M2.15 everything
+  the counters see is released before `reldex_hub_destroy` returns (a session
+  stops counting when its `TERMINAL` is drained, or at destroy), so the wait is
+  a guard rather than a necessity — kept, because it costs nothing when the
+  counts are already right;
 - the baseline is taken **before** anything is created and after the library
-  has gone quiescent. Taking it while a previous test's pump thread was still
-  finishing made a test fail for having *fewer* live objects than it started
-  with — found that way, not by reasoning.
+  has gone quiescent. Taking it while a previous test was still finishing
+  made a test fail for having *fewer* live objects than it started with —
+  found that way, not by reasoning.
 
 What the counters cannot see is a leak on our own side of the boundary; the
 RAII handles in `ReldexHandles.h` and the flat RSS across 12,000 teardowns
@@ -1749,14 +1734,16 @@ module (`Qt6Charts`, `Qt6WebEngineCore`, etc.) is present.
   `ReldexOpenOptions` with `RELDEX_DRIVER_KIND_MOCK`, because that is the only
   kind this build of `reldex-ffi` accepts (ADR-0003 A8). Connection profiles
   exist as of M3.2 (see "Connection manager (M3.2)" above); a real driver is
-  still M3/M4. `ReldexMockScenarioConfig` also has no configurable open/ping
-  failure, which limits M3.2's test-connect failure-path test coverage to the
-  profile-validation stage — see that section's "FFI gaps found".
-- **`ProfileError` has no per-variant numeric sub-code across the ABI**
-  (M3.2). Every profile/connect-param validation failure, including the
-  credential-pattern refusal, surfaces under one `error.configuration`
-  message key. Deferred to M2.15. See "Connection manager (M3.2)" → "FFI gaps
+  still M3/M4. Until M2.15 (ABI 3.2) `ReldexMockScenarioConfig` had no
+  configurable open/ping failure, which limits M3.2's test-connect
+  failure-path test coverage to the profile-validation stage; the fields now
+  exist but those tests do not use them yet — see that section's "FFI gaps
   found".
+- **Every profile/connect-param validation failure surfaces under one
+  `error.configuration` message key** (M3.2), including the credential-pattern
+  refusal. Since M2.15 (ABI 3.2) the reply carries a `ReldexProfileError` as
+  `native_code`; mapping it to finer keys is a follow-up. See "Connection
+  manager (M3.2)" → "FFI gaps found".
 - **The connection dialog has no transport/CA/certificate-pin controls**
   (M3.2; M3.5, Opus, adds them). Every profile is created with
   `transport: Plain` and an empty `caDirectory`. See "Connection manager

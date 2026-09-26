@@ -6,6 +6,13 @@
 [ADR-0002](../../decisions/0002-driver-api-and-concurrency-model.md) amendment E1–E6 ·
 **Architecture:** [`ARCHITECTURE.md`](../../architecture/ARCHITECTURE.md) §6
 
+> **Update 2026-09-26 (M2.15).** The FFI switch this file plans (§3.1, §7.2) has landed:
+> `crates/ffi` drains this queue and the per-session pump is gone (ADR-0003 A32–A37, ABI 3.2). Where
+> it differs from the plan: the hub allocates the `RequestId`s `db-core` sees and maps each reply back
+> to the caller's id; `FetchedSegment` crosses as an opaque `FETCHED_SEGMENT` kind; `abandon` reports
+> a `ReldexAbandonOutcome`; `TERMINAL` carries its cause as an owned error; and a session id is
+> `NOT_FOUND` once its `TERMINAL` has been drained.
+
 This file holds the two things that would have swamped the milestone table: the performance
 numbers either side of the refactor (§2), and the exact `SessionEvent` → `ReldexEvent` mapping
 M2.11 has to write (§3). §7 adds the part M2.6 produced — the open events, `abandon`, and what the
