@@ -639,6 +639,15 @@ void SessionController::setRunOnOpen(bool run)
     Q_EMIT runOnOpenChanged();
 }
 
+void SessionController::setActiveProfileIsProduction(bool production)
+{
+    if (production == m_activeProfileIsProduction) {
+        return;
+    }
+    m_activeProfileIsProduction = production;
+    Q_EMIT activeProfileIsProductionChanged();
+}
+
 void SessionController::setMockRows(qint64 rows)
 {
     if (rows == m_mockRows) {

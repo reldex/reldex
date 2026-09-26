@@ -13,11 +13,12 @@ import Reldex.Adapter
 // this file's).
 //
 // Presentation only, per ARCHITECTURE.md invariant 4: no business rules
-// here. Every backend-shaped placeholder (session state, connections,
-// results, DBMS_OUTPUT, production indicator) names the milestone that
-// replaces it. See `ui/README.md` "App shell" for the layout diagram and
-// how this differs from `Harness.qml`, the still-reachable S15 measurement
-// window (`ui/app/main.cpp` picks between the two).
+// here. Every backend-shaped placeholder (session state, results,
+// DBMS_OUTPUT) names the milestone that replaces it; connections (M3.2) and
+// the production indicator (M3.4) are filled in already. See
+// `ui/README.md` "App shell" for the layout diagram and how this differs
+// from `Harness.qml`, the still-reachable S15 measurement window
+// (`ui/app/main.cpp` picks between the two).
 //
 // M6.1 is the first milestone to fill in a placeholder with a real
 // adapter-backed panel (the sidebar's object browser), which is why this
@@ -129,6 +130,13 @@ ApplicationWindow {
                 id: worksheetAreaPane
                 SplitView.fillHeight: true
                 SplitView.minimumHeight: 120
+                // M3.4: `SessionController.activeProfileIsProduction` is
+                // itself `Profile::treat_as_production()`, read through the
+                // adapter (ADR-0006 P3) -- never `ReldexEnvironmentKind`.
+                // `bridge.session` can be null on a `Bridge` that failed to
+                // start (see `Bridge::Bridge()`), so this guards the same way
+                // every other `bridge.session` read in this shell would.
+                productionActive: bridge.session ? bridge.session.activeProfileIsProduction : false
             }
 
             OutputPanes {
@@ -146,5 +154,7 @@ ApplicationWindow {
         anchors.right: parent.right
         anchors.bottom: parent.bottom
         height: 28
+        // M3.4: see the same-named binding on `WorksheetArea` above.
+        productionActive: bridge.session ? bridge.session.activeProfileIsProduction : false
     }
 }
