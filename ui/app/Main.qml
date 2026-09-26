@@ -45,31 +45,12 @@ ApplicationWindow {
     title: root.productName
     color: Theme.tokens.background
 
-    // The one `Bridge` (ADR-0003 D1) this window's adapter-backed panels
-    // share -- today just the object browser (M6.1), which opens its own
-    // metadata session against this hub, distinct from any worksheet's
-    // session. M3.2's connection manager and later worksheet execution (M4.x)
-    // are expected to reuse this same instance rather than each creating
-    // their own hub.
-    Bridge {
-        id: bridge
-        objectName: "bridge"
-    }
-
-    // Session-only, per the task brief: resets to expanded on every launch.
-    // Persisting this is M6.2 ("UI layout" in SPEC.md §20's local-persistence
-    // list), not M3.1.
-    property bool sidebarVisible: true
-    property bool outputPaneVisible: true
-
-    function toggleSidebar() { root.sidebarVisible = !root.sidebarVisible }
-    function toggleOutputPane() { root.outputPaneVisible = !root.outputPaneVisible }
-
-    // M3.2: the app's one Bridge (one hub, one workspace service thread --
-    // ADR-0006 P6). Every other milestone's placeholder in this shell
-    // (session state, results, DBMS_OUTPUT, the production indicator) names
-    // itself as the reason this was not created in M3.1; the connection
-    // manager is the first of those to actually need it. Named the same way
+    // The one `Bridge` (ADR-0003 D1, one hub, one workspace service thread --
+    // ADR-0006 P6) this window's adapter-backed panels share: the object
+    // browser (M6.1), which opens its own metadata session against this hub
+    // distinct from any worksheet's session, and the connection manager
+    // (M3.2). Later worksheet execution (M4.x) is expected to reuse this same
+    // instance rather than creating its own hub. Named the same way
     // Harness.qml already does ("bridge"), so a test can reach it the same
     // way there.
     Bridge {
@@ -84,6 +65,15 @@ ApplicationWindow {
         // first.
         Component.onCompleted: connections.open()
     }
+
+    // Session-only, per the task brief: resets to expanded on every launch.
+    // Persisting this is M6.2 ("UI layout" in SPEC.md §20's local-persistence
+    // list), not M3.1.
+    property bool sidebarVisible: true
+    property bool outputPaneVisible: true
+
+    function toggleSidebar() { root.sidebarVisible = !root.sidebarVisible }
+    function toggleOutputPane() { root.outputPaneVisible = !root.outputPaneVisible }
 
     // VSCode's own bindings for the same two affordances (sidebar / bottom
     // panel), chosen because they are already muscle memory for a large
