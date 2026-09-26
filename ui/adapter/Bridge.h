@@ -27,6 +27,22 @@
 //    anything a drain calls.** `~Bridge` tears the hub down underneath the
 //    loop that is still walking it; `deleteLater()` defers that to the next
 //    return to the event loop, which is after the drain has finished.
+//
+// Teardown order for every dependent this Bridge owns (M3.2 round-2 fix,
+// 2026-09-26): a dependent that is BOTH a QObject child of this Bridge (e.g.
+// `new ConnectionManager(this, this)`) AND reaches back into one of this
+// Bridge's own data members from its own destructor (`m_hubSinks`, via
+// `unregisterHubSink()`) must be deleted explicitly, in `~Bridge()`'s body,
+// before that data member's destructor runs. C++ destroys a derived class's
+// own data members (in reverse declaration order) only *after* that class's
+// destructor body finishes, and only *then* does the `QObject` base
+// destructor run `deleteChildren()` -- so a QObject child left for that
+// automatic cleanup is destroyed after `m_hubSinks` (a plain `QHash` member,
+// not a QObject) has already been destructed, and any callback into it from
+// that child's destructor is a use-after-destruction. `m_session` and
+// `m_connections` both follow this rule below; anything added later that
+// shares this shape (a QObject child + a callback into a Bridge member on
+// teardown) must too.
 
 #include <QAtomicInt>
 #include <QHash>
@@ -40,6 +56,10 @@
 // moc needs a complete type to register a pointer property.
 #include "ScrollDriver.h"
 #include "SessionController.h"
+
+// `ConnectionManager` is a Q_PROPERTY type too (`connections`), for the same
+// reason as the three above.
+#include "ConnectionManager.h"
 
 class Bridge : public QObject
 {
@@ -56,6 +76,10 @@ class Bridge : public QObject
     Q_PROPERTY(bool valid READ isValid CONSTANT)
     Q_PROPERTY(SessionController *session READ session CONSTANT)
     Q_PROPERTY(Metrics *metrics READ metrics CONSTANT)
+    /// M3.2's connection manager: profile list, create/edit/delete,
+    /// test-connect. Owns its own workspace service thread, independent of
+    /// this Bridge's hub (ADR-0006 P6/M2.11 README "Threads").
+    Q_PROPERTY(ConnectionManager *connections READ connections CONSTANT)
     /// Spike S15's measurement driver (M1.8). Inert unless the environment
     /// asks for a measurement run; see `ui/adapter/ScrollDriver.h`.
     Q_PROPERTY(ScrollDriver *scrollDriver READ scrollDriver CONSTANT)
@@ -76,6 +100,7 @@ public:
     [[nodiscard]] SessionController *session() const noexcept { return m_session; }
     [[nodiscard]] Metrics *metrics() const noexcept { return m_metrics; }
     [[nodiscard]] ScrollDriver *scrollDriver() const noexcept { return m_scrollDriver; }
+    [[nodiscard]] ConnectionManager *connections() const noexcept { return m_connections; }
 
     [[nodiscard]] int drainEventBudget() const noexcept { return m_drainEventBudget; }
     void setDrainEventBudget(int events);
@@ -86,6 +111,14 @@ public:
     /// unregistered or destroyed.
     void registerSession(quint64 id, SessionController *controller);
     void unregisterSession(quint64 id);
+
+    /// As `registerSession`, for `ConnectionManager`'s test-connect probe --
+    /// a second, concrete consumer of hub events rather than a general
+    /// interface, matching this class's existing direct coupling to
+    /// `SessionController` (no `HubEventSink` abstraction exists yet; adding
+    /// one for exactly one more caller would be speculative).
+    void registerHubSink(quint64 id, ConnectionManager *sink);
+    void unregisterHubSink(quint64 id);
 
     /// The hub's queue depth. Diagnostic only (A4): `drain()` loops on
     /// `reldex_hub_next_event` instead, which is the same information without
@@ -137,6 +170,7 @@ private:
     SessionController *m_session = nullptr;
     Metrics *m_metrics = nullptr;
     ScrollDriver *m_scrollDriver = nullptr;
+    ConnectionManager *m_connections = nullptr;
 
     /// 1 while a drain is posted but has not started. Written from a Reldex
     /// pump thread (the waker) and from the Qt thread (`drain()`), so it is
@@ -149,6 +183,7 @@ private:
     bool m_draining = false;
 
     QHash<quint64, QPointer<SessionController>> m_sessions;
+    QHash<quint64, QPointer<ConnectionManager>> m_hubSinks;
 
     int m_drainEventBudget = 256; // ADR-0003 D5
     int m_drainTimeBudgetMs = 4; // ADR-0003 D5

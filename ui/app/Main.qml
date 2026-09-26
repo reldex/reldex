@@ -45,15 +45,25 @@ ApplicationWindow {
     title: root.productName
     color: Theme.tokens.background
 
-    // The one `Bridge` (ADR-0003 D1) this window's adapter-backed panels
-    // share -- today just the object browser (M6.1), which opens its own
-    // metadata session against this hub, distinct from any worksheet's
-    // session. M3.2's connection manager and later worksheet execution (M4.x)
-    // are expected to reuse this same instance rather than each creating
-    // their own hub.
+    // The one `Bridge` (ADR-0003 D1, one hub, one workspace service thread --
+    // ADR-0006 P6) this window's adapter-backed panels share: the object
+    // browser (M6.1), which opens its own metadata session against this hub
+    // distinct from any worksheet's session, and the connection manager
+    // (M3.2). Later worksheet execution (M4.x) is expected to reuse this same
+    // instance rather than creating its own hub. Named the same way
+    // Harness.qml already does ("bridge"), so a test can reach it the same
+    // way there.
     Bridge {
         id: bridge
         objectName: "bridge"
+
+        // M3.2 fix round (2026-09-26): `ConnectionManager` never opens its
+        // workspace automatically (see `ConnectionManager::open()`'s own doc
+        // comment for why) -- this is the app's own startup path calling it
+        // explicitly, exactly the alternative that class documents. `open()`
+        // is idempotent, so this is safe even if something else calls it
+        // first.
+        Component.onCompleted: connections.open()
     }
 
     // Session-only, per the task brief: resets to expanded on every launch.
@@ -100,6 +110,7 @@ ApplicationWindow {
             SplitView.maximumWidth: 480
             visible: root.sidebarVisible
             bridge: bridge
+            connectionManager: bridge.connections
         }
 
         SplitView {

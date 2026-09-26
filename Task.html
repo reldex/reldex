@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-26T19:22:00+07:00",
+  "updatedAt": "2026-09-26T20:55:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -526,6 +526,11 @@
     }
   ],
   "risks": [
+    {
+      "title": "Adapter teardown-order bugs: two use-after-destruction crashes found in one day (M3.2, M6.1, 2026-09-26)",
+      "detail": "Closing the app while work is in flight walked two different dangling pointers: ConnectionManager (a QObject child of Bridge) touched Bridge's already-destructed m_hubSinks member from its destructor (members die before children), and SessionController held a raw pointer to a QML-owned sibling Bridge that the QML engine destroyed first. Both were invisible to the normal test runs — one was hidden by a test-side wait, the other only surfaced under CI's qt-asan job. The same pattern can recur in every adapter object that keeps a pointer to Bridge or a SessionController.",
+      "mitigation": "Rule recorded in Bridge.h and SessionController.h: Bridge deletes its dependents explicitly before its members go; any cross-object pointer an adapter destructor may touch is a QPointer; no test may wait a session to idle just to dodge teardown. Regression tests destroy Bridge with work in flight (tst_connectionmanager, tst_objectbrowsermodel); the qt-asan job stays a merge gate; reviewers probe destroy-while-busy on every new adapter class."
+    },
     {
       "title": "Credential Manager two-process test failed once on the Windows CI runner (2026-09-25) — cause found, test fixed",
       "detail": "The failure was self-inflicted by test scheduling, not a lock defect: the one test that writes through cmdkey outside Reldex's per-user lock ran concurrently with the two-process test, and Credential Manager's whole-file rewrite revived a just-deleted entry — the same residual race ADR-0007 S4 already records for any unlocked writer.",
@@ -1264,8 +1269,8 @@
               "status": "done"
             },
             {
-              "title": "M3.2 Connection manager UI: list, create/edit/delete, environment, test-connect (sonnet)",
-              "status": "todo"
+              "title": "M3.2 Connection manager UI: list, create/edit/delete, environment, test-connect (sonnet) — done 2026-09-26 (PR #45, three review rounds): profiles list/create/edit/delete, environment + treat-as-production, role picker, test-connect that resolves the stored password first; reviews found and fixed unguarded tests writing the developer's real store (lazy open + harness guard + build.sh store check), store directory creation on the UI thread (moved into the FFI service thread), a 2× DPI Popup collapse, and a Bridge/ConnectionManager teardown use-after-free (regression tests crash before, pass after)",
+              "status": "done"
             },
             {
               "title": "M3.3 ★ Connect flow over the async path, with a bounded timeout and a cancellable \"Connecting…\" state (opus, review mandatory)",
@@ -1713,6 +1718,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-26",
+      "text": "M3.2 connection manager UI done (PR #45): profiles list/create/edit/delete, environment and treat-as-production, role picker, test-connect that resolves the stored password first. Three review rounds found and fixed real defects: unguarded test binaries wrote the developer's real store (now lazy open, a harness-level in-memory guard and a build.sh store check), store directory creation ran on the UI thread (moved into the FFI service thread), the dialog collapsed at 2× DPI, and destroying Bridge with a test-connect in flight was a use-after-free — the same class of bug fixed the same day in the object browser (PR #47), now recorded as a risk."
+    },
     {
       "date": "2026-09-26",
       "text": "M6.1 object browser UI half merged (PR #47): lazy tree model and panel over the mock driver with its own metadata session; the review found and the fix round removed a race where a refresh or filter change during an in-flight fetch was silently dropped; keyboard navigation wired; the real-database half (permission message, large-schema measurement, row cap as a setting) waits for M3.3."

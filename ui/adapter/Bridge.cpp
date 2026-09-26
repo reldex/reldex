@@ -153,6 +153,13 @@ Bridge::Bridge(QObject *parent)
 
     // Commit. `isValid()` is true from here and nowhere earlier.
     m_hub = std::move(hub);
+
+    // M3.2: its own workspace service thread, independent of the hub above
+    // (ADR-0006 P6). Created last, and its own constructor never throws past
+    // a partial state (it owns its workspace handle the same RAII way `m_hub`
+    // is owned here), so a failure inside it cannot leave this Bridge's own
+    // invariant ("m_hub set means isValid()") in question.
+    m_connections = new ConnectionManager(this, this);
 }
 
 Bridge::~Bridge()
@@ -181,6 +188,24 @@ Bridge::~Bridge()
     delete m_session;
     m_session = nullptr;
     m_sessions.clear();
+
+    // 2b. Same teardown-order rule (this class's own documentation above),
+    //     for `ConnectionManager`: it is a QObject child of this Bridge, and
+    //     its own destructor calls back into `unregisterHubSink()` (below)
+    //     when a test-connect is still in flight at teardown -- nothing
+    //     stops the user closing the app while Test Connect is busy. Without
+    //     this explicit delete, `QObject::~QObject()` would destroy it via
+    //     `deleteChildren()` only *after* `m_hubSinks` (a plain data member,
+    //     not a QObject) has already been destructed by this destructor
+    //     returning -- a use-after-destruction, reproduced 5/5 on MSVC as an
+    //     access violation before this fix. `ConnectionManager::m_bridge` is
+    //     also a `QPointer` now (not a raw pointer), so this object no longer
+    //     depends on being deleted in exactly this order to stay safe -- but
+    //     the order is still correct and still documented, the same as
+    //     `m_session` above.
+    delete m_connections;
+    m_connections = nullptr;
+    m_hubSinks.clear();
 
     // 3. Take and release whatever is still queued. A queued FETCHED event
     //    owns a batch, and an undrained batch is our memory (A16).
@@ -224,6 +249,16 @@ void Bridge::registerSession(quint64 id, SessionController *controller)
 void Bridge::unregisterSession(quint64 id)
 {
     m_sessions.remove(id);
+}
+
+void Bridge::registerHubSink(quint64 id, ConnectionManager *sink)
+{
+    m_hubSinks.insert(id, sink);
+}
+
+void Bridge::unregisterHubSink(quint64 id)
+{
+    m_hubSinks.remove(id);
 }
 
 qint64 Bridge::pendingEvents() const
@@ -365,11 +400,16 @@ void Bridge::dispatch(ReldexEvent &raw)
     m_metrics->markFirstEvent();
 
     const auto owner = m_sessions.constFind(raw.session);
-    if (owner == m_sessions.cend() || owner->isNull()) {
-        ++m_orphanEvents;
-        return; // the handles release what the event carried
+    if (owner != m_sessions.cend() && !owner->isNull()) {
+        (*owner)->handleEvent(raw, std::move(batch), std::move(error));
+        return;
     }
-    (*owner)->handleEvent(raw, std::move(batch), std::move(error));
+    const auto sink = m_hubSinks.constFind(raw.session);
+    if (sink != m_hubSinks.cend() && !sink->isNull()) {
+        (*sink)->handleHubEvent(raw, std::move(batch), std::move(error));
+        return;
+    }
+    ++m_orphanEvents; // the handles release what the event carried
 }
 
 void Bridge::drainAndRelease()
