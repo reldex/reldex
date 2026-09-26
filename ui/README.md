@@ -938,11 +938,11 @@ Measured 2026-09-27 on an AMD Ryzen 7 5700G, 64 GB, Windows 11. The build was `u
 default RelWithDebInfo, against the local 19c container. Each run is n = 5 and each figure is a
 p50:
 
-| Measure | Run 1 | Run 2 | Run 3 (via `run-it.ps1`) |
-| --- | --- | --- | --- |
-| Connect (open → `OPENED`) | 46 ms | 48 ms | 49 ms |
-| `select 1 from dual` (execute → result complete) | 2 ms | 2 ms | 3 ms |
-| Longest UI-thread call (click Connect, or press Connect in the prompt) | 226 µs | 264 µs | 314 µs |
+| Measure | Run 1 | Run 2 | Run 3 (via `run-it.ps1`) | Run 4 (before pushing) |
+| --- | --- | --- | --- | --- |
+| Connect (open → `OPENED`) | 46 ms | 48 ms | 49 ms | 47 ms |
+| `select 1 from dual` (execute → result complete) | 2 ms | 2 ms | 3 ms | 3 ms |
+| Longest UI-thread call (click Connect, or press Connect in the prompt) | 226 µs | 264 µs | 314 µs | 430 µs |
 
 The test asserts that the UI-thread call is shorter than the connect.
 

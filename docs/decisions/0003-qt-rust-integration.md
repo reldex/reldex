@@ -1194,13 +1194,18 @@ a product build is simply `--no-default-features`.
   - Both rest on one observed assumption: the driver never reports expiry early. It is recorded in
     `phase-1.md`'s M3.3 note.
 - **Cancel is `reldex_session_abandon`** (A33). It does not wait for the connect.
-  - Against the live database it returned `CONNECTING` in 21–105 µs.
+  - Against the live database it returned `CONNECTING` in 18–105 µs.
   - The connect then runs to its end on the worker. A connection that arrives afterwards is closed
     by the registry and never adopted: `OPENED` carries `CANCELLED`, then `TERMINAL` carries
     `abandoned`.
-  - A second session watched `v$session` for 3 s after the abandon and never saw the test user's
-    late session. A control check shows the same watch does see a live one
+  - A second session watched `v$session` for 3 s after the abandon
     (`abandoning_a_real_connect_returns_at_once_and_adopts_nothing`).
+    - The late connection does reach the server: the watch saw at most one of the test user's
+      sessions at a time.
+    - It was always gone again before the watch ended, and nothing was left.
+    - A control check shows the same watch does see a session that is kept open.
+  - Abandon therefore bounds how long a connection that is not wanted lives. It cannot stop the
+    connect from reaching the server (U-15).
 
 ### A43 — real-driver behaviours an adapter must handle
 
