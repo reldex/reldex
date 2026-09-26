@@ -194,6 +194,7 @@ bool SessionController::open()
             static_cast<quint64>(std::max<qint64>(0, m_mockFirstBatchLatencyUs));
     options.mock.block_duration_ms =
             static_cast<quint64>(std::max<qint64>(0, m_mockBlockDurationMs));
+    options.mock.server_output = m_mockServerOutputSupported;
 
     const quint64 request = nextRequest(RELDEX_EVENT_KIND_OPENED);
     ReldexSessionId session = 0;
@@ -324,6 +325,22 @@ bool SessionController::closeSession(int disposition)
     return true;
 }
 
+bool SessionController::setServerOutput(int mode, quint64 bufferBytes)
+{
+    if (!checkThread() || m_bridge == nullptr || !m_bridge->isValid() || m_sessionId == 0) {
+        return false;
+    }
+    const quint64 request = nextRequest(RELDEX_EVENT_KIND_SERVER_OUTPUT_CONFIGURED);
+    const ReldexStatus status = reldex_session_set_server_output(m_bridge->hub(), m_sessionId,
+                                                                  request, mode, bufferBytes);
+    if (status != RELDEX_STATUS_OK) {
+        m_outstanding.remove(request);
+        takeThreadLocalError();
+        return false;
+    }
+    return true;
+}
+
 bool SessionController::canFetchMoreRows() const
 {
     // The question `QAbstractItemModel::canFetchMore()` is really asking is
@@ -392,7 +409,7 @@ void SessionController::submitFetches()
 }
 
 void SessionController::handleEvent(const ReldexEvent &raw, reldex::BatchHandle batch,
-                                    reldex::ErrorHandle error)
+                                    reldex::ErrorHandle error, reldex::LinesHandle lines)
 {
     // Only a reply may touch the request bookkeeping. Everything else is
     // handled -- or ignored -- first (ABI 3.2): `EXECUTING`, `TERMINAL`,
@@ -411,6 +428,11 @@ void SessionController::handleEvent(const ReldexEvent &raw, reldex::BatchHandle 
             Q_EMIT transactionStateChanged(m_transactionPossiblyActive);
         }
         return;
+    case RELDEX_EVENT_KIND_SERVER_OUTPUT:
+        // M4.7: `request == 0` like the two kinds above -- this is not a
+        // reply, so it never touches `m_outstanding`.
+        handleServerOutput(raw, error, std::move(lines));
+        return;
     case RELDEX_EVENT_KIND_TERMINAL:
         handleTerminal(raw, error);
         return;
@@ -423,9 +445,7 @@ void SessionController::handleEvent(const ReldexEvent &raw, reldex::BatchHandle 
     case RELDEX_EVENT_KIND_SERVER_OUTPUT_CONFIGURED:
         break;
     default:
-        // SERVER_OUTPUT (its lines are released by the Bridge; the output
-        // pane is M3.x's), FETCHED_SEGMENT, and every kind this build
-        // predates.
+        // FETCHED_SEGMENT and every kind this build predates.
         return;
     }
 
@@ -566,6 +586,14 @@ void SessionController::handleEvent(const ReldexEvent &raw, reldex::BatchHandle 
         Q_EMIT sessionClosed(raw.close_outcome, raw.session_still_open);
         return;
 
+    case RELDEX_EVENT_KIND_SERVER_OUTPUT_CONFIGURED:
+        if (error) {
+            Q_EMIT serverOutputConfigureFailed();
+            return;
+        }
+        Q_EMIT serverOutputConfigured(raw.server_output_mode, raw.server_output_buffer_bytes);
+        return;
+
     default:
         return;
     }
@@ -592,6 +620,12 @@ void SessionController::handleTerminal(const ReldexEvent &raw, const reldex::Err
     } else if (m_state != Closed && m_state != Failed) {
         setState(Closed);
     }
+    // M4.7/ADR-0003 A34: lines the session lost that no earlier
+    // `SERVER_OUTPUT` reported -- the pane must not go silent just because
+    // the loss happened between two `SERVER_OUTPUT` events.
+    if (raw.server_output_dropped > 0) {
+        Q_EMIT serverOutputReceived(QStringList(), raw.server_output_dropped, 0, false, QString());
+    }
     // Whatever was open went with the session; whether it was lost is
     // `transactionPossiblyLost`, not this flag.
     if (m_transactionPossiblyActive) {
@@ -599,6 +633,36 @@ void SessionController::handleTerminal(const ReldexEvent &raw, const reldex::Err
         Q_EMIT transactionStateChanged(false);
     }
     Q_EMIT terminated(raw.transaction_possibly_lost, raw.abandoned);
+}
+
+void SessionController::handleServerOutput(const ReldexEvent &raw, const reldex::ErrorHandle &error,
+                                           reldex::LinesHandle lines)
+{
+    QStringList text;
+    if (lines) {
+        const std::size_t count = reldex_server_output_lines_count(lines.get());
+        text.reserve(static_cast<qsizetype>(count));
+        for (std::size_t index = 0; index < count; ++index) {
+            const ReldexStr line = reldex_server_output_lines_get(lines.get(), index);
+            text.append(QString::fromUtf8(reinterpret_cast<const char *>(line.ptr),
+                                          static_cast<qsizetype>(line.len)));
+        }
+    }
+    // Deliberately not `adoptError()`: a failed read of the server's output
+    // buffer means the *output* is incomplete, not the session or the
+    // statement that triggered it -- `executed()` still follows with whatever
+    // the statement itself reported. `reldex.h`: "a non-null error is a read
+    // that failed, so the output is incomplete and the pane must say why."
+    QString errorMessage;
+    if (error) {
+        ReldexErrorView view = reldex::makeErrorView();
+        if (reldex_error_view(error.get(), &view) == RELDEX_STATUS_OK) {
+            errorMessage = QString::fromUtf8(reinterpret_cast<const char *>(view.message.ptr),
+                                             static_cast<qsizetype>(view.message.len));
+        }
+    }
+    Q_EMIT serverOutputReceived(text, raw.server_output_dropped, raw.server_output_invalid_utf8_lines,
+                                error != nullptr, errorMessage);
 }
 
 void SessionController::setMaxFetchesInFlight(int fetches)
@@ -637,6 +701,15 @@ void SessionController::setRunOnOpen(bool run)
     }
     m_runOnOpen = run;
     Q_EMIT runOnOpenChanged();
+}
+
+void SessionController::setMockServerOutputSupported(bool supported)
+{
+    if (supported == m_mockServerOutputSupported) {
+        return;
+    }
+    m_mockServerOutputSupported = supported;
+    Q_EMIT mockServerOutputSupportedChanged();
 }
 
 void SessionController::setMockRows(qint64 rows)

@@ -182,6 +182,17 @@ Bridge::Bridge(QObject *parent)
     // is owned here), so a failure inside it cannot leave this Bridge's own
     // invariant ("m_hub set means isValid()") in question.
     m_connections = new ConnectionManager(this, this);
+
+    // M4.7: a second, independent workspace handle (ADR-0006 P6: "two
+    // handles on one file ... are safe") for the settings registry, and the
+    // DBMS_OUTPUT pane built on it -- see `ServerOutputController`'s own
+    // documentation for why this is "the active worksheet's pane" rather
+    // than one per tab today, and `reldex_workspace_new_worksheet_id()`'s
+    // own doc comment for why generating one here needs no open workspace.
+    m_settings = new SettingsController(this);
+    QByteArray worksheetId(16, Qt::Uninitialized);
+    reldex_workspace_new_worksheet_id(reinterpret_cast<std::uint8_t *>(worksheetId.data()));
+    m_serverOutput = new ServerOutputController(this, m_settings, worksheetId, this);
 }
 
 Bridge::~Bridge()
@@ -209,6 +220,17 @@ Bridge::~Bridge()
     //    documents that precondition).
     delete m_session;
     m_session = nullptr;
+
+    // 2a. Same teardown-order rule, for M4.7's `ServerOutputController`: it
+    //     owns its own `SessionController` (a second, independent mock
+    //     session on this hub), whose destructor also calls back into
+    //     `unregisterSession()` below -- it must go before `m_sessions`
+    //     itself is destructed, exactly like `m_session` above. Deleting it
+    //     also destroys its child `SettingsController*` connections
+    //     harmlessly (that object is `m_settings`, deleted separately below;
+    //     a `QPointer`, so this order does not matter for it either way).
+    delete m_serverOutput;
+    m_serverOutput = nullptr;
     m_sessions.clear();
 
     // 2b. Same teardown-order rule (this class's own documentation above),
@@ -228,6 +250,14 @@ Bridge::~Bridge()
     delete m_connections;
     m_connections = nullptr;
     m_hubSinks.clear();
+
+    // 2c. `SettingsController` has no back-reference into this Bridge (it
+    //     only owns its own workspace handle), so it carries none of the
+    //     hazard above -- explicit anyway, for the same reason `m_hub` is
+    //     reset explicitly below rather than left to `~QObject`: deterministic
+    //     order over relying on `deleteChildren()`'s.
+    delete m_settings;
+    m_settings = nullptr;
 
     // 3. Take and release whatever is still queued. A queued FETCHED event
     //    owns a batch, and an undrained batch is our memory (A16).
@@ -418,8 +448,10 @@ void Bridge::dispatch(ReldexEvent &raw)
     raw.batch = nullptr;
     reldex::ErrorHandle error(raw.error);
     raw.error = nullptr;
-    // ABI 3.2: `SERVER_OUTPUT` owns its lines. Nothing here shows output yet
-    // (the output pane is M3.x's), so they are released with this handle.
+    // ABI 3.2: `SERVER_OUTPUT` owns its lines (M4.7: handed to the owning
+    // `SessionController`, which shows them; a sink -- `ConnectionManager`'s
+    // test-connect session, which never turns output on -- releases them here
+    // when this handle goes out of scope unused).
     reldex::LinesHandle lines(raw.server_output_lines);
     raw.server_output_lines = nullptr;
 
@@ -427,7 +459,7 @@ void Bridge::dispatch(ReldexEvent &raw)
 
     const auto owner = m_sessions.constFind(raw.session);
     if (owner != m_sessions.cend() && !owner->isNull()) {
-        (*owner)->handleEvent(raw, std::move(batch), std::move(error));
+        (*owner)->handleEvent(raw, std::move(batch), std::move(error), std::move(lines));
         return;
     }
     const auto sink = m_hubSinks.constFind(raw.session);

@@ -57,6 +57,17 @@ class SessionController : public QObject, public ResultFetchSource
     /// Run the mock generated query as soon as the session opens.
     Q_PROPERTY(bool runOnOpen READ runOnOpen WRITE setRunOnOpen NOTIFY runOnOpenChanged)
 
+    /// M4.7: whether `open()` should advertise the mock driver's
+    /// `server_output` capability (`ReldexMockScenarioConfig::server_output`),
+    /// without which `setServerOutput()` is refused and
+    /// `RELDEX_MOCK_STATEMENT_SERVER_OUTPUT` prints nothing (ABI 3.2 keeps
+    /// this off by default, matching a 3.1 world that did not advertise it at
+    /// all). Must be set before `open()`; changing it afterwards has no
+    /// effect on the session already open. False by default so every
+    /// existing caller of this class is unaffected.
+    Q_PROPERTY(bool mockServerOutputSupported READ mockServerOutputSupported WRITE
+                       setMockServerOutputSupported NOTIFY mockServerOutputSupportedChanged)
+
     // --- the mock scenario, which is the only driver this build can open ---
     Q_PROPERTY(qint64 mockRows READ mockRows WRITE setMockRows NOTIFY mockConfigChanged)
     Q_PROPERTY(qint64 mockSeed READ mockSeed WRITE setMockSeed NOTIFY mockConfigChanged)
@@ -129,6 +140,12 @@ public:
     [[nodiscard]] bool runOnOpen() const noexcept { return m_runOnOpen; }
     void setRunOnOpen(bool run);
 
+    [[nodiscard]] bool mockServerOutputSupported() const noexcept
+    {
+        return m_mockServerOutputSupported;
+    }
+    void setMockServerOutputSupported(bool supported);
+
     [[nodiscard]] qint64 mockRows() const noexcept { return m_mockRows; }
     void setMockRows(qint64 rows);
     [[nodiscard]] qint64 mockSeed() const noexcept { return m_mockSeed; }
@@ -151,6 +168,13 @@ public:
     Q_INVOKABLE bool execute(const QString &sql, qint64 deadlineMs = 0);
     Q_INVOKABLE bool closeResult();
     Q_INVOKABLE bool closeSession(int disposition = RELDEX_CLOSE_DISPOSITION_NONE);
+    /// M4.7: `reldex_session_set_server_output` (ADR-0002 amendment T). `mode`
+    /// is a `ReldexServerOutputMode`; `bufferBytes` is read only for
+    /// `RELDEX_SERVER_OUTPUT_MODE_ENABLED_BYTES`. The reply arrives as
+    /// `serverOutputConfigured()`/`serverOutputConfigureFailed()`, carrying
+    /// the setting **actually in force** -- a driver may clamp the requested
+    /// buffer size (ADR-0006 P2).
+    Q_INVOKABLE bool setServerOutput(int mode, quint64 bufferBytes = 0);
 
     // --- ResultFetchSource -------------------------------------------------
     [[nodiscard]] bool canFetchMoreRows() const override;
@@ -158,7 +182,8 @@ public:
 
     /// Called by `Bridge::drain()` with ownership of whatever the event
     /// carried.
-    void handleEvent(const ReldexEvent &raw, reldex::BatchHandle batch, reldex::ErrorHandle error);
+    void handleEvent(const ReldexEvent &raw, reldex::BatchHandle batch, reldex::ErrorHandle error,
+                     reldex::LinesHandle lines);
 
 Q_SIGNALS:
     void stateChanged();
@@ -169,6 +194,7 @@ Q_SIGNALS:
     void fetchRowsChanged();
     void autoFetchChanged();
     void runOnOpenChanged();
+    void mockServerOutputSupportedChanged();
     void mockConfigChanged();
 
     void opened();
@@ -183,6 +209,27 @@ Q_SIGNALS:
     /// surface `transactionPossiblyLost` (`SPEC.md` §10).
     void terminated(bool transactionPossiblyLost, bool abandoned);
 
+    /// Reply to `setServerOutput()`: the setting **actually in force**
+    /// (`mode` a `ReldexServerOutputMode`; `bufferBytes` meaningful only for
+    /// `RELDEX_SERVER_OUTPUT_MODE_ENABLED_BYTES`).
+    void serverOutputConfigured(int mode, quint64 bufferBytes);
+    void serverOutputConfigureFailed();
+    /// Unsolicited (M2.7/M2.15, ABI 3.2, `request == 0`): one `SERVER_OUTPUT`
+    /// event's lines, in arrival order, delivered strictly before the
+    /// statement's own `executed()` (ADR-0003 A32's per-session production
+    /// order) -- except the two documented exceptions in
+    /// `ARCHITECTURE.md` "Server output", which land with the *next*
+    /// statement's window instead. `dropped`/`invalidUtf8Lines` are the
+    /// counts *this* event carries (incremental since the previous delivered
+    /// one, or since the session opened); a consumer that wants a running
+    /// total accumulates them itself. `readFailed` means this read failed --
+    /// the output is incomplete and `lines` may be empty -- and
+    /// `errorMessage` is safe to show verbatim. Also emitted, with an empty
+    /// `lines` and `readFailed` false, from `TERMINAL` when the session ended
+    /// still holding dropped lines no earlier `SERVER_OUTPUT` reported.
+    void serverOutputReceived(const QStringList &lines, quint32 dropped, quint32 invalidUtf8Lines,
+                              bool readFailed, const QString &errorMessage);
+
 private:
     void setState(State state);
     void clearError();
@@ -190,6 +237,11 @@ private:
     void takeThreadLocalError();
     void submitFetches();
     void handleTerminal(const ReldexEvent &raw, const reldex::ErrorHandle &error);
+    /// M4.7: `RELDEX_EVENT_KIND_SERVER_OUTPUT`. `request == 0` (unsolicited),
+    /// so this is called from `handleEvent()`'s early switch, before the
+    /// reply/request bookkeeping that every other kind here goes through.
+    void handleServerOutput(const ReldexEvent &raw, const reldex::ErrorHandle &error,
+                            reldex::LinesHandle lines);
     /// Submits `close_result` for `result`. Used both by `closeResult()` and
     /// by `execute()`, which must not leave the result it replaces open.
     bool submitCloseResult(quint64 result);
@@ -263,6 +315,7 @@ private:
     int m_fetchRows = 1000;
     bool m_autoFetch = true;
     bool m_runOnOpen = false;
+    bool m_mockServerOutputSupported = false;
 
     qint64 m_mockRows = 0;
     qint64 m_mockSeed = 0;

@@ -33,6 +33,12 @@ qt_add_qml_module(reldex_adapter
         ProfileModel.cpp
         ConnectionManager.h
         ConnectionManager.cpp
+        SettingsController.h
+        SettingsController.cpp
+        ServerOutputModel.h
+        ServerOutputModel.cpp
+        ServerOutputController.h
+        ServerOutputController.cpp
 )
 
 target_include_directories(reldex_adapter PUBLIC
