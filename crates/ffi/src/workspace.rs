@@ -5487,30 +5487,50 @@ mod tests {
 
     #[test]
     fn every_setting_id_is_pinned_to_its_numeric_abi_id() {
+        // `Some(id)` for a setting this ABI exposes numerically; `None` for
+        // one it does not yet. M5.2 (landed on `main` after this task's
+        // branch point) added three result-store settings --
+        // `ResultsMaxRows`/`ResultsMaxBytes`/`ResultsCloseCursorAtLimit` --
+        // that `crates/ffi` has not been extended to expose (M2.11's review
+        // round 2 lead decision: the fetch-hint/result-store FFI surface is
+        // M5.2 Stage B's own follow-up, not this task's -- see
+        // `crates/ffi/README.md`'s limitations section). `from_setting_id`'s
+        // `#[non_exhaustive]` catch-all correctly maps each of them to
+        // `Unknown` today; this test pins that as the current, deliberate
+        // answer rather than letting it drift unnoticed.
         let pinned = [
-            (SettingId::ConnectTimeout, ReldexSettingId::ConnectTimeout),
+            (
+                SettingId::ConnectTimeout,
+                Some(ReldexSettingId::ConnectTimeout),
+            ),
             (
                 SettingId::RewriteTriggerDdl,
-                ReldexSettingId::RewriteTriggerDdl,
+                Some(ReldexSettingId::RewriteTriggerDdl),
             ),
             (
                 SettingId::StatementTimeLimit,
-                ReldexSettingId::StatementTimeLimit,
+                Some(ReldexSettingId::StatementTimeLimit),
             ),
-            (SettingId::FetchRows, ReldexSettingId::FetchRows),
-            (SettingId::FetchesInFlight, ReldexSettingId::FetchesInFlight),
+            (SettingId::FetchRows, Some(ReldexSettingId::FetchRows)),
+            (
+                SettingId::FetchesInFlight,
+                Some(ReldexSettingId::FetchesInFlight),
+            ),
             (
                 SettingId::ServerOutputEnabled,
-                ReldexSettingId::ServerOutputEnabled,
+                Some(ReldexSettingId::ServerOutputEnabled),
             ),
             (
                 SettingId::ServerOutputBuffer,
-                ReldexSettingId::ServerOutputBuffer,
+                Some(ReldexSettingId::ServerOutputBuffer),
             ),
             (
                 SettingId::HistoryMaxEntriesPerProfile,
-                ReldexSettingId::HistoryMaxEntriesPerProfile,
+                Some(ReldexSettingId::HistoryMaxEntriesPerProfile),
             ),
+            (SettingId::ResultsMaxRows, None),
+            (SettingId::ResultsMaxBytes, None),
+            (SettingId::ResultsCloseCursorAtLimit, None),
         ];
         assert_eq!(
             pinned.len(),
@@ -5524,18 +5544,20 @@ mod tests {
                 "SettingId::ALL[{index}] changed; update the pinned table and the ABI id it maps \
                  to deliberately, never let it drift"
             );
+            let expected = pinned[index].1;
             assert_eq!(
                 ReldexSettingId::from_setting_id(*id),
-                pinned[index].1,
+                expected.unwrap_or(ReldexSettingId::Unknown),
                 "SettingId::ALL[{index}] ({id:?}) must map to {:?}",
-                pinned[index].1
+                expected
             );
-            assert_eq!(
-                ReldexSettingId::from_i32(pinned[index].1 as i32),
-                Some(pinned[index].1),
-                "the numeric id for {:?} must round-trip through from_i32",
-                pinned[index].1
-            );
+            if let Some(reldex_id) = expected {
+                assert_eq!(
+                    ReldexSettingId::from_i32(reldex_id as i32),
+                    Some(reldex_id),
+                    "the numeric id for {reldex_id:?} must round-trip through from_i32"
+                );
+            }
         }
     }
 }

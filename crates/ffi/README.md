@@ -82,12 +82,21 @@ Until M2.15 lands, this build cannot deliver:
 See `lib.rs`'s own module documentation ("What is interim here") and `ReldexEventKind::ServerOutput`'s
 doc comment for the same list next to the code.
 
-## Known limitation: the fetch-size hint
+## Known limitation: the fetch-size hint and the result-store settings
 
 `Statement::with_fetch_rows` (`db-driver-api`) is never set by anything in this crate today —
 `reldex_session_fetch`'s `max_rows` caps one call's row count but does not become a server-side
 fetch-array-size hint. Closing that gap belongs to M5.2 Stage B, not this crate; it is recorded here
 so a caller does not assume `max_rows` tunes round-trip count.
+
+Relatedly, M5.2 (landed on `main` after M2.11's branch point) added three settings to
+`reldex-workspace`'s registry — `SettingId::ResultsMaxRows`/`ResultsMaxBytes`/
+`ResultsCloseCursorAtLimit` — that this crate has not been extended to expose: they resolve on the
+Rust side but `ReldexSettingId::from_setting_id` currently maps all three to `Unknown`, so
+`reldex_workspace_resolve_setting`/`_set_setting`/`_clear_setting` cannot name them yet. Pinned as
+the current, deliberate answer by `every_setting_id_is_pinned_to_its_numeric_abi_id`
+(`workspace.rs`), not a bug for this task to fix — exposing them is part of the same M5.2 Stage B
+follow-up as the fetch-size hint above.
 
 ## Testing this crate without a GUI
 
