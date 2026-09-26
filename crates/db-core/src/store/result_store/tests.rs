@@ -199,7 +199,7 @@ fn outcome(kind: StatementKind) -> ExecuteOutcome {
 
 #[test]
 fn the_first_fetch_is_due_at_once_and_sized_by_the_declared_widths() {
-    // 256 KiB / (44 + 4008 + 1) = 64 rows: a declared VARCHAR2(4000) keeps
+    // 192 KiB / (44 + 4008 + 1) = 48 rows: a declared VARCHAR2(4000) keeps
     // the blind first round trip small.
     let mut wide = store(unlimited(), 1_000, 2, 4_000);
     wide.fetch_all();
@@ -209,7 +209,7 @@ fn the_first_fetch_is_due_at_once_and_sized_by_the_declared_widths() {
         1,
         "one first fetch, whatever the demand, and none beside it until it          is answered: only one request is sized blind"
     );
-    assert_eq!(due[0].max_rows().get(), 64);
+    assert_eq!(due[0].max_rows().get(), 48);
     assert_eq!(due[0].ticket().sequence(), 0);
     assert!(matches!(wide.state().phase(), ResultPhase::Fetching));
 
@@ -223,9 +223,9 @@ fn the_observed_width_replaces_the_declared_one_after_the_first_segment() {
     let mut store = store(unlimited(), 1_000, 1, 4_000);
     let mut cursor = FakeCursor::new(10_000);
     let first = fetches(&pump(&mut store))[0];
-    assert_eq!(first.max_rows().get(), 64);
+    assert_eq!(first.max_rows().get(), 48);
     store.on_fetched(first.ticket(), cursor.answer(first));
-    store.set_demand(64);
+    store.set_demand(48);
     let second = fetches(&pump(&mut store));
     assert_eq!(second.len(), 1);
     // The rows are ~30 bytes each, far under the declared 4 KB: the next

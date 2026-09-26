@@ -1,0 +1,7 @@
+link,shape,metric,points,a_ms,b_ms_per_packet,c_ms_per_packet_sq,max_rel_error
+direct,clob,fetch_p50_ms,6,0.0905,1.33261,0.0247994,0.165
+direct,clob,cpu_ms_per_fetch,6,0.0306,0.23055,0.0870023,0.249
+rtt0,clob,fetch_p50_ms,6,0.5228,1.28527,0.0391579,0.327
+rtt0,clob,cpu_ms_per_fetch,5,0.0451,0.28200,0.0403258,0.493
+rtt10,clob,fetch_p50_ms,6,12.8654,0.84236,0.1079770,0.029
+rtt10,clob,cpu_ms_per_fetch,5,-0.3837,0.78171,-0.0294051,0.387

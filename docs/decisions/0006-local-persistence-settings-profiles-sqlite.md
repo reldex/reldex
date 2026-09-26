@@ -14,7 +14,9 @@ guard in endpoints, production flag, SID builder moved into the driver, store ha
 performance finding, a narrowed `SchemaMismatch` mapping, corrected ADR-0002 citations and
 `Debug` redaction for history/worksheet text; amended 2026-09-25 by ADR-0004 with three result-cap
 settings, per-target built-in defaults and a per-result `fetches_in_flight` — see "Amendment:
-result caps (ADR-0004)" (registry only; implemented with M5.2 on 2026-09-26).
+result caps (ADR-0004)" (registry only; implemented with M5.2 on 2026-09-26). Amended
+2026-09-26 by M5.6 with the measured bytes-per-round-trip budget as a setting — see "Amendment:
+the round-trip budget (M5.6)" (registry only; the owner's sign-off is pending).
 **Task:** M2.9 ★ (`phase-1.md` §C.2); amendment tasks M4.10/M6.2 (`phase-1.md` §M4/§M6, store side
 only); fix round on the same tasks, PR #38 independent review
 
@@ -916,3 +918,62 @@ ADR-0004 RS2 bounds each round trip by bytes, computed from the describe's decla
 `results.fetch_rows` is then the most rows one round trip may carry, not the number it always
 carries. The default, the bounds and the levels are unchanged. The owner's sign-off (`phase-1.md`
 §C.3 item 10) is re-asked as a bytes-per-round-trip budget (ADR-0004 owner-review point (a)).
+
+## Amendment: the round-trip budget (M5.6) (2026-09-26, task M5.6)
+
+**Status:** proposed with M5.6's measurement; registry only, **implemented**. The number awaits the
+owner's sign-off (ADR-0004 owner-review point (a), `phase-1.md` §C.3 item 10). It needed no schema
+migration, because a setting is a row keyed by its storage key. As built
+(`crates/workspace/src/settings/registry.rs`): `SettingId::ResultsRoundTripBytes` (appended, so
+no id moved) and the constant `RESULTS_ROUND_TRIP_BYTES`. `db-core`'s fallback,
+`DEFAULT_ROUND_TRIP_BYTES`, went from M5.2's 256 KiB placeholder to the same 192 KiB, and
+`crates/workspace/tests/result_pipeline_defaults.rs` pins the two together. Turning the resolved
+setting into `ResultPolicy::with_round_trip_bytes` is the composition root's job in M5.2 Stage B,
+with the result caps. The FFI assigns it no numeric id yet, like the result caps.
+
+The measurement, the method and the decision are in
+`docs/exec-plans/active/phase-1-fetch-benchmark.md`.
+
+### Registry addition
+
+| Setting (`storage key`) | Kind | Default | Levels | Bounds | "No limit" | Takes effect |
+| --- | --- | --- | --- | --- | --- | --- |
+| `results.round_trip_bytes` | `ByteLimit` | 192 KiB (196,608 bytes) | application, profile, worksheet | 16 KiB–4 MiB | **refused** | next statement |
+
+- **What it does.** The Result Store asks for `clamp(budget / row width, 1, results.fetch_rows)`
+  rows a request (ADR-0004 RS2). The width is the declared one for the first request and the
+  observed average after it.
+- **Why a setting.** The owner's rule of 2026-09-19: every default the lead chooses is
+  user-configurable. Beyond that, the best budget grows with the round-trip time, so one number
+  cannot be right for every server. For the mixed shape it is about 90 KiB on loopback, 180 KiB at
+  2 ms and 360 KiB at 10 ms; for 16 KB rows about 160 KiB on loopback and 800 KiB from 2 ms up.
+- **Why profile level.** A profile for a distant server is where a larger budget belongs.
+  Worksheet level is allowed as it is for `results.fetch_rows`.
+- **Why "no limit" is refused.** It is the first limit-kind setting that refuses it. On Oracle
+  before 23ai a round trip costs about the square of its bytes (upstream gap U-19). An unbounded
+  round trip is exactly what the budget prevents, so there is no consequence a UI could state that
+  would make it a reasonable choice. The settings UI (M3.6) therefore offers a number only.
+- **The bounds.**
+  - 16 KiB is two of the 8 KiB packets Oracle 19c negotiates. Below it a round trip is mostly
+    latency: one 16 KB row per round trip ran at 40% of the best rate on loopback and 3% at
+    40 ms.
+  - 4 MiB is where one round trip already takes about 0.85 s on 19c (a 4.0 MB fetch of 250
+    16 KB rows). A larger budget would make "Stop fetching" wait seconds for the fetches in
+    flight.
+- **The kind.** `ByteLimit` rather than a bounded count, because the value is bytes and the
+  settings UI already renders byte limits. `Unlimited` is a representable value that the
+  descriptor refuses (`SettingError::UnlimitedNotAllowed`), as the registry has always allowed.
+
+### `results.fetch_rows`: measured, unchanged
+
+The default (1,000), the bounds (1–100,000) and the levels are unchanged.
+
+- **Measured.** M5.6 measured the bound it now is. At the 192 KiB default the budget binds rows
+  wider than about 200 bytes in the store. Below that `results.fetch_rows` binds, and 1,000 keeps
+  a narrow row at 88% of its best rate on loopback and 90% at 10 ms.
+- **The upper bound stays at 100,000.** The budget caps the bytes of every round trip whatever
+  this setting says, so a large value only matters for very narrow rows. The per-row part of the
+  re-parse (U-19) still grows with it, so raising it is a trade a user can make, not a default.
+- **Not a wire hint.** It is still not passed as the driver's fetch-size hint (ADR-0004 accepted
+  limitation 12, owner-review point (g)). What changing that would do is in the benchmark
+  document's "The wire array" section.

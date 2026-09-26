@@ -281,6 +281,12 @@ fn every_setting_kind_round_trips_at_every_level_it_allows() {
             SettingId::ResultsCloseCursorAtLimit,
             SettingValue::Bool(true),
         ),
+        (
+            SettingId::ResultsRoundTripBytes,
+            SettingValue::ByteLimit(ByteLimit::Bytes(
+                NonZeroU32::new(4 << 20).expect("non-zero"),
+            )),
+        ),
     ];
     assert_eq!(values.len(), SettingId::ALL.len(), "one value per setting");
     let scopes = [

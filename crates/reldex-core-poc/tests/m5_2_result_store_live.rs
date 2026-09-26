@@ -243,8 +243,8 @@ fn wide_rows_are_sized_by_declared_width_and_stop_at_the_byte_cap() {
         "{:?}",
         state.phase()
     );
-    // 256 KiB over four declared 4000-byte columns: a few dozen rows a round
-    // trip, not `results.fetch_rows`' thousand.
+    // 192 KiB over four declared 4000-byte columns: about a dozen rows a
+    // round trip, not `results.fetch_rows`' thousand.
     assert!(sizes[0] <= 64, "first request {}", sizes[0]);
     // The overshoot is what the fetches in flight carried: at most two
     // requests of full-width rows (no cell exceeds its declared 4000 bytes),

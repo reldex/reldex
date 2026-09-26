@@ -146,7 +146,7 @@ owner/inputs/outputs/deps/acceptance table per task). ★ = independent review m
 - [ ] M5.3 Grid features: row numbers, NULL visualization, column resize/reorder, type-aware formatting via the bulk formatter, search-in-results (sonnet)
 - [ ] M5.4 Copy: cell, row, range, with/without headers (sonnet)
 - [ ] M5.5 CLOB/BLOB viewers over `read_lob_chunk`, paged, with a size warning (sonnet)
-- [ ] M5.6 ★ Fetch-batch benchmark across row shapes and a real network; pick and record the shipped default (opus, review mandatory)
+- [x] M5.6 ★ Fetch-batch benchmark across row shapes and a real network; pick and record the shipped default (opus, review mandatory) — done 2026-09-26 (PR #46): 375-run matrix on 19c, 3 shapes × batch sizes × loopback/10 ms/40 ms; recommends a 192 KiB per-round-trip budget with `results.fetch_rows` 1,000 as the bound (160 KiB also defensible, 256 KiB is not); the wire-array change itself stays the owner's call (ADR-0004 point (a))
 - [ ] M5.7 Perf gate re-run on the real database; record against M1's numbers (sonnet)
 - [ ] M5.8 ★ Scrolling while a result is still streaming drops ≈ 0.3% of frames (GUI-thread bound: drains + view work) — budget the drain per frame / insert coalescing (opus, review mandatory)
 
