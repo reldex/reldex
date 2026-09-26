@@ -219,18 +219,51 @@ static uint64_t next_request_id(void)
  * Event helpers.
  * --------------------------------------------------------------------- */
 
-/* Submits nothing itself -- the caller must reset g_wake_flag and submit
- * its request first. Waits for the wake, then takes exactly one event
- * (the queue is expected to be empty before every submission in this
- * harness, so one wake means exactly one event is ready). */
+/* Progress events seen and skipped by wait_and_take_event (ABI 3.2):
+ * EXECUTING and TRANSACTION_STATE own nothing, and most checks below are
+ * about replies. The sections that are about them use take_any_event. */
+static long g_progress_seen = 0;
+
+static bool is_progress(int32_t kind)
+{
+    return kind == RELDEX_EVENT_KIND_EXECUTING || kind == RELDEX_EVENT_KIND_TRANSACTION_STATE;
+}
+
+/* Takes the next event of any kind into `out`, declaring `struct_size`
+ * bytes, waiting for a wake whenever the queue is empty. The flag is reset
+ * BEFORE each attempt, never after: a push landing between an empty take
+ * and the wait then either is taken by that attempt or sets the flag the
+ * wait is watching, because the waker fires on empty -> non-empty. */
+static bool take_sized(ReldexHub *hub, ReldexEvent *out, uint32_t struct_size, bool skip_progress)
+{
+    for (;;) {
+        g_wake_flag = 0;
+        memset(out, 0, sizeof(*out));
+        out->struct_size = struct_size;
+        if (reldex_hub_next_event(hub, out)) {
+            if (skip_progress && is_progress(out->kind)) {
+                g_progress_seen += 1;
+                continue;
+            }
+            return true;
+        }
+        if (!wait_for_wake()) {
+            return false;
+        }
+    }
+}
+
+/* The next reply, TERMINAL, SERVER_OUTPUT or unknown kind -- skipping
+ * progress. Submits nothing itself. */
 static bool wait_and_take_event(ReldexHub *hub, ReldexEvent *out)
 {
-    memset(out, 0, sizeof(*out));
-    out->struct_size = sizeof(*out);
-    if (!wait_for_wake()) {
-        return false;
-    }
-    return reldex_hub_next_event(hub, out) != 0;
+    return take_sized(hub, out, (uint32_t)sizeof(*out), true);
+}
+
+/* The next event of any kind, progress included. */
+static bool take_any_event(ReldexHub *hub, ReldexEvent *out)
+{
+    return take_sized(hub, out, (uint32_t)sizeof(*out), false);
 }
 
 static void release_event_batch(const ReldexEvent *event)
@@ -1667,11 +1700,10 @@ int main(void)
     g_wake_flag = 0;
     status = reldex_session_execute(hub, session_b, execute_b_request, generated_sql, 0);
     smoke_require(status == RELDEX_STATUS_OK, "reldex_session_execute(GENERATED_QUERY) is accepted on session B");
-    smoke_require(wait_for_wake(), "session B's EXECUTED wake arrives");
     ReldexEvent large_event;
-    memset(&large_event, 0, sizeof(large_event));
-    large_event.struct_size = (uint32_t)(sizeof(large_event) + 64); /* claims to be from a newer, larger header */
-    took = reldex_hub_next_event(hub, &large_event) != 0;
+    /* Claims to be from a newer, larger header. EXECUTING comes first and is
+     * skipped; the reply after it lands in the same oversized struct. */
+    took = take_sized(hub, &large_event, (uint32_t)(sizeof(large_event) + 64), true);
     smoke_require(took, "an oversized (zero-padded) ReldexEvent is still accepted");
     smoke_check(
         large_event.struct_size == (uint32_t)sizeof(ReldexEvent),
@@ -1736,14 +1768,12 @@ int main(void)
     smoke_check(event.kind == RELDEX_EVENT_KIND_SESSION_CLOSED, "session B's event is SESSION_CLOSED");
     smoke_check(event.close_outcome == RELDEX_CLOSE_OUTCOME_CLOSED, "session B closed cleanly (no open transaction)");
     smoke_check(!event.session_still_open, "session B is reported as no longer open");
-    /* M2.11 family 1: a session that actually closes pushes exactly one
-     * TERMINAL event right after SESSION_CLOSED, in the same batch (before
-     * any wake), so draining "the" close reply now means draining both --
-     * see reldex_session_close's SPEC.md §10 contract in the header. */
-    memset(&event, 0, sizeof(event));
-    event.struct_size = sizeof(event);
-    took = reldex_hub_next_event(hub, &event) != 0;
-    smoke_require(took, "session B's TERMINAL event follows SESSION_CLOSED in the same batch");
+    /* A session that actually closes is followed by exactly one TERMINAL.
+     * The session's worker pushes it just after SESSION_CLOSED, so it may
+     * not be queued yet when SESSION_CLOSED is taken: wait for it rather
+     * than poll (ABI 3.2). Draining it retires the session id. */
+    took = wait_and_take_event(hub, &event);
+    smoke_require(took, "session B's TERMINAL event follows SESSION_CLOSED");
     smoke_check(event.kind == RELDEX_EVENT_KIND_TERMINAL, "session B's second queued event is TERMINAL");
     smoke_check(event.session == session_b, "session B's TERMINAL event carries its session id");
     smoke_check(!event.transaction_possibly_lost, "session B's clean close does not report a possibly-lost transaction");
@@ -1758,30 +1788,28 @@ int main(void)
     smoke_check(event.kind == RELDEX_EVENT_KIND_SESSION_CLOSED, "session A's event is SESSION_CLOSED");
     smoke_check(event.close_outcome == RELDEX_CLOSE_OUTCOME_CLOSED, "session A closed cleanly (no open transaction)");
     smoke_check(!event.session_still_open, "session A is reported as no longer open");
-    memset(&event, 0, sizeof(event));
-    event.struct_size = sizeof(event);
-    took = reldex_hub_next_event(hub, &event) != 0;
-    smoke_require(took, "session A's TERMINAL event follows SESSION_CLOSED in the same batch");
+    took = wait_and_take_event(hub, &event);
+    smoke_require(took, "session A's TERMINAL event follows SESSION_CLOSED");
     smoke_check(event.kind == RELDEX_EVENT_KIND_TERMINAL, "session A's second queued event is TERMINAL");
     smoke_check(event.session == session_a, "session A's TERMINAL event carries its session id");
     smoke_check(!event.transaction_possibly_lost, "session A's clean close does not report a possibly-lost transaction");
+    smoke_check(!event.abandoned, "session A's close was not an abandon");
+    smoke_check(reldex_hub_session_count(hub) == 0, "both closed sessions stop counting once their TERMINALs are drained");
+    status = reldex_session_execute(hub, session_a, next_request_id(), generated_sql, 0);
+    smoke_check(status == RELDEX_STATUS_NOT_FOUND, "a retired session id is not found");
+    {
+        ReldexError *retired_error = reldex_last_error_take();
+        if (retired_error != NULL) {
+            reldex_error_free(retired_error);
+        }
+    }
 
-    /* 11b. Server output control (M2.11 family 2), on a dedicated session C
-     * so the carefully sequenced session A/B flow above stays untouched.
-     *
-     * The mock driver's only FFI-reachable scenario (S14) does not
-     * advertise the server_output capability (`Scenario::default()` in
-     * crates/drivers/mock/src/scenario.rs turns on savepoints, exact
-     * transaction state, LOB streaming and error positions, but not this
-     * one), and `Scenario::set_capabilities` -- the only way to turn it on
-     * -- is a Rust-only test API, not part of this ABI. So the reachable,
-     * correct behaviour to exercise here is the REFUSAL path: every mode
-     * comes back as RELDEX_EVENT_KIND_SERVER_OUTPUT_CONFIGURED carrying an
-     * UNSUPPORTED error, never silently ignored. Exercising the success
-     * path (an in-force mode/buffer size actually read back) needs either a
-     * capability knob added to the mock driver's FFI surface or a real
-     * Oracle session -- noted as a smoke-harness gap in the PR description,
-     * not fixed here. */
+    /* 11b. Server output (M2.11 family 2; delivered ahead of the reply
+     * since ABI 3.2), on a dedicated session C so the carefully sequenced
+     * session A/B flow above stays untouched. The S14 world advertises the
+     * server_output capability since M2.15, so every mode is accepted and
+     * read back; then a statement that prints delivers its lines between
+     * its EXECUTING and its EXECUTED. */
     {
         ReldexOpenOptions open_options_c;
         memset(&open_options_c, 0, sizeof(open_options_c));
@@ -1818,21 +1846,55 @@ int main(void)
                 event.kind == RELDEX_EVENT_KIND_SERVER_OUTPUT_CONFIGURED,
                 "session C's event is SERVER_OUTPUT_CONFIGURED");
             smoke_check(event.request == set_request, "session C's SERVER_OUTPUT_CONFIGURED event carries the request id");
-            smoke_check(
-                event.error != NULL,
-                "the mock driver's only FFI-reachable scenario does not advertise server_output, "
-                "so setting it is refused, not silently accepted");
-            printf("  server output %s -> refused (capability not advertised): ", modes[i].what);
+            smoke_check(event.error == NULL, "setting server output is accepted");
             if (event.error != NULL) {
-                ErrorSummary summary = read_and_free_error(event.error);
-                smoke_check(
-                    summary.kind == RELDEX_ERROR_KIND_UNSUPPORTED,
-                    "the refusal's error kind is UNSUPPORTED");
-            } else {
-                printf("\n");
+                read_and_free_error(event.error);
             }
+            smoke_check(event.server_output_mode == modes[i].mode, "the mode in force is the one requested");
+            if (modes[i].mode == RELDEX_SERVER_OUTPUT_MODE_ENABLED_BYTES) {
+                smoke_check(event.server_output_buffer_bytes > 0, "a byte-limited buffer reports its size");
+            }
+            printf("  server output %s -> in force\n", modes[i].what);
             smoke_check(!reldex_hub_next_event(hub, &event), "the queue is empty after draining SERVER_OUTPUT_CONFIGURED");
         }
+
+        /* On again, then a statement that prints three lines, one of them
+         * reported as invalid UTF-8 on the wire. */
+        uint64_t on_request = next_request_id();
+        status = reldex_session_set_server_output(
+            hub, session_c, on_request, RELDEX_SERVER_OUTPUT_MODE_ENABLED_UNLIMITED, 0);
+        smoke_require(status == RELDEX_STATUS_OK, "server output is turned back on");
+        smoke_require(wait_and_take_event(hub, &event), "the second SERVER_OUTPUT_CONFIGURED arrives");
+        smoke_check(event.error == NULL, "turning output back on succeeds");
+
+        uint64_t print_request = next_request_id();
+        ReldexStr print_sql = reldex_mock_statement(RELDEX_MOCK_STATEMENT_SERVER_OUTPUT);
+        smoke_check(print_sql.len > 0, "the SERVER_OUTPUT statement text is available");
+        status = reldex_session_execute(hub, session_c, print_request, print_sql, 2500);
+        smoke_require(status == RELDEX_STATUS_OK, "the printing statement is accepted");
+        smoke_require(take_any_event(hub, &event), "the printing statement's first event arrives");
+        smoke_check(event.kind == RELDEX_EVENT_KIND_EXECUTING, "EXECUTING comes first");
+        smoke_check(event.request == print_request, "EXECUTING names the statement's request");
+        smoke_check(event.has_deadline && event.deadline_ms == 2500, "EXECUTING echoes the armed deadline");
+        smoke_require(take_any_event(hub, &event), "the statement's output arrives");
+        smoke_check(event.kind == RELDEX_EVENT_KIND_SERVER_OUTPUT, "SERVER_OUTPUT comes before the reply");
+        smoke_check(event.request == 0, "SERVER_OUTPUT is unsolicited");
+        smoke_check(event.server_output_invalid_utf8_lines == 1, "one line arrived as invalid UTF-8");
+        smoke_check(event.server_output_dropped == 0, "nothing was dropped");
+        smoke_require(event.server_output_lines != NULL, "the output owns its lines");
+        smoke_check(reldex_server_output_lines_count(event.server_output_lines) == 3, "three lines were printed");
+        {
+            ReldexStr first = reldex_server_output_lines_get(event.server_output_lines, 0);
+            smoke_check(first.len > 0 && first.ptr[first.len] == '\0', "an output line is a usable C string");
+            ReldexStr blank = reldex_server_output_lines_get(event.server_output_lines, 1);
+            smoke_check(blank.len == 0, "an empty line is an empty string");
+            printf("  server output line 0: \"%s\"\n", (const char *)first.ptr);
+        }
+        reldex_server_output_lines_release(event.server_output_lines);
+        smoke_require(take_any_event(hub, &event), "the statement's reply arrives");
+        smoke_check(event.kind == RELDEX_EVENT_KIND_EXECUTED, "EXECUTED comes last");
+        smoke_check(event.request == print_request && event.error == NULL, "the printing statement succeeded");
+        smoke_check(!reldex_hub_next_event(hub, &event), "the queue is empty after the printing statement");
 
         uint64_t close_c_request = next_request_id();
         g_wake_flag = 0;
@@ -1840,12 +1902,165 @@ int main(void)
         smoke_require(status == RELDEX_STATUS_OK, "reldex_session_close is accepted on session C");
         smoke_require(wait_and_take_event(hub, &event), "session C's SESSION_CLOSED event arrives");
         smoke_check(event.kind == RELDEX_EVENT_KIND_SESSION_CLOSED, "session C's event is SESSION_CLOSED");
-        memset(&event, 0, sizeof(event));
-        event.struct_size = sizeof(event);
-        took = reldex_hub_next_event(hub, &event) != 0;
-        smoke_require(took, "session C's TERMINAL event follows SESSION_CLOSED in the same batch");
-        smoke_check(event.kind == RELDEX_EVENT_KIND_TERMINAL, "session C's second queued event is TERMINAL");
+        took = wait_and_take_event(hub, &event);
+        smoke_require(took, "session C's TERMINAL event follows SESSION_CLOSED");
+        smoke_check(event.kind == RELDEX_EVENT_KIND_TERMINAL, "session C's second event is TERMINAL");
         smoke_check(!reldex_hub_next_event(hub, &event), "the queue is empty after draining session C's close");
+    }
+
+    /* 11c. A session lost mid-statement (ABI 3.2): its TERMINAL arrives at
+     * once, without a close, carrying the cause and the transaction-loss
+     * flag the UI must surface. The DML first opens a transaction, which
+     * TRANSACTION_STATE reports. */
+    {
+        ReldexOpenOptions open_options_d;
+        memset(&open_options_d, 0, sizeof(open_options_d));
+        open_options_d.struct_size = sizeof(open_options_d);
+        open_options_d.driver = RELDEX_DRIVER_KIND_MOCK;
+        open_options_d.mock.struct_size = sizeof(open_options_d.mock);
+
+        uint64_t session_d = 0;
+        status = reldex_hub_open_session(hub, &open_options_d, next_request_id(), &session_d);
+        smoke_require(status == RELDEX_STATUS_OK, "reldex_hub_open_session(session D) is accepted");
+        smoke_require(wait_and_take_event(hub, &event), "session D's OPENED event arrives");
+        smoke_check(event.error == NULL, "session D opened without an error");
+
+        uint64_t dml_request = next_request_id();
+        status = reldex_session_execute(hub, session_d, dml_request, reldex_mock_statement(RELDEX_MOCK_STATEMENT_DML), 0);
+        smoke_require(status == RELDEX_STATUS_OK, "the DML is accepted");
+        bool saw_reply = false;
+        bool saw_transaction = false;
+        while (!(saw_reply && saw_transaction)) {
+            smoke_require(take_any_event(hub, &event), "the DML's events arrive");
+            if (event.kind == RELDEX_EVENT_KIND_TRANSACTION_STATE) {
+                saw_transaction = true;
+                smoke_check(event.transaction_possibly_active, "the DML opened a transaction");
+                smoke_check(event.request == 0, "TRANSACTION_STATE is unsolicited");
+            } else if (event.kind == RELDEX_EVENT_KIND_EXECUTED) {
+                saw_reply = true;
+                smoke_check(event.request == dml_request && event.error == NULL, "the DML succeeded");
+            } else {
+                smoke_check(event.kind == RELDEX_EVENT_KIND_EXECUTING, "only EXECUTING precedes them");
+            }
+        }
+
+        uint64_t lose_request = next_request_id();
+        status = reldex_session_execute(
+            hub, session_d, lose_request, reldex_mock_statement(RELDEX_MOCK_STATEMENT_LOSE_SESSION), 0);
+        smoke_require(status == RELDEX_STATUS_OK, "the statement that loses the session is accepted");
+        smoke_require(wait_and_take_event(hub, &event), "its EXECUTED arrives");
+        smoke_check(event.kind == RELDEX_EVENT_KIND_EXECUTED && event.request == lose_request, "the statement is answered");
+        smoke_check(event.session_state == RELDEX_SESSION_STATE_LOST, "the reply reports the session lost");
+        smoke_require(event.error != NULL, "the loss is the reply's error");
+        {
+            ErrorSummary summary = read_and_free_error(event.error);
+            smoke_check(summary.kind == RELDEX_ERROR_KIND_NETWORK_LOST, "the error kind is NETWORK_LOST");
+            smoke_check(summary.has_native && summary.native_code == 3113, "the native code is 3113 (ORA-03113)");
+        }
+        smoke_require(wait_and_take_event(hub, &event), "session D's TERMINAL arrives without a close");
+        smoke_check(event.kind == RELDEX_EVENT_KIND_TERMINAL, "the event is TERMINAL");
+        smoke_check(event.session_state == RELDEX_SESSION_STATE_LOST, "TERMINAL says LOST");
+        smoke_check(event.transaction_possibly_lost, "TERMINAL says the DML's transaction may be lost");
+        smoke_check(!event.abandoned, "nobody abandoned session D");
+        smoke_require(event.error != NULL, "a lost session's TERMINAL carries its cause, owned by the caller");
+        read_and_free_error(event.error);
+        smoke_check(reldex_hub_session_count(hub) == 0, "the lost session stopped counting");
+    }
+
+    /* 11d. Abandon (ABI 3.2): an open session, and one still connecting. */
+    {
+        ReldexOpenOptions open_options_e;
+        memset(&open_options_e, 0, sizeof(open_options_e));
+        open_options_e.struct_size = sizeof(open_options_e);
+        open_options_e.driver = RELDEX_DRIVER_KIND_MOCK;
+        open_options_e.mock.struct_size = sizeof(open_options_e.mock);
+
+        uint64_t session_e = 0;
+        status = reldex_hub_open_session(hub, &open_options_e, next_request_id(), &session_e);
+        smoke_require(status == RELDEX_STATUS_OK, "reldex_hub_open_session(session E) is accepted");
+        smoke_require(wait_and_take_event(hub, &event), "session E's OPENED event arrives");
+        int32_t outcome = -1;
+        bool early_loss = true;
+        status = reldex_session_abandon(hub, session_e, &outcome, &early_loss);
+        smoke_check(status == RELDEX_STATUS_OK, "reldex_session_abandon succeeds on an open session");
+        smoke_check(outcome == RELDEX_ABANDON_OUTCOME_OPEN, "the abandon found it open");
+        smoke_check(!early_loss, "an idle session with nothing open reports no early loss");
+        smoke_require(wait_and_take_event(hub, &event), "session E's TERMINAL arrives");
+        smoke_check(event.kind == RELDEX_EVENT_KIND_TERMINAL && event.abandoned, "TERMINAL says the caller abandoned it");
+
+        ReldexOpenOptions open_options_f;
+        memset(&open_options_f, 0, sizeof(open_options_f));
+        open_options_f.struct_size = sizeof(open_options_f);
+        open_options_f.driver = RELDEX_DRIVER_KIND_MOCK;
+        open_options_f.mock.struct_size = sizeof(open_options_f.mock);
+        open_options_f.mock.block_connect = true;
+        uint64_t session_f = 0;
+        uint64_t open_f_request = next_request_id();
+        status = reldex_hub_open_session(hub, &open_options_f, open_f_request, &session_f);
+        smoke_require(status == RELDEX_STATUS_OK, "reldex_hub_open_session(session F, parked connect) is accepted");
+        status = reldex_session_abandon(hub, session_f, &outcome, NULL);
+        smoke_check(status == RELDEX_STATUS_OK, "reldex_session_abandon succeeds on a connecting session");
+        smoke_check(outcome == RELDEX_ABANDON_OUTCOME_CONNECTING, "the abandon found it connecting");
+        smoke_require(wait_and_take_event(hub, &event), "session F's OPENED arrives at once");
+        smoke_check(event.kind == RELDEX_EVENT_KIND_OPENED && event.request == open_f_request, "the open is answered");
+        smoke_require(event.error != NULL, "an abandoned connect is answered with an error");
+        {
+            ErrorSummary summary = read_and_free_error(event.error);
+            smoke_check(summary.kind == RELDEX_ERROR_KIND_CANCELLED, "the error kind is CANCELLED");
+        }
+        smoke_require(wait_and_take_event(hub, &event), "session F's TERMINAL arrives");
+        smoke_check(event.kind == RELDEX_EVENT_KIND_TERMINAL && event.abandoned, "TERMINAL says it was abandoned");
+        smoke_check(!event.transaction_possibly_lost, "nothing connected, so nothing was lost");
+        smoke_check(reldex_hub_session_count(hub) == 0, "both abandoned sessions stopped counting");
+    }
+
+    /* 11e. A connect that fails (ABI 3.2 mock knob): OPENED with the error,
+     * then TERMINAL, whose cause the caller also owns. */
+    {
+        ReldexOpenOptions open_options_g;
+        memset(&open_options_g, 0, sizeof(open_options_g));
+        open_options_g.struct_size = sizeof(open_options_g);
+        open_options_g.driver = RELDEX_DRIVER_KIND_MOCK;
+        open_options_g.mock.struct_size = sizeof(open_options_g.mock);
+        open_options_g.mock.connect_failure = RELDEX_MOCK_FAILURE_AUTHENTICATION;
+        uint64_t session_g = 0;
+        status = reldex_hub_open_session(hub, &open_options_g, next_request_id(), &session_g);
+        smoke_require(status == RELDEX_STATUS_OK, "an open that will fail is still accepted");
+        smoke_require(wait_and_take_event(hub, &event), "session G's OPENED arrives");
+        smoke_require(event.error != NULL, "the failed connect is the OPENED event's error");
+        {
+            ErrorSummary summary = read_and_free_error(event.error);
+            smoke_check(summary.kind == RELDEX_ERROR_KIND_AUTHENTICATION, "the error kind is AUTHENTICATION");
+            smoke_check(summary.has_native && summary.native_code == 1017, "the native code is 1017 (ORA-01017)");
+        }
+        smoke_require(wait_and_take_event(hub, &event), "session G's TERMINAL arrives");
+        smoke_check(event.kind == RELDEX_EVENT_KIND_TERMINAL, "the failed open ends with TERMINAL");
+        if (event.error != NULL) {
+            read_and_free_error(event.error);
+        }
+        smoke_check(reldex_hub_session_count(hub) == 0, "the failed open stopped counting");
+    }
+
+    /* 11f. An adapter must ignore a kind it does not know (ADR-0003 D7):
+     * this is the dispatch shape every consumer of this header needs, shown
+     * against a value no header defines. */
+    {
+        int32_t future_kind = 9999;
+        int handled = 0;
+        switch (future_kind) {
+        case RELDEX_EVENT_KIND_OPENED:
+        case RELDEX_EVENT_KIND_EXECUTED:
+        case RELDEX_EVENT_KIND_TERMINAL:
+            handled = 1;
+            break;
+        default:
+            /* Unknown: nothing owned to release beyond the documented
+             * error/batch/lines pointers, which are all null for it. */
+            break;
+        }
+        smoke_check(handled == 0, "an unknown event kind falls through to the ignore branch");
+        printf("  progress events skipped by the reply helper: %ld\n", g_progress_seen);
+        smoke_check(g_progress_seen > 0, "EXECUTING events were delivered and skipped");
     }
 
     /* 12. Final drain: nothing more should be queued. */
@@ -1862,10 +2077,10 @@ int main(void)
     reldex_hub_destroy(hub);
     printf("reldex_hub_destroy returned; process is intact\n");
 
-    /* 14. Nothing this harness was handed is still alive. A hub's teardown
-     * finishes on its session pump threads, so the counts fall shortly after
-     * the call returns -- waited for under the same hang guard as everything
-     * else, which asserts no upper bound on how fast it happens. */
+    /* 14. Nothing this harness was handed is still alive. Everything the
+     * library counts is released before reldex_hub_destroy returns; the wait
+     * below is kept under the same hang guard as everything else, which
+     * asserts no upper bound on how fast it happens. */
     {
         double counts_started = smoke_now_seconds();
         ReldexLiveCounts final_counts = live_counts();
