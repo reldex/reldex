@@ -503,7 +503,7 @@
     "tagline": "High-performance, cross-platform database development environment — Rust core, Qt Quick UI, vendor-neutral core (initial compatibility: Oracle Database 19c+).",
     "repo": "https://github.com/reldex/reldex"
   },
-  "updatedAt": "2026-09-27T01:25:00+07:00",
+  "updatedAt": "2026-09-27T01:54:00+07:00",
   "updatedBy": "Claude (lead) + workers",
   "currentPhase": {
     "id": "P1",
@@ -1277,8 +1277,8 @@
               "status": "todo"
             },
             {
-              "title": "M3.4 Production indicator: persistent, not colour-only (icon + text + tab badge) (sonnet)",
-              "status": "todo"
+              "title": "M3.4 Production indicator: persistent, not colour-only (icon + text + tab badge) (sonnet) — done 2026-09-27 (PR #49, reviewed): icon + text indicator in the status bar, a worksheet-header strip above the editor and a badge on every worksheet tab, driven by one adapter bool (treat_as_production, never the Environment enum) that M3.3 sets on connect; greyscale and 1×/2× DPI tests; re-check placement at M4.1/M4.9 once a real Run affordance exists, and add a tab-badge hit-test/accessibility test before M4.9",
+              "status": "done"
             },
             {
               "title": "M3.5 ★ TCPS UI described exactly as SPEC.md §8; surfaces the descriptor-guard warnings from C-6 (opus, review mandatory)",
@@ -1718,6 +1718,10 @@
     }
   ],
   "activity": [
+    {
+      "date": "2026-09-27",
+      "text": "M3.4 production indicator done (PR #49): icon plus text, never colour alone, in the status bar, a strip above the editor and a badge on every worksheet tab; QML only displays a bool the adapter derives from treat_as_production; the review's mutation check confirmed the visibility and greyscale tests fail when the indicator is hidden. Follow-ups: M3.3 sets the flag on connect; re-check placement when M4.1 adds the Run affordance; tab-badge accessibility test before M4.9."
+    },
     {
       "date": "2026-09-27",
       "text": "M2.15 FFI pump switch done and merged (PR #48, two independent review rounds): the interim per-session pump thread is gone; the hub drains one M2.5 event queue on the caller's thread, a session lost mid-statement gets a real TERMINAL, abandon exists, EXECUTING/TRANSACTION_STATE events and server output before the reply are delivered, and the hub session count now decrements. ABI 3.1→3.2 stays additive — the review caught EXECUTING reusing the request id (a 3.1 caller would have broken) and it now travels in a trailing field; the adapter refuses an older library minor. The drain's boundary share rose from ~1% to ~3% of a drain (whole drain unchanged within noise), recorded honestly in ADR-0003 A37 with drain_into as the next step if ever needed. ReldexProfileError gives profile validation failures a numeric code. M3.3 (first real session) is unblocked."
