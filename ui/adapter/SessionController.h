@@ -57,6 +57,17 @@ class SessionController : public QObject, public ResultFetchSource
     /// Run the mock generated query as soon as the session opens.
     Q_PROPERTY(bool runOnOpen READ runOnOpen WRITE setRunOnOpen NOTIFY runOnOpenChanged)
 
+    /// M3.4: whether the profile this worksheet's session is bound to should
+    /// show the persistent production indicator (SPEC.md §17; ADR-0006 P3).
+    /// This is `Profile::treat_as_production()` itself, carried across the
+    /// adapter boundary as a plain bool -- QML never sees, and never derives
+    /// this from, `ReldexEnvironmentKind`. M3.3 (the connect flow) is the
+    /// class that sets this once a worksheet's session is actually bound to
+    /// a profile; nothing sets it yet, so it defaults to `false` (see
+    /// `ui/README.md`, "Production indicator (M3.4)" -> "Hand-off").
+    Q_PROPERTY(bool activeProfileIsProduction READ activeProfileIsProduction WRITE
+                       setActiveProfileIsProduction NOTIFY activeProfileIsProductionChanged)
+
     // --- the mock scenario, which is the only driver this build can open ---
     Q_PROPERTY(qint64 mockRows READ mockRows WRITE setMockRows NOTIFY mockConfigChanged)
     Q_PROPERTY(qint64 mockSeed READ mockSeed WRITE setMockSeed NOTIFY mockConfigChanged)
@@ -113,6 +124,12 @@ public:
     [[nodiscard]] bool runOnOpen() const noexcept { return m_runOnOpen; }
     void setRunOnOpen(bool run);
 
+    [[nodiscard]] bool activeProfileIsProduction() const noexcept
+    {
+        return m_activeProfileIsProduction;
+    }
+    void setActiveProfileIsProduction(bool production);
+
     [[nodiscard]] qint64 mockRows() const noexcept { return m_mockRows; }
     void setMockRows(qint64 rows);
     [[nodiscard]] qint64 mockSeed() const noexcept { return m_mockSeed; }
@@ -153,6 +170,7 @@ Q_SIGNALS:
     void fetchRowsChanged();
     void autoFetchChanged();
     void runOnOpenChanged();
+    void activeProfileIsProductionChanged();
     void mockConfigChanged();
 
     void opened();
@@ -238,6 +256,7 @@ private:
     int m_fetchRows = 1000;
     bool m_autoFetch = true;
     bool m_runOnOpen = false;
+    bool m_activeProfileIsProduction = false;
 
     qint64 m_mockRows = 0;
     qint64 m_mockSeed = 0;
