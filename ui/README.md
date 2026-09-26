@@ -594,7 +594,25 @@ C++):
   fetch's row count exceeds the row cap (friend access to `applyRows()`);
 - `setFilter()` is a no-op on a `ColumnsNode` (and every other kind besides
   `Connection`/`Group`) — `ColumnsOf` has no name filter by contract
-  (`MetadataRequest::with_name_filter` panics on it).
+  (`MetadataRequest::with_name_filter` panics on it);
+- `aFilterChangeWhileTheFirstFetchIsInFlightSupersedesRatherThanBeingDropped()`
+  (review follow-up, real FFI, under `QAbstractItemModelTester`): regression
+  test for a bug found in independent review of this PR —
+  `expand(force = true)`/`setFilter()` used to be silently dropped by
+  `if (node->loading) return;` whenever a fetch for the same node was already
+  outstanding, so the node settled on the FIRST (by then stale) fetch while
+  `filterFor()` reported the SECOND, never-queried filter text. Fixed by
+  letting `force` supersede an in-flight fetch (bump the node's generation,
+  queue a fresh fetch, discard the superseded reply via a new
+  `m_activeGeneration` captured at submission time — see
+  `ObjectBrowserModel.h`'s doc comments on `expand()`/`m_activeGeneration` for
+  the mechanism). This test injects a second `setFilter()` the instant the
+  first fetch reaches `SessionController::Executing`, and asserts a second
+  fetch really was submitted and `filterFor()` agrees with the settled state;
+- `destroyingTheModelWhileAFetchIsInFlightDoesNotCrash()` (review follow-up,
+  under `QAbstractItemModelTester`): destroys the model with a fetch/session-
+  open genuinely outstanding, no wait first — the shape an ASan run
+  (`qt-asan` CI job) would catch a use-after-free in.
 
 Also covered by the existing `tst_coreinfo.cpp` QML suite as a side effect:
 every `appShellXxx` test that loads `Main.qml` now also loads `Sidebar.qml` →
