@@ -345,6 +345,12 @@ pub struct ReldexEvent {
     /// `Fetched`: the batch, or null. The caller owns it.
     pub batch: *mut ReldexBatch,
     /// The session's lifecycle as of this event: a [`ReldexSessionState`].
+    ///
+    /// A successful reply reports `USABLE` (the request succeeded, so the
+    /// session was usable when it answered) even if the session was lost
+    /// while the reply waited in the queue; that loss is the `TERMINAL`
+    /// behind it. A failed reply, a progress event and a notification report
+    /// the session's state when the event was taken.
     pub session_state: i32,
     /// `Executed`: a [`ReldexStatementKind`].
     pub statement_kind: i32,

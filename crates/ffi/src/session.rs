@@ -504,8 +504,18 @@ pub(crate) fn translate(hub: &ReldexHub, event: SessionEvent) -> QueuedEvent {
     let caller = pending.as_ref().map_or(0, |pending| pending.caller);
     let id = event.session();
     let key = id.get();
-    let entry = hub.session_entry(key);
+    // Only the kinds that change this crate's per-session state look the
+    // entry up; a FETCHED — the one kind a result stream is made of — does not.
+    let entry = if matches!(event, SessionEvent::Fetched { .. }) {
+        None
+    } else {
+        hub.session_entry(key)
+    };
     let entry = entry.as_deref();
+    // A successful reply reports the state as of that reply: a request that
+    // succeeded left the session usable. Progress and notifications report
+    // the session's state now.
+    let usable = ReldexSessionState::Usable;
     let state = || entry.map_or(ReldexSessionState::Unknown, SessionEntry::state);
     let reply = |kind| QueuedEvent::new(kind, key, caller);
     let failed =
@@ -524,7 +534,7 @@ pub(crate) fn translate(hub: &ReldexHub, event: SessionEvent) -> QueuedEvent {
             opened.connection_id = connection.get();
             opened.cancel_kind = cancel_kind.into();
             opened.warning_count = warnings.len();
-            opened.with_session_state(state())
+            opened.with_session_state(usable)
         }
         SessionEvent::OpenFailed { error, .. } => {
             if let Some(entry) = entry {
@@ -554,7 +564,7 @@ pub(crate) fn translate(hub: &ReldexHub, event: SessionEvent) -> QueuedEvent {
                 };
                 reply(ReldexEventKind::Executed)
                     .with_execute_outcome(&outcome, result, column_count)
-                    .with_session_state(state())
+                    .with_session_state(usable)
             }
             Err(error) => failed(reply(ReldexEventKind::Executed), &error),
         },
@@ -570,7 +580,7 @@ pub(crate) fn translate(hub: &ReldexHub, event: SessionEvent) -> QueuedEvent {
                     let columns = columns.unwrap_or_else(|| ResultColumns::new(Vec::new()));
                     reply(ReldexEventKind::Fetched)
                         .with_batch(Box::new(ReldexBatch::new(batch, columns)), rows)
-                        .with_session_state(state())
+                        .with_session_state(usable)
                 }
                 Err(error) => failed(reply(ReldexEventKind::Fetched), &error),
             };
@@ -583,7 +593,7 @@ pub(crate) fn translate(hub: &ReldexHub, event: SessionEvent) -> QueuedEvent {
             );
             match segment {
                 Ok(segment) => {
-                    let mut event = event.with_session_state(state());
+                    let mut event = event.with_session_state(usable);
                     event.row_count = segment.segment.row_count();
                     event
                 }
@@ -605,7 +615,7 @@ pub(crate) fn translate(hub: &ReldexHub, event: SessionEvent) -> QueuedEvent {
                     .with_completed_operation(completed_operation(operation))
             };
             match result {
-                Ok(()) => event.with_session_state(state()),
+                Ok(()) => event.with_session_state(usable),
                 Err(error) => failed(event, &error),
             }
         }
@@ -628,7 +638,7 @@ pub(crate) fn translate(hub: &ReldexHub, event: SessionEvent) -> QueuedEvent {
         SessionEvent::ServerOutputConfigured { result, .. } => match result {
             Ok(setting) => reply(ReldexEventKind::ServerOutputConfigured)
                 .with_server_output_setting(setting)
-                .with_session_state(state()),
+                .with_session_state(usable),
             Err(error) => failed(reply(ReldexEventKind::ServerOutputConfigured), &error),
         },
         SessionEvent::Executing { deadline, .. } => reply(ReldexEventKind::Executing)

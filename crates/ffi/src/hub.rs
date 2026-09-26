@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -137,11 +138,11 @@ pub struct ReldexHub {
     /// touches it); on the drain path it is uncontended.
     queue: Mutex<EventQueue>,
     pub(crate) registry: SessionRegistry,
-    pub(crate) sessions: Mutex<HashMap<u64, Arc<SessionEntry>>>,
+    pub(crate) sessions: Mutex<IdMap<Arc<SessionEntry>>>,
     /// Keyed by the `db-core` request id this hub allocated (never the
     /// caller's, which is caller-chosen and unchecked): an entry lives from
     /// the moment a request is accepted until its one reply is drained.
-    pending: Mutex<HashMap<u64, Pending>>,
+    pending: Mutex<IdMap<Pending>>,
     next_request: AtomicU64,
     /// Column descriptions of results that were open when their session was
     /// **lost** — nothing the caller did ended their documented lifetime, so
@@ -150,6 +151,33 @@ pub struct ReldexHub {
     orphaned_columns: Mutex<Vec<Arc<ResultColumns>>>,
     _live: LiveHub,
 }
+
+/// Hashes the `u64` ids this crate keys its maps by: one multiply, rather than
+/// SipHash on every event drained. The keys are allocated here or by
+/// `db-core`, never chosen by the caller, so hash flooding is not a concern.
+#[derive(Default)]
+pub(crate) struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn write_u64(&mut self, id: u64) {
+        // Fibonacci hashing: spreads sequential ids over the high bits, which
+        // is where the table's control bytes come from.
+        self.0 = id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+/// A map keyed by one of this crate's `u64` ids.
+pub(crate) type IdMap<V> = HashMap<u64, V, BuildHasherDefault<IdHasher>>;
 
 /// Locks `mutex`, recovering from poisoning: every structure behind one of
 /// this crate's mutexes stays consistent across a panic, which `catch_unwind`
@@ -166,8 +194,8 @@ impl ReldexHub {
         Self {
             queue: Mutex::new(queue),
             registry: SessionRegistry::new(SessionManager::new(), sink),
-            sessions: Mutex::new(HashMap::new()),
-            pending: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(IdMap::default()),
+            pending: Mutex::new(IdMap::default()),
             next_request: AtomicU64::new(1),
             orphaned_columns: Mutex::new(Vec::new()),
             _live: LiveHub::new(),

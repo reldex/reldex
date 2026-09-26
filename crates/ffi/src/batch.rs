@@ -497,7 +497,11 @@ pub struct ReldexBatch {
     /// concurrent first use, not merely unlikely to be hit. Each mirror is
     /// also its own allocation, so building a later one cannot move a pointer
     /// already handed out for an earlier one.
-    mirrors: Box<[OnceLock<Option<Mirror>>]>,
+    ///
+    /// The table itself is allocated on first use too: since M2.15 a batch is
+    /// built on the caller's thread, inside `reldex_hub_next_event`, and most
+    /// batches never have a mirror asked of them.
+    mirrors: OnceLock<Box<[OnceLock<Option<Mirror>>]>>,
 }
 
 // The `Sync` bound is load-bearing (see this module's docs): the read-only
@@ -517,12 +521,11 @@ impl Drop for ReldexBatch {
 
 impl ReldexBatch {
     pub(crate) fn new(batch: FetchedBatch, columns: Arc<ResultColumns>) -> Self {
-        let column_count = batch.column_count();
         crate::counters::created(crate::counters::Kind::Batch);
         Self {
             batch,
             columns,
-            mirrors: (0..column_count).map(|_| OnceLock::new()).collect(),
+            mirrors: OnceLock::new(),
         }
     }
 
@@ -541,7 +544,14 @@ impl ReldexBatch {
     /// initializer on exactly one thread and every caller gets that value, so
     /// two threads asking for the same column see the same pointer.
     fn mirror_of(&self, index: usize, column: &Column) -> Option<(*const std::ffi::c_void, usize)> {
-        let slot = self.mirrors.get(index)?;
+        let slot = self
+            .mirrors
+            .get_or_init(|| {
+                (0..self.batch.column_count())
+                    .map(|_| OnceLock::new())
+                    .collect()
+            })
+            .get(index)?;
         let mirror = slot.get_or_init(|| match column.data() {
             ColumnData::Number(values) => Some(Mirror::Numbers(
                 values.iter().map(ReldexNumber::from).collect(),

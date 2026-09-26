@@ -379,11 +379,21 @@ fn describing_every_column_allocates_nothing() {
     let built = allocations_during(|| {
         assert!(!fixed(0).fixed.is_null());
     });
-    assert_eq!(built, 1, "one boxed slice for the whole column");
+    assert_eq!(
+        built, 2,
+        "the batch's mirror table (built on the first ask since M2.15, not per batch), then one          boxed slice for the whole column"
+    );
     let cached = allocations_during(|| {
         assert!(!fixed(0).fixed.is_null());
     });
     assert_eq!(cached, 0, "the second ask is the cache");
+    let second = allocations_during(|| {
+        assert!(!fixed(2).fixed.is_null());
+    });
+    assert_eq!(
+        second, 1,
+        "a second column's mirror is its own slice, and nothing else"
+    );
 }
 
 /// Prints the bytes a retained result costs per row, with and without the
@@ -392,7 +402,7 @@ fn describing_every_column_allocates_nothing() {
 ///
 /// **What the absolute numbers are, exactly.** They are whole-process live
 /// bytes — everything allocated and not yet freed, including the mock driver's
-/// generation buffers and whatever the pump thread happens to be holding — so
+/// generation buffers and whatever the session's worker happens to be holding — so
 /// they are an upper bound on the boundary's own retention, not a measurement
 /// of it, and they are not RSS either. The robust figure is the **difference**
 /// between the two runs: the two differ in exactly one thing, so the delta is

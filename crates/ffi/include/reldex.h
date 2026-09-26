@@ -2479,21 +2479,21 @@ typedef struct ReldexLiveCounts {
    */
   uint32_t struct_size;
   /**
-   * Hubs created by `reldex_hub_create` and not yet fully torn down. A hub
-   * outlives `reldex_hub_destroy` until its last session pump exits.
+   * Hubs created by `reldex_hub_create` and not yet destroyed.
    */
   size_t hubs;
   /**
-   * Sessions whose registry entry or pump thread is still alive.
+   * Sessions opened and not yet ended: until the session's `TERMINAL` is
+   * drained, or its hub is destroyed.
    */
   size_t sessions;
   /**
-   * Fetched batches: held by the caller, or queued in an undrained event.
+   * Fetched batches handed out and not yet released.
    */
   size_t batches;
   /**
-   * Error objects: held by the caller, queued in an undrained event, or
-   * sitting in some thread's last-error slot.
+   * Error objects: handed out and not yet released, or sitting in some
+   * thread's last-error slot.
    */
   size_t errors;
   /**
@@ -2744,6 +2744,12 @@ typedef struct ReldexEvent {
   struct ReldexBatch *batch;
   /**
    * The session's lifecycle as of this event: a [`ReldexSessionState`].
+   *
+   * A successful reply reports `USABLE` (the request succeeded, so the
+   * session was usable when it answered) even if the session was lost
+   * while the reply waited in the queue; that loss is the `TERMINAL`
+   * behind it. A failed reply, a progress event and a notification report
+   * the session's state when the event was taken.
    */
   int32_t session_state;
   /**
@@ -3857,12 +3863,19 @@ void reldex_batch_release(struct ReldexBatch *batch);
  * reason to make an exception to the rule it would be used to debug.
  *
  * Counts are process-wide and include objects that are not the caller's yet:
- * a `ReldexBatch` sitting inside an event nobody has drained is **live**,
- * because its rows are still in memory. So is the `ReldexError` in a thread's
- * last-error slot, until it is taken or cleared. A session stays live until
- * its pump thread has finished, which after `reldex_hub_destroy` may be a
- * while if it is parked inside an uninterruptible statement (ADR-0003 A17) —
- * that is exactly the leak this is meant to make visible.
+ * the `ReldexError` in a thread's last-error slot is **live** until it is
+ * taken or cleared. Since M2.15 a `ReldexBatch` or `ReldexError` an event
+ * carries is built when `reldex_hub_next_event` hands that event out, so an
+ * event nobody has drained is not counted here; what it holds is still in
+ * memory, and bounded by `db-core`'s per-session limits.
+ *
+ * A session counts from the call that opened it until its
+ * `RELDEX_EVENT_KIND_TERMINAL` is drained, or until `reldex_hub_destroy`,
+ * whichever comes first. Both are exact: nothing the counts see outlives
+ * `reldex_hub_destroy`. What they do **not** see is a session worker still
+ * parked inside an uninterruptible statement after that call — the leak
+ * ADR-0003 A17 describes, which the registry bounds and documents rather
+ * than counts.
  *
  * # Safety
  *
