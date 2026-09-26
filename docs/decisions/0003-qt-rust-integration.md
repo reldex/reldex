@@ -746,13 +746,37 @@ through one new object, `ReldexWorkspace`. Status is unchanged: this ADR is stil
 The M2.11 brief asked for a major bump (3 → 4). `RELDEX_ABI_VERSION_MINOR` moved 0 → 1 instead.
 Every family M2.11 adds is purely additive — new opaque types, new functions, new `struct_size`-
 prefixed structs, new enum variants appended after the existing ones with their `0` case already
-reserved for "unknown" (D7) — and nothing existing changed shape or meaning. D7's own rule is that a
-minor bump is for exactly this: "an addition an old header can still link against, even though it
-cannot see the new function." An old adapter built against ABI 3.0 still links and runs correctly
+reserved for "unknown" (D7) — and nothing existing changed shape or meaning.
+`RELDEX_ABI_VERSION_MINOR`'s own doc comment (`crates/ffi/src/lib.rs`) states the rule this follows:
+a minor bump is for exactly a symbol, a *trailing* struct field, or an enum value being added, with
+an older adapter kept working by D7's `struct_size`-prefix and reserved-`0` mechanisms (correcting an
+earlier version of this entry, which misattributed that sentence to D7 itself rather than to the
+constant's own doc comment). An old adapter built against ABI 3.0 still links and runs correctly
 against this library; it simply does not call the M2.11 functions. Recorded here, next to D7, rather
 than silently overriding the brief, because "the brief asked for X and the diff did Y" is exactly the
 kind of drift this ADR exists to catch — the reviewer should see the reasoning and either accept the
 deviation or ask for the major bump instead.
+
+**M2.11 review round 2 additions, still under ABI 3.1 (ADR-0004 reserves major version 4 for
+M5.2; this task does not touch it):**
+
+* `crates/ffi/src/splitter.rs`'s `reldex_split_statements` now honours the caller's `struct_size` on
+  each written `ReldexStatementSpan` via `write_out_struct` (should-fix 11) instead of writing at this
+  build's own size regardless of what the caller declared — a correctness fix, not an ABI change.
+* `ReldexWorkspaceReply`'s two growable fields, `setting_value: ReldexSettingValue` and
+  `layout: ReldexLayout`, sat inline in the *middle* of the struct — a real ABI-growth hazard, since a
+  future append to either one would shift the byte offset of every field declared after it, unlike an
+  append at the very end. Both are moved to immediately before the end of the struct (should-fix 11).
+  This is still an additive change, not a breaking one: ABI 3.1 has not shipped on `main` yet, Rust,
+  C and C++ all access struct fields by name rather than position, and no adapter exists yet to have
+  compiled against the old layout — so this is a pre-release fix, not a case that would otherwise need
+  a major bump.
+* `crates/ffi/tests/fences.rs`'s line-count budget (ADR-0003 D2, "a reviewer must be able to read the
+  whole crate in an hour") was raised a third time, to 13,600, to accommodate this round's genuine
+  correctness and testability additions (`CredentialError`/`SettingError` carrying a native code,
+  panic containment on the workspace service thread with a real fault-injection test, the structural
+  header guard, typed-password-in, and their tests) — see that test's own comment for the full
+  accounting.
 
 ### A27 — `cbindgen.toml`'s `[export] include` allowlist is easy to forget, and this task found it twice
 
@@ -785,9 +809,11 @@ lists all twenty-one enums with a comment explaining why the allowlist exists an
 one to it looks like; `crates/ffi/tests/header.rs`'s `every_export_reaches_the_header` test (which
 walks every `#[unsafe(no_mangle)]` function, not every type) did not and structurally cannot catch
 this class of gap, since the *function* using the enum is always present — only the type it names is
-missing. A future amendment worth considering: a test that walks every `pub enum` in the crate and
-asserts each name appears somewhere in the generated header, so this stops depending on the smoke
-harness happening to exercise every enum.
+missing. **Added (M2.11 review round 2, should-fix 3):** `every_repr_c_type_reaches_the_header` in
+the same file now does exactly that — it scans `src/*.rs` for a `#[repr(C)]`/`#[repr(i32)]`
+immediately before a `pub struct`/`pub enum` and asserts the name reaches `include/reldex.h`,
+independent of `cbindgen.toml`'s allowlist, so this stops depending on the smoke harness happening
+to exercise every enum.
 
 ### A28 — a session close that actually closes now delivers two events, not one
 
@@ -806,17 +832,28 @@ run.sh`) actually ran, which nothing had done since `Terminal` was added — the
 nothing had caught it yet, are both recorded here for the reviewer's benefit, not left implicit in a
 diff.
 
-### A29 — the interim pump is unchanged; A5 still holds through M2.11
+### A29 — the interim pump is unchanged; the switch is split out as M2.15, not attempted here
 
 A5 records that the per-session pump in `crates/ffi/src/session.rs` is deliberately interim, to be
 replaced when `db-core`'s `SessionRegistry`/`EventQueue`/`Waker` (`docs/exec-plans/active/
-phase-1.md` §B2/§B3, tasks M2.5/M2.6) land. Those tasks have not landed as of M2.11: `Terminal` and
-`ServerOutput` are both produced by the same interim pump, not by a real event-queue switch, and the
-module documentation added for `ServerOutput` says so plainly — it is delivered only on the
-completion path (drained after every reply while output is on), not as a genuinely unsolicited,
-mid-statement event, which needs the switch this crate has not made yet. Nothing about M2.11 changes
-this plan; it is recorded here only so a reviewer does not have to reconstruct "was the pump swapped
-for this task" from the diff.
+phase-1.md` §B2/§B3, tasks M2.5/M2.6) land. **Correction (M2.11 review round 2):** an earlier
+version of this entry said those tasks "have not landed as of M2.11" — false, and caught by an
+independent reviewer. M2.5 and M2.6 landed 2026-09-21, well before this task. What is still true,
+and is the actual reason the pump is unchanged, is that *this crate has not switched onto them* —
+`Terminal` and `ServerOutput` are both produced by the same interim per-session-thread pump, not by
+a real event-queue switch, and the module documentation for `ServerOutput` (and `crate::lib`'s "What
+is interim here") says so plainly: it is delivered only on the completion path (drained after every
+reply while output is on), not as a genuinely unsolicited, mid-statement event.
+
+That switch is real concurrency work — replacing a thread-per-session pump with a shared event queue
+and waker while every existing ordering guarantee (D5) keeps holding — and does not belong riding
+along with M2.11's already-large review-round fix pass. It is split out as its own task, **M2.15**
+("FFI pump switch to the M2.5 event queue"), `opus`, review mandatory, listed in `phase-1.md` after
+M2.14 and in `TASKS.md`. Until M2.15 lands, the interim pump cannot deliver: a genuinely unsolicited,
+mid-statement `Terminal` (today's only fires on close, failed open, or a contained panic); `abandon`
+relayed through the real `SessionRegistry`; `EXECUTING`/`TRANSACTION_STATE` events; or server output
+ahead of the reply that follows it. `crates/ffi/src/lib.rs`'s module documentation lists the same
+four gaps next to the code, and `crates/ffi/README.md`'s limitations section points here.
 
 ### A30 — `ReldexSecret`'s exposed text is the one exception to A13's NUL-termination promise
 

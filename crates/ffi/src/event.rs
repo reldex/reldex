@@ -135,9 +135,9 @@ pub enum ReldexEventKind {
     /// M2.11 delivers this only on the **completion path**
     /// (`reldex-db-core`'s `DatabaseSession::take_server_output`, drained
     /// after every reply while output is on) — never as a fully unsolicited,
-    /// mid-statement event, which needs the event-queue switch this crate has
-    /// not made yet (see the crate's module documentation, "What is
-    /// interim here"). A caller sees a session's output attributed to the
+    /// mid-statement event, which needs the event-queue switch task M2.15
+    /// makes (see the crate's module documentation, "What is interim
+    /// here"). A caller sees a session's output attributed to the
     /// request whose reply immediately follows it, which is correct for
     /// every case except the two rare mid-statement exceptions
     /// `docs/exec-plans/active/phase-1-m2-5-event-queue.md` §7.5 documents.

@@ -380,6 +380,16 @@ the product). No `dirs`, `directories` or `tempfile`: the test temp directory is
   **Delivered:** `OracleDriverBinding` in `crates/ffi/src/workspace.rs`, on the `ReldexWorkspace`
   service thread this task adds; `ProfileId`/`WorksheetId` cross as 16 raw bytes throughout;
   settings cross by `ReldexSettingId` (see ADR-0003's M2.11 amendment for the FFI-side detail).
+  **Deviation (noted in M2.11 review round 2):** `reldex-driver-oracle-thin` ended up an
+  *unconditional* dependency of `crates/ffi/Cargo.toml`, not "behind its Oracle driver feature" as
+  written above — `crates/ffi` is the one place allowed to name a concrete driver
+  (`ARCHITECTURE.md` §2), and metadata/settings/profile mapping (families 4-7) needs the driver's
+  extension-key constants, SQL dialect and `sid_endpoint` regardless of which driver a build will
+  actually open a connection against. None of that opens a database connection or reaches the
+  network, so gating it behind a feature would buy no isolation and would just make
+  `cargo test --workspace`'s default run skip real coverage of the mapping. Kept unconditional, with
+  the reasoning next to the dependency itself in `Cargo.toml`; `mock-driver`, the feature that does
+  gate something (whether a session can actually be opened), is unaffected.
 - **M3.4** shows the production indicator from `Profile::treat_as_production()`, not from the
   environment enum.
 - M4.10 and M6.2 add tables as migration steps 2 and 3. M6.2 also decides when a closed

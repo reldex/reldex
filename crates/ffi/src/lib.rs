@@ -72,17 +72,31 @@
 //!
 //! # What is interim here
 //!
-//! `db-core` today offers `Completion<T>` and a blocking `open_session`; the
-//! `EventQueue`/`EventSink`/`Waker`/`SessionRegistry` of
-//! `docs/exec-plans/active/phase-1.md` §B2/§B3 are tasks M2.5/M2.6 and have
-//! not been written. So the event pump lives *here*, as one thread per
-//! session that owns that session's pending `Completion`s and turns them into
-//! events (see the module docs in `src/session.rs`). It is deliberately small
-//! and deliberately
-//! temporary: when M2.5 lands, `session.rs` loses the pump and forwards a
-//! `db-core` `SessionEvent` instead, and nothing in the C ABI has to change.
-//! The interim pump blocks; it never polls, so no polling interval can
-//! distort the S15 measurements.
+//! `db-core` today offers `Completion<T>` and a blocking `open_session`.
+//! `EventQueue`/`EventSink`/`Waker`/`SessionRegistry`
+//! (`docs/exec-plans/active/phase-1.md` §B2/§B3) **have** landed, as tasks
+//! M2.5/M2.6 (2026-09-21) — but this crate has not switched the FFI pump onto
+//! them yet. That switch is a separate task, **M2.15** (`docs/exec-plans/
+//! active/phase-1.md`, after M2.14; ADR-0003 A29 records why it was split out
+//! of M2.11 rather than attempted alongside a review-round fix pass), not
+//! something M2.11 does. So the event pump still lives *here*, as one thread
+//! per session that owns that session's pending `Completion`s and turns them
+//! into events (see the module docs in `src/session.rs`). It is deliberately
+//! small and deliberately temporary: when M2.15 lands, `session.rs` loses the
+//! pump and forwards a `db-core` `SessionEvent` instead, and nothing in the C
+//! ABI has to change.
+//!
+//! **What the interim pump cannot deliver today, until M2.15:** a genuinely
+//! unsolicited, mid-statement [`ReldexEventKind::Terminal`] — this build only
+//! ever produces one on a close that actually closes, a failed open, or a
+//! contained panic, never on a loss the pump discovers between requests;
+//! `abandon` is not relayed through the real `SessionRegistry`; there are no
+//! `EXECUTING`/`TRANSACTION_STATE` events; and [`ReldexEventKind::ServerOutput`]
+//! is delivered only on the completion path (drained after a reply while
+//! output is on), never as a truly unsolicited event ahead of it. Each of
+//! these is also stated next to the relevant type's own doc comment. The
+//! interim pump blocks; it never polls, so no polling interval can distort
+//! the S15 measurements.
 //!
 //! Not yet exported, and out of scope for M1.3: binds and LOB reads. Commit /
 //! rollback / savepoint / ping, server output control, statement splitting,
