@@ -2826,9 +2826,20 @@ pub unsafe extern "C" fn reldex_workspace_open(
 /// queued, then exits on its own. This **never blocks** the caller -- it does
 /// not join the thread, the same "promptly, not necessarily finished" shape
 /// as [`crate::reldex_hub_destroy`] (whose doc comment explains the trade-off
-/// in full). Any reply already queued, and any the thread pushes while
-/// draining the rest of the channel, must still be drained and released or it
-/// leaks.
+/// in full).
+///
+/// **The caller does not need to drain the reply queue first, and must not
+/// try to drain it afterwards** (M2.11 review round 2, should-fix 8 -- this
+/// doc comment previously said the opposite and was wrong). Once this
+/// returns, `workspace` may already be deallocated, so calling
+/// [`reldex_workspace_next_reply`] on it is a use-after-free, not a way to
+/// collect what was left. Nothing leaks by skipping the drain: `workspace`
+/// is reference-counted, and whichever of this call or the service thread's
+/// own exit drops the last reference also drops the reply queue itself,
+/// which releases everything a queued [`ReldexWorkspaceReply`] owns --
+/// including an undrained [`ReldexSecret`] -- through their own ordinary
+/// `Drop` implementations. A caller that wants every reply is still free to
+/// drain the queue empty *before* calling this; it is simply not required.
 ///
 /// # Safety
 ///
