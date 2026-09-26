@@ -169,24 +169,31 @@ fn the_boundary_stays_small_enough_to_audit() {
     // it, the growth should be a deliberate, reviewed decision rather than
     // something that happened.
     //
-    // Raised twice, deliberately, in M2.11: that task adds seven FFI families
-    // in one change (server output control, statement splitting, metadata,
-    // and, in `workspace.rs` alone, settings/profiles/the local store's
-    // composition root, credentials, and history/worksheets/layout — three
-    // families sharing one service-thread module because `Store` and the
-    // credential store must live on the same non-`Sync` thread) on top of
-    // the session family this limit was originally sized for. 13,000 is not
-    // "however big M2.11 happens to land" — it is sized with headroom above
-    // the actual total (crates/ffi/src is 12,1xx lines with every M2.11
-    // family landed) so the next *unplanned* crossing is still a signal, and
-    // ADR-0003's M2.11 amendment records the new number and the reasoning
-    // next to this one. Growing past 13,000 without raising this again,
-    // deliberately, is the bug this test exists to catch; reaching it is
-    // also the cue to consider whether `workspace.rs`'s three families
+    // Raised three times, deliberately, in M2.11. The first two: that task
+    // adds seven FFI families in one change (server output control,
+    // statement splitting, metadata, and, in `workspace.rs` alone,
+    // settings/profiles/the local store's composition root, credentials, and
+    // history/worksheets/layout — three families sharing one service-thread
+    // module because `Store` and the credential store must live on the same
+    // non-`Sync` thread) on top of the session family this limit was
+    // originally sized for. The third: M2.11's independent review round 2
+    // landed two must-fixes and most of ten should-fixes in the same crate
+    // (`CredentialError`/`SettingError` carrying a native code instead of
+    // folding into one generic error kind, panic containment on the
+    // workspace service thread with a real fault-injection test, an
+    // additional structural header guard, typed-password-in, and their
+    // accompanying Rust tests) — real correctness and testability fixes an
+    // independent reviewer asked for, not scope creep. 13,600 is sized with
+    // headroom above the actual total (crates/ffi/src is 13,1xx lines with
+    // this round landed) so the next *unplanned* crossing is still a signal,
+    // and ADR-0003's M2.11 amendment records the new number and the
+    // reasoning next to this one. Growing past 13,600 without raising this
+    // again, deliberately, is the bug this test exists to catch; reaching it
+    // is also the cue to consider whether `workspace.rs`'s three families
     // belong in a sibling crate of their own rather than growing
     // `crates/ffi` further — recorded, not acted on, in M2.11: splitting a
     // module this size out is exactly the kind of change that should not
-    // ride along with seven other families in the same PR.
+    // ride along with a review-round fix pass in the same PR.
     let mut files = Vec::new();
     rust_files(&workspace_root().join("crates/ffi/src"), &mut files);
     let lines: usize = files
@@ -195,9 +202,9 @@ fn the_boundary_stays_small_enough_to_audit() {
         .map(|text| text.lines().count())
         .sum();
     assert!(
-        lines < 13_000,
+        lines < 13_600,
         "crates/ffi/src is {lines} lines; ADR-0003 D2 expects a boundary a reviewer can read \
-         in one sitting (raised twice already, in M2.11 — see the comment above and ADR-0003's \
-         M2.11 amendment)"
+         in one sitting (raised three times already, in M2.11 — see the comment above and \
+         ADR-0003's M2.11 amendment)"
     );
 }

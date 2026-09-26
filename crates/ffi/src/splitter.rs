@@ -34,7 +34,7 @@
 
 use reldex_sql_text::{EndedBy, StatementKind, StatementSpan, split_statements};
 
-use crate::strings::{CStruct, ReldexStr};
+use crate::strings::{CStruct, ReldexStr, write_out_struct};
 
 /// Whether a statement is plain or a block (`SPEC.md` §15).
 ///
@@ -212,8 +212,21 @@ pub unsafe extern "C" fn reldex_split_statements(
         if !out.is_null() && out.is_aligned() {
             for (index, span) in spans.iter().take(capacity).enumerate() {
                 // SAFETY: `index < capacity` and the caller promises `out` has
-                // room for `capacity` elements.
-                unsafe { out.add(index).write(ReldexStatementSpan::from(span)) };
+                // room for `capacity` elements, each with `struct_size` set
+                // (the header's VERSION rule: "Set it to sizeof(the struct)
+                // before every call, in and out").
+                let slot = unsafe { out.add(index) };
+                // SAFETY: delegated to this function's contract for `out`.
+                // `write_out_struct` honours *this* element's own declared
+                // `struct_size` instead of assuming it matches this build's
+                // `size_of::<ReldexStatementSpan>()` -- a stale caller with a
+                // smaller (older-header) span gets exactly its own bytes'
+                // worth written and reported back, never this build's full,
+                // possibly larger, struct blindly written over its buffer. A
+                // `struct_size` below `MIN_SIZE` leaves that slot untouched,
+                // the same refusal every other growable struct in this crate
+                // gives (`strings::write_out_struct`'s own doc comment).
+                unsafe { write_out_struct(slot, ReldexStatementSpan::from(span)) };
             }
         }
         spans.len()

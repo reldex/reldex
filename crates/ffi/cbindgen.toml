@@ -138,6 +138,20 @@ extern "C" {
  */
 typedef void (*ReldexWakeFn)(void *user_data);
 
+/**
+ * Called when the workspace's reply queue goes from empty to non-empty.
+ * Same contract as `ReldexWakeFn` (ADR-0003 D5), and hand-written here for
+ * the same reason: declared inside `extern "C"` so it has C linkage in a
+ * C++ build, matching `reldex_workspace_set_waker`'s parameter exactly
+ * instead of drifting into the C++-linkage typedef cbindgen would emit for
+ * a plain Rust `pub type` alias above this block.
+ *
+ * It is called from the workspace's own service thread, never the
+ * caller's, and never the hub's -- a workspace does not share the hub's
+ * event queue or waker.
+ */
+typedef void (*ReldexWorkspaceWakeFn)(void *user_data);
+
 /* The C++ standard level, as MSVC also reports it.
  *
  * MSVC leaves __cplusplus at 199711L unless /Zc:__cplusplus is passed, and
@@ -170,6 +184,19 @@ typedef void (*ReldexWakeFn)(void *user_data);
  */
 using ReldexWakeFnNoexcept = void (*)(void *user_data) noexcept;
 #define RELDEX_HAVE_WAKE_FN_NOEXCEPT 1
+
+/**
+ * `ReldexWorkspaceWakeFn` with the no-exceptions rule made compiler-visible.
+ * Same reasoning as `ReldexWakeFnNoexcept`: a `noexcept` function pointer
+ * converts to `ReldexWorkspaceWakeFn` implicitly, so
+ * `reldex_workspace_set_waker` takes it unchanged, and removing `noexcept`
+ * later stops the assignment from compiling instead of leaving undefined
+ * behaviour for an exception to hit at run time.
+ *
+ * Defined only under C++17 or later, same guard as `ReldexWakeFnNoexcept`.
+ */
+using ReldexWorkspaceWakeFnNoexcept = void (*)(void *user_data) noexcept;
+#define RELDEX_HAVE_WORKSPACE_WAKE_FN_NOEXCEPT 1
 #endif  // C++17
 
 #ifdef __cplusplus
@@ -238,10 +265,19 @@ include = [
   "ReldexPromptReasonKind",
   "ReldexHistoryOutcomeKind",
   "ReldexWorkspaceReplyKind",
+  # Added in M2.11's review round 2 (must-fix 1): `CredentialError`/
+  # `CredentialStoreKind` crossing the ABI as numeric enums was the M2.10
+  # hand-off criterion this task missed the first time. Both cross only as
+  # an `int32_t` (`ReldexErrorView::native_code`, `reldex_workspace_
+  # credential_store_kind`'s return value), the same "never reached by
+  # value in an exported signature" reason as every entry above.
+  "ReldexCredentialError",
+  "ReldexCredentialStoreKind",
+  "ReldexSettingError",
 ]
 # Defined by hand in `after_includes`, with C language linkage; see the note
 # there. Generating it as well would define it twice.
-exclude = ["ReldexWakeFn"]
+exclude = ["ReldexWakeFn", "ReldexWorkspaceWakeFn"]
 
 [enum]
 # `ReldexStatus::Ok` becomes `RELDEX_STATUS_OK`.

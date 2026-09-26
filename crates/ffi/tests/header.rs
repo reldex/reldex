@@ -145,6 +145,85 @@ fn every_forced_type_reaches_the_header() {
     );
 }
 
+/// A structural guard against `cbindgen.toml`'s `[export] include` allowlist
+/// (ADR-0003 A27) silently losing an entry. `every_forced_type_reaches_the_
+/// header` only checks names `cbindgen.toml` *already lists* -- it cannot
+/// catch one being removed, because a type cbindgen never reaches through a
+/// function signature just stops appearing in both the freshly generated
+/// header and, once regenerated and committed, the checked-in one, with
+/// `gen-header.sh --check` reporting "up to date" the entire time (this is
+/// exactly how the M2.11 review round 1 gap went unnoticed: a fresh
+/// generation was just as incomplete as the stale commit it was diffed
+/// against). This test instead rediscovers every `#[repr(C)]`/`#[repr(i32)]`
+/// `pub struct`/`pub enum` directly from `src/*.rs`, independently of
+/// `cbindgen.toml`, and asserts each one is *defined* in the committed
+/// header -- however cbindgen reached it, allowlist or a real signature.
+#[test]
+fn every_repr_c_type_reaches_the_header() {
+    let header = header();
+    let defined: Vec<&str> = header
+        .lines()
+        .map(str::trim_end)
+        .filter_map(|line| {
+            line.strip_prefix("enum ")
+                .or_else(|| line.strip_prefix("typedef struct "))
+        })
+        .map(|rest| rest.trim_end_matches(" {"))
+        .collect();
+
+    let mut names: Vec<String> = Vec::new();
+    for (path, text) in sources() {
+        let lines: Vec<&str> = text.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            let Some(rest) = trimmed
+                .strip_prefix("pub enum ")
+                .or_else(|| trimmed.strip_prefix("pub struct "))
+            else {
+                continue;
+            };
+            // `#[repr(C)]`/`#[repr(i32)]` may sit a few lines above the
+            // declaration (derives and doc comments come between them, in
+            // either order), so a small backward window rather than "the
+            // line right above".
+            let window_start = index.saturating_sub(8);
+            let has_repr = lines[window_start..index].iter().any(|candidate| {
+                let candidate = candidate.trim();
+                candidate == "#[repr(C)]" || candidate == "#[repr(i32)]"
+            });
+            if !has_repr {
+                continue;
+            }
+            let name = rest
+                .split(['<', '{', '(', ' ', ':', ';'])
+                .next()
+                .unwrap_or_else(|| {
+                    panic!("could not read a type name from `{trimmed}` in {path:?}")
+                });
+            names.push(name.trim().to_owned());
+        }
+    }
+    names.sort_unstable();
+    names.dedup();
+    assert!(
+        names.len() >= 30,
+        "only found {} repr(C)/repr(i32) public types; the parser above is probably broken",
+        names.len()
+    );
+
+    let missing: Vec<&String> = names
+        .iter()
+        .filter(|name| !defined.contains(&name.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these #[repr(C)]/#[repr(i32)] types are not defined in include/reldex.h: {missing:?}. \
+         If a type is intentionally never used by value in an exported function's signature, add \
+         it to cbindgen.toml's `[export] include` list and regenerate (ADR-0003 A27); otherwise \
+         this is a genuine gap."
+    );
+}
+
 #[test]
 fn the_abi_version_macro_matches_the_rust_constants() {
     // The adapter checks `reldex_abi_version() == RELDEX_ABI_VERSION` before
@@ -286,16 +365,64 @@ fn the_hand_written_waker_typedef_matches_the_rust_alias() {
          update this test."
     );
 
-    // And cbindgen must still be told not to generate a second one.
+    // And cbindgen must still be told not to generate a second one. Checked
+    // by substring, not the exact `exclude = [...]` line, since
+    // `ReldexWorkspaceWakeFn` (added alongside this one, same reason) now
+    // shares that list.
     let config =
         fs::read_to_string(crate_dir().join("cbindgen.toml")).expect("cbindgen.toml is readable");
     assert!(
-        config.contains("exclude = [\"ReldexWakeFn\"]"),
+        config.contains("\"ReldexWakeFn\""),
         "cbindgen must keep excluding ReldexWakeFn, or the header defines it twice"
     );
     assert_eq!(
         header.matches("(*ReldexWakeFn)").count(),
         1,
         "ReldexWakeFn must be declared exactly once"
+    );
+}
+
+/// The same tie as [`the_hand_written_waker_typedef_matches_the_rust_alias`],
+/// for [`ReldexWorkspaceWakeFn`] (M2.11's review round 2, should-fix #12):
+/// it had the exact same C++-linkage hazard `ReldexWakeFn` was hand-written
+/// in `after_includes` to avoid, but was left as a plain Rust `pub type`
+/// alias -- which cbindgen would emit *outside* the `extern "C"` block, the
+/// bug this test exists to catch.
+#[test]
+fn the_hand_written_workspace_waker_typedef_matches_the_rust_alias() {
+    let header = header();
+    for needle in [
+        "typedef void (*ReldexWorkspaceWakeFn)(void *user_data);",
+        "using ReldexWorkspaceWakeFnNoexcept = void (*)(void *user_data) noexcept;",
+        "#define RELDEX_HAVE_WORKSPACE_WAKE_FN_NOEXCEPT 1",
+    ] {
+        assert!(
+            header.contains(needle),
+            "include/reldex.h no longer contains the hand-written line {needle:?}; it lives in \
+             crates/ffi/cbindgen.toml under `after_includes`"
+        );
+    }
+
+    let workspace =
+        fs::read_to_string(crate_dir().join("src/workspace.rs")).expect("workspace.rs is readable");
+    assert!(
+        workspace.contains(
+            "pub type ReldexWorkspaceWakeFn = Option<extern \"C\" fn(user_data: *mut c_void)>;"
+        ),
+        "the Rust `ReldexWorkspaceWakeFn` alias changed. The header's typedef is hand-written and \
+         does not follow it: update `after_includes` in crates/ffi/cbindgen.toml, regenerate, and \
+         update this test."
+    );
+
+    let config =
+        fs::read_to_string(crate_dir().join("cbindgen.toml")).expect("cbindgen.toml is readable");
+    assert!(
+        config.contains("\"ReldexWorkspaceWakeFn\""),
+        "cbindgen must keep excluding ReldexWorkspaceWakeFn, or the header defines it twice"
+    );
+    assert_eq!(
+        header.matches("(*ReldexWorkspaceWakeFn)").count(),
+        1,
+        "ReldexWorkspaceWakeFn must be declared exactly once"
     );
 }

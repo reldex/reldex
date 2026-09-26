@@ -55,8 +55,12 @@ use reldex_driver_oracle_thin::{
 };
 #[cfg(feature = "mock-driver")]
 use reldex_secrets::MemoryCredentialStore;
-use reldex_secrets::{CredentialError, CredentialStore, PasswordSource, PromptReason};
-use reldex_workspace::settings::{ByteLimit, EntryLimit, SettingId, SettingValue, TimeLimit};
+use reldex_secrets::{
+    CredentialError, CredentialStore, CredentialStoreKind, PasswordSource, PromptReason,
+};
+use reldex_workspace::settings::{
+    ByteLimit, EntryLimit, SettingError, SettingId, SettingValue, TimeLimit,
+};
 use reldex_workspace::{
     Authentication, ConnectSettings, CredentialKey, DatabaseType, DriverBinding, DriverOptions,
     Environment, HistoryEntry, HistoryId, HistoryOutcome, HistoryPage, HistoryRecord, IdError,
@@ -65,7 +69,7 @@ use reldex_workspace::{
     UnixTimeMs, WindowGeometry, Worksheet, WorksheetError, WorksheetId, WorksheetState,
 };
 
-use crate::error::{ReldexError, set_last_argument_error};
+use crate::error::{ReldexError, set_last_argument_error, set_last_error};
 use crate::status::{ReldexStatus, WakerGuard, entry, entry_value};
 use crate::strings::{
     CStruct, OwnedStr, ReldexStr, check_out_struct, read_in_struct, write_out_struct,
@@ -90,7 +94,27 @@ fn store_error(prefix: &str, error: StoreError) -> DbError {
         | StoreError::WorksheetNotFound(_) => ErrorKind::Configuration,
         _ => ErrorKind::Other,
     };
-    DbError::new(kind, format!("{prefix}: {error}"))
+    // `SettingError`'s own variants (`LevelNotAllowed`, `KindMismatch`,
+    // `OutOfBounds`, `UnlimitedNotAllowed`) are already this precise in
+    // `crates/workspace` -- carry that distinction across the ABI the same
+    // way `credential_error` does for `CredentialError`, instead of
+    // collapsing every one of them into the same
+    // `RELDEX_ERROR_KIND_CONFIGURATION` with nothing but the free-text
+    // message to tell "the level is wrong" from "the value's kind is wrong"
+    // (M2.11's review round 2, should-fix #10).
+    let native = if let StoreError::InvalidSetting(setting_error) = &error {
+        Some(reldex_db_driver_api::NativeError::new(
+            ReldexSettingError::from(*setting_error) as i32,
+            setting_error.to_string(),
+        ))
+    } else {
+        None
+    };
+    let built = DbError::new(kind, format!("{prefix}: {error}"));
+    match native {
+        Some(native) => built.with_native(native),
+        None => built,
+    }
 }
 
 fn profile_error(prefix: &str, error: ProfileError) -> DbError {
@@ -113,9 +137,21 @@ fn millis_to_ffi(value: UnixTimeMs) -> u64 {
 fn credential_error(prefix: &str, error: CredentialError) -> DbError {
     let kind = match error {
         CredentialError::NotFound => ErrorKind::Configuration,
+        CredentialError::Denied => ErrorKind::Permission,
         _ => ErrorKind::Other,
     };
-    DbError::new(kind, format!("{prefix}: {error}"))
+    // The finer-grained classification `ErrorKind`'s vendor-neutral
+    // vocabulary has no room for (`Locked` vs `Backend` vs `Malformed`, ...)
+    // rides in `native_code`/`native_message`, the same slot a database
+    // driver's own vendor error number uses -- see `ReldexCredentialError`'s
+    // doc comment. `error.to_string()` is value-free by construction
+    // (`CredentialError`'s own doc comment), so it is safe here exactly the
+    // way a vendor's own error message is.
+    let native = reldex_db_driver_api::NativeError::new(
+        ReldexCredentialError::from(error) as i32,
+        error.to_string(),
+    );
+    DbError::new(kind, format!("{prefix}: {error}")).with_native(native)
 }
 
 // ============================================================================
@@ -1319,6 +1355,22 @@ impl ReldexSecret {
 /// Borrows the secret's text. The borrow is valid only until
 /// [`reldex_secret_release`]; do not copy it into a longer-lived buffer.
 ///
+/// **Kept, not removed** (M2.11's review round 2, should-fix #9, offered
+/// removal as the default unless a consumer needs it):
+/// `reldex_workspace_build_connect_params` is not the only place a resolved
+/// password goes. A "show password" toggle
+/// on a connect dialog (a password field is not `IDENTIFIED BY "…"` shown
+/// once and forgotten; SPEC.md's connection manager assumes ordinary
+/// password-field affordances) needs the bytes, not just the ability to feed
+/// them into one specific call -- and both this crate's own tests and the C
+/// smoke harness already need this exact function to prove
+/// `credential_get`/`resolve_password`/`credential_put` round-trip a
+/// password byte-exact, which nothing else in this ABI can show. It zeroizes
+/// on release regardless of how many times it was exposed
+/// ([`reldex_secret_release`]'s doc comment, ADR-0007 S6) -- exposure only
+/// ever *borrows*, it never copies the bytes into a second, unmanaged
+/// allocation this object would then also have to track and wipe.
+///
 /// # Safety
 ///
 /// `secret` must be null (reported as empty) or a live [`ReldexSecret`].
@@ -1344,6 +1396,43 @@ pub unsafe extern "C" fn reldex_secret_expose(secret: *const ReldexSecret) -> Re
             ptr: text.as_ptr(),
             len: text.len(),
         }
+    })
+}
+
+/// Builds an owned, zeroizing [`ReldexSecret`] from `text`, so a caller can
+/// hand a typed-in password to [`reldex_workspace_build_connect_params`] or
+/// [`reldex_workspace_credential_put`] through the same owned shape a
+/// resolved or fetched one already uses (M2.11's review round 2, should-fix
+/// #9: M3.3's connect dialog saves a password only *after* a successful
+/// connect, so the typed text needs to survive from "the user typed it" to
+/// "the connect succeeded" as one of these, not a plain string the caller
+/// manages itself and might copy or leak along the way).
+///
+/// Copies `text` into the new [`ReldexSecret`], which owns and zeroizes its
+/// own copy on release ([`reldex_secret_release`]). **The caller's own
+/// buffer is not wiped by this call** -- it is the caller's, on the caller's
+/// stack or heap, and remains the caller's responsibility to clear once this
+/// returns, the same as passing a password into any other `ReldexStr`
+/// parameter in this ABI.
+///
+/// Returns null, with the last error set, if `text` is null or not valid
+/// UTF-8.
+///
+/// # Safety
+///
+/// `text` must point at `text.len` readable UTF-8 bytes, read only for the
+/// duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reldex_secret_from_utf8(text: ReldexStr) -> *mut ReldexSecret {
+    entry_value(std::ptr::null_mut(), || {
+        // SAFETY: delegated to this function's contract.
+        let Some(text) = (unsafe { text.as_str() }) else {
+            set_last_argument_error(
+                "reldex_secret_from_utf8: `text` is null or is not valid UTF-8",
+            );
+            return std::ptr::null_mut();
+        };
+        Box::into_raw(Box::new(ReldexSecret::new(Secret::new(text))))
     })
 }
 
@@ -1395,6 +1484,169 @@ pub enum ReldexPromptReasonKind {
     NotStored = 3,
     /// The store failed; see the reply's `error`.
     StoreFailed = 4,
+}
+
+/// Why a credential-store call failed -- the FFI shape of `reldex_secrets::
+/// CredentialError`, one variant per Rust variant (M2.10 hand-off criterion:
+/// `CredentialError` crosses the ABI as a numeric enum, not folded into
+/// `RELDEX_ERROR_KIND_OTHER` with nothing to tell `Locked` from `Backend`
+/// from `Malformed`).
+///
+/// Carried as [`crate::ReldexErrorView::native_code`] on every error
+/// `credential_error` (private to this crate) builds, with `has_native` set
+/// -- the same slot a
+/// database driver's own vendor error number uses; the platform's own
+/// OS-level code, when [`Self::Locked`]/[`Self::Backend`] carry one
+/// (`reldex_secrets::CredentialError::Locked`/`Backend`'s `code`), is folded
+/// into `native_message` (`CredentialError`'s own `Display` already renders
+/// it), not a second numeric field.
+///
+/// M3.2's rules for what to do with each of these, recorded next to the enum
+/// they will switch on rather than left to be reconstructed from the diff:
+/// - [`Self::Unavailable`]: no store is usable at all; there is nothing to
+///   check, so treat the password as already cleared and fall back to
+///   prompting every time.
+/// - [`Self::NotFound`]: nothing was stored; not itself an error condition
+///   (see [`crate::ReldexWorkspaceReply::found`] on
+///   `reldex_workspace_credential_get`/`_delete`).
+/// - [`Self::Denied`], [`Self::Locked`], [`Self::Backend`]: the entry may
+///   still exist but could not be read or removed right now -- report it as
+///   a leftover to sweep (ADR-0007 S4, M2.14), never assume it is gone.
+/// - [`Self::TooLarge`], [`Self::InvalidSecret`], [`Self::Malformed`]: the
+///   write, or the entry already there, was refused; the profile falls back
+///   to "prompt each time".
+/// - Offer "save this password" only when
+///   [`crate::reldex_credential_store_kind_can_store`] is true for the
+///   workspace's [`ReldexCredentialStoreKind`].
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReldexCredentialError {
+    /// A reason this header does not know.
+    Unknown = 0,
+    /// [`CredentialError::Unavailable`].
+    Unavailable = 1,
+    /// [`CredentialError::NotFound`].
+    NotFound = 2,
+    /// [`CredentialError::Denied`].
+    Denied = 3,
+    /// [`CredentialError::TooLarge`]. The limit itself is not carried as a
+    /// number; it is in the error's message text.
+    TooLarge = 4,
+    /// [`CredentialError::InvalidSecret`].
+    InvalidSecret = 5,
+    /// [`CredentialError::Malformed`].
+    Malformed = 6,
+    /// [`CredentialError::Locked`].
+    Locked = 7,
+    /// [`CredentialError::Backend`].
+    Backend = 8,
+}
+
+impl From<CredentialError> for ReldexCredentialError {
+    fn from(error: CredentialError) -> Self {
+        match error {
+            CredentialError::Unavailable => Self::Unavailable,
+            CredentialError::NotFound => Self::NotFound,
+            CredentialError::Denied => Self::Denied,
+            CredentialError::TooLarge { .. } => Self::TooLarge,
+            CredentialError::InvalidSecret => Self::InvalidSecret,
+            CredentialError::Malformed => Self::Malformed,
+            CredentialError::Locked { .. } => Self::Locked,
+            CredentialError::Backend { .. } => Self::Backend,
+            // `CredentialError` is `#[non_exhaustive]`.
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Which credential-store backend a workspace opened -- the FFI shape of
+/// `reldex_secrets::CredentialStoreKind` (M2.10 hand-off criterion:
+/// `CredentialStoreKind` crosses the ABI as a numeric enum). Read with
+/// [`crate::reldex_workspace_credential_store_kind`], valid once
+/// `RELDEX_WORKSPACE_REPLY_KIND_OPENED` has been drained without an error.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReldexCredentialStoreKind {
+    /// Not yet known (the workspace has not finished opening), or a kind
+    /// this header does not know.
+    Unknown = 0,
+    /// Windows Credential Manager.
+    WindowsCredentialManager = 1,
+    /// No credential store on this platform; every password is asked for at
+    /// every connect.
+    Absent = 2,
+    /// An in-process, per-process-lifetime store. Only ever reported by a
+    /// workspace opened with `use_memory_credential_store` (the `mock-driver`
+    /// feature); a product build never reports it.
+    Memory = 3,
+}
+
+impl From<CredentialStoreKind> for ReldexCredentialStoreKind {
+    fn from(kind: CredentialStoreKind) -> Self {
+        match kind {
+            CredentialStoreKind::WindowsCredentialManager => Self::WindowsCredentialManager,
+            CredentialStoreKind::Absent => Self::Absent,
+            CredentialStoreKind::Memory => Self::Memory,
+            // `CredentialStoreKind` is `#[non_exhaustive]`.
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl ReldexCredentialStoreKind {
+    fn from_i32(value: i32) -> Option<Self> {
+        Some(match value {
+            x if x == Self::WindowsCredentialManager as i32 => Self::WindowsCredentialManager,
+            x if x == Self::Absent as i32 => Self::Absent,
+            x if x == Self::Memory as i32 => Self::Memory,
+            _ => return None,
+        })
+    }
+}
+
+/// Why a setting value was refused -- the FFI shape of `reldex_workspace::
+/// settings::SettingError`, one variant per Rust variant (M2.11's review
+/// round 2, should-fix #10: "the level is wrong" and "the value's kind is
+/// wrong" were both `RELDEX_ERROR_KIND_CONFIGURATION` with nothing typed to
+/// tell them apart).
+///
+/// Carried as [`crate::ReldexErrorView::native_code`] on every
+/// `RELDEX_ERROR_KIND_CONFIGURATION` error `store_error` (private to this
+/// crate) builds from a `StoreError::InvalidSetting`, the same slot a
+/// database driver's own
+/// vendor error number uses; see [`ReldexCredentialError`]'s doc comment for
+/// the identical reasoning applied there.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReldexSettingError {
+    /// A reason this header does not know.
+    Unknown = 0,
+    /// [`SettingError::LevelNotAllowed`]: the setting may not be set at the
+    /// requested [`ReldexSettingLevel`].
+    LevelNotAllowed = 1,
+    /// [`SettingError::KindMismatch`]: `ReldexSettingValue::kind` does not
+    /// match the setting's own [`ReldexValueKind`].
+    KindMismatch = 2,
+    /// [`SettingError::OutOfBounds`]: the number is outside the setting's
+    /// accepted range. The range itself is not carried as a number; it is in
+    /// the error's message text.
+    OutOfBounds = 3,
+    /// [`SettingError::UnlimitedNotAllowed`]: `no_limit` was set for a
+    /// setting that requires a limit.
+    UnlimitedNotAllowed = 4,
+}
+
+impl From<SettingError> for ReldexSettingError {
+    fn from(error: SettingError) -> Self {
+        match error {
+            SettingError::LevelNotAllowed { .. } => Self::LevelNotAllowed,
+            SettingError::KindMismatch { .. } => Self::KindMismatch,
+            SettingError::OutOfBounds { .. } => Self::OutOfBounds,
+            SettingError::UnlimitedNotAllowed { .. } => Self::UnlimitedNotAllowed,
+            // `SettingError` is `#[non_exhaustive]`.
+            _ => Self::Unknown,
+        }
+    }
 }
 
 // ============================================================================
@@ -2271,6 +2523,13 @@ pub enum ReldexWorkspaceReplyKind {
     /// Reply to [`crate::reldex_workspace_load_layout`]. `found` is whether
     /// a layout had ever been saved.
     LayoutLoaded = 20,
+    /// Reply to [`crate::reldex_workspace_set_setting`]. Added after `20`
+    /// rather than resequenced among the values above it, even though ABI
+    /// 3.1 has not shipped (ADR-0003 A26): `reldex_workspace_set_setting`
+    /// wrongly answered with `SettingCleared` until this review round found
+    /// it (should-fix #7), and every existing test/harness call already
+    /// compares against the numeric value, not just the name.
+    SettingSet = 21,
 }
 
 /// What one completed workspace request looks like on the way out. One flat
@@ -2303,8 +2562,6 @@ pub struct ReldexWorkspaceReply {
     pub count: u64,
     /// A [`ReldexSettingId`], for `SettingResolved`.
     pub setting_id: i32,
-    /// The resolved value, for `SettingResolved`.
-    pub setting_value: ReldexSettingValue,
     /// A [`ReldexSettingLevel`], for `SettingResolved`.
     pub setting_source: i32,
     /// 0 or 1 profile (`ProfileFetched`) or every matching profile
@@ -2331,7 +2588,19 @@ pub struct ReldexWorkspaceReply {
     /// Every open worksheet, for `WorksheetsLoaded`. Owned by the caller;
     /// release with [`reldex_worksheet_list_release`].
     pub worksheet_list: *mut ReldexWorksheetList,
-    /// The saved layout, for `LayoutLoaded` when `found`.
+    /// The resolved value, for `SettingResolved`. Moved here, after every
+    /// pointer field, in M2.11's review round 2 (should-fix #11): embedded
+    /// inline *before* `profile_list` and everything after it, a future
+    /// growth of `ReldexSettingValue` itself would have shifted every field
+    /// below it -- exactly the hazard `struct_size`-prefixed growth exists
+    /// to avoid. Reordering is still additive here only because ABI 3.1 has
+    /// not shipped (ADR-0003 A26); after it ships, a field may only be
+    /// *appended*, never moved.
+    pub setting_value: ReldexSettingValue,
+    /// The saved layout, for `LayoutLoaded` when `found`. Was already the
+    /// last field, so it never had `setting_value`'s hazard; kept here,
+    /// still last, for the same "every inline growable struct sits after
+    /// every pointer field" rule now that `setting_value` moved to join it.
     pub layout: ReldexLayout,
 }
 
@@ -2370,6 +2639,18 @@ pub struct ReldexWorkspace {
     replies: Mutex<VecDeque<QueuedWorkspaceReply>>,
     waker: RwLock<Option<WakerSlot>>,
     destroyed: AtomicBool,
+    /// Set once, from the service thread, right after the credential store
+    /// opens (before the `Opened` reply is pushed). `Unknown` (`0`) until
+    /// then. Read synchronously by
+    /// [`crate::reldex_workspace_credential_store_kind`] -- metadata, not a
+    /// request that needs a reply's round trip.
+    credential_store_kind: std::sync::atomic::AtomicI32,
+    /// Set from the service thread if a command panics (should-fix #5,
+    /// M2.11 review round 2): every request already queued gets one typed
+    /// failure reply, the thread then exits and drops its `Receiver`, and
+    /// every later `submit()` sees the channel closed -- both paths report
+    /// `RELDEX_STATUS_INVALID_STATE`, not a silent hang.
+    failed: AtomicBool,
 }
 
 impl Drop for ReldexWorkspace {
@@ -2431,6 +2712,23 @@ impl ReldexWorkspace {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *slot = func.map(|func| WakerSlot { func, user_data });
     }
+
+    fn credential_store_kind(&self) -> i32 {
+        self.credential_store_kind.load(Ordering::Acquire)
+    }
+
+    fn set_credential_store_kind(&self, kind: ReldexCredentialStoreKind) {
+        self.credential_store_kind
+            .store(kind as i32, Ordering::Release);
+    }
+
+    fn mark_failed(&self) {
+        self.failed.store(true, Ordering::Release);
+    }
+
+    fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
 }
 
 /// Opens (or creates) the settings/profiles/credentials/history/worksheets/
@@ -2491,6 +2789,10 @@ pub unsafe extern "C" fn reldex_workspace_open(
             replies: Mutex::new(VecDeque::new()),
             waker: RwLock::new(None),
             destroyed: AtomicBool::new(false),
+            credential_store_kind: std::sync::atomic::AtomicI32::new(
+                ReldexCredentialStoreKind::Unknown as i32,
+            ),
+            failed: AtomicBool::new(false),
         });
         crate::counters::created(crate::counters::Kind::WorkspaceObject);
 
@@ -2595,6 +2897,50 @@ pub unsafe extern "C" fn reldex_workspace_pending_replies(
     })
 }
 
+/// Which credential-store backend this workspace opened -- a
+/// [`ReldexCredentialStoreKind`] (M2.10 hand-off criterion). Never blocks
+/// and does not go through the reply queue: the kind is recorded once, on
+/// the service thread, right before it pushes `RELDEX_WORKSPACE_REPLY_KIND_
+/// OPENED`, so it is available by the time a caller has drained that reply.
+/// `RELDEX_CREDENTIAL_STORE_KIND_UNKNOWN` before then, or if the open
+/// itself failed.
+///
+/// # Safety
+///
+/// `workspace` must be null (reported as
+/// `RELDEX_CREDENTIAL_STORE_KIND_UNKNOWN`) or a live workspace.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reldex_workspace_credential_store_kind(
+    workspace: *const ReldexWorkspace,
+) -> i32 {
+    entry_value(ReldexCredentialStoreKind::Unknown as i32, || {
+        if workspace.is_null() {
+            return ReldexCredentialStoreKind::Unknown as i32;
+        }
+        // SAFETY: delegated to this function's contract.
+        unsafe { &*workspace }.credential_store_kind()
+    })
+}
+
+/// Whether `kind` can save a password at all -- the FFI shape of
+/// `reldex_secrets::CredentialStoreKind::can_store` (M2.10 hand-off: a
+/// connection dialog offers "save this password" only when this is `true`;
+/// when it is `false` the profile is saved as "prompt each time" instead). A
+/// `kind` this header does not know reports `false`, the safe default: never
+/// offer to save into a backend an old adapter cannot identify.
+#[unsafe(no_mangle)]
+pub extern "C" fn reldex_credential_store_kind_can_store(kind: i32) -> bool {
+    entry_value(false, || {
+        matches!(
+            ReldexCredentialStoreKind::from_i32(kind),
+            Some(
+                ReldexCredentialStoreKind::WindowsCredentialManager
+                    | ReldexCredentialStoreKind::Memory
+            )
+        )
+    })
+}
+
 /// Takes the next reply, or reports that there is none. Never blocks. Same
 /// draining contract as [`crate::reldex_hub_next_event`]: `false` means
 /// `*out` was not touched.
@@ -2673,6 +3019,7 @@ fn service_main(
         let _ = use_memory_credential_store;
         reldex_secrets::platform_default()
     };
+    workspace.set_credential_store_kind(ReldexCredentialStoreKind::from(credential_store.kind()));
 
     workspace.push_reply(QueuedWorkspaceReply {
         kind: ReldexWorkspaceReplyKind::Opened as i32,
@@ -2680,17 +3027,155 @@ fn service_main(
         payload: Ok(WorkspacePayload::None),
     });
 
+    // Panic containment (ADR-0003 D2, should-fix #5 of M2.11's review round
+    // 2): this thread is *ours*, like a session's pump (`session.rs`'s
+    // `pump_main` doc comment) -- an unwind out of it would leave every
+    // request still in `commands` unanswered forever, since nothing else
+    // ever drains that channel. `request`/the reply `kind` a panicked
+    // command owed are read from it *before* the call, so they are known
+    // even though `run_command` itself is what unwound.
     while let Ok(command) = commands.recv() {
-        let reply = run_command(&mut store, credential_store.as_ref(), command);
-        workspace.push_reply(reply);
+        let request = command_request(&command);
+        let reply_kind = command_reply_kind(&command);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_command(&mut store, credential_store.as_ref(), command)
+        }));
+        match outcome {
+            Ok(reply) => workspace.push_reply(reply),
+            Err(payload) => {
+                workspace.mark_failed();
+                let message = workspace_panic_message(&payload);
+                workspace.push_reply(QueuedWorkspaceReply {
+                    kind: reply_kind as i32,
+                    request,
+                    payload: Err(DbError::new(ErrorKind::DriverInternal, message.clone())),
+                });
+                // The command that panicked may have left `store` (a
+                // stateful SQLite session, ARCHITECTURE.md §6) or
+                // `credential_store` mid-operation; nothing further may
+                // safely use either; and unlike a session, one workspace has
+                // no per-request "session lost, try again on a fresh open"
+                // recovery, so the whole workspace is done. Everything still
+                // queued gets the same typed failure, then this thread exits
+                // and drops `commands`, so every request submitted *after*
+                // this point sees the channel closed and `submit()` reports
+                // `RELDEX_STATUS_INVALID_STATE` (never a silent hang).
+                while let Ok(queued) = commands.try_recv() {
+                    workspace.push_reply(QueuedWorkspaceReply {
+                        kind: command_reply_kind(&queued) as i32,
+                        request: command_request(&queued),
+                        payload: Err(DbError::new(ErrorKind::DriverInternal, message.clone())),
+                    });
+                }
+                return;
+            }
+        }
     }
 }
+
+/// Reads a panic payload's message, for the error every request still owed
+/// a reply is answered with. Mirrors `session.rs`'s `panic_message`.
+fn workspace_panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    let detail = payload
+        .downcast_ref::<&'static str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".to_owned());
+    format!(
+        "reldex-ffi: the workspace's service thread panicked ({detail}); the workspace is no longer usable"
+    )
+}
+
+/// The request id every [`WorkspaceCommand`] variant carries, read without
+/// consuming it -- for the panic path, which must know what a command owed
+/// *before* handing it to [`run_command`].
+const fn command_request(command: &WorkspaceCommand) -> u64 {
+    match command {
+        WorkspaceCommand::ResolveSetting { request, .. }
+        | WorkspaceCommand::SetSetting { request, .. }
+        | WorkspaceCommand::ClearSetting { request, .. }
+        | WorkspaceCommand::CreateProfile { request, .. }
+        | WorkspaceCommand::UpdateProfile { request, .. }
+        | WorkspaceCommand::DeleteProfile { request, .. }
+        | WorkspaceCommand::GetProfile { request, .. }
+        | WorkspaceCommand::ListProfiles { request }
+        | WorkspaceCommand::BuildConnectParams { request, .. }
+        | WorkspaceCommand::CredentialGet { request, .. }
+        | WorkspaceCommand::CredentialPut { request, .. }
+        | WorkspaceCommand::CredentialDelete { request, .. }
+        | WorkspaceCommand::ResolvePassword { request, .. }
+        | WorkspaceCommand::RecordHistory { request, .. }
+        | WorkspaceCommand::ListHistory { request, .. }
+        | WorkspaceCommand::ClearHistory { request, .. }
+        | WorkspaceCommand::SaveWorksheet { request, .. }
+        | WorkspaceCommand::LoadWorksheets { request }
+        | WorkspaceCommand::DeleteWorksheet { request, .. }
+        | WorkspaceCommand::SaveLayout { request, .. }
+        | WorkspaceCommand::LoadLayout { request } => *request,
+    }
+}
+
+/// The [`ReldexWorkspaceReplyKind`] every [`WorkspaceCommand`] variant
+/// answers with -- for the panic path, which must build a reply of the
+/// *shape a success would have had* (`session.rs`'s `answer_after_panic`
+/// doc comment) without having reached the match arm in [`run_command`] that
+/// normally names it. Kept as its own match, not derived from
+/// `run_command`'s, so a new command variant fails to compile here too if
+/// this is forgotten.
+const fn command_reply_kind(command: &WorkspaceCommand) -> ReldexWorkspaceReplyKind {
+    match command {
+        WorkspaceCommand::ResolveSetting { .. } => ReldexWorkspaceReplyKind::SettingResolved,
+        WorkspaceCommand::SetSetting { .. } => ReldexWorkspaceReplyKind::SettingSet,
+        WorkspaceCommand::ClearSetting { .. } => ReldexWorkspaceReplyKind::SettingCleared,
+        WorkspaceCommand::CreateProfile { .. } | WorkspaceCommand::UpdateProfile { .. } => {
+            ReldexWorkspaceReplyKind::ProfileSaved
+        }
+        WorkspaceCommand::DeleteProfile { .. } => ReldexWorkspaceReplyKind::ProfileDeleted,
+        WorkspaceCommand::GetProfile { .. } => ReldexWorkspaceReplyKind::ProfileFetched,
+        WorkspaceCommand::ListProfiles { .. } => ReldexWorkspaceReplyKind::ProfilesListed,
+        WorkspaceCommand::BuildConnectParams { .. } => ReldexWorkspaceReplyKind::ConnectParamsBuilt,
+        WorkspaceCommand::CredentialGet { .. } => ReldexWorkspaceReplyKind::CredentialGot,
+        WorkspaceCommand::CredentialPut { .. } => ReldexWorkspaceReplyKind::CredentialPut,
+        WorkspaceCommand::CredentialDelete { .. } => ReldexWorkspaceReplyKind::CredentialDeleted,
+        WorkspaceCommand::ResolvePassword { .. } => ReldexWorkspaceReplyKind::PasswordResolved,
+        WorkspaceCommand::RecordHistory { .. } => ReldexWorkspaceReplyKind::HistoryRecorded,
+        WorkspaceCommand::ListHistory { .. } => ReldexWorkspaceReplyKind::HistoryListed,
+        WorkspaceCommand::ClearHistory { .. } => ReldexWorkspaceReplyKind::HistoryCleared,
+        WorkspaceCommand::SaveWorksheet { .. } => ReldexWorkspaceReplyKind::WorksheetSaved,
+        WorkspaceCommand::LoadWorksheets { .. } => ReldexWorkspaceReplyKind::WorksheetsLoaded,
+        WorkspaceCommand::DeleteWorksheet { .. } => ReldexWorkspaceReplyKind::WorksheetDeleted,
+        WorkspaceCommand::SaveLayout { .. } => ReldexWorkspaceReplyKind::LayoutSaved,
+        WorkspaceCommand::LoadLayout { .. } => ReldexWorkspaceReplyKind::LayoutLoaded,
+    }
+}
+
+/// Test-only fault injection for `a_panicking_command_fails_only_itself_
+/// and_the_workspace_stays_usable_for_a_normal_request` below: when non-zero,
+/// the *next* command whose own `request` equals this value panics instead
+/// of running, and this disarms itself first so it fires exactly once.
+///
+/// `#[cfg(test)]`, so this does not exist at all in the `cdylib`/`staticlib`
+/// the adapter links -- it costs nothing and cannot be reached in
+/// production. A large, distinctive sentinel value (never a small sequential
+/// id like the rest of this module's tests use) is the test's job, not this
+/// static's, to keep the risk of colliding with an unrelated test's request
+/// id effectively zero under `cargo test`'s parallel execution.
+#[cfg(test)]
+static PANIC_ON_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn run_command(
     store: &mut Store,
     credentials: &dyn CredentialStore,
     command: WorkspaceCommand,
 ) -> QueuedWorkspaceReply {
+    #[cfg(test)]
+    {
+        let armed = PANIC_ON_REQUEST.load(std::sync::atomic::Ordering::Acquire);
+        if armed != 0 && armed == command_request(&command) {
+            PANIC_ON_REQUEST.store(0, std::sync::atomic::Ordering::Release);
+            panic!("reldex-ffi test: injected panic for request {armed}");
+        }
+    }
     match command {
         WorkspaceCommand::ResolveSetting {
             request,
@@ -2742,7 +3227,7 @@ fn run_command(
                 .map(|()| WorkspacePayload::None)
                 .map_err(|error| store_error("set_setting", error));
             QueuedWorkspaceReply {
-                kind: ReldexWorkspaceReplyKind::SettingCleared as i32,
+                kind: ReldexWorkspaceReplyKind::SettingSet as i32,
                 request,
                 payload,
             }
@@ -3061,6 +3546,19 @@ fn run_command(
 // echoed back on the reply.
 // ============================================================================
 
+/// Records why a workspace call was refused because the workspace itself is
+/// not usable (closed, or its service thread panicked) -- distinct from
+/// [`set_last_argument_error`]'s `RELDEX_STATUS_INVALID_ARGUMENT`, the same
+/// way `crate::hub::set_last_hub_error` is distinct from an argument error
+/// for the hub. A workspace that will never answer is a state problem, not a
+/// bad argument (`ReldexStatus::InvalidState`'s own doc comment: "a session
+/// that is still opening, or one that is closed" -- a workspace is the same
+/// shape).
+fn set_last_workspace_state_error(message: &str) -> ReldexStatus {
+    set_last_error(DbError::internal(format!("reldex-ffi: {message}")));
+    ReldexStatus::InvalidState
+}
+
 /// Sends `command` on `workspace`'s channel, reporting why it could not.
 fn submit(workspace: *mut ReldexWorkspace, command: WorkspaceCommand) -> ReldexStatus {
     if workspace.is_null() || !workspace.is_aligned() {
@@ -3069,7 +3567,13 @@ fn submit(workspace: *mut ReldexWorkspace, command: WorkspaceCommand) -> ReldexS
     // SAFETY: the caller of every function in this module that reaches
     // `submit` promises `workspace` is a live handle for the duration of the
     // call, the same contract `crate::hub::with_hub` documents.
-    let sender = unsafe { &*workspace }
+    let workspace_ref = unsafe { &*workspace };
+    if workspace_ref.is_failed() {
+        return set_last_workspace_state_error(
+            "reldex_workspace: the service thread panicked and is no longer running",
+        );
+    }
+    let sender = workspace_ref
         .commands
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3077,9 +3581,11 @@ fn submit(workspace: *mut ReldexWorkspace, command: WorkspaceCommand) -> ReldexS
     match sender {
         Some(sender) => match sender.send(command) {
             Ok(()) => ReldexStatus::Ok,
-            Err(_) => set_last_argument_error("reldex_workspace: the workspace has been closed"),
+            Err(_) => {
+                set_last_workspace_state_error("reldex_workspace: the workspace has been closed")
+            }
         },
-        None => set_last_argument_error("reldex_workspace: the workspace has been closed"),
+        None => set_last_workspace_state_error("reldex_workspace: the workspace has been closed"),
     }
 }
 
@@ -3501,6 +4007,20 @@ pub unsafe extern "C" fn reldex_workspace_credential_get(
 
 /// Stores `password` for `profile`, replacing whatever was there.
 ///
+/// **An empty `password` is refused** (M2.11's review round 2, a nit asking
+/// this to be decided and documented, not left implicit): an empty string is
+/// never a real password, and storing one would make
+/// [`reldex_workspace_resolve_password`] report `FromStore` for a profile
+/// that has nothing meaningful saved, silently turning "connect with an
+/// empty password" into the resolved answer instead of "prompt" or "not
+/// stored". Delete the credential instead
+/// ([`reldex_workspace_credential_delete`]) when there is nothing to save.
+/// This mirrors the credential store's own refusal of a password containing
+/// a control character ([`crate::ReldexCredentialError::InvalidSecret`]) —
+/// both are "this is not a value that could ever be a real password",
+/// checked as close to the argument as it can be rather than left to the
+/// backend to notice.
+///
 /// # Safety
 ///
 /// `workspace` must be a live workspace. `profile` must point at 16 readable
@@ -3527,6 +4047,13 @@ pub unsafe extern "C" fn reldex_workspace_credential_put(
                 "reldex_workspace_credential_put: `password` is null or is not valid UTF-8",
             );
         };
+        if text.is_empty() {
+            return set_last_argument_error(
+                "reldex_workspace_credential_put: `password` is empty -- storing an empty \
+                 password is refused; use reldex_workspace_credential_delete if there is \
+                 nothing to save",
+            );
+        }
         submit(
             workspace,
             WorkspaceCommand::CredentialPut {
@@ -4081,6 +4608,15 @@ mod tests {
         assert_eq!(status, ReldexStatus::Ok);
         let set_reply = workspace.wait_for(3);
         assert!(set_reply.error.is_null(), "set_setting failed");
+        // Review round 2, should-fix #7: this used to answer with
+        // `SettingCleared`, the same kind `clear_setting` (below) uses --
+        // indistinguishable from C without inspecting `error`, and wrong on
+        // its own terms (nothing was cleared).
+        assert_eq!(
+            set_reply.kind,
+            ReldexWorkspaceReplyKind::SettingSet as i32,
+            "reldex_workspace_set_setting must reply SettingSet, not SettingCleared"
+        );
 
         // SAFETY: as above.
         let status = unsafe {
@@ -4114,6 +4650,10 @@ mod tests {
         let cleared = workspace.wait_for(5);
         assert!(cleared.error.is_null());
         assert!(cleared.found, "a value existed to clear");
+        assert_eq!(
+            cleared.kind,
+            ReldexWorkspaceReplyKind::SettingCleared as i32
+        );
 
         // SAFETY: as above.
         let status = unsafe {
@@ -4338,6 +4878,30 @@ mod tests {
             allow_unenforced_certificate_pin: false,
             ca_directory: ReldexStr::empty(),
         }
+    }
+
+    #[test]
+    fn credential_put_refuses_an_empty_password() {
+        let (mut workspace, _opened) = TestWorkspace::open();
+        let details = profile_details(1521, false);
+        // SAFETY: `workspace.handle()` is live; `details` is a real local.
+        let status = unsafe {
+            reldex_workspace_create_profile(workspace.handle(), 70, std::ptr::from_ref(&details))
+        };
+        assert_eq!(status, ReldexStatus::Ok);
+        let created = workspace.wait_for(70);
+        let id = created.id;
+
+        // SAFETY: `id` is a real local array; `ReldexStr::empty()` is a
+        // valid, zero-length string.
+        let status = unsafe {
+            reldex_workspace_credential_put(workspace.handle(), 71, id.as_ptr(), ReldexStr::empty())
+        };
+        assert_eq!(
+            status,
+            ReldexStatus::InvalidArgument,
+            "an empty password must be refused before it ever reaches the store"
+        );
     }
 
     #[test]
@@ -4604,6 +5168,363 @@ mod tests {
             tab_order: 0,
             created_at: 0,
             updated_at: 0,
+        }
+    }
+
+    // ========================================================================
+    // M2.11's review round 2, must-fix 1: `CredentialError`/
+    // `CredentialStoreKind` cross the ABI as numeric enums, with the native
+    // code preserved.
+    // ========================================================================
+
+    #[test]
+    fn every_credential_error_variant_maps_to_its_own_reldex_credential_error() {
+        let cases = [
+            (
+                CredentialError::Unavailable,
+                ReldexCredentialError::Unavailable,
+            ),
+            (CredentialError::NotFound, ReldexCredentialError::NotFound),
+            (CredentialError::Denied, ReldexCredentialError::Denied),
+            (
+                CredentialError::TooLarge { max_bytes: 2555 },
+                ReldexCredentialError::TooLarge,
+            ),
+            (
+                CredentialError::InvalidSecret,
+                ReldexCredentialError::InvalidSecret,
+            ),
+            (CredentialError::Malformed, ReldexCredentialError::Malformed),
+            (
+                CredentialError::Locked { code: 258 },
+                ReldexCredentialError::Locked,
+            ),
+            (
+                CredentialError::Backend { code: 1783 },
+                ReldexCredentialError::Backend,
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                ReldexCredentialError::from(input),
+                expected,
+                "{input:?} must map to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_error_carries_the_mapped_variant_as_native_code() {
+        for (input, expected_native) in [
+            (
+                CredentialError::Unavailable,
+                ReldexCredentialError::Unavailable,
+            ),
+            (CredentialError::Denied, ReldexCredentialError::Denied),
+            (
+                CredentialError::Locked { code: 258 },
+                ReldexCredentialError::Locked,
+            ),
+            (
+                CredentialError::Backend { code: 1783 },
+                ReldexCredentialError::Backend,
+            ),
+        ] {
+            let built = credential_error("test", input);
+            let native = built
+                .native()
+                .unwrap_or_else(|| panic!("{input:?} must carry a native code"));
+            assert_eq!(
+                native.code(),
+                expected_native as i32,
+                "{input:?} must carry {expected_native:?} as its native code"
+            );
+            // The platform's own OS-level code, when there is one, rides in
+            // the message text (`CredentialError::Display`), not a second
+            // numeric field -- see `ReldexCredentialError`'s doc comment.
+            if let CredentialError::Locked { code } | CredentialError::Backend { code } = input {
+                assert!(
+                    native.message().contains(&code.to_string()),
+                    "the platform code must still be readable in the native message: {:?}",
+                    native.message()
+                );
+            }
+        }
+        // `Denied` is not a database-vendor error, but it still deserves a
+        // vendor-neutral `ErrorKind` more specific than `Other`.
+        assert_eq!(
+            credential_error("test", CredentialError::Denied).kind(),
+            ErrorKind::Permission
+        );
+    }
+
+    #[test]
+    fn every_credential_store_kind_maps_to_its_own_reldex_credential_store_kind() {
+        for (input, expected) in [
+            (
+                CredentialStoreKind::WindowsCredentialManager,
+                ReldexCredentialStoreKind::WindowsCredentialManager,
+            ),
+            (
+                CredentialStoreKind::Absent,
+                ReldexCredentialStoreKind::Absent,
+            ),
+            (
+                CredentialStoreKind::Memory,
+                ReldexCredentialStoreKind::Memory,
+            ),
+        ] {
+            assert_eq!(ReldexCredentialStoreKind::from(input), expected);
+        }
+    }
+
+    #[test]
+    fn credential_store_kind_can_store_matches_the_rust_source_of_truth() {
+        for (kind, expected) in [
+            (ReldexCredentialStoreKind::WindowsCredentialManager, true),
+            (ReldexCredentialStoreKind::Memory, true),
+            (ReldexCredentialStoreKind::Absent, false),
+            (ReldexCredentialStoreKind::Unknown, false),
+        ] {
+            assert_eq!(
+                reldex_credential_store_kind_can_store(kind as i32),
+                expected,
+                "{kind:?}.can_store() must be {expected}"
+            );
+        }
+        // A value no header knows must be refused, not treated as storable.
+        assert!(!reldex_credential_store_kind_can_store(999));
+    }
+
+    #[test]
+    fn a_freshly_opened_memory_workspace_reports_the_memory_credential_store_kind() {
+        let (mut workspace, _opened) = TestWorkspace::open();
+        // SAFETY: `workspace.handle()` is live.
+        let kind = unsafe { reldex_workspace_credential_store_kind(workspace.handle()) };
+        assert_eq!(kind, ReldexCredentialStoreKind::Memory as i32);
+        assert!(reldex_credential_store_kind_can_store(kind));
+    }
+
+    #[test]
+    fn credential_store_kind_is_unknown_for_a_null_or_unopened_workspace() {
+        assert_eq!(
+            // SAFETY: null is explicitly documented as accepted.
+            unsafe { reldex_workspace_credential_store_kind(std::ptr::null()) },
+            ReldexCredentialStoreKind::Unknown as i32
+        );
+    }
+
+    // ========================================================================
+    // Should-fix #5: a panic on the service thread fails every outstanding
+    // and later request instead of hanging them forever.
+    // ========================================================================
+
+    #[test]
+    fn a_panicking_command_fails_only_itself_and_the_workspace_stays_usable_for_a_normal_request() {
+        // Real fault injection through `PANIC_ON_REQUEST`, which exercises
+        // `service_main`'s actual `catch_unwind` containment (mark_failed,
+        // answer the panicked request, drain and answer everything else
+        // already queued), not a re-description of it. A large sentinel
+        // request id, never a small sequential one, keeps this collision-
+        // free against every other test's requests under `cargo test`'s
+        // parallel execution -- see `PANIC_ON_REQUEST`'s own doc comment.
+        const INJECTED_PANIC_REQUEST: u64 = 0x5245_4C44_5F54_3031; // "RELD_T01"
+
+        let (mut workspace, _opened) = TestWorkspace::open();
+
+        // A first, ordinary request to prove the workspace works before the
+        // injected panic -- the baseline "this would have succeeded" the
+        // panic-handling reply is compared against.
+        // SAFETY: `workspace.handle()` is live.
+        let status = unsafe { reldex_workspace_list_profiles(workspace.handle(), 60) };
+        assert_eq!(status, ReldexStatus::Ok);
+        let listed = workspace.wait_for(60);
+        assert!(listed.error.is_null());
+        // SAFETY: `listed.profile_list` is live and owned by this test.
+        unsafe { reldex_profile_list_release(listed.profile_list) };
+
+        PANIC_ON_REQUEST.store(INJECTED_PANIC_REQUEST, std::sync::atomic::Ordering::Release);
+        // SAFETY: `workspace.handle()` is live.
+        let status =
+            unsafe { reldex_workspace_list_profiles(workspace.handle(), INJECTED_PANIC_REQUEST) };
+        assert_eq!(status, ReldexStatus::Ok);
+        let panicked = workspace.wait_for(INJECTED_PANIC_REQUEST);
+        assert!(
+            !panicked.error.is_null(),
+            "the request the service thread panicked on must still get exactly one failure reply"
+        );
+        assert_eq!(
+            panicked.kind,
+            ReldexWorkspaceReplyKind::ProfilesListed as i32
+        );
+        // SAFETY: `panicked.error` is live and owned by this test.
+        unsafe { crate::error::reldex_error_free(panicked.error) };
+
+        // Every later request must fail promptly, `INVALID_STATE`, never
+        // hang -- the service thread exited and dropped its `Receiver`.
+        // SAFETY: `workspace.handle()` is live.
+        let status = unsafe { reldex_workspace_list_profiles(workspace.handle(), 62) };
+        assert_eq!(status, ReldexStatus::InvalidState);
+        // This thread's own last error, just set by the call above; not
+        // `unsafe` (no pointer to dereference on the way in).
+        let error = crate::error::reldex_last_error_take();
+        assert!(!error.is_null(), "the InvalidState status must explain why");
+        // SAFETY: `error` is live and owned by this call.
+        unsafe { crate::error::reldex_error_free(error) };
+    }
+
+    #[test]
+    fn command_request_and_reply_kind_agree_with_run_commands_own_match() {
+        // A structural guard for the panic path's parallel match
+        // (`command_request`/`command_reply_kind`): every variant must be
+        // covered, which the compiler already enforces (no wildcard arm in
+        // either function), but this pins the *values* they report for one
+        // representative command per family, so a future edit that changes
+        // one match without the other is caught here, not only by the
+        // compiler refusing a non-exhaustive match.
+        let command = WorkspaceCommand::ListProfiles { request: 77 };
+        assert_eq!(command_request(&command), 77);
+        assert_eq!(
+            command_reply_kind(&command),
+            ReldexWorkspaceReplyKind::ProfilesListed
+        );
+
+        let command = WorkspaceCommand::SetSetting {
+            request: 78,
+            scope: reldex_workspace::Scope::Application,
+            setting: SettingId::ConnectTimeout,
+            value: SettingValue::TimeLimit(TimeLimit::NoLimit),
+        };
+        assert_eq!(command_request(&command), 78);
+        assert_eq!(
+            command_reply_kind(&command),
+            ReldexWorkspaceReplyKind::SettingSet
+        );
+    }
+
+    // Should-fix #7 (`set_setting` replies `SettingSet`, not `SettingCleared`)
+    // is asserted directly inside
+    // `setting_a_value_is_seen_on_resolve_and_clearing_it_reverts_to_the_default`
+    // above, rather than a second test repeating that setup.
+
+    // ========================================================================
+    // Should-fix #9: a typed password in, round-tripped byte-exact.
+    // ========================================================================
+
+    #[test]
+    fn a_secret_built_from_utf8_exposes_the_same_bytes_and_is_released_cleanly() {
+        let text = "s3cr3t \u{0E44}\u{0E17}\u{0E22}"; // includes Thai text
+        // SAFETY: `text` is a real, live `&str` for the duration of the call.
+        let secret = unsafe { reldex_secret_from_utf8(str_of(text)) };
+        assert!(!secret.is_null());
+        // SAFETY: `secret` is live and owned by this test.
+        let exposed = unsafe { reldex_secret_expose(secret) };
+        // SAFETY: `exposed` borrows from `secret`, still live.
+        let exposed_bytes = unsafe { std::slice::from_raw_parts(exposed.ptr, exposed.len) };
+        assert_eq!(exposed_bytes, text.as_bytes());
+        // SAFETY: `secret` is live and owned by this test; releasing it must
+        // not crash or double-free (the counted-object bookkeeping this
+        // shares with every other `misc_objects` kind is proved process-wide
+        // by `tests/live_counts.rs` and the C smoke harness's baseline-
+        // return checks, not repeated here against a global counter shared
+        // with every other test in this binary).
+        unsafe { reldex_secret_release(secret) };
+    }
+
+    #[test]
+    fn a_secret_built_from_invalid_utf8_is_refused() {
+        let bytes: &[u8] = b"\xff\xfe";
+        let text = ReldexStr {
+            ptr: bytes.as_ptr(),
+            len: bytes.len(),
+        };
+        // SAFETY: `bytes` covers `len` readable bytes; they are not UTF-8,
+        // which is the case under test.
+        let secret = unsafe { reldex_secret_from_utf8(text) };
+        assert!(secret.is_null());
+    }
+
+    // ========================================================================
+    // Should-fix #10 (continued): `LevelNotAllowed`/`KindMismatch` carry a
+    // distinct native code instead of a generic CONFIGURATION error.
+    // ========================================================================
+
+    #[test]
+    fn every_setting_error_variant_maps_to_its_own_reldex_setting_error() {
+        let level_not_allowed = SettingError::LevelNotAllowed {
+            setting: SettingId::FetchRows,
+            level: reldex_workspace::Level::Worksheet,
+        };
+        let kind_mismatch = SettingError::KindMismatch {
+            setting: SettingId::FetchRows,
+            expected: reldex_workspace::settings::ValueKind::Count,
+            found: reldex_workspace::settings::ValueKind::Bool,
+        };
+        for (input, expected) in [
+            (level_not_allowed, ReldexSettingError::LevelNotAllowed),
+            (kind_mismatch, ReldexSettingError::KindMismatch),
+        ] {
+            assert_eq!(ReldexSettingError::from(input), expected);
+            let built = store_error("test", StoreError::InvalidSetting(input));
+            let native = built
+                .native()
+                .unwrap_or_else(|| panic!("{input:?} must carry a native code"));
+            assert_eq!(native.code(), expected as i32);
+            assert_eq!(built.kind(), ErrorKind::Configuration);
+        }
+    }
+
+    #[test]
+    fn every_setting_id_is_pinned_to_its_numeric_abi_id() {
+        let pinned = [
+            (SettingId::ConnectTimeout, ReldexSettingId::ConnectTimeout),
+            (
+                SettingId::RewriteTriggerDdl,
+                ReldexSettingId::RewriteTriggerDdl,
+            ),
+            (
+                SettingId::StatementTimeLimit,
+                ReldexSettingId::StatementTimeLimit,
+            ),
+            (SettingId::FetchRows, ReldexSettingId::FetchRows),
+            (SettingId::FetchesInFlight, ReldexSettingId::FetchesInFlight),
+            (
+                SettingId::ServerOutputEnabled,
+                ReldexSettingId::ServerOutputEnabled,
+            ),
+            (
+                SettingId::ServerOutputBuffer,
+                ReldexSettingId::ServerOutputBuffer,
+            ),
+            (
+                SettingId::HistoryMaxEntriesPerProfile,
+                ReldexSettingId::HistoryMaxEntriesPerProfile,
+            ),
+        ];
+        assert_eq!(
+            pinned.len(),
+            SettingId::ALL.len(),
+            "every SettingId::ALL entry must be pinned here, in `to_setting_id`, and in \
+             `from_i32`, or a reorder upstream silently relabels a resolved setting"
+        );
+        for (index, id) in SettingId::ALL.iter().enumerate() {
+            assert_eq!(
+                *id, pinned[index].0,
+                "SettingId::ALL[{index}] changed; update the pinned table and the ABI id it maps \
+                 to deliberately, never let it drift"
+            );
+            assert_eq!(
+                ReldexSettingId::from_setting_id(*id),
+                pinned[index].1,
+                "SettingId::ALL[{index}] ({id:?}) must map to {:?}",
+                pinned[index].1
+            );
+            assert_eq!(
+                ReldexSettingId::from_i32(pinned[index].1 as i32),
+                Some(pinned[index].1),
+                "the numeric id for {:?} must round-trip through from_i32",
+                pinned[index].1
+            );
         }
     }
 }
