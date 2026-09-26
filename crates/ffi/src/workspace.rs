@@ -118,7 +118,15 @@ fn store_error(prefix: &str, error: StoreError) -> DbError {
 }
 
 fn profile_error(prefix: &str, error: ProfileError) -> DbError {
-    DbError::new(ErrorKind::Configuration, format!("{prefix}: {error}"))
+    // Which rule refused the profile rides in `native_code`, exactly as
+    // `credential_error` does for `CredentialError`; `ProfileError`'s
+    // `Display` names the field (and the credential-pattern class) and never
+    // the field's text, so it is safe as the native message.
+    let native = reldex_db_driver_api::NativeError::new(
+        ReldexProfileError::from(&error) as i32,
+        error.to_string(),
+    );
+    DbError::new(ErrorKind::Configuration, format!("{prefix}: {error}")).with_native(native)
 }
 
 fn id_error(prefix: &str, error: IdError) -> DbError {
@@ -1634,6 +1642,55 @@ pub enum ReldexSettingError {
     /// [`SettingError::UnlimitedNotAllowed`]: `no_limit` was set for a
     /// setting that requires a limit.
     UnlimitedNotAllowed = 4,
+}
+
+/// Why a profile was refused — the FFI shape of `reldex_workspace::
+/// ProfileError`, one variant per Rust variant (ABI 3.2, M2.15; mirroring
+/// [`ReldexCredentialError`]).
+///
+/// Carried as [`crate::ReldexErrorView::native_code`] on the
+/// `RELDEX_ERROR_KIND_CONFIGURATION` error a `reldex_workspace_create_profile`
+/// or `reldex_workspace_update_profile` reply carries. `native_message` names
+/// the field — and, for [`Self::CredentialInEndpoint`], the kind of
+/// credential-looking text it matched — and never the field's text, so a UI
+/// can show it verbatim. Before 3.2 every one of these arrived as the same
+/// `CONFIGURATION` error with nothing typed to tell them apart.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReldexProfileError {
+    /// A reason this header does not know.
+    Unknown = 0,
+    /// A required text field is empty (the name: or only whitespace).
+    Empty = 1,
+    /// A text field is too long.
+    TooLong = 2,
+    /// A text field contains a NUL or another control character.
+    ControlCharacter = 3,
+    /// Port 0 is not a listener.
+    PortZero = 4,
+    /// The CA directory path is not valid Unicode.
+    PathNotUnicode = 5,
+    /// An endpoint field contains credential-looking text (refused so a
+    /// password never lands in the profile store; ADR-0006).
+    CredentialInEndpoint = 6,
+    /// "Treat as production" contradicts the environment.
+    ProductionFlagMismatch = 7,
+}
+
+impl From<&ProfileError> for ReldexProfileError {
+    fn from(error: &ProfileError) -> Self {
+        match error {
+            ProfileError::Empty { .. } => Self::Empty,
+            ProfileError::TooLong { .. } => Self::TooLong,
+            ProfileError::ControlCharacter { .. } => Self::ControlCharacter,
+            ProfileError::PortZero => Self::PortZero,
+            ProfileError::PathNotUnicode => Self::PathNotUnicode,
+            ProfileError::CredentialInEndpoint { .. } => Self::CredentialInEndpoint,
+            ProfileError::ProductionFlagMismatch => Self::ProductionFlagMismatch,
+            // `ProfileError` is `#[non_exhaustive]`.
+            _ => Self::Unknown,
+        }
+    }
 }
 
 impl From<SettingError> for ReldexSettingError {
@@ -5190,6 +5247,61 @@ mod tests {
             tab_order: 0,
             created_at: 0,
             updated_at: 0,
+        }
+    }
+
+    // ========================================================================
+    // M2.15: `ProfileError` crosses the ABI as a numeric enum too.
+    // ========================================================================
+
+    #[test]
+    fn every_profile_error_variant_maps_to_its_own_reldex_profile_error_as_native_code() {
+        use reldex_workspace::{CredentialPattern, ProfileField};
+        let cases = [
+            (
+                ProfileError::Empty {
+                    field: ProfileField::Name,
+                },
+                ReldexProfileError::Empty,
+            ),
+            (
+                ProfileError::TooLong {
+                    field: ProfileField::Host,
+                },
+                ReldexProfileError::TooLong,
+            ),
+            (
+                ProfileError::ControlCharacter {
+                    field: ProfileField::Username,
+                },
+                ReldexProfileError::ControlCharacter,
+            ),
+            (ProfileError::PortZero, ReldexProfileError::PortZero),
+            (
+                ProfileError::PathNotUnicode,
+                ReldexProfileError::PathNotUnicode,
+            ),
+            (
+                ProfileError::CredentialInEndpoint {
+                    field: ProfileField::ConnectString,
+                    pattern: CredentialPattern::PasswordKeyword,
+                },
+                ReldexProfileError::CredentialInEndpoint,
+            ),
+            (
+                ProfileError::ProductionFlagMismatch,
+                ReldexProfileError::ProductionFlagMismatch,
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(ReldexProfileError::from(&input), expected, "{input:?}");
+            let built = profile_error("create_profile", input.clone());
+            assert_eq!(built.kind(), ErrorKind::Configuration, "{input:?}");
+            let native = built
+                .native()
+                .unwrap_or_else(|| panic!("{input:?} must carry a native code"));
+            assert_eq!(native.code(), expected as i32, "{input:?}");
+            assert_eq!(native.message(), input.to_string(), "{input:?}");
         }
     }
 

@@ -37,8 +37,8 @@
 // FFI gaps this class works around, documented in the M3.2 hand-off (see
 // ui/README.md "Connection manager (M3.2)"):
 //  * `reldex_hub_open_session` accepts only `RELDEX_DRIVER_KIND_MOCK` in this
-//    build, and the mock cannot be configured to fail its open or a ping --
-//    so `testConnect()` proves the pipeline (build params -> open -> ping ->
+//    build, and (until ABI 3.2) the mock could not be configured to fail its
+//    open or a ping -- so `testConnect()` proves the pipeline (build params -> open -> ping ->
 //    close) rather than a real socket to the target database. A profile's own
 //    typed failures (an invalid profile, a missing password) are still real,
 //    caught entirely by `reldex_workspace_build_connect_params` before any
@@ -50,7 +50,13 @@
 //    the pattern class and never the text", `crates/workspace/src/
 //    profile.rs`), so this class shows that message verbatim under one
 //    message key (`error.configuration`) rather than inventing a fragile
-//    English-text parse to recover a finer one. Deferred to M2.15.
+//    English-text parse to recover a finer one.
+//  * Both closed on the FFI side by M2.15 (ABI 3.2): a refused profile's
+//    reply now carries a `ReldexProfileError` as `native_code`, and
+//    `ReldexMockScenarioConfig` gained `connect_failure`/`ping_failure`.
+//    Mapping the former to finer message keys and driving this class's
+//    failure-path tests through the latter are follow-ups for this class; it
+//    does not use either yet.
 //
 // Fixed since the first version of this class (M3.2 fix round, 2026-09-26):
 // `reldex_workspace_open` now creates a non-in-memory store's directory and

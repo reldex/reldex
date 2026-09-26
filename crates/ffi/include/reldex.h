@@ -2206,6 +2206,66 @@ typedef int32_t ReldexMockFailure;
 #endif // __cplusplus
 
 /**
+ * Why a profile was refused — the FFI shape of `reldex_workspace::
+ * ProfileError`, one variant per Rust variant (ABI 3.2, M2.15; mirroring
+ * [`ReldexCredentialError`]).
+ *
+ * Carried as [`crate::ReldexErrorView::native_code`] on the
+ * `RELDEX_ERROR_KIND_CONFIGURATION` error a `reldex_workspace_create_profile`
+ * or `reldex_workspace_update_profile` reply carries. `native_message` names
+ * the field — and, for [`Self::CredentialInEndpoint`], the kind of
+ * credential-looking text it matched — and never the field's text, so a UI
+ * can show it verbatim. Before 3.2 every one of these arrived as the same
+ * `CONFIGURATION` error with nothing typed to tell them apart.
+ */
+enum ReldexProfileError
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * A reason this header does not know.
+   */
+  RELDEX_PROFILE_ERROR_UNKNOWN = 0,
+  /**
+   * A required text field is empty (the name: or only whitespace).
+   */
+  RELDEX_PROFILE_ERROR_EMPTY = 1,
+  /**
+   * A text field is too long.
+   */
+  RELDEX_PROFILE_ERROR_TOO_LONG = 2,
+  /**
+   * A text field contains a NUL or another control character.
+   */
+  RELDEX_PROFILE_ERROR_CONTROL_CHARACTER = 3,
+  /**
+   * Port 0 is not a listener.
+   */
+  RELDEX_PROFILE_ERROR_PORT_ZERO = 4,
+  /**
+   * The CA directory path is not valid Unicode.
+   */
+  RELDEX_PROFILE_ERROR_PATH_NOT_UNICODE = 5,
+  /**
+   * An endpoint field contains credential-looking text (refused so a
+   * password never lands in the profile store; ADR-0006).
+   */
+  RELDEX_PROFILE_ERROR_CREDENTIAL_IN_ENDPOINT = 6,
+  /**
+   * "Treat as production" contradicts the environment.
+   */
+  RELDEX_PROFILE_ERROR_PRODUCTION_FLAG_MISMATCH = 7,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum ReldexProfileError ReldexProfileError;
+#else
+typedef int32_t ReldexProfileError;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
  * One fetched batch, owned by the caller from the moment its event is handed
  * out until [`reldex_batch_release`].
  *

@@ -691,10 +691,16 @@ Not fixed here — `crates/ffi` was otherwise out of scope for this task:
   no raw endpoint or password text, per `crates/workspace/src/profile.rs`'s
   `Display` impls), but a future caller wanting to react differently to, say,
   "credential pattern refused" versus "environment/production mismatch" has
-  no numeric code to switch on. Deferred to M2.15.
+  no numeric code to switch on. **FFI side fixed in M2.15 (ABI 3.2):** the
+  `CONFIGURATION` error a refused `create_profile`/`update_profile` reply
+  carries now has a `ReldexProfileError` as its `native_code`, one value per
+  `ProfileError` variant. `ConnectionManager` does not map it to finer
+  message keys yet — a follow-up.
 - **The hub can only open `RELDEX_DRIVER_KIND_MOCK` sessions in this build,
   and the mock has no configurable open/ping failure**
-  (`ReldexMockScenarioConfig` has no such field). Test-connect's "typed
+  (`ReldexMockScenarioConfig` had no such field until M2.15, ABI 3.2, added
+  `connect_failure`/`ping_failure`; this section's tests do not use them
+  yet — a follow-up). Test-connect's "typed
   failure" test coverage therefore exercises the
   `build_connect_params`/profile-validation stage (`PasswordRequired`, folded
   to `error.configuration`) rather than a real connect/authentication
@@ -1603,14 +1609,16 @@ module (`Qt6Charts`, `Qt6WebEngineCore`, etc.) is present.
   `ReldexOpenOptions` with `RELDEX_DRIVER_KIND_MOCK`, because that is the only
   kind this build of `reldex-ffi` accepts (ADR-0003 A8). Connection profiles
   exist as of M3.2 (see "Connection manager (M3.2)" above); a real driver is
-  still M3/M4. `ReldexMockScenarioConfig` also has no configurable open/ping
-  failure, which limits M3.2's test-connect failure-path test coverage to the
-  profile-validation stage — see that section's "FFI gaps found".
-- **`ProfileError` has no per-variant numeric sub-code across the ABI**
-  (M3.2). Every profile/connect-param validation failure, including the
-  credential-pattern refusal, surfaces under one `error.configuration`
-  message key. Deferred to M2.15. See "Connection manager (M3.2)" → "FFI gaps
+  still M3/M4. Until M2.15 (ABI 3.2) `ReldexMockScenarioConfig` had no
+  configurable open/ping failure, which limits M3.2's test-connect
+  failure-path test coverage to the profile-validation stage; the fields now
+  exist but those tests do not use them yet — see that section's "FFI gaps
   found".
+- **Every profile/connect-param validation failure surfaces under one
+  `error.configuration` message key** (M3.2), including the credential-pattern
+  refusal. Since M2.15 (ABI 3.2) the reply carries a `ReldexProfileError` as
+  `native_code`; mapping it to finer keys is a follow-up. See "Connection
+  manager (M3.2)" → "FFI gaps found".
 - **The connection dialog has no transport/CA/certificate-pin controls**
   (M3.2; M3.5, Opus, adds them). Every profile is created with
   `transport: Plain` and an empty `caDirectory`. See "Connection manager
