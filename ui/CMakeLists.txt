@@ -165,6 +165,7 @@ set(RELDEX_APP_QML_FILES
     OutputPanes.qml
     StatusBar.qml
     ConnectionManagerDialog.qml
+    ProductionIndicator.qml
 )
 
 enable_testing()
