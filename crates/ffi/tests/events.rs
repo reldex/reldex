@@ -19,8 +19,9 @@ use reldex_ffi::{
     ReldexAbandonOutcome, ReldexCloseDisposition, ReldexCloseOutcome, ReldexCompletedOperation,
     ReldexErrorKind, ReldexEvent, ReldexEventKind, ReldexMockFailure, ReldexMockScenarioConfig,
     ReldexMockStatement, ReldexOpenOptions, ReldexSessionState, ReldexStatus,
-    reldex_hub_open_session, reldex_hub_pending_events, reldex_mock_statement,
-    reldex_server_output_lines_count, reldex_server_output_lines_get, reldex_session_execute,
+    reldex_hub_next_event, reldex_hub_open_session, reldex_hub_pending_events,
+    reldex_mock_statement, reldex_server_output_lines_count, reldex_server_output_lines_get,
+    reldex_session_execute,
 };
 
 use support::{ErrorSnapshot, Harness, take_error, wait_until};
@@ -29,6 +30,7 @@ fn config() -> ReldexMockScenarioConfig {
     ReldexMockScenarioConfig {
         rows: 100,
         seed: 3,
+        server_output: true,
         ..ReldexMockScenarioConfig::default()
     }
 }
@@ -88,14 +90,13 @@ fn until_terminal(harness: &Harness) -> Vec<Seen> {
     }
 }
 
-/// Every event, of any kind, until (and including) the reply to `request`.
+/// Every event, of any kind, until (and including) the reply to `request`:
+/// the one event that carries `request` in its `request` field.
 fn until_reply(harness: &Harness, request: u64) -> Vec<Seen> {
     let mut events = Vec::new();
     loop {
         let event = seen(harness.next_any_event());
-        let done = event.request == request
-            && !event.is(ReldexEventKind::Executing)
-            && !event.is(ReldexEventKind::Terminal);
+        let done = event.request == request;
         events.push(event);
         if done {
             return events;
@@ -456,7 +457,14 @@ fn executing_opens_a_statement_and_transaction_state_tracks_the_transaction() {
         started.is(ReldexEventKind::Executing),
         "EXECUTING comes first"
     );
-    assert_eq!(started.request, 2, "and names the statement it is about");
+    assert_eq!(
+        started.request, 0,
+        "EXECUTING answers nothing, so a 3.1 caller sees an unknown unsolicited kind"
+    );
+    assert_eq!(
+        started.event.executing_request, 2,
+        "and names the statement it is about in its own field"
+    );
     assert!(started.event.has_deadline);
     assert_eq!(started.event.deadline_ms, 5_000);
     assert!(
@@ -505,6 +513,153 @@ fn executing_opens_a_statement_and_transaction_state_tracks_the_transaction() {
     let events = until_reply(&harness, 4);
     assert!(events[0].is(ReldexEventKind::Executing));
     assert!(!events[0].event.has_deadline);
+}
+
+/// The 3.1 contract a 3.1 adapter still relies on, and the reason ABI 3.2 is
+/// additive: every accepted request's id is carried by exactly one event, its
+/// reply, and every other event carries `0` — progress and notifications
+/// included.
+#[test]
+fn exactly_one_event_carries_each_request_id() {
+    let harness = Harness::new();
+    let session = harness.open(config());
+    assert_eq!(
+        harness.set_server_output(session, 2, true),
+        ReldexStatus::Ok
+    );
+    for (request, statement) in [
+        (3, ReldexMockStatement::Dml),
+        (4, ReldexMockStatement::ServerOutput),
+        (5, ReldexMockStatement::GeneratedQuery),
+    ] {
+        assert_eq!(
+            harness.execute(session, request, statement),
+            ReldexStatus::Ok
+        );
+    }
+    assert_eq!(harness.commit(session, 6), ReldexStatus::Ok);
+    assert_eq!(
+        harness.close(session, 7, ReldexCloseDisposition::Rollback),
+        ReldexStatus::Ok
+    );
+    let events = until_terminal(&harness);
+
+    let mut carried = std::collections::BTreeMap::<u64, Vec<i32>>::new();
+    for event in &events {
+        if event.request != 0 {
+            carried.entry(event.request).or_default().push(event.kind);
+        }
+    }
+    let replies = [
+        (2, ReldexEventKind::ServerOutputConfigured),
+        (3, ReldexEventKind::Executed),
+        (4, ReldexEventKind::Executed),
+        (5, ReldexEventKind::Executed),
+        (6, ReldexEventKind::Completed),
+        (7, ReldexEventKind::SessionClosed),
+    ];
+    let expected: std::collections::BTreeMap<u64, Vec<i32>> = replies
+        .into_iter()
+        .map(|(request, kind)| (request, vec![kind as i32]))
+        .collect();
+    assert_eq!(
+        carried, expected,
+        "one event per request, and it is the reply"
+    );
+
+    let started: Vec<u64> = events
+        .iter()
+        .filter(|event| event.is(ReldexEventKind::Executing))
+        .map(|event| event.event.executing_request)
+        .collect();
+    assert_eq!(started, [3, 4, 5], "EXECUTING names each statement instead");
+    assert!(
+        events
+            .iter()
+            .any(|event| event.is(ReldexEventKind::TransactionState)),
+        "the DML's transaction was announced, with no request id"
+    );
+}
+
+/// A caller built against a 3.1 header declares 3.1's smaller `struct_size`,
+/// and gets 3.1's event stream: no kind its header predates, and no wake whose
+/// only news is one — so "wait for the wake, take the reply" still works, as
+/// origin/main's own `smoke.c` does.
+#[test]
+fn a_caller_built_against_3_1_is_never_given_a_3_2_kind_nor_woken_for_one() {
+    let harness = Harness::new();
+    let session = harness.open(config());
+    // `sizeof(ReldexEvent)` in the 3.1 header: 3.2's first field past it.
+    let legacy_size = u32::try_from(std::mem::offset_of!(ReldexEvent, deadline_ms)).expect("small");
+    let take = || {
+        let mut event = ReldexEvent {
+            struct_size: legacy_size,
+            ..ReldexEvent::default()
+        };
+        // SAFETY: the hub is live and `event` is a real local.
+        unsafe { reldex_hub_next_event(harness.hub(), &raw mut event) }.then(|| {
+            assert_eq!(event.struct_size, legacy_size, "3.1's size is honoured");
+            seen(event)
+        })
+    };
+    // Every drain a 3.1 caller makes declares its size; this is the first.
+    assert!(take().is_none());
+
+    // One request at a time, exactly as the 3.1 smoke harness does: submit,
+    // wait for the wake, take one event, and it is the reply.
+    let mut result = 0;
+    let steps: [(u64, ReldexEventKind); 4] = [
+        (2, ReldexEventKind::Executed),
+        (3, ReldexEventKind::Executed),
+        (4, ReldexEventKind::Fetched),
+        (5, ReldexEventKind::Completed),
+    ];
+    for (request, expected) in steps {
+        let before = harness.signal.wakes();
+        let status = match request {
+            2 => harness.execute(session, request, ReldexMockStatement::Dml),
+            3 => harness.execute(session, request, ReldexMockStatement::GeneratedQuery),
+            4 => harness.fetch(session, request, result, 10),
+            _ => harness.commit(session, request),
+        };
+        assert_eq!(status, ReldexStatus::Ok);
+        assert!(harness.signal.wait_past(before) > before, "woken");
+        let reply = take().expect("the wake had something a 3.1 caller can take");
+        assert!(
+            reply.is(expected),
+            "request {request}: got kind {}",
+            reply.kind
+        );
+        assert_eq!(reply.request, request);
+        if request == 3 {
+            result = reply.event.result;
+        }
+    }
+
+    assert_eq!(
+        harness.close(session, 6, ReldexCloseDisposition::Rollback),
+        ReldexStatus::Ok
+    );
+    let mut rest = Vec::new();
+    let mut seen_wakes = harness.signal.wakes();
+    while !rest
+        .iter()
+        .any(|event: &Seen| event.is(ReldexEventKind::Terminal))
+    {
+        match take() {
+            Some(event) => rest.push(event),
+            None => seen_wakes = harness.signal.wait_past(seen_wakes),
+        }
+    }
+    let kinds: Vec<i32> = rest.iter().map(|event| event.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            ReldexEventKind::SessionClosed as i32,
+            ReldexEventKind::Terminal as i32
+        ]
+    );
+    assert!(take().is_none());
 }
 
 // ---------------------------------------------------------------- server output

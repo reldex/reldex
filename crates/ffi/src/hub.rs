@@ -22,8 +22,8 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 
 use reldex_db_core::{
     EventCaps, EventQueue, RequestId, SessionEvent, SessionId, SessionManager, SessionRegistry,
@@ -32,7 +32,7 @@ use reldex_db_core::{
 
 use crate::batch::ResultColumns;
 use crate::error::set_last_argument_error;
-use crate::event::ReldexEvent;
+use crate::event::{EVENT_SIZE_3_2, ReldexEvent, introduced_in_3_2};
 use crate::session::SessionEntry;
 use crate::status::{ReldexStatus, WakerGuard, entry, entry_value};
 use crate::strings::{check_out_struct, write_out_struct};
@@ -66,6 +66,7 @@ pub type ReldexWakeFn = Option<extern "C" fn(user_data: *mut c_void)>;
 struct Wake {
     func: extern "C" fn(*mut c_void),
     user_data: *mut c_void,
+    hub: Weak<ReldexHub>,
 }
 
 // SAFETY: `user_data` is an opaque token this library never dereferences; it
@@ -81,12 +82,75 @@ unsafe impl Sync for Wake {}
 
 impl reldex_db_core::Waker for Wake {
     fn wake(&self) {
+        if !self.anything_visible() {
+            return;
+        }
         // Any `reldex_*` call the callback makes is refused while this is held
         // — including on the caller's own thread, where a submit can wake —
         // rather than deadlocking or re-entering the queue it is being told
-        // about (D5 rule 1).
+        // about (D5 rule 1). Nothing of this crate's is locked by now.
         let _guard = WakerGuard::enter();
         (self.func)(self.user_data);
+    }
+}
+
+impl Wake {
+    /// Whether this wake has something the caller will be given.
+    ///
+    /// Always, for a caller built against ABI 3.2 or later. For an older one,
+    /// the kinds its header predates are never delivered (`introduced_in_3_2`),
+    /// so a wake whose only news is one of them would be a wake with nothing
+    /// to take — which a 3.1 caller had never seen, and some assume cannot
+    /// happen. Such events are taken off the queue here and discarded, and the
+    /// first event that caller can see is parked in `HubQueue::front`, so the
+    /// queue's empty → non-empty edge still fires for the next one.
+    ///
+    /// Runs on whichever thread made the queue non-empty, with no `db-core`
+    /// lock held. It only `try_lock`s the hub's queue: if the caller is inside
+    /// a drain, or `reldex_hub_set_waker` is waiting for this wake to finish,
+    /// it does not wait — it lets the wake through, which is always safe.
+    fn anything_visible(&self) -> bool {
+        let Some(hub) = self.hub.upgrade() else {
+            return true;
+        };
+        if !hub.legacy_caller.load(Ordering::Acquire) {
+            return true;
+        }
+        let mut queue = match hub.queue.try_lock() {
+            Ok(queue) => queue,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return true,
+        };
+        if queue.front.is_some() {
+            return true;
+        }
+        while let Some(event) = queue.events.next() {
+            if introduced_in_3_2(&event) {
+                hub.discard(&event);
+            } else {
+                queue.front = Some(event);
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// `db-core`'s queue, plus at most one event already taken out of it on a
+/// pre-3.2 caller's behalf ([`Wake::anything_visible`]). Everything that
+/// takes from the hub takes `front` first, so order is unchanged.
+struct HubQueue {
+    events: EventQueue,
+    front: Option<SessionEvent>,
+}
+
+impl HubQueue {
+    fn next(&mut self) -> Option<SessionEvent> {
+        self.front.take().or_else(|| self.events.next())
+    }
+
+    fn len(&self) -> usize {
+        self.events.len() + usize::from(self.front.is_some())
     }
 }
 
@@ -136,7 +200,10 @@ pub struct ReldexHub {
     /// mutex is what lets the hub be shared with the one call that may come
     /// from another thread (`reldex_session_request_cancel`, which never
     /// touches it); on the drain path it is uncontended.
-    queue: Mutex<EventQueue>,
+    queue: Mutex<HubQueue>,
+    /// The caller's last `reldex_hub_next_event` declared a `struct_size` from
+    /// a header older than ABI 3.2 (see [`Wake::anything_visible`]).
+    legacy_caller: AtomicBool,
     pub(crate) registry: SessionRegistry,
     pub(crate) sessions: Mutex<IdMap<Arc<SessionEntry>>>,
     /// Keyed by the `db-core` request id this hub allocated (never the
@@ -192,7 +259,11 @@ impl ReldexHub {
     fn new() -> Self {
         let (sink, queue) = event_channel(EventCaps::new());
         Self {
-            queue: Mutex::new(queue),
+            queue: Mutex::new(HubQueue {
+                events: queue,
+                front: None,
+            }),
+            legacy_caller: AtomicBool::new(false),
             registry: SessionRegistry::new(SessionManager::new(), sink),
             sessions: Mutex::new(IdMap::default()),
             pending: Mutex::new(IdMap::default()),
@@ -239,7 +310,7 @@ impl ReldexHub {
 
     /// Output lines this session lost that no delivered event has reported.
     pub(crate) fn pending_dropped_lines(&self, session: SessionId) -> u32 {
-        lock(&self.queue).pending_dropped_lines(session)
+        lock(&self.queue).events.pending_dropped_lines(session)
     }
 
     /// Takes the next `db-core` event without translating it, for the unit
@@ -256,13 +327,26 @@ impl ReldexHub {
         }
     }
 
-    fn set_waker(&self, func: ReldexWakeFn, user_data: *mut c_void) {
-        let waker =
-            func.map(|func| Arc::new(Wake { func, user_data }) as Arc<dyn reldex_db_core::Waker>);
+    fn set_waker(self: &Arc<Self>, func: ReldexWakeFn, user_data: *mut c_void) {
+        let waker = func.map(|func| {
+            Arc::new(Wake {
+                func,
+                user_data,
+                hub: Arc::downgrade(self),
+            }) as Arc<dyn reldex_db_core::Waker>
+        });
         // Does not return while a wake is in flight: `EventQueue` read-locks
         // its registration for the duration of every wake (D5 rule 2, spike
-        // criterion K5).
-        lock(&self.queue).set_waker(waker);
+        // criterion K5). A wake in flight only ever `try_lock`s this mutex,
+        // so holding it here cannot deadlock against one.
+        lock(&self.queue).events.set_waker(waker);
+    }
+
+    /// Drops an event a pre-3.2 caller is never given, releasing what this
+    /// hub kept for it: a `FETCHED_SEGMENT` is a reply, and its pending entry
+    /// goes with it; the other two own nothing.
+    fn discard(&self, event: &SessionEvent) {
+        drop(self.pending_for(event));
     }
 }
 
@@ -506,6 +590,14 @@ pub unsafe extern "C" fn reldex_hub_pending_events(hub: *const ReldexHub) -> usi
 
 /// Takes the next event, or reports that there is none. Never blocks.
 ///
+/// **A caller is never given a kind its header predates.** `out->struct_size`
+/// says which header the caller was built against: below 3.2's `ReldexEvent`
+/// size, the kinds ABI 3.2 introduced (`EXECUTING`, `TRANSACTION_STATE`,
+/// `FETCHED_SEGMENT`) are taken off the queue and discarded rather than
+/// delivered — none owns anything or answers a request such a caller can
+/// make — and the waker is not called for a wake whose only news is one of
+/// them. A 3.1 caller therefore sees exactly 3.1's event kinds.
+///
 /// Returns `true` when `out` was filled. The caller then **owns** `out->error`,
 /// `out->batch` and `out->server_output_lines` when they are non-null. Drain in
 /// a loop until this returns `false`, budgeting the loop so a flood cannot
@@ -557,11 +649,24 @@ pub unsafe extern "C" fn reldex_hub_next_event(hub: *mut ReldexHub, out: *mut Re
             );
             return false;
         }
+        // SAFETY: `check_out_struct` just proved `out` non-null, aligned and
+        // its leading `u32` initialized.
+        let declared = unsafe { out.cast::<u32>().read() } as usize;
+        let legacy = declared < EVENT_SIZE_3_2;
         let take = |hub: &Arc<ReldexHub>| {
-            // The queue's lock is released before translating: translation
-            // can retire a session, which must not happen under it.
-            let Some(event) = lock(&hub.queue).next() else {
-                return false;
+            hub.legacy_caller.store(legacy, Ordering::Release);
+            let event = loop {
+                // The queue's lock is released before translating: translation
+                // can retire a session, which must not happen under it.
+                let Some(event) = lock(&hub.queue).next() else {
+                    return false;
+                };
+                // A caller whose header predates a kind is never given it.
+                if legacy && introduced_in_3_2(&event) {
+                    hub.discard(&event);
+                    continue;
+                }
+                break event;
             };
             let event = crate::session::translate(hub, event);
             // SAFETY: `out` was just checked non-null, aligned and large

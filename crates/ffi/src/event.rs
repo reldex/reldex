@@ -166,13 +166,17 @@ pub enum ReldexEventKind {
     /// observe it.
     Terminal = 9,
     /// Progress, not a reply (ABI 3.2): the worker has **started** the
-    /// statement submitted as `request` — it has left the queue, and
-    /// `deadline_ms`/`has_deadline` echo the limit actually armed on it. This
-    /// is the honest "running, with this limit" state a UI shows on a driver
-    /// that cannot cancel (`SPEC.md` §24.8). The one reply to that request is
-    /// still its `EXECUTED`, which always follows; an adapter that treats
-    /// every event carrying a known `request` as that request's reply must
-    /// switch on `kind` first.
+    /// statement submitted as `executing_request` — it has left the queue,
+    /// and `deadline_ms`/`has_deadline` echo the limit actually armed on it.
+    /// This is the honest "running, with this limit" state a UI shows on a
+    /// driver that cannot cancel (`SPEC.md` §24.8). The one reply to that
+    /// request is still its `EXECUTED`, which always follows.
+    ///
+    /// `request` is `0`, as on every other kind that answers nothing: exactly
+    /// one event per accepted request carries that request's id, its reply —
+    /// the 3.1 contract, unchanged. Like the other two kinds 3.2 added, it is
+    /// never delivered to a caller whose `struct_size` predates 3.2 (see
+    /// `reldex_hub_next_event`).
     Executing = 10,
     /// Unsolicited (ABI 3.2): whether a transaction may be open on this
     /// session flipped; read `transaction_possibly_active`. Advisory — it
@@ -323,9 +327,11 @@ pub struct ReldexEvent {
     pub kind: i32,
     /// The session this reply belongs to.
     pub session: u64,
-    /// The `request_id` the caller passed to the submitting call: on a reply,
-    /// the request it answers; on `Executing`, the execute that started. `0`
-    /// on the unsolicited kinds (`ServerOutput`, `TransactionState`,
+    /// The `request_id` the caller passed to the submitting call, on a reply:
+    /// the request it answers. Exactly one event per accepted request carries
+    /// that request's id. `0` on every kind that answers nothing — progress
+    /// (`Executing`, which names its statement in `executing_request`
+    /// instead) and the unsolicited kinds (`ServerOutput`, `TransactionState`,
     /// `Terminal`).
     pub request: u64,
     /// The result set this event is about, when `has_result`:
@@ -430,6 +436,31 @@ pub struct ReldexEvent {
     /// `Executing` (ABI 3.2): the deadline armed on the statement, in
     /// milliseconds, when `has_deadline`.
     pub deadline_ms: u64,
+    /// `Executing` (ABI 3.2): the `request_id` of the execute that started.
+    /// Its `EXECUTED` — the one event that carries this id in `request` — is
+    /// still to come. `0` on every other kind.
+    pub executing_request: u64,
+}
+
+/// How much of [`ReldexEvent`] a caller built against ABI 3.2 or later
+/// declares: everything up to and including `executing_request`. A smaller
+/// `struct_size` comes from an older header, whose caller is never handed a
+/// kind that header predates (see [`introduced_in_3_2`]).
+pub(crate) const EVENT_SIZE_3_2: usize =
+    std::mem::offset_of!(ReldexEvent, executing_request) + size_of::<u64>();
+
+/// Whether `event` translates to a kind ABI 3.2 introduced (`EXECUTING`,
+/// `TRANSACTION_STATE`, `FETCHED_SEGMENT`). None of them owns anything a
+/// caller must release, and none answers a request a pre-3.2 caller can
+/// make, so a caller whose header predates them is simply never given one:
+/// its event stream keeps 3.1's shape (ADR-0003 A26, A35).
+pub(crate) const fn introduced_in_3_2(event: &reldex_db_core::SessionEvent) -> bool {
+    matches!(
+        event,
+        reldex_db_core::SessionEvent::Executing { .. }
+            | reldex_db_core::SessionEvent::TransactionStateChanged { .. }
+            | reldex_db_core::SessionEvent::FetchedSegment { .. }
+    )
 }
 
 // SAFETY: `#[repr(C)]`, `struct_size` first, every field an integer, a `bool`
@@ -477,6 +508,7 @@ impl Default for ReldexEvent {
             transaction_possibly_active: false,
             abandoned: false,
             deadline_ms: 0,
+            executing_request: 0,
         }
     }
 }
@@ -513,6 +545,7 @@ pub(crate) struct QueuedEvent {
     pub(crate) server_output_lines: Option<Box<ReldexServerOutputLines>>,
     pub(crate) transaction_possibly_lost: bool,
     pub(crate) deadline_ms: Option<u64>,
+    pub(crate) executing_request: u64,
     pub(crate) transaction_possibly_active: bool,
     pub(crate) abandoned: bool,
 }
@@ -545,6 +578,7 @@ impl QueuedEvent {
             server_output_lines: None,
             transaction_possibly_lost: false,
             deadline_ms: None,
+            executing_request: 0,
             transaction_possibly_active: false,
             abandoned: false,
         }
@@ -609,7 +643,13 @@ impl QueuedEvent {
     }
 
     /// `Executing`: the deadline armed on the statement.
-    pub(crate) fn with_deadline(mut self, deadline: Option<std::time::Duration>) -> Self {
+    /// `Executing`: the statement that started, and the limit armed on it.
+    pub(crate) fn with_executing(
+        mut self,
+        request: u64,
+        deadline: Option<std::time::Duration>,
+    ) -> Self {
+        self.executing_request = request;
         self.deadline_ms =
             deadline.map(|limit| u64::try_from(limit.as_millis()).unwrap_or(u64::MAX));
         self
@@ -719,6 +759,7 @@ impl QueuedEvent {
             transaction_possibly_active: self.transaction_possibly_active,
             abandoned: self.abandoned,
             deadline_ms: self.deadline_ms.unwrap_or(0),
+            executing_request: self.executing_request,
             ..ReldexEvent::default()
         }
     }

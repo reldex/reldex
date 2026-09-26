@@ -82,13 +82,21 @@ A29, A32–A36). What a caller can rely on:
 - **`reldex_session_abandon`** relays to the registry and never blocks; it reports what it found
   (`ReldexAbandonOutcome`) and whether a transaction may have been lost. The session's `TERMINAL`
   then says `abandoned`.
-- **Progress and notifications**: `EXECUTING` (with the statement's request id and, if set, its
-  deadline) precedes that statement's `EXECUTED`; `TRANSACTION_STATE` reports
-  `transaction_possibly_active` when it changes (coalesced, never dropped); `SERVER_OUTPUT` arrives
-  ahead of the reply that follows it, with `server_output_dropped` and
-  `server_output_invalid_utf8_lines`. None of them answers a request — a caller must not let them
-  consume its request bookkeeping. `FETCHED_SEGMENT` is surfaced as an opaque kind; nothing in 3.2
-  submits one.
+- **Only a reply carries a request id.** Exactly one event per accepted request has that request's
+  id in `request` — the 3.1 contract, unchanged — and every other event has `0`.
+- **A caller is never given a kind its header predates.** `reldex_hub_next_event` reads the
+  caller's `struct_size`: below 3.2's `ReldexEvent` size, `EXECUTING`, `TRANSACTION_STATE` and
+  `FETCHED_SEGMENT` are discarded, not delivered, and no wake is raised for them alone. A 3.1
+  adapter sees 3.1's kinds and nothing else; origin/main's 3.1 `smoke.c`, built against the 3.1
+  header, passes 457/458 against this library. The one check it fails asserts that the library's
+  `sizeof(ReldexEvent)` *equals* the 3.1 header's, which no minor that appends a field can satisfy
+  (3.0 → 3.1 grew it from 112 to 152 bytes; 3.2 to 168); the 3.2 harness checks `>=` instead.
+- **Progress and notifications**: `EXECUTING` (`request == 0`; the statement's id is in
+  `executing_request`, and its deadline in `deadline_ms` when `has_deadline`) precedes that
+  statement's `EXECUTED`; `TRANSACTION_STATE` reports `transaction_possibly_active` when it changes
+  (coalesced, never dropped); `SERVER_OUTPUT` arrives ahead of the reply that follows it, with
+  `server_output_dropped` and `server_output_invalid_utf8_lines`. `FETCHED_SEGMENT` is surfaced as
+  an opaque kind; nothing in 3.2 submits one.
 - **Unknown kinds**: a kind this header predates arrives as its raw value, or as
   `RELDEX_EVENT_KIND_UNKNOWN` for a `db-core` event this build does not translate. Ignore both (D7).
 - **Bounds**: a session holds at most 1,024 accepted-but-undrained replies; past that a submit is

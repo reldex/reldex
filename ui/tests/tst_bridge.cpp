@@ -357,8 +357,9 @@ void TstBridge::aSessionLostMidStatementEndsWithTerminalAndStopsCounting()
 
 void TstBridge::progressAndUnknownEventsNeverTouchTheRequestBookkeeping()
 {
-    // EXECUTING carries the request id of the statement it announces; a kind
-    // no header defines may carry anything. Neither may consume the entry the
+    // EXECUTING names the statement it announces (in `executing_request`,
+    // with `request == 0`); a kind no header defines may carry anything,
+    // including a live request id. Neither may consume the entry the
     // statement's EXECUTED is owed (ABI 3.2; D7).
     Bridge bridge;
     QVERIFY(bridge.isValid());

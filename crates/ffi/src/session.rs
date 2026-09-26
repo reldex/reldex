@@ -502,6 +502,10 @@ pub(crate) unsafe fn with_session(
 pub(crate) fn translate(hub: &ReldexHub, event: SessionEvent) -> QueuedEvent {
     let pending = hub.pending_for(&event);
     let caller = pending.as_ref().map_or(0, |pending| pending.caller);
+    // Only a reply carries the caller's id in `request` — exactly one event per
+    // accepted request does (D5 rule 5, and the 3.1 contract a 3.1 adapter
+    // still relies on). Progress names its request elsewhere.
+    let answered = if event.is_reply() { caller } else { 0 };
     let id = event.session();
     let key = id.get();
     // Only the kinds that change this crate's per-session state look the
@@ -517,7 +521,7 @@ pub(crate) fn translate(hub: &ReldexHub, event: SessionEvent) -> QueuedEvent {
     // the session's state now.
     let usable = ReldexSessionState::Usable;
     let state = || entry.map_or(ReldexSessionState::Unknown, SessionEntry::state);
-    let reply = |kind| QueuedEvent::new(kind, key, caller);
+    let reply = |kind| QueuedEvent::new(kind, key, answered);
     let failed =
         |event: QueuedEvent, error: &DbError| event.with_error(ReldexError::from_db_error(error));
     match event {
@@ -641,9 +645,11 @@ pub(crate) fn translate(hub: &ReldexHub, event: SessionEvent) -> QueuedEvent {
                 .with_session_state(usable),
             Err(error) => failed(reply(ReldexEventKind::ServerOutputConfigured), &error),
         },
-        SessionEvent::Executing { deadline, .. } => reply(ReldexEventKind::Executing)
-            .with_deadline(deadline)
-            .with_session_state(state()),
+        SessionEvent::Executing { deadline, .. } => {
+            QueuedEvent::new(ReldexEventKind::Executing, key, 0)
+                .with_executing(caller, deadline)
+                .with_session_state(state())
+        }
         SessionEvent::ServerOutput {
             lines,
             dropped,
@@ -677,7 +683,8 @@ pub(crate) fn translate(hub: &ReldexHub, event: SessionEvent) -> QueuedEvent {
         // `LobChunk` (nothing in this ABI reads a LOB yet) and every variant
         // a later `db-core` adds: delivered as `RELDEX_EVENT_KIND_UNKNOWN`,
         // which an adapter already ignores (ADR-0003 D7), rather than dropped
-        // — its reply slot is released either way.
+        // — its reply slot is released either way. `request` is the caller's
+        // id only if the variant is a reply; a future progress kind carries 0.
         _ => reply(ReldexEventKind::Unknown),
     }
 }

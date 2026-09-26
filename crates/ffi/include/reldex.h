@@ -510,13 +510,17 @@ enum ReldexEventKind
   RELDEX_EVENT_KIND_TERMINAL = 9,
   /**
    * Progress, not a reply (ABI 3.2): the worker has **started** the
-   * statement submitted as `request` — it has left the queue, and
-   * `deadline_ms`/`has_deadline` echo the limit actually armed on it. This
-   * is the honest "running, with this limit" state a UI shows on a driver
-   * that cannot cancel (`SPEC.md` §24.8). The one reply to that request is
-   * still its `EXECUTED`, which always follows; an adapter that treats
-   * every event carrying a known `request` as that request's reply must
-   * switch on `kind` first.
+   * statement submitted as `executing_request` — it has left the queue,
+   * and `deadline_ms`/`has_deadline` echo the limit actually armed on it.
+   * This is the honest "running, with this limit" state a UI shows on a
+   * driver that cannot cancel (`SPEC.md` §24.8). The one reply to that
+   * request is still its `EXECUTED`, which always follows.
+   *
+   * `request` is `0`, as on every other kind that answers nothing: exactly
+   * one event per accepted request carries that request's id, its reply —
+   * the 3.1 contract, unchanged. Like the other two kinds 3.2 added, it is
+   * never delivered to a caller whose `struct_size` predates 3.2 (see
+   * `reldex_hub_next_event`).
    */
   RELDEX_EVENT_KIND_EXECUTING = 10,
   /**
@@ -2701,9 +2705,11 @@ typedef struct ReldexEvent {
    */
   uint64_t session;
   /**
-   * The `request_id` the caller passed to the submitting call: on a reply,
-   * the request it answers; on `Executing`, the execute that started. `0`
-   * on the unsolicited kinds (`ServerOutput`, `TransactionState`,
+   * The `request_id` the caller passed to the submitting call, on a reply:
+   * the request it answers. Exactly one event per accepted request carries
+   * that request's id. `0` on every kind that answers nothing — progress
+   * (`Executing`, which names its statement in `executing_request`
+   * instead) and the unsolicited kinds (`ServerOutput`, `TransactionState`,
    * `Terminal`).
    */
   uint64_t request;
@@ -2863,6 +2869,12 @@ typedef struct ReldexEvent {
    * milliseconds, when `has_deadline`.
    */
   uint64_t deadline_ms;
+  /**
+   * `Executing` (ABI 3.2): the `request_id` of the execute that started.
+   * Its `EXECUTED` — the one event that carries this id in `request` — is
+   * still to come. `0` on every other kind.
+   */
+  uint64_t executing_request;
 } ReldexEvent;
 
 /**
@@ -2971,6 +2983,14 @@ typedef struct ReldexMockScenarioConfig {
    * or destroy the hub — deterministically.
    */
   bool block_connect;
+  /**
+   * Advertises the `server_output` capability (ABI 3.2), so
+   * `reldex_session_set_server_output` is accepted and
+   * `RELDEX_MOCK_STATEMENT_SERVER_OUTPUT` prints. Off by default, exactly
+   * as in 3.1, where the world did not advertise it and setting output was
+   * refused — a 3.1 caller, whose struct ends before this field, keeps that.
+   */
+  bool server_output;
 } ReldexMockScenarioConfig;
 
 /**
@@ -4152,6 +4172,14 @@ size_t reldex_hub_pending_events(const struct ReldexHub *hub);
 
 /**
  * Takes the next event, or reports that there is none. Never blocks.
+ *
+ * **A caller is never given a kind its header predates.** `out->struct_size`
+ * says which header the caller was built against: below 3.2's `ReldexEvent`
+ * size, the kinds ABI 3.2 introduced (`EXECUTING`, `TRANSACTION_STATE`,
+ * `FETCHED_SEGMENT`) are taken off the queue and discarded rather than
+ * delivered — none owns anything or answers a request such a caller can
+ * make — and the waker is not called for a wake whose only news is one of
+ * them. A 3.1 caller therefore sees exactly 3.1's event kinds.
  *
  * Returns `true` when `out` was filled. The caller then **owns** `out->error`,
  * `out->batch` and `out->server_output_lines` when they are non-null. Drain in

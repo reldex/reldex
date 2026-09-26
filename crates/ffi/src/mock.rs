@@ -142,6 +142,12 @@ pub struct ReldexMockScenarioConfig {
     /// a caller can act on a session that is still connecting — abandon it,
     /// or destroy the hub — deterministically.
     pub block_connect: bool,
+    /// Advertises the `server_output` capability (ABI 3.2), so
+    /// `reldex_session_set_server_output` is accepted and
+    /// `RELDEX_MOCK_STATEMENT_SERVER_OUTPUT` prints. Off by default, exactly
+    /// as in 3.1, where the world did not advertise it and setting output was
+    /// refused — a 3.1 caller, whose struct ends before this field, keeps that.
+    pub server_output: bool,
 }
 
 // SAFETY: `#[repr(C)]`, `struct_size` first, integers and one `bool`, all
@@ -167,6 +173,7 @@ impl Default for ReldexMockScenarioConfig {
             connect_failure: ReldexMockFailure::None as i32,
             ping_failure: ReldexMockFailure::None as i32,
             block_connect: false,
+            server_output: false,
         }
     }
 }
@@ -312,7 +319,7 @@ pub(crate) fn build_driver(options: &ReldexOpenOptions) -> Result<DriverChoice, 
             .with_exact_transaction_state(true)
             .with_lob_streaming(true)
             .with_error_position(true)
-            .with_server_output(true),
+            .with_server_output(config.server_output),
     );
 
     let rows = if config.rows == 0 { 1_000 } else { config.rows };

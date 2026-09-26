@@ -395,13 +395,13 @@ void SessionController::handleEvent(const ReldexEvent &raw, reldex::BatchHandle 
                                     reldex::ErrorHandle error)
 {
     // Only a reply may touch the request bookkeeping. Everything else is
-    // handled -- or ignored -- first (ABI 3.2): `EXECUTING` carries the
-    // request id of the statement it announces, whose `EXECUTED` is still to
-    // come, so letting it through would consume that entry; `TERMINAL`,
-    // `SERVER_OUTPUT` and `TRANSACTION_STATE` answer no request
-    // (`request == 0`); and a kind this build does not know -- or
-    // `FETCHED_SEGMENT`, which it never asks for -- is ignored (D7) before it
-    // can do either.
+    // handled -- or ignored -- first (ABI 3.2): `EXECUTING`, `TERMINAL`,
+    // `SERVER_OUTPUT` and `TRANSACTION_STATE` answer no request (`request ==
+    // 0`; `EXECUTING` names its statement in `executing_request`), and a kind
+    // this build does not know -- or `FETCHED_SEGMENT`, which it never asks
+    // for -- is ignored (D7). The library already guarantees that only a
+    // reply carries a request id; switching on the kind first keeps this
+    // class from depending on that for anything but its assert.
     switch (raw.kind) {
     case RELDEX_EVENT_KIND_EXECUTING:
         return;

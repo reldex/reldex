@@ -1705,8 +1705,13 @@ int main(void)
      * skipped; the reply after it lands in the same oversized struct. */
     took = take_sized(hub, &large_event, (uint32_t)(sizeof(large_event) + 64), true);
     smoke_require(took, "an oversized (zero-padded) ReldexEvent is still accepted");
+    /* At least this header's size, and never more than was declared: a
+     * library from a later minor may report more of the struct valid than
+     * this header knows about (D7), so `==` would tie the check to one
+     * version. */
     smoke_check(
-        large_event.struct_size == (uint32_t)sizeof(ReldexEvent),
+        large_event.struct_size >= (uint32_t)sizeof(ReldexEvent)
+            && large_event.struct_size <= (uint32_t)(sizeof(large_event) + 64),
         "the library reports back how much of an oversized struct is valid");
     smoke_check(large_event.request == execute_b_request, "the oversized struct's request id is correct");
     smoke_check(large_event.kind == RELDEX_EVENT_KIND_EXECUTED, "the oversized struct's kind is correct");
@@ -1806,10 +1811,11 @@ int main(void)
 
     /* 11b. Server output (M2.11 family 2; delivered ahead of the reply
      * since ABI 3.2), on a dedicated session C so the carefully sequenced
-     * session A/B flow above stays untouched. The S14 world advertises the
-     * server_output capability since M2.15, so every mode is accepted and
-     * read back; then a statement that prints delivers its lines between
-     * its EXECUTING and its EXECUTED. */
+     * session A/B flow above stays untouched. Session C asks the S14 world
+     * to advertise the server_output capability (a 3.2 config field; off by
+     * default, as in 3.1), so every mode is accepted and read back; then a
+     * statement that prints delivers its lines between its EXECUTING and its
+     * EXECUTED. */
     {
         ReldexOpenOptions open_options_c;
         memset(&open_options_c, 0, sizeof(open_options_c));
@@ -1817,6 +1823,7 @@ int main(void)
         open_options_c.driver = RELDEX_DRIVER_KIND_MOCK;
         open_options_c.mock.struct_size = sizeof(open_options_c.mock);
         open_options_c.mock.scenario = RELDEX_MOCK_SCENARIO_S14;
+        open_options_c.mock.server_output = true;
 
         uint64_t session_c = 0;
         uint64_t open_c_request = next_request_id();
@@ -1874,7 +1881,8 @@ int main(void)
         smoke_require(status == RELDEX_STATUS_OK, "the printing statement is accepted");
         smoke_require(take_any_event(hub, &event), "the printing statement's first event arrives");
         smoke_check(event.kind == RELDEX_EVENT_KIND_EXECUTING, "EXECUTING comes first");
-        smoke_check(event.request == print_request, "EXECUTING names the statement's request");
+        smoke_check(event.request == 0, "EXECUTING answers nothing: request is 0, as for any unsolicited kind");
+        smoke_check(event.executing_request == print_request, "EXECUTING names the statement in executing_request");
         smoke_check(event.has_deadline && event.deadline_ms == 2500, "EXECUTING echoes the armed deadline");
         smoke_require(take_any_event(hub, &event), "the statement's output arrives");
         smoke_check(event.kind == RELDEX_EVENT_KIND_SERVER_OUTPUT, "SERVER_OUTPUT comes before the reply");

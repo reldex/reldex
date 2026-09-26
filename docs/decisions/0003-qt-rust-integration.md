@@ -961,14 +961,36 @@ A `FETCHED` batch is still the caller's memory once handed out; that part of A16
 
 All additive (a symbol, a trailing field, or an enum value; A26's rule):
 
-- Event kinds `EXECUTING` (10, carries the **request id** of the statement it announces and, if one
-  is set, its deadline), `TRANSACTION_STATE` (11, `transaction_possibly_active`) and
-  `FETCHED_SEGMENT` (12, opaque: result key and row count only; nothing in 3.2 submits one). A
-  `db-core` event this build does not translate arrives as `RELDEX_EVENT_KIND_UNKNOWN`. An adapter
-  must route only the reply kinds through its request bookkeeping. `EXECUTING` carries a live
-  request id whose `EXECUTED` is still to come.
+- Event kinds `EXECUTING` (10: `request` is `0`; the statement it announces is named in the new
+  `executing_request` field, with its deadline if one is set), `TRANSACTION_STATE` (11,
+  `transaction_possibly_active`) and `FETCHED_SEGMENT` (12, opaque: result key and row count only;
+  nothing in 3.2 submits one). A `db-core` event this build does not translate arrives as
+  `RELDEX_EVENT_KIND_UNKNOWN`, carrying the caller's request id only if it is a reply.
+- **Behaviourally additive, not just structurally.** The 3.1 contract — exactly one event per
+  accepted request carries that request's id, its reply — still holds, and every new kind carries
+  `request == 0`. A 3.1 adapter therefore sees each new kind as one more unsolicited kind it does
+  not know and ignores it (D7); no new rule is imposed on an old caller. **Correction (M2.15
+  review):** the first version of this change delivered `EXECUTING` with the live request id of the
+  statement in `request` and asked adapters to "route only reply kinds through bookkeeping" — a new
+  rule on old callers, contrary to A26. The 3.1 `smoke.c`, built against the 3.1 header and run
+  against the 3.2 library, failed at its first execute. `exactly_one_event_carries_each_request_id`
+  (`crates/ffi/tests/events.rs`) now pins the contract.
+- **A caller is never given a kind its header predates.** Moving the id out of `request` was not
+  enough on its own: a 3.1 caller that submits, waits for the wake and takes "the" reply — as the
+  3.1 smoke harness does, one request at a time — would take `EXECUTING` instead. The caller's
+  `struct_size` says which header it was built against (3.1's `ReldexEvent` is 152 bytes, 3.2's
+  168), so below 3.2's size `reldex_hub_next_event` discards the three 3.2 kinds instead of
+  delivering them. The waker is not called for a wake whose only news is one of them: it
+  `try_lock`s the hub's queue, discards them, and parks the first visible event in front of the
+  queue, so the next push still raises its edge. It never waits for the lock, and lets the wake
+  through when it cannot take it. Result: origin/main's 3.1 `smoke.c` passes **457/458** against
+  this library. The one failure asserts `returned struct_size == sizeof(ReldexEvent)` for a
+  caller that declared *more* than its header's size — equality with the older header's size,
+  which any minor that appends a field breaks (3.0 → 3.1 did, 112 → 152). The library reports
+  `min(declared, 168)`, which is D7's contract, and the 3.2 harness checks `>=`.
+  `a_caller_built_against_3_1_is_never_given_a_3_2_kind_nor_woken_for_one` pins the behaviour.
 - Trailing `ReldexEvent` fields `has_deadline`, `transaction_possibly_active`, `abandoned`,
-  `deadline_ms`. `TERMINAL` now carries the cause in `error` (caller-owned), and `SERVER_OUTPUT`
+  `deadline_ms`, `executing_request`. `TERMINAL` now carries the cause in `error` (caller-owned), and `SERVER_OUTPUT`
   carries its lines, `server_output_dropped`, `server_output_invalid_utf8_lines` and a read failure.
 - `reldex_session_abandon` and `ReldexAbandonOutcome`.
 - Mock only (`mock-driver` feature): `ReldexMockStatement` `SERVER_OUTPUT` (8) and `LOSE_SESSION` (9),
