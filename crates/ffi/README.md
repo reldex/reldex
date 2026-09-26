@@ -112,7 +112,14 @@ A29, A32–A36). What a caller can rely on:
   (256), with dropped output counted.
 - **What the drain costs**: translation now happens inside `reldex_hub_next_event`, on the caller's
   thread, including the one `ReldexBatch` allocation per `FETCHED` that the pump used to make on its
-  own thread. Measured before/after in ADR-0003 A37: about 1 µs more per event on the caller.
+  own thread. Measured before/after in ADR-0003 A37: about **1.1 µs** more per event on the caller
+  during the initial stream and about **2.4 µs** more per event under `streamscroll`; the whole
+  drain did not move beyond noise. Allocations per event taken: `FETCHED` 1 (the `ReldexBatch`
+  box), `EXECUTING`/`TRANSACTION_STATE`/`COMPLETED`/`SERVER_OUTPUT_CONFIGURED`/a DML's `EXECUTED` 0
+  — pinned by `allocations.rs`'s `taking_an_event_allocates_what_it_hands_over_and_nothing_else`;
+  off the hot path, a query's `EXECUTED` 9 (its column descriptions, once per result),
+  `SERVER_OUTPUT` 5 for three lines, `TERMINAL` 1 on a clean close and about 10 when it carries a
+  loss's error.
 
 ## Known limitation: the fetch-size hint and the result-store settings
 

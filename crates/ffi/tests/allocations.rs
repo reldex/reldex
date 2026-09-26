@@ -28,10 +28,11 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use reldex_ffi::{
-    ReldexColumnView, ReldexEventKind, ReldexFormatOptions, ReldexMockScenarioConfig,
+    ReldexColumnView, ReldexEvent, ReldexEventKind, ReldexFormatOptions, ReldexMockScenarioConfig,
     ReldexMockStatement, ReldexStatus, reldex_batch_column, reldex_batch_column_fixed,
-    reldex_batch_format_column, reldex_hub_pending_events, reldex_text_arena_clear,
-    reldex_text_arena_count, reldex_text_arena_create, reldex_text_arena_release,
+    reldex_batch_format_column, reldex_hub_next_event, reldex_hub_pending_events,
+    reldex_text_arena_clear, reldex_text_arena_count, reldex_text_arena_create,
+    reldex_text_arena_release,
 };
 
 use support::{Harness, OwnedBatch};
@@ -146,6 +147,153 @@ fn config() -> ReldexMockScenarioConfig {
         seed: 11,
         ..ReldexMockScenarioConfig::default()
     }
+}
+
+/// Takes the `expected` events one request produced, once the worker has
+/// queued all of them and gone back to waiting, measuring each
+/// `reldex_hub_next_event` call on its own. Returns `(kind, allocations)`.
+fn take_measured(harness: &Harness, expected: usize) -> Vec<(i32, u64)> {
+    support::wait_until("the request's events to be queued", || {
+        // SAFETY: the hub is live.
+        let pending = unsafe { reldex_hub_pending_events(harness.hub()) };
+        pending == expected
+    });
+    (0..expected)
+        .map(|_| {
+            let mut event = ReldexEvent::default();
+            let allocations = allocations_during(|| {
+                // SAFETY: the hub is live and `event` is a real local.
+                let taken = unsafe { reldex_hub_next_event(harness.hub(), &raw mut event) };
+                assert!(taken);
+            });
+            support::release_batch(&event);
+            drop(support::take_error(&event));
+            (event.kind, allocations)
+        })
+        .collect()
+}
+
+/// What taking one event costs in allocations, per kind — ADR-0003 A37's
+/// table, pinned. The **hot path** is what a result stream and a transaction
+/// are made of: `FETCHED` allocates exactly one thing (the `ReldexBatch` box
+/// the caller owns; since M2.15 its mirror table is built only on first use),
+/// and progress, transaction state and a completion allocate nothing.
+/// An `EXECUTED` that opens a result pays once per result for its column
+/// descriptions, off the hot path; it is printed, not pinned.
+#[test]
+#[expect(
+    clippy::print_stdout,
+    reason = "the off-hot-path counts are reported for ADR-0003 A37, not pinned"
+)]
+fn taking_an_event_allocates_what_it_hands_over_and_nothing_else() {
+    let _guard = exclusively();
+    let harness = Harness::new();
+    let session = harness.open(ReldexMockScenarioConfig {
+        server_output: true,
+        ..config()
+    });
+    let kind = |kind: ReldexEventKind| kind as i32;
+
+    // A DML: EXECUTING, the transaction opening, and its EXECUTED.
+    assert_eq!(
+        harness.execute(session, 2, ReldexMockStatement::Dml),
+        ReldexStatus::Ok
+    );
+    let dml = take_measured(&harness, 3);
+    assert_eq!(
+        dml,
+        [
+            (kind(ReldexEventKind::Executing), 0),
+            (kind(ReldexEventKind::TransactionState), 0),
+            (kind(ReldexEventKind::Executed), 0),
+        ],
+        "EXECUTING, TRANSACTION_STATE and a DML's EXECUTED allocate nothing"
+    );
+
+    // A commit: the transaction closing, and COMPLETED.
+    assert_eq!(harness.commit(session, 3), ReldexStatus::Ok);
+    let commit = take_measured(&harness, 2);
+    assert_eq!(
+        commit,
+        [
+            (kind(ReldexEventKind::TransactionState), 0),
+            (kind(ReldexEventKind::Completed), 0),
+        ]
+    );
+
+    assert_eq!(
+        harness.set_server_output(session, 4, true),
+        ReldexStatus::Ok
+    );
+    let configured = take_measured(&harness, 1);
+    assert_eq!(
+        configured,
+        [(kind(ReldexEventKind::ServerOutputConfigured), 0)]
+    );
+
+    // A query: EXECUTING, then an EXECUTED that describes its columns once.
+    assert_eq!(
+        harness.execute(session, 5, ReldexMockStatement::GeneratedQuery),
+        ReldexStatus::Ok
+    );
+    let query = take_measured(&harness, 2);
+    assert_eq!(query[0], (kind(ReldexEventKind::Executing), 0));
+    assert_eq!(query[1].0, kind(ReldexEventKind::Executed));
+    println!(
+        "a query's EXECUTED: {} allocations (its column descriptions, once per result)",
+        query[1].1
+    );
+
+    // Every FETCHED after that: the one `ReldexBatch` box, nothing else.
+    let mut event = ReldexEvent::default();
+    let result = {
+        assert_eq!(
+            harness.execute(session, 6, ReldexMockStatement::GeneratedQuery),
+            ReldexStatus::Ok
+        );
+        support::wait_until("the second query's events to be queued", || {
+            // SAFETY: the hub is live.
+            let pending = unsafe { reldex_hub_pending_events(harness.hub()) };
+            pending == 2
+        });
+        for _ in 0..2 {
+            // SAFETY: the hub is live and `event` is a real local.
+            assert!(unsafe { reldex_hub_next_event(harness.hub(), &raw mut event) });
+        }
+        event.result
+    };
+    for round in 0..4_u64 {
+        assert_eq!(
+            harness.fetch(session, 10 + round, result, 25),
+            ReldexStatus::Ok
+        );
+        let fetched = take_measured(&harness, 1);
+        assert_eq!(
+            fetched,
+            [(kind(ReldexEventKind::Fetched), 1)],
+            "FETCHED allocates exactly the ReldexBatch box it hands over"
+        );
+    }
+
+    // Off the hot path, printed for ADR-0003 A37: output lines are copied
+    // into their NUL-terminated form, and a session's end carries its error.
+    assert_eq!(
+        harness.execute(session, 20, ReldexMockStatement::ServerOutput),
+        ReldexStatus::Ok
+    );
+    let output = take_measured(&harness, 3);
+    assert_eq!(output[1].0, kind(ReldexEventKind::ServerOutput));
+    println!("SERVER_OUTPUT (3 lines): {} allocations", output[1].1);
+    assert_eq!(
+        harness.close(session, 21, reldex_ffi::ReldexCloseDisposition::Rollback),
+        ReldexStatus::Ok
+    );
+    let closed = take_measured(&harness, 2);
+    assert_eq!(closed[1].0, kind(ReldexEventKind::Terminal));
+    println!(
+        "SESSION_CLOSED: {} allocations; TERMINAL: {} allocations",
+        closed[0].1, closed[1].1
+    );
 }
 
 #[test]

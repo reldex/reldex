@@ -1025,17 +1025,41 @@ with a game running in the background (CPU load 48–93 % across the runs, recor
 | whole drain, initial stream | 66–95 µs | 67–86 µs | 72–78 µs |
 | whole drain, `streamscroll` | 225–327 µs | 225–232 µs | 242–306 µs |
 
-**The boundary's own share went up**, by about 1 µs per event, and the brief's "must not raise it"
-is **not met**. The whole drain did not move beyond run-to-run noise, because the drain is dominated
-by the model's own work. Per event, in-process (release, worker idle), the pop is ≈0.2 µs, the
+**Independent review's A/B (M2.15 review, HEAD c6b2cc2, p50 of 3 runs, busy machine):**
+
+| p50 per drain | before (pump) | after |
+| --- | --- | --- |
+| boundary share, initial 1M-row stream | 0.6 µs | 1.8 µs |
+| boundary share, `streamscroll` | 2.2 µs | 7.0 µs |
+| whole drain, initial stream | 75.6 µs | 69.7 µs |
+| whole drain, `streamscroll` | 232.2 µs | 235.6 µs |
+
+**The boundary's own share went up.** Per event that is about **1.1 µs** during the initial stream
+and about **2.4 µs** under `streamscroll` (where a drain carries fewer, colder events). The brief's
+criterion that the boundary share must not rise is **not met**. The whole-drain criterion **is**:
+the whole drain did not move beyond run-to-run noise, because it is dominated by the model's own
+work. The review accepted the performance line on that basis. Per event, in-process (release, worker idle), the pop is ≈0.2 µs, the
 pending-table lookup ≈0.1 µs, and the one `ReldexBatch` allocation ≈0.3 µs. Before this was measured,
 M2.15 also allocated a per-column mirror table per batch, hashed with SipHash, and took the session's
 state lock on every `FETCHED`. All three were removed (A36; mirror table built on first use). What is
 left is the translation itself, which has to run somewhere and, with no thread of this crate's, runs
-here. If it ever matters, the next steps are a recycled `ReldexBatch` allocation and a budgeted
-`drain_into` (one queue lock per drain). Neither is worth its complexity at ~1 µs per event against
-a ~240 µs drain. The raw JSON is not committed. The numbers above were taken on a loaded machine and
-should be re-taken on a quiet one before anyone quotes them as more than a direction.
+here. If it ever matters, the next step is a budgeted `drain_into`: take up to a budget of events
+under one queue lock, saving about 0.2 µs per event. A recycled `ReldexBatch` allocation would come
+after that. Neither is worth its complexity at 1–2.4 µs per event against a ~70–240 µs drain. The
+raw JSON is not committed. Both sets of numbers were taken on loaded machines and should be re-taken
+on a quiet one before anyone quotes them as more than a direction.
+
+**Allocations per event taken** (`reldex_hub_next_event`, counting allocator; the review's counts,
+pinned for the hot path by `allocations.rs`'s
+`taking_an_event_allocates_what_it_hands_over_and_nothing_else`):
+
+| event | allocations | |
+| --- | --- | --- |
+| `FETCHED` | 1 | the `ReldexBatch` box the caller owns — hot path, pinned |
+| `EXECUTING`, `TRANSACTION_STATE`, `COMPLETED`, `SERVER_OUTPUT_CONFIGURED`, a DML's `EXECUTED` | 0 | pinned |
+| a query's `EXECUTED` | 9 | its column descriptions, once per result |
+| `SERVER_OUTPUT` (three lines) | 5 | the lines' NUL-terminated copies |
+| `TERMINAL` | 1 (clean close) – 10 (a loss, with its error) | once per session |
 
 ### A38 — field presence is decided by the ABI minor, not by `struct_size` (M2.15 review)
 
