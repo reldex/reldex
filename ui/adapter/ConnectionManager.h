@@ -381,6 +381,13 @@ private:
 
     friend void reldexConnectionManagerWakeImpl(void *userData) noexcept;
     friend class Bridge;
+    // M3.2 fix round 3 (2026-09-26): `tst_connectionmanager.cpp`'s
+    // `destroyingBridgeAfterTheTestConnectSessionIsRegisteredDoesNotCrash()`
+    // spins on `m_testConnectSessionId` directly (same pattern as
+    // `ObjectBrowserModel`'s `friend class tst_ObjectBrowserModel` /
+    // `m_sessionReady`) to reach, deterministically, the exact registered
+    // state `~ConnectionManager()`'s `unregisterHubSink()` guard is about.
+    friend class TstConnectionManager;
 
     /// `QPointer`, not a plain `Bridge *` (M3.2 round-2 fix, 2026-09-26): a
     /// raw pointer stays non-null even after the pointee is destroyed, so a

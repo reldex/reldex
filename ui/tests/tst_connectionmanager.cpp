@@ -114,6 +114,7 @@ private Q_SLOTS:
     void testConnectFailsTypedWhenAPasswordIsRequiredAndNoneWasGiven();
     void testConnectResolvesAndUsesAStoredPasswordWithoutRetypingIt();
     void destroyingBridgeWithATestConnectInFlightDoesNotCrash();
+    void destroyingBridgeAfterTheTestConnectSessionIsRegisteredDoesNotCrash();
     void authFailureAgainstStoredPasswordDecisionCoversAllFourCases();
     void messageKeyForErrorCoversEveryFfiErrorKind();
     void messageKeyForErrorCoversEveryCredentialErrorCode();
@@ -468,6 +469,77 @@ void TstConnectionManager::destroyingBridgeWithATestConnectInFlightDoesNotCrash(
     QVERIFY(cm->testConnect(idHex, QStringLiteral("whatever-the-user-typed")));
     QVERIFY(cm->testConnectBusy()); // always true here; see the comment above
     delete bridge; // must not crash (this is the entire assertion)
+}
+
+void TstConnectionManager::destroyingBridgeAfterTheTestConnectSessionIsRegisteredDoesNotCrash()
+{
+    // Round-3 follow-up (2026-09-26): the test above deliberately deletes
+    // `bridge` before the async build-connect-params reply even arrives, so
+    // `m_testConnectSessionId` is still 0 there and `~ConnectionManager()`'s
+    // `unregisterHubSink()` guard is never actually taken -- coverage for the
+    // literal round-2 crash line rested on that commit's historical
+    // reproduction alone (5/5 crashes with the fix reverted, recorded in
+    // 085dc22), not on anything that runs today. This test closes that gap
+    // deterministically instead of leaving it as a documented trade-off.
+    //
+    // `m_testConnectSessionId` is set synchronously inside
+    // `handleConnectParamsBuilt()` -- the moment `reldex_hub_open_session()`
+    // succeeds and `registerHubSink()` is called -- which is *before* the
+    // mock driver's own OPENED/COMPLETED/SESSION_CLOSED/TERMINAL event chain
+    // has run at all. `friend class TstConnectionManager` (ConnectionManager.h)
+    // lets this spin on that member directly, the same pattern
+    // `tst_objectbrowsermodel.cpp` uses on `ObjectBrowserModel::m_sessionReady`
+    // via `friend class tst_ObjectBrowserModel`.
+    //
+    // Whether that window is actually observable from a polling spin was not
+    // assumed -- it was checked. `spinUntil()` re-checks its predicate
+    // between `processEvents(AllEvents, 2)` calls, so it can only catch this
+    // state if the reply that sets `m_testConnectSessionId` lands in a
+    // *different* processEvents() call than the one that runs the rest of
+    // the mock's open->ping->complete->close->terminal chain and
+    // `finishTestConnect()` (which resets it back to 0) -- the same hazard
+    // `destroyingBridgeWithATestConnectInFlightDoesNotCrash()`'s own comment
+    // above describes for `succeeded`. Measured directly: 30/30 runs caught
+    // `m_testConnectSessionId != 0` well within the default 60s spin
+    // deadline (each run settles in well under a second -- see this file's
+    // own timing in the ctest log), with no observed flake in either
+    // direction (never missed, never caught something already reset to 0).
+    // Unlike the `succeeded` spin in the test above -- which starts only
+    // once the mock's chain has already reached COMPLETED, leaving just
+    // close+terminal as the "can it all land in one processEvents() call"
+    // risk -- this spin starts at the very first step (right as the session
+    // opens), before the mock has done any of its own asynchronous work, so
+    // in practice `handleConnectParamsBuilt()` finishing is consistently its
+    // own processEvents() call, with OPENED not yet queued.
+    //
+    // Crash proof: with the round-2 fix (Bridge.cpp's explicit
+    // `delete m_connections` plus `ConnectionManager::m_bridge` as a
+    // `QPointer`) temporarily reverted to exactly the pre-085dc22 code, this
+    // test alone (filtered, isolated from every other test in this binary)
+    // crashed 10/10 runs -- the captured stack is
+    // `Bridge::unregisterHubSink()` <- `ConnectionManager::~ConnectionManager()`
+    // <- `QObjectPrivate::deleteChildren()` <- `QObject::~QObject()` <-
+    // `Bridge`'s own deleting destructor, i.e. the literal round-2 line.
+    // Restored immediately after (diff against HEAD confirmed empty before
+    // rebuilding), then this test measured 30/30 as described above.
+    auto *bridge = new Bridge();
+    ConnectionManager *cm = bridge->connections();
+    QVERIFY(cm->open());
+    QVERIFY(spinUntil([cm] { return cm->isReady(); }));
+
+    QSignalSpy saved(cm, &ConnectionManager::profileSaved);
+    QVERIFY(cm->createProfile(baseProfileFields()));
+    QVERIFY(spinUntil([&saved] { return saved.count() >= 1; }));
+    const QString idHex = saved.constFirst().at(0).toString();
+
+    QVERIFY(cm->testConnect(idHex, QStringLiteral("whatever-the-user-typed")));
+    QVERIFY(spinUntil([cm] { return cm->m_testConnectSessionId != 0; }));
+    // The hub sink is registered now -- exactly the state
+    // `~ConnectionManager()`'s `unregisterHubSink()` guard is about. Assert
+    // and delete immediately, before any further event-loop turn, so nothing
+    // else (in particular the mock's own OPENED event) can run first.
+    QVERIFY(cm->testConnectBusy());
+    delete bridge; // must not crash -- this is the round-2 crash line itself
 }
 
 void TstConnectionManager::authFailureAgainstStoredPasswordDecisionCoversAllFourCases()
