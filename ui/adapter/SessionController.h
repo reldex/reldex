@@ -100,6 +100,8 @@ public:
         return static_cast<int>(m_outstanding.size());
     }
     /// The last `TRANSACTION_STATE` (ABI 3.2): a transaction may be open.
+    /// False once the session has ended (`isTerminated()`): whether what was
+    /// open was lost is `transactionPossiblyLost()`.
     [[nodiscard]] bool transactionPossiblyActive() const noexcept
     {
         return m_transactionPossiblyActive;

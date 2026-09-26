@@ -6,6 +6,9 @@
 #include <QTest>
 #include <QTimer>
 
+#include <chrono>
+#include <thread>
+
 using adapter_test::liveCounts;
 using adapter_test::settledBaseline;
 using adapter_test::spinUntil;
@@ -29,6 +32,7 @@ private Q_SLOTS:
     void closingASessionDrainsTheUnsolicitedTerminalEventWithoutAsserting();
     void aSessionLostMidStatementEndsWithTerminalAndStopsCounting();
     void progressAndUnknownEventsNeverTouchTheRequestBookkeeping();
+    void aCloseAnsweredAfterTerminalLeavesTheSessionFailed();
 };
 
 void TstBridge::theAbiVersionIsCheckedBeforeAnythingElse()
@@ -369,6 +373,11 @@ void TstBridge::aSessionLostMidStatementEndsWithTerminalAndStopsCounting()
         QCOMPARE(session->errorNativeCode(), 3113);
         QCOMPARE(session->outstandingRequests(), 0);
         QCOMPARE(liveCounts().sessions, baseline.sessions);
+        // The session ended, so no transaction is open any more -- the flag
+        // says so, and says it once; whether one was lost is the TERMINAL's.
+        QVERIFY(!session->transactionPossiblyActive());
+        QCOMPARE(transaction.count(), 2);
+        QCOMPARE(transaction.last().at(0).toBool(), false);
     }
     QVERIFY2(spinUntilLiveCounts(baseline),
              qPrintable(QStringLiteral("live counts after a lost session: %1 (baseline %2)")
@@ -417,6 +426,43 @@ void TstBridge::progressAndUnknownEventsNeverTouchTheRequestBookkeeping()
             [session] { return session->state() != SessionController::Executing; }));
     QCOMPARE(session->outstandingRequests(), 0);
     QVERIFY(!session->hasError());
+}
+
+void TstBridge::aCloseAnsweredAfterTerminalLeavesTheSessionFailed()
+{
+    // A close submitted after the session was lost but before its TERMINAL
+    // is drained is answered after that TERMINAL, as FAILED. It must not turn
+    // the Failed the TERMINAL set into Closed.
+    Bridge bridge;
+    QVERIFY(bridge.isValid());
+    SessionController *session = bridge.session();
+    QVERIFY(session->open());
+    QVERIFY(spinUntil([session] { return session->state() == SessionController::Ready; }));
+
+    QVERIFY(session->executeMockStatement(RELDEX_MOCK_STATEMENT_LOSE_SESSION));
+    // Without spinning the event loop, so nothing is drained yet: a fresh
+    // session's loss queues EXECUTING, TRANSACTION_STATE, EXECUTED and then
+    // TERMINAL (the Rust suite pins the order), so four queued events mean
+    // TERMINAL is among them.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (bridge.pendingEvents() < 4) {
+        QVERIFY2(std::chrono::steady_clock::now() < deadline, "the loss was never queued");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    QSignalSpy closed(session, &SessionController::sessionClosed);
+    QSignalSpy terminated(session, &SessionController::terminated);
+    QSignalSpy failures(session, &SessionController::failed);
+    QVERIFY(session->closeSession());
+
+    QVERIFY(spinUntil([&closed] { return closed.count() == 1; }));
+    QCOMPARE(terminated.count(), 1);
+    QCOMPARE(closed.constFirst().at(0).toInt(), static_cast<int>(RELDEX_CLOSE_OUTCOME_FAILED));
+    QCOMPARE(closed.constFirst().at(1).toBool(), false);
+    QCOMPARE(session->state(), SessionController::Failed);
+    QCOMPARE(failures.count(), 1);
+    QVERIFY(session->isTerminated());
+    QVERIFY(!session->transactionPossiblyActive());
+    QCOMPARE(session->outstandingRequests(), 0);
 }
 
 QTEST_GUILESS_MAIN(TstBridge)

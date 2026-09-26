@@ -447,6 +447,21 @@ void SessionController::handleEvent(const ReldexEvent &raw, reldex::BatchHandle 
         adoptError(error.get());
     }
 
+    if (m_terminated) {
+        // The session's TERMINAL has been drained, so the state it set --
+        // Failed on a loss, Closed otherwise -- is final. A reply can still
+        // arrive after it, for a request submitted after the session ended
+        // but before its TERMINAL was drained (always a failure, or a close
+        // settled as FAILED): it may clear bookkeeping and report its error,
+        // never move the state. A close still says it was answered, because
+        // whoever submitted it is waiting for exactly that.
+        if (raw.kind == RELDEX_EVENT_KIND_SESSION_CLOSED) {
+            m_closeOutcome = raw.close_outcome;
+            Q_EMIT sessionClosed(raw.close_outcome, false);
+        }
+        return;
+    }
+
     switch (raw.kind) {
     case RELDEX_EVENT_KIND_OPENED:
         m_cancelKind = raw.cancel_kind;
@@ -566,12 +581,22 @@ void SessionController::handleTerminal(const ReldexEvent &raw, const reldex::Err
     if (error) {
         adoptError(error.get());
     }
-    if (m_state != Closed && m_state != Failed) {
-        const bool lost = raw.session_state == RELDEX_SESSION_STATE_LOST;
-        setState(lost ? Failed : Closed);
-        if (lost) {
+    // TERMINAL is authoritative (`SPEC.md` §10). A lost session is Failed
+    // even if a close settled first and said Closed; an ended one is Closed
+    // unless something already failed it.
+    if (raw.session_state == RELDEX_SESSION_STATE_LOST) {
+        if (m_state != Failed) {
+            setState(Failed);
             Q_EMIT failed();
         }
+    } else if (m_state != Closed && m_state != Failed) {
+        setState(Closed);
+    }
+    // Whatever was open went with the session; whether it was lost is
+    // `transactionPossiblyLost`, not this flag.
+    if (m_transactionPossiblyActive) {
+        m_transactionPossiblyActive = false;
+        Q_EMIT transactionStateChanged(false);
     }
     Q_EMIT terminated(raw.transaction_possibly_lost, raw.abandoned);
 }
