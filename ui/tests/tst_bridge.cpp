@@ -416,7 +416,8 @@ void TstBridge::progressAndUnknownEventsNeverTouchTheRequestBookkeeping()
         future.kind = 9999;
         future.session = session->sessionId();
         future.request = request;
-        session->handleEvent(future, reldex::BatchHandle(), reldex::ErrorHandle());
+        session->handleEvent(future, reldex::BatchHandle(), reldex::ErrorHandle(),
+                             reldex::LinesHandle());
     }
     QCOMPARE(session->outstandingRequests(), 1);
     QCOMPARE(session->state(), SessionController::Executing);
