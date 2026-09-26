@@ -4,15 +4,22 @@ import QtQuick.Controls
 import Reldex.Adapter
 
 // Status bar (M3.1): connection/session-state placeholder (M3.3 wires the
-// real SessionController state), a reserved slot for M3.4's persistent
-// production indicator, and -- for now, the only reachable spot for it --
-// the theme override picker (owner rule: every default is
-// user-configurable; M3.6 gives it a real settings-UI home). Presentation
-// only -- ARCHITECTURE.md invariant 4.
+// real SessionController state), M3.4's persistent production indicator, and
+// -- for now, the only reachable spot for it -- the theme override picker
+// (owner rule: every default is user-configurable; M3.6 gives it a real
+// settings-UI home). Presentation only -- ARCHITECTURE.md invariant 4:
+// `productionActive` is set by `Main.qml` straight off
+// `SessionController.activeProfileIsProduction` (itself
+// `Profile::treat_as_production()`, ADR-0006 P3); this file makes no
+// production/non-production decision of its own.
 Rectangle {
     id: statusBar
     objectName: "statusBar"
     color: Theme.tokens.surfaceAlt
+
+    /// M3.4: whether the worksheet's active profile is production. See
+    /// `ui/README.md` "Production indicator (M3.4)".
+    property bool productionActive: false
 
     Accessible.role: Accessible.StatusBar
     Accessible.name: qsTr("Status bar")
@@ -37,12 +44,12 @@ Rectangle {
             font.pixelSize: 12
         }
 
-        // Reserved slot for M3.4's persistent production indicator (icon +
-        // text + tab badge, never colour alone). Empty until M3.4.
-        Item {
-            objectName: "productionIndicatorSlot"
-            width: 0
-            height: parent.height
+        ProductionIndicator {
+            objectName: "productionIndicatorStatusBar"
+            // No vertical anchor, matching the plain `Text` siblings in this
+            // `Row`: all three simply top-align, which reads as centred
+            // since they are all close to the same height.
+            active: statusBar.productionActive
         }
 
         Text {

@@ -57,6 +57,14 @@ private slots:
     void appShellRendersAtCurrentScaleFactor();
     void connectionManagerDialogRendersAtCurrentScaleFactor();
     void objectBrowserTreeKeyboardNavigationExpandsAndActivates();
+
+    // M3.4: persistent production indicator (SPEC.md §17; phase-1.md row
+    // M3.4). See ui/README.md "Production indicator (M3.4)".
+    void productionIndicatorHiddenByDefault();
+    void productionIndicatorVisibleInAllThreePlacesWhenActive();
+    void productionIndicatorFollowsTheFlagNotTheEnvironment();
+    void productionIndicatorPassesGreyscaleCheck();
+    void productionIndicatorRendersAtCurrentScaleFactor();
 };
 
 void TstCoreInfo::initTestCase()
@@ -534,6 +542,263 @@ void TstCoreInfo::objectBrowserTreeKeyboardNavigationExpandsAndActivates()
     QTest::keyClick(window, Qt::Key_Return);
     QCoreApplication::processEvents();
     QVERIFY(refreshButton->property("enabled").toBool());
+}
+
+namespace {
+
+/// The three places `ui/README.md` "Production indicator (M3.4)" lists.
+const QStringList kProductionIndicatorNames = { QStringLiteral("productionIndicatorStatusBar"),
+                                                 QStringLiteral("productionIndicatorWorksheetHeader"),
+                                                 QStringLiteral("productionIndicatorTabBadge") };
+
+} // namespace
+
+void TstCoreInfo::productionIndicatorHiddenByDefault()
+{
+    QQmlApplicationEngine engine;
+    engine.loadFromModule("Reldex.App", "Main");
+    QObject *root = engine.rootObjects().constFirst();
+    QVERIFY(root != nullptr);
+    auto *window = qobject_cast<QQuickWindow *>(root);
+    QVERIFY(window != nullptr);
+    QCoreApplication::processEvents();
+    QTest::qWait(50);
+
+    // Nothing has called `SessionController::setActiveProfileIsProduction()`
+    // yet (M3.3 is the class that will), so this is the "no active profile /
+    // non-production profile" case from the task brief.
+    auto *bridge = root->findChild<Bridge *>(QStringLiteral("bridge"));
+    QVERIFY(bridge != nullptr);
+    QVERIFY(bridge->session() != nullptr);
+    QVERIFY(!bridge->session()->activeProfileIsProduction());
+
+    QQuickItem *rootItem = window->contentItem();
+    QVERIFY(rootItem != nullptr);
+    for (const QString &name : kProductionIndicatorNames) {
+        auto *item = adapter_test::findVisualChild(rootItem, name);
+        QVERIFY2(item != nullptr, qPrintable(name));
+        QVERIFY2(!item->isVisible(),
+                 qPrintable(name + QStringLiteral(": should be hidden when not production")));
+    }
+
+    // The worksheet-header strip also takes no layout space when hidden
+    // (`ui/app/WorksheetArea.qml`'s `worksheetHeader.height` binding).
+    auto *header = root->findChild<QQuickItem *>(QStringLiteral("worksheetHeader"));
+    QVERIFY(header != nullptr);
+    QCOMPARE(header->height(), 0.0);
+}
+
+void TstCoreInfo::productionIndicatorVisibleInAllThreePlacesWhenActive()
+{
+    QQmlApplicationEngine engine;
+    engine.loadFromModule("Reldex.App", "Main");
+    QObject *root = engine.rootObjects().constFirst();
+    QVERIFY(root != nullptr);
+    auto *window = qobject_cast<QQuickWindow *>(root);
+    QVERIFY(window != nullptr);
+
+    auto *bridge = root->findChild<Bridge *>(QStringLiteral("bridge"));
+    QVERIFY(bridge != nullptr);
+    SessionController *session = bridge->session();
+    QVERIFY(session != nullptr);
+
+    session->setActiveProfileIsProduction(true);
+    QCoreApplication::processEvents();
+    QCoreApplication::processEvents();
+    QTest::qWait(50);
+
+    QQuickItem *rootItem = window->contentItem();
+    QVERIFY(rootItem != nullptr);
+    for (const QString &name : kProductionIndicatorNames) {
+        auto *item = adapter_test::findVisualChild(rootItem, name);
+        QVERIFY2(item != nullptr, qPrintable(name));
+        QVERIFY2(item->isVisible(),
+                 qPrintable(name + QStringLiteral(": should be visible when production")));
+
+        // Icon *and* text, never colour alone (phase-1.md row M3.4).
+        auto *icon = adapter_test::findVisualChild(item, QStringLiteral("productionIndicatorIcon"));
+        auto *label = adapter_test::findVisualChild(item, QStringLiteral("productionIndicatorLabel"));
+        QVERIFY2(icon != nullptr, qPrintable(name));
+        QVERIFY2(label != nullptr, qPrintable(name));
+        QVERIFY2(icon->property("contentWidth").toReal() > 0.0,
+                 qPrintable(name + QStringLiteral(": icon did not render")));
+        QVERIFY2(label->property("contentWidth").toReal() > 0.0,
+                 qPrintable(name + QStringLiteral(": label did not render")));
+
+        const QString text = label->property("text").toString();
+        QVERIFY2(text == QStringLiteral("PRODUCTION") || text == QStringLiteral("PROD"),
+                 qPrintable(name + QStringLiteral(": unexpected label text '") + text
+                            + QStringLiteral("'")));
+    }
+
+    auto *header = root->findChild<QQuickItem *>(QStringLiteral("worksheetHeader"));
+    QVERIFY(header != nullptr);
+    QVERIFY2(header->height() > 0.0, "worksheetHeader: height should be nonzero when active");
+
+    session->setActiveProfileIsProduction(false);
+}
+
+void TstCoreInfo::productionIndicatorFollowsTheFlagNotTheEnvironment()
+{
+    QQmlApplicationEngine engine;
+    engine.loadFromModule("Reldex.App", "Main");
+    QObject *root = engine.rootObjects().constFirst();
+    QVERIFY(root != nullptr);
+    auto *window = qobject_cast<QQuickWindow *>(root);
+    QVERIFY(window != nullptr);
+
+    auto *bridge = root->findChild<Bridge *>(QStringLiteral("bridge"));
+    QVERIFY(bridge != nullptr);
+    SessionController *session = bridge->session();
+    QVERIFY(session != nullptr);
+
+    QQuickItem *rootItem = window->contentItem();
+    QVERIFY(rootItem != nullptr);
+
+    // Stands in for a Custom-environment profile with `treat_as_production`
+    // toggled on, then off (ADR-0006 P3): the adapter hands this layer only
+    // the resolved bool, never `ReldexEnvironmentKind`, so a named
+    // environment (always on/off) and a Custom one (the user's choice) are
+    // indistinguishable from here -- which is exactly the point.
+    for (const bool production : { true, false, true, false }) {
+        session->setActiveProfileIsProduction(production);
+        QCoreApplication::processEvents();
+        QCoreApplication::processEvents();
+
+        for (const QString &name : kProductionIndicatorNames) {
+            auto *item = adapter_test::findVisualChild(rootItem, name);
+            QVERIFY2(item != nullptr, qPrintable(name));
+            QCOMPARE(item->isVisible(), production);
+        }
+    }
+}
+
+void TstCoreInfo::productionIndicatorPassesGreyscaleCheck()
+{
+    QQmlApplicationEngine engine;
+    engine.loadFromModule("Reldex.App", "Main");
+    QObject *root = engine.rootObjects().constFirst();
+    QVERIFY(root != nullptr);
+    auto *window = qobject_cast<QQuickWindow *>(root);
+    QVERIFY(window != nullptr);
+
+    auto *bridge = root->findChild<Bridge *>(QStringLiteral("bridge"));
+    QVERIFY(bridge != nullptr);
+    SessionController *session = bridge->session();
+    QVERIFY(session != nullptr);
+    session->setActiveProfileIsProduction(true);
+    QCoreApplication::processEvents();
+    QCoreApplication::processEvents();
+    QTest::qWait(50);
+
+    auto *statusBarItem = root->findChild<QQuickItem *>(QStringLiteral("statusBar"));
+    QVERIFY(statusBarItem != nullptr);
+    QQuickItem *rootItem = window->contentItem();
+    QVERIFY(rootItem != nullptr);
+    auto *indicator =
+            adapter_test::findVisualChild(rootItem, QStringLiteral("productionIndicatorStatusBar"));
+    QVERIFY(indicator != nullptr);
+    QVERIFY(indicator->isVisible());
+    QVERIFY2(indicator->width() > 0.0 && indicator->height() > 0.0,
+             "productionIndicatorStatusBar: zero-size geometry");
+
+    const QImage grab = window->grabWindow();
+    QVERIFY(!grab.isNull());
+    // Desaturate exactly as a colour-blind or monochrome-display user would
+    // see it -- the task brief's own wording ("convert to greyscale").
+    const QImage grey = grab.convertToFormat(QImage::Format_Grayscale8);
+    QVERIFY(!grey.isNull());
+
+    const qreal dpr = window->devicePixelRatio();
+
+    // The indicator's own bounding box, scene -> grabbed-image pixels.
+    const QPointF indicatorScenePos = indicator->mapToScene(QPointF(0, 0));
+    const int ix0 = qMax(0, static_cast<int>(indicatorScenePos.x() * dpr));
+    const int iy0 = qMax(0, static_cast<int>(indicatorScenePos.y() * dpr));
+    const int ix1 = qMin(grey.width(), ix0 + qMax(1, static_cast<int>(indicator->width() * dpr)));
+    const int iy1 = qMin(grey.height(), iy0 + qMax(1, static_cast<int>(indicator->height() * dpr)));
+    QVERIFY2(ix1 > ix0 && iy1 > iy0, "productionIndicatorStatusBar: geometry maps outside the grab");
+
+    // The darkest pixel anywhere inside that box is the icon/label ink --
+    // whichever of the two rendered a fully-covered pixel closest to
+    // `Theme.tokens.warning`.
+    int darkestIndicatorGrey = 255;
+    for (int y = iy0; y < iy1; ++y) {
+        for (int x = ix0; x < ix1; ++x) {
+            darkestIndicatorGrey = qMin(darkestIndicatorGrey, qGray(grey.pixel(x, y)));
+        }
+    }
+
+    // A background sample from the status bar's own plain fill, at a point
+    // no child item reaches: (2, 2) is inside the 1px top divider's shadow
+    // but past it, and well left of the Row's own 8px left margin.
+    const QPointF backgroundScenePos = statusBarItem->mapToScene(QPointF(2, 2));
+    const int bx = qBound(0, static_cast<int>(backgroundScenePos.x() * dpr), grey.width() - 1);
+    const int by = qBound(0, static_cast<int>(backgroundScenePos.y() * dpr), grey.height() - 1);
+    const int backgroundGrey = qGray(grey.pixel(bx, by));
+
+    qInfo() << "productionIndicatorPassesGreyscaleCheck: darkest indicator pixel"
+            << darkestIndicatorGrey << "background" << backgroundGrey;
+
+    // A presence/contrast assertion, not a pixel-diff (task brief): the
+    // indicator's ink must read as meaningfully darker than the plain
+    // background once colour is gone, by a margin well past antialiasing
+    // noise. `Theme.tokens.warning` against `surfaceAlt` clears this by a
+    // wide margin in both palettes (see ui/README.md "Production indicator
+    // (M3.4)").
+    QVERIFY2(backgroundGrey - darkestIndicatorGrey >= 24,
+             qPrintable(QStringLiteral("indicator not distinguishable from its background in "
+                                       "greyscale: darkest-indicator=%1 background=%2")
+                                .arg(darkestIndicatorGrey)
+                                .arg(backgroundGrey)));
+
+    session->setActiveProfileIsProduction(false);
+}
+
+void TstCoreInfo::productionIndicatorRendersAtCurrentScaleFactor()
+{
+    // Mirrors appShellRendersAtCurrentScaleFactor()/
+    // connectionManagerDialogRendersAtCurrentScaleFactor() above: registered
+    // in ui/tests/CMakeLists.txt at the default 1x (as part of the plain
+    // "tst_coreinfo" entry) and once more at QT_SCALE_FACTOR=2.
+    QQmlApplicationEngine engine;
+    engine.loadFromModule("Reldex.App", "Main");
+    QObject *root = engine.rootObjects().constFirst();
+    QVERIFY(root != nullptr);
+    auto *window = qobject_cast<QQuickWindow *>(root);
+    QVERIFY(window != nullptr);
+    QCoreApplication::processEvents();
+    QCoreApplication::processEvents();
+
+    auto *bridge = root->findChild<Bridge *>(QStringLiteral("bridge"));
+    QVERIFY(bridge != nullptr);
+    SessionController *session = bridge->session();
+    QVERIFY(session != nullptr);
+    session->setActiveProfileIsProduction(true);
+    QCoreApplication::processEvents();
+    QTest::qWait(50);
+
+    const qreal dpr = window->devicePixelRatio();
+    QVERIFY2(dpr > 0.0, "devicePixelRatio must be positive");
+    if (const QByteArray requested = qgetenv("QT_SCALE_FACTOR"); !requested.isEmpty()) {
+        const qreal expected = requested.toDouble();
+        QVERIFY2(qAbs(dpr - expected) < 0.01,
+                 qPrintable(QStringLiteral("expected QT_SCALE_FACTOR=%1, devicePixelRatio was %2")
+                                    .arg(expected)
+                                    .arg(dpr)));
+    }
+
+    QQuickItem *rootItem = window->contentItem();
+    QVERIFY(rootItem != nullptr);
+    for (const QString &name : kProductionIndicatorNames) {
+        auto *item = adapter_test::findVisualChild(rootItem, name);
+        QVERIFY2(item != nullptr, qPrintable(name));
+        QVERIFY2(item->isVisible(), qPrintable(name));
+        QVERIFY2(item->width() > 0.0, qPrintable(name + QStringLiteral(": width is zero")));
+        QVERIFY2(item->height() > 0.0, qPrintable(name + QStringLiteral(": height is zero")));
+    }
+
+    session->setActiveProfileIsProduction(false);
 }
 
 QTEST_MAIN(TstCoreInfo)

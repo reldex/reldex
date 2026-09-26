@@ -7,10 +7,22 @@ import QtQuick.Controls
 // Tab add/remove here is pure UI state -- no session is opened, no
 // `SessionController` exists yet (that is M3.3/M4.9's "N sessions, per-tab
 // state" work). Presentation only -- ARCHITECTURE.md invariant 4.
+//
+// M3.4 adds two of the three places SPEC.md §17's persistent production
+// indicator must appear: a worksheet-header strip above the editor/result
+// split, and a badge on each worksheet's own tab (the third is
+// `StatusBar.qml`). Every worksheet here still shares the one
+// `SessionController`/session `Bridge` owns (M4.9 is what gives each tab its
+// own), so `productionActive` -- set by `Main.qml` from
+// `SessionController.activeProfileIsProduction` -- applies to all of them
+// alike; see `ui/README.md` "Production indicator (M3.4)".
 Rectangle {
     id: worksheetArea
     objectName: "worksheetArea"
     color: Theme.tokens.background
+
+    /// M3.4: whether the worksheet's active profile is production.
+    property bool productionActive: false
 
     Accessible.role: Accessible.Pane
     Accessible.name: qsTr("Worksheet")
@@ -64,9 +76,24 @@ Rectangle {
                         model: tabsModel
 
                         delegate: TabButton {
+                            id: tabButton
                             required property string label
 
                             text: label
+
+                            // M3.4 tab badge: overlaid rather than folded into
+                            // `text`, so the icon/label pair keeps its own
+                            // colour and size independent of Basic's
+                            // TabButton palette roles (documented above).
+                            ProductionIndicator {
+                                objectName: "productionIndicatorTabBadge"
+                                compact: true
+                                active: worksheetArea.productionActive
+                                anchors.top: parent.top
+                                anchors.right: parent.right
+                                anchors.topMargin: 3
+                                anchors.rightMargin: 4
+                            }
                         }
                     }
                 }
@@ -84,12 +111,34 @@ Rectangle {
             }
         }
 
+        // M3.4's worksheet-header placement: a slim strip above the
+        // editor/result split, present only while the active profile is
+        // production (zero height otherwise, so nothing shifts for the
+        // common case).
+        Rectangle {
+            id: worksheetHeader
+            objectName: "worksheetHeader"
+            width: parent.width
+            height: headerIndicator.active ? 22 : 0
+            clip: true
+            color: Theme.tokens.surfaceAlt
+
+            ProductionIndicator {
+                id: headerIndicator
+                objectName: "productionIndicatorWorksheetHeader"
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: 8
+                active: worksheetArea.productionActive
+            }
+        }
+
         SplitView {
             id: paneSplit
             objectName: "worksheetPaneSplit"
             orientation: Qt.Vertical
             width: parent.width
-            height: parent.height - tabBarRow.height
+            height: parent.height - tabBarRow.height - worksheetHeader.height
 
             handle: Rectangle {
                 implicitWidth: 4

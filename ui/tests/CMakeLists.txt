@@ -113,6 +113,16 @@ set_tests_properties(tst_connectionmanagerdialog_dpi200 PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_SCALE_FACTOR=2"
 )
 
+# M3.4: DPI coverage for the persistent production indicator (status bar,
+# worksheet header, tab badge), at the default 1x (as part of the plain
+# "tst_coreinfo" entry above) and 2x, same pattern as the connection-manager
+# dialog registration just above.
+add_test(NAME tst_productionindicator_dpi200
+         COMMAND tst_coreinfo productionIndicatorRendersAtCurrentScaleFactor)
+set_tests_properties(tst_productionindicator_dpi200 PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_SCALE_FACTOR=2"
+)
+
 # M1.4: the Qt-free C/C++ smoke harness (ADR-0003 D10 item 2). Reuses the
 # reldex_ffi-shared target and RELDEX_FFI_INCLUDE_DIR that ui/CMakeLists.txt
 # already imported/set; see ui/tests/ffi_smoke/CMakeLists.txt for the guard
