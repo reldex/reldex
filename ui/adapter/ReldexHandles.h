@@ -2,8 +2,9 @@
 
 // Small RAII wrappers and argument helpers for the reldex-ffi C ABI.
 //
-// Three objects cross the boundary with caller ownership (ADR-0003 D3): a
-// fetched `ReldexBatch*`, a `ReldexError*`, and a `ReldexTextArena*`. Each is
+// Four objects cross the boundary with caller ownership (ADR-0003 D3): a
+// fetched `ReldexBatch*`, a `ReldexError*`, a `ReldexTextArena*`, and a
+// `SERVER_OUTPUT` event's `ReldexServerOutputLines*`. Each is
 // released exactly once by a `std::unique_ptr` with a custom deleter, so no
 // early return, exception, or destruction order can leak or double-free one --
 // `reldex.h` says releasing twice is undefined behaviour, like every `free`.
@@ -35,6 +36,14 @@ struct ArenaDeleter
     void operator()(ReldexTextArena *arena) const noexcept { reldex_text_arena_release(arena); }
 };
 
+struct LinesDeleter
+{
+    void operator()(ReldexServerOutputLines *lines) const noexcept
+    {
+        reldex_server_output_lines_release(lines);
+    }
+};
+
 struct HubDeleter
 {
     void operator()(ReldexHub *hub) const noexcept { reldex_hub_destroy(hub); }
@@ -49,11 +58,14 @@ using ErrorHandle = std::unique_ptr<ReldexError, ErrorDeleter>;
 /// Owns one formatting arena. Views taken from it die with it.
 using ArenaHandle = std::unique_ptr<ReldexTextArena, ArenaDeleter>;
 
+/// Owns one `SERVER_OUTPUT` event's lines.
+using LinesHandle = std::unique_ptr<ReldexServerOutputLines, LinesDeleter>;
+
 /// Owns the hub.
 ///
 /// A handle rather than a raw pointer so a `Bridge` constructor that fails
-/// part of the way through -- or unwinds -- cannot leak the hub and the pump
-/// threads behind it. The deleter is only `reldex_hub_destroy`; the ordered
+/// part of the way through -- or unwinds -- cannot leak the hub and the
+/// sessions behind it. The deleter is only `reldex_hub_destroy`; the ordered
 /// teardown D5 rule 2 requires (unregister the waker, release every batch,
 /// drain) happens in `~Bridge` before this handle is reset.
 using HubHandle = std::unique_ptr<ReldexHub, HubDeleter>;

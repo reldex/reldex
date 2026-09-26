@@ -93,6 +93,20 @@ public:
     [[nodiscard]] int cancelKind() const noexcept { return m_cancelKind; }
     [[nodiscard]] int closeOutcome() const noexcept { return m_closeOutcome; }
     [[nodiscard]] qint64 rowsAffected() const noexcept { return m_rowsAffected; }
+    /// Requests submitted and not yet answered.
+    [[nodiscard]] int outstandingRequests() const noexcept
+    {
+        return static_cast<int>(m_outstanding.size());
+    }
+    /// The last `TRANSACTION_STATE` (ABI 3.2): a transaction may be open.
+    [[nodiscard]] bool transactionPossiblyActive() const noexcept
+    {
+        return m_transactionPossiblyActive;
+    }
+    /// The session's `TERMINAL` has arrived; it is gone for good.
+    [[nodiscard]] bool isTerminated() const noexcept { return m_terminated; }
+    /// What that `TERMINAL` said about the transaction (`SPEC.md` §10).
+    [[nodiscard]] bool transactionPossiblyLost() const noexcept { return m_transactionPossiblyLost; }
 
     [[nodiscard]] bool hasError() const noexcept { return m_hasError; }
     [[nodiscard]] QString errorMessage() const { return m_errorMessage; }
@@ -160,6 +174,11 @@ Q_SIGNALS:
     void resultComplete();
     void sessionClosed(int outcome, bool stillOpen);
     void failed();
+    /// `TRANSACTION_STATE` flipped (ABI 3.2).
+    void transactionStateChanged(bool possiblyActive);
+    /// The session ended, however it ended (ABI 3.2 `TERMINAL`). The UI must
+    /// surface `transactionPossiblyLost` (`SPEC.md` §10).
+    void terminated(bool transactionPossiblyLost, bool abandoned);
 
 private:
     void setState(State state);
@@ -167,6 +186,7 @@ private:
     void adoptError(const ReldexError *error);
     void takeThreadLocalError();
     void submitFetches();
+    void handleTerminal(const ReldexEvent &raw, const reldex::ErrorHandle &error);
     /// Submits `close_result` for `result`. Used both by `closeResult()` and
     /// by `execute()`, which must not leave the result it replaces open.
     bool submitCloseResult(quint64 result);
@@ -200,6 +220,9 @@ private:
     bool m_hasResult = false;
     int m_cancelKind = RELDEX_CANCEL_KIND_UNKNOWN;
     int m_closeOutcome = RELDEX_CLOSE_OUTCOME_UNKNOWN;
+    bool m_transactionPossiblyActive = false;
+    bool m_terminated = false;
+    bool m_transactionPossiblyLost = false;
 
     bool m_hasError = false;
     QString m_errorMessage;

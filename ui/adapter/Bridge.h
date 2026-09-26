@@ -6,7 +6,7 @@
 //
 // The three rules it exists to enforce, stated where they are implemented:
 //
-//  * the waker callback runs on a Reldex pump thread and does **exactly one**
+//  * the waker callback runs on a Reldex worker thread and does **exactly one**
 //    thing -- a coalesced queued `invokeMethod` back to this object. It calls
 //    no `reldex_*` function (the library answers `RELDEX_STATUS_REENTRANT`,
 //    A3/A18) and lets no C++ exception escape into Rust (A18);
@@ -139,7 +139,7 @@ private:
     ScrollDriver *m_scrollDriver = nullptr;
 
     /// 1 while a drain is posted but has not started. Written from a Reldex
-    /// pump thread (the waker) and from the Qt thread (`drain()`), so it is
+    /// worker thread (the waker) and from the Qt thread (`drain()`), so it is
     /// atomic; it coalesces the waker's post with the drain's own re-post.
     QAtomicInt m_drainPosted { 0 };
 

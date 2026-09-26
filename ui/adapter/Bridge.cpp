@@ -16,7 +16,9 @@
 /// `extern "C"` entry point below stays three lines long.
 void reldexBridgeWakeImpl(void *userData) noexcept
 {
-    // Runs on a Reldex pump thread, never on the Qt thread.
+    // Runs on a Reldex session's worker thread (or, rarely, inside a
+    // reldex_* call on the Qt thread that made the queue non-empty) -- either
+    // way it only posts.
     //
     // reldex.h, "THE WAKER": must not block, must not call ANY reldex_*
     // function on any hub, and must not let a C++ exception escape -- that
@@ -361,6 +363,10 @@ void Bridge::dispatch(ReldexEvent &raw)
     raw.batch = nullptr;
     reldex::ErrorHandle error(raw.error);
     raw.error = nullptr;
+    // ABI 3.2: `SERVER_OUTPUT` owns its lines. Nothing here shows output yet
+    // (the output pane is M3.x's), so they are released with this handle.
+    reldex::LinesHandle lines(raw.server_output_lines);
+    raw.server_output_lines = nullptr;
 
     m_metrics->markFirstEvent();
 
@@ -378,6 +384,7 @@ void Bridge::drainAndRelease()
     while (reldex_hub_next_event(m_hub.get(), &raw)) {
         reldex::BatchHandle batch(raw.batch);
         reldex::ErrorHandle error(raw.error);
+        reldex::LinesHandle lines(raw.server_output_lines);
         raw = reldex::makeEvent();
     }
 }

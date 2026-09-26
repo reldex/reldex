@@ -248,7 +248,7 @@ reads them back with the public `QAccessible::queryAccessibleInterface()` API
 Three classes, one job each, in the shape ADR-0003 D1 fixes.
 
 **`Bridge`** owns the `ReldexHub*`. It registers the waker; the callback runs
-on a Reldex pump thread and does exactly one thing — a coalesced
+on a Reldex session's worker thread and does exactly one thing — a coalesced
 `QMetaObject::invokeMethod(bridge, &Bridge::drain, Qt::QueuedConnection)`. It
 calls no `reldex_*` function (the library answers `RELDEX_STATUS_REENTRANT`)
 and lets no C++ exception escape into Rust. `drain()` takes events until the
@@ -645,9 +645,8 @@ iterations on CI: 6.3 s here, and even an order of magnitude slower on a
 two-core runner leaves the `qt-build` job's 25-minute budget untouched.
 `RELDEX_UI_TEARDOWN_ITERATIONS` / `RELDEX_UI_TEARDOWN_CONNECT_ITERATIONS` are
 the lever if the first real Linux/macOS run says otherwise. The live-count
-waits in that test use a 300-second hang guard for the same reason — it waits
-for up to 10,000 pump threads to finish (A17), and that is a hang guard, not a
-latency bound.
+waits in that test use a 300-second hang guard for the same reason — a hang
+guard, not a latency bound.
 
 **Reading a test's own output on this machine:** a Qt test binary's stdout does
 not reach a redirected file or a pipe from Git Bash or PowerShell here (the
@@ -830,12 +829,15 @@ return to it: the 10,000-iteration flood, the connect-window variant, the
 `deleteLater()`-mid-drain teardown, the error path, and the mid-stream result
 reset. Two details the header is explicit about and the tests follow:
 
-- it is always a **wait**, never an immediate compare, because A17 says
-  `reldex_hub_destroy` does not join the session pump threads;
+- it is always a **wait**, never an immediate compare. Since M2.15 everything
+  the counters see is released before `reldex_hub_destroy` returns (a session
+  stops counting when its `TERMINAL` is drained, or at destroy), so the wait is
+  a guard rather than a necessity — kept, because it costs nothing when the
+  counts are already right;
 - the baseline is taken **before** anything is created and after the library
-  has gone quiescent. Taking it while a previous test's pump thread was still
-  finishing made a test fail for having *fewer* live objects than it started
-  with — found that way, not by reasoning.
+  has gone quiescent. Taking it while a previous test was still finishing
+  made a test fail for having *fewer* live objects than it started with —
+  found that way, not by reasoning.
 
 What the counters cannot see is a leak on our own side of the boundary; the
 RAII handles in `ReldexHandles.h` and the flat RSS across 12,000 teardowns

@@ -26,6 +26,8 @@ private Q_SLOTS:
     void deleteLaterFromInsideADrainTearsDownCleanly();
     void eventsWithNoOwnerAreReleasedAndCounted();
     void closingASessionDrainsTheUnsolicitedTerminalEventWithoutAsserting();
+    void aSessionLostMidStatementEndsWithTerminalAndStopsCounting();
+    void progressAndUnknownEventsNeverTouchTheRequestBookkeeping();
 };
 
 void TstBridge::theAbiVersionIsCheckedBeforeAnythingElse()
@@ -309,6 +311,91 @@ void TstBridge::closingASessionDrainsTheUnsolicitedTerminalEventWithoutAsserting
     QVERIFY(session->closeSession());
     QVERIFY(spinUntil([session] { return session->state() == SessionController::Closed; }));
     QCOMPARE(closed.count(), 1);
+}
+
+void TstBridge::aSessionLostMidStatementEndsWithTerminalAndStopsCounting()
+{
+    // ABI 3.2: a session lost mid-statement ends with TERMINAL at once --
+    // nobody closed it -- and stops counting while the hub lives on.
+    const auto baseline = settledBaseline();
+    {
+        Bridge bridge;
+        QVERIFY(bridge.isValid());
+        SessionController *session = bridge.session();
+        QVERIFY(session->open());
+        QVERIFY(spinUntil([session] { return session->state() == SessionController::Ready; }));
+        QCOMPARE(liveCounts().sessions, baseline.sessions + 1);
+
+        QSignalSpy transaction(session, &SessionController::transactionStateChanged);
+        QVERIFY(session->executeMockStatement(RELDEX_MOCK_STATEMENT_DML));
+        QVERIFY(spinUntil([session] {
+            return session->state() == SessionController::Ready
+                    && session->transactionPossiblyActive();
+        }));
+        QCOMPARE(transaction.count(), 1);
+
+        QSignalSpy terminated(session, &SessionController::terminated);
+        QSignalSpy failures(session, &SessionController::failed);
+        QVERIFY(session->executeMockStatement(RELDEX_MOCK_STATEMENT_LOSE_SESSION));
+        QVERIFY(spinUntil([&terminated] { return terminated.count() == 1; }));
+        QCOMPARE(session->state(), SessionController::Failed);
+        QCOMPARE(failures.count(), 1);
+        QVERIFY(session->isTerminated());
+        QVERIFY2(terminated.at(0).at(0).toBool(),
+                 "the DML's transaction went with the connection, and TERMINAL says so");
+        QVERIFY(!terminated.at(0).at(1).toBool());
+        QVERIFY(session->transactionPossiblyLost());
+        QCOMPARE(session->errorKind(), static_cast<int>(RELDEX_ERROR_KIND_NETWORK_LOST));
+        QCOMPARE(session->errorNativeCode(), 3113);
+        QCOMPARE(session->outstandingRequests(), 0);
+        QCOMPARE(liveCounts().sessions, baseline.sessions);
+    }
+    QVERIFY2(spinUntilLiveCounts(baseline),
+             qPrintable(QStringLiteral("live counts after a lost session: %1 (baseline %2)")
+                                .arg(liveCounts().toString(), baseline.toString())));
+}
+
+void TstBridge::progressAndUnknownEventsNeverTouchTheRequestBookkeeping()
+{
+    // EXECUTING carries the request id of the statement it announces; a kind
+    // no header defines may carry anything. Neither may consume the entry the
+    // statement's EXECUTED is owed (ABI 3.2; D7).
+    Bridge bridge;
+    QVERIFY(bridge.isValid());
+    SessionController *session = bridge.session();
+    session->setMockBlockDurationMs(0);
+    QVERIFY(session->open());
+    QVERIFY(spinUntil([session] { return session->state() == SessionController::Ready; }));
+
+    QSignalSpy drains(&bridge, &Bridge::drained);
+    QVERIFY(session->executeMockStatement(RELDEX_MOCK_STATEMENT_BLOCK));
+    QCOMPARE(session->outstandingRequests(), 1);
+    // The worker announces the statement, then blocks: EXECUTING is drained
+    // while the EXECUTED is still owed.
+    QVERIFY(spinUntil([&drains] {
+        int events = 0;
+        for (const QList<QVariant> &drain : std::as_const(drains)) {
+            events += drain.at(0).toInt();
+        }
+        return events >= 1;
+    }));
+    QCOMPARE(session->outstandingRequests(), 1);
+
+    for (quint64 request = 0; request < 8; ++request) {
+        ReldexEvent future = reldex::makeEvent();
+        future.kind = 9999;
+        future.session = session->sessionId();
+        future.request = request;
+        session->handleEvent(future, reldex::BatchHandle(), reldex::ErrorHandle());
+    }
+    QCOMPARE(session->outstandingRequests(), 1);
+    QCOMPARE(session->state(), SessionController::Executing);
+
+    QVERIFY(bridge.releaseMockBlock(session->sessionId()));
+    QVERIFY(spinUntil(
+            [session] { return session->state() != SessionController::Executing; }));
+    QCOMPARE(session->outstandingRequests(), 0);
+    QVERIFY(!session->hasError());
 }
 
 QTEST_GUILESS_MAIN(TstBridge)

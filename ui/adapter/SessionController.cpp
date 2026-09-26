@@ -394,23 +394,49 @@ void SessionController::submitFetches()
 void SessionController::handleEvent(const ReldexEvent &raw, reldex::BatchHandle batch,
                                     reldex::ErrorHandle error)
 {
+    // Only a reply may touch the request bookkeeping. Everything else is
+    // handled -- or ignored -- first (ABI 3.2): `EXECUTING` carries the
+    // request id of the statement it announces, whose `EXECUTED` is still to
+    // come, so letting it through would consume that entry; `TERMINAL`,
+    // `SERVER_OUTPUT` and `TRANSACTION_STATE` answer no request
+    // (`request == 0`); and a kind this build does not know -- or
+    // `FETCHED_SEGMENT`, which it never asks for -- is ignored (D7) before it
+    // can do either.
+    switch (raw.kind) {
+    case RELDEX_EVENT_KIND_EXECUTING:
+        return;
+    case RELDEX_EVENT_KIND_TRANSACTION_STATE:
+        if (m_transactionPossiblyActive != raw.transaction_possibly_active) {
+            m_transactionPossiblyActive = raw.transaction_possibly_active;
+            Q_EMIT transactionStateChanged(m_transactionPossiblyActive);
+        }
+        return;
+    case RELDEX_EVENT_KIND_TERMINAL:
+        handleTerminal(raw, error);
+        return;
+    case RELDEX_EVENT_KIND_OPENED:
+    case RELDEX_EVENT_KIND_EXECUTED:
+    case RELDEX_EVENT_KIND_FETCHED:
+    case RELDEX_EVENT_KIND_RESULT_CLOSED:
+    case RELDEX_EVENT_KIND_SESSION_CLOSED:
+    case RELDEX_EVENT_KIND_COMPLETED:
+    case RELDEX_EVENT_KIND_SERVER_OUTPUT_CONFIGURED:
+        break;
+    default:
+        // SERVER_OUTPUT (its lines are released by the Bridge; the output
+        // pane is M3.x's), FETCHED_SEGMENT, and every kind this build
+        // predates.
+        return;
+    }
+
     // "Exactly one reply per accepted request" is a library guarantee, so it
     // is asserted in debug rather than defended against (ADR-0003 A5 rule 5).
-    //
-    // `request == 0` marks an unsolicited event this session never asked
-    // for -- `TERMINAL` and `SERVER_OUTPUT` (ADR-0003 A28), queued the same
-    // way a request-less event always has been. Request ids here start at 1
-    // (m_nextRequestId's initializer above), so 0 is never registered in
-    // m_outstanding; without this guard the assert below fired on every
-    // close/failed-open that actually ends a session. `Q_ASSERT_X` compiles
-    // to nothing under this project's default RelWithDebInfo build
-    // (ui/build.sh), which is why nothing caught this until a Debug build
-    // was tried.
-    const bool unsolicited = raw.request == 0;
+    // `Q_ASSERT_X` compiles to nothing under this project's default
+    // RelWithDebInfo build (ui/build.sh).
     const auto entry = m_outstanding.find(raw.request);
     const bool known = entry != m_outstanding.end();
-    Q_ASSERT_X(unsolicited || known, "SessionController::handleEvent",
-               "an event arrived for a request that was never accepted, or was already replied to");
+    Q_ASSERT_X(known, "SessionController::handleEvent",
+               "a reply arrived for a request that was never accepted, or was already replied to");
     if (known) {
         Q_ASSERT_X(entry.value() == raw.kind, "SessionController::handleEvent",
                    "the reply's kind does not match the request that was submitted");
@@ -526,9 +552,28 @@ void SessionController::handleEvent(const ReldexEvent &raw, reldex::BatchHandle 
         return;
 
     default:
-        // D7: an event kind this build predates is unknown, never an assert.
         return;
     }
+}
+
+void SessionController::handleTerminal(const ReldexEvent &raw, const reldex::ErrorHandle &error)
+{
+    // Since ABI 3.2 this also arrives the moment a session is lost
+    // mid-statement, with nobody having asked to close it. Replies to requests
+    // accepted before then may still follow, so `m_outstanding` is left alone.
+    m_terminated = true;
+    m_transactionPossiblyLost = raw.transaction_possibly_lost;
+    if (error) {
+        adoptError(error.get());
+    }
+    if (m_state != Closed && m_state != Failed) {
+        const bool lost = raw.session_state == RELDEX_SESSION_STATE_LOST;
+        setState(lost ? Failed : Closed);
+        if (lost) {
+            Q_EMIT failed();
+        }
+    }
+    Q_EMIT terminated(raw.transaction_possibly_lost, raw.abandoned);
 }
 
 void SessionController::setMaxFetchesInFlight(int fetches)
