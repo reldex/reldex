@@ -281,8 +281,9 @@ impl Store {
     /// the store file itself if either is missing -- owner-only on Unix,
     /// exactly like [`Store::open_default`] does for its own directory
     /// (module documentation). This is the caller-supplied-path counterpart
-    /// to [`Store::open_default`]/[`Store::open_in_directory`], for a caller
-    /// that (unlike them) does not fix the file name: `reldex-ffi`'s
+    /// to [`Store::open_default`]/`Store::open_in_directory` (crate-private,
+    /// so not a doc link here), for a caller that (unlike them) does not fix
+    /// the file name: `reldex-ffi`'s
     /// `reldex_workspace_open` takes a full path from across the ABI (an
     /// explicit override, or the C++ adapter's own copy of the ADR-0006 P5
     /// platform-default-path rule) and used to call [`Store::open`] directly,
