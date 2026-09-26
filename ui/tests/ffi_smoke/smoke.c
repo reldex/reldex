@@ -780,6 +780,30 @@ static void smoke_run_workspace_checks(void)
         release_workspace_reply_objects(&reply);
     }
 
+    /* ---- Credential-store kind (M2.11 review round 2, must-fix 1): a
+     * synchronous, workspace-level property, valid once OPENED was drained
+     * without an error -- this harness always opens with
+     * use_memory_credential_store=true, so the memory backend is the only
+     * kind reachable from here; the platform backends'
+     * Locked/Backend/Malformed native codes are covered by
+     * crates/ffi/src/workspace.rs's own Rust unit tests instead, which do
+     * not need a portable-across-CI-OSes credential backend to run. ---- */
+    {
+        int32_t kind = reldex_workspace_credential_store_kind(workspace);
+        smoke_check(
+            kind == RELDEX_CREDENTIAL_STORE_KIND_MEMORY,
+            "a workspace opened with use_memory_credential_store reports the memory store kind");
+        smoke_check(
+            reldex_credential_store_kind_can_store(kind),
+            "the memory store can save a password");
+        smoke_check(
+            !reldex_credential_store_kind_can_store(RELDEX_CREDENTIAL_STORE_KIND_ABSENT),
+            "the absent store cannot save a password");
+        smoke_check(
+            !reldex_credential_store_kind_can_store(999),
+            "a kind this header does not know cannot save a password either");
+    }
+
     /* ---- Credentials (family 6): put/get/delete, keyed by profile id. ---- */
     {
         uint64_t r1 = next_request_id();
@@ -830,6 +854,41 @@ static void smoke_run_workspace_checks(void)
         smoke_check(reply.kind == RELDEX_WORKSPACE_REPLY_KIND_CREDENTIAL_DELETED, "the reply is CREDENTIAL_DELETED");
         smoke_check(reply.found, "the deleted credential had existed");
         release_workspace_reply_objects(&reply);
+    }
+
+    /* ---- reldex_secret_from_utf8 (M2.11 review round 2, should-fix 9): a
+     * typed-in password, not one resolved from the store, fed straight into
+     * build_connect_params through the same owned ReldexSecret shape. ---- */
+    {
+        static const char typed_password[] = "reldex-smoke-typed-in-7b3e";
+        ReldexSecret *typed = reldex_secret_from_utf8(str_of(typed_password));
+        smoke_require(typed != NULL, "reldex_secret_from_utf8 builds a secret from valid UTF-8");
+        ReldexStr exposed = reldex_secret_expose(typed);
+        smoke_check(
+            exposed.len == sizeof(typed_password) - 1
+                && memcmp(exposed.ptr, typed_password, exposed.len) == 0,
+            "the built secret exposes exactly the bytes it was given");
+
+        uint64_t r = next_request_id();
+        g_workspace_wake_flag = 0;
+        status = reldex_workspace_build_connect_params(workspace, r, service_name_profile_id, typed);
+        smoke_require(status == RELDEX_STATUS_OK, "build_connect_params with a typed-in secret is accepted");
+        smoke_require(
+            wait_and_take_workspace_reply(workspace, &reply),
+            "the ConnectParamsBuilt reply for the typed-in secret arrives");
+        smoke_check(reply.error == NULL, "building connect params with a typed-in secret did not fail");
+        smoke_check(reply.connect != NULL, "the connect summary is present");
+        release_workspace_reply_objects(&reply);
+
+        reldex_secret_release(typed);
+
+        /* Invalid UTF-8 is refused, not silently truncated or replaced. */
+        static const unsigned char invalid_utf8[] = {0xff, 0xfe};
+        struct ReldexStr bad;
+        bad.ptr = (const uint8_t *)invalid_utf8;
+        bad.len = sizeof(invalid_utf8);
+        ReldexSecret *refused = reldex_secret_from_utf8(bad);
+        smoke_check(refused == NULL, "reldex_secret_from_utf8 refuses invalid UTF-8");
     }
 
     /* ---- resolve_password (family 6): PromptRequired/NotStored, then
