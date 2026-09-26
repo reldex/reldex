@@ -1,6 +1,7 @@
 #include "ConnectionManager.h"
 
 #include "Bridge.h"
+#include "SessionController.h"
 
 #include <QByteArray>
 #include <QDir>
@@ -731,6 +732,9 @@ void ConnectionManager::continueUpdateProfile(quint64 request, PendingOp &op,
             op.fields.passwordStorage = RELDEX_PASSWORD_STORAGE_KIND_PROMPT_EACH_TIME;
         } else {
             op.fields.passwordStorage = RELDEX_PASSWORD_STORAGE_KIND_CREDENTIAL_STORE;
+            // M3.3: a new password is in the store, so the one the database
+            // refused is gone; the next connect may use the store again.
+            m_refusedStoredPasswords.remove(op.profileId);
         }
         const OwnedProfileDetails details = buildDetails(op.fields);
         const QByteArray id16 = idToBytes16(op.profileId);
@@ -955,6 +959,11 @@ void ConnectionManager::handleReply(const ReldexWorkspaceReply &reply)
 
     if (reply.kind == RELDEX_WORKSPACE_REPLY_KIND_PASSWORD_RESOLVED) {
         handlePasswordResolved(reply);
+        return;
+    }
+
+    if (reply.kind == RELDEX_WORKSPACE_REPLY_KIND_CONNECT_PREPARED) {
+        handleConnectPrepared(reply);
         return;
     }
 
@@ -1216,4 +1225,120 @@ void ConnectionManager::finishTestConnect()
     m_testConnectSessionId = 0;
     m_testConnectBusy = false;
     Q_EMIT testConnectStateChanged();
+}
+
+// ============================================================================
+// M3.3: the workspace half of the connect flow. `SessionController` owns the
+// session half; see ui/README.md "Connect flow (M3.3)".
+// ============================================================================
+
+bool ConnectionManager::prepareConnect(const QByteArray &profileId, const ReldexSecret *typed,
+                                       SessionController *sink)
+{
+    clearError();
+    if (!ensureReady()) {
+        return false;
+    }
+    const QByteArray id16 = idToBytes16(profileId);
+    const quint64 request = nextRequest();
+    // Resolved on the workspace's service thread, never here: the credential
+    // store read (`resolve_password`) and the settings lookup both happen
+    // there (ADR-0007 S3, `AGENTS.md` "no I/O on the UI thread").
+    const ReldexStatus status = reldex_workspace_prepare_connect(
+            m_workspace.get(), request, reinterpret_cast<const std::uint8_t *>(id16.constData()),
+            typed);
+    if (status != RELDEX_STATUS_OK) {
+        adoptError(reldex_last_error_take(), false);
+        return false;
+    }
+    m_connectPrepares.insert(request, sink);
+    return true;
+}
+
+void ConnectionManager::forgetConnectPrepare(SessionController *sink)
+{
+    for (auto it = m_connectPrepares.begin(); it != m_connectPrepares.end();) {
+        if (it.value() == sink) {
+            it = m_connectPrepares.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void ConnectionManager::handleConnectPrepared(const ReldexWorkspaceReply &reply)
+{
+    const QPointer<SessionController> sink = m_connectPrepares.take(reply.request);
+    if (sink) {
+        sink->handleConnectPrepared(reply);
+    }
+    // Otherwise the connect was cancelled (or its controller is gone): the
+    // reply is released unread by drain()'s handles, summary and all.
+}
+
+ConnectionManager::ProfileFields ConnectionManager::fieldsFromRow(const ProfileModel::Row &row)
+{
+    ProfileFields fields;
+    fields.name = row.name;
+    fields.environment = row.environment;
+    fields.environmentLabel = row.environmentLabel;
+    fields.treatAsProduction = row.treatAsProduction;
+    fields.endpointKind = row.endpointKind;
+    fields.host = row.host;
+    fields.port = row.port;
+    fields.serviceTargetKind = row.serviceTargetKind;
+    fields.serviceNameOrSid = row.serviceNameOrSid;
+    fields.connectString = row.connectString;
+    fields.authKind = row.authKind;
+    fields.username = row.username;
+    fields.passwordStorage = row.passwordStorage;
+    fields.role = row.sessionRole;
+    fields.transport = row.transport;
+    fields.caDirectory = row.caDirectory;
+    fields.allowUnenforcedCertificatePin = row.allowUnenforcedCertificatePin;
+    return fields;
+}
+
+bool ConnectionManager::saveConnectPassword(const QByteArray &profileId,
+                                            const ReldexSecret *password)
+{
+    clearError();
+    if (!ensureReady() || password == nullptr) {
+        return false;
+    }
+    const QByteArray id16 = idToBytes16(profileId);
+    const ProfileModel::Row *row = m_profiles->findRow(id16);
+    if (row == nullptr) {
+        m_hasError = true;
+        m_errorMessage = QStringLiteral("the profile is no longer in the list");
+        m_errorMessageKey = QStringLiteral("error.profile.notFound");
+        m_errorKind = RELDEX_ERROR_KIND_UNKNOWN;
+        Q_EMIT errorChanged();
+        return false;
+    }
+
+    // M3.2's own update step, entered at "the put is in flight": the flag
+    // moves to CredentialStore only once `put` has succeeded (ADR-0007 write
+    // order), and to prompt-each-time if it failed.
+    PendingOp op;
+    op.kind = OpKind::UpdateProfile;
+    op.step = Step::UpdateAwaitingCredentialPut;
+    op.profileId = id16;
+    op.fields = fieldsFromRow(*row);
+    op.finalPasswordStorage = RELDEX_PASSWORD_STORAGE_KIND_CREDENTIAL_STORE;
+
+    const quint64 request = nextRequest();
+    // Borrowed from the secret for this call only; the store keeps its own
+    // copy. Nothing here copies the text into a Qt string.
+    const ReldexStr exposed = reldex_secret_expose(password);
+    const ReldexStatus status = reldex_workspace_credential_put(
+            m_workspace.get(), request, reinterpret_cast<const std::uint8_t *>(id16.constData()),
+            exposed);
+    if (status != RELDEX_STATUS_OK) {
+        adoptError(reldex_last_error_take(), false);
+        Q_EMIT credentialWarning(m_errorMessageKey, m_errorMessage);
+        return false;
+    }
+    m_pending.insert(request, op);
+    return true;
 }

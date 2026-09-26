@@ -162,15 +162,22 @@ pub enum ReldexCloseDisposition {
 pub struct ReldexOpenOptions {
     /// `sizeof(ReldexOpenOptions)`.
     pub struct_size: u32,
-    /// A [`crate::ReldexDriverKind`]. This build accepts only
-    /// `RELDEX_DRIVER_KIND_MOCK`.
+    /// A [`crate::ReldexDriverKind`]: `RELDEX_DRIVER_KIND_MOCK` (a build with
+    /// the `mock-driver` feature) or `RELDEX_DRIVER_KIND_ORACLE` (ABI 3.3).
     pub driver: i32,
     /// The scripted world, when `driver` is the mock.
     pub mock: ReldexMockScenarioConfig,
+    /// What to connect to, when `driver` is `RELDEX_DRIVER_KIND_ORACLE` (ABI
+    /// 3.3): a summary `reldex_workspace_prepare_connect` handed out, which
+    /// carries the parameters, password included. **Borrowed** for the call
+    /// only — the session keeps its own copy — so release it straight after
+    /// the call returns. Ignored for the mock.
+    pub connect: *const crate::ReldexConnectSummary,
 }
 
-// SAFETY: `#[repr(C)]`, `struct_size` first, and every field is an integer or
-// another `CStruct` that is itself valid when zeroed.
+// SAFETY: `#[repr(C)]`, `struct_size` first, and every field is an integer, a
+// pointer (null is valid) or another `CStruct` that is itself valid when
+// zeroed.
 unsafe impl CStruct for ReldexOpenOptions {
     const MIN_SIZE: usize = size_of::<u32>() + size_of::<i32>();
 }
@@ -182,6 +189,7 @@ impl Default for ReldexOpenOptions {
             struct_size: u32::try_from(size_of::<Self>()).unwrap_or(u32::MAX),
             driver: crate::ReldexDriverKind::Mock as i32,
             mock: ReldexMockScenarioConfig::default(),
+            connect: std::ptr::null(),
         }
     }
 }
@@ -779,11 +787,17 @@ fn retire(hub: &ReldexHub, id: SessionId) -> bool {
 /// submitted on it until the connect has succeeded (see
 /// [`reldex_session_execute`] for exactly when that is).
 ///
+/// An Oracle session (`RELDEX_DRIVER_KIND_ORACLE`, ABI 3.3) connects on its
+/// worker with the parameters in `options->connect`, bounded by the
+/// connection's connect limit; `reldex_session_abandon` gives up on it at
+/// once, and a connection that arrives after that is closed, never adopted.
+///
 /// # Safety
 ///
 /// `hub` must be a live hub; `options` must be null (for the defaults) or
-/// point at a [`ReldexOpenOptions`] with `struct_size` set; `out_session` must
-/// be null or point at a writable `uint64_t`.
+/// point at a [`ReldexOpenOptions`] with `struct_size` set, whose `connect` is
+/// null or a live [`crate::ReldexConnectSummary`]; `out_session` must be null
+/// or point at a writable `uint64_t`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reldex_hub_open_session(
     hub: *mut ReldexHub,
@@ -809,16 +823,12 @@ pub unsafe extern "C" fn reldex_hub_open_session(
         if !out_session.is_null() && !out_session.is_aligned() {
             return set_last_argument_error("reldex_hub_open_session: `out_session` is unaligned");
         }
-        let choice = match build_driver(&options) {
+        // SAFETY: delegated to this function's contract for `options.connect`;
+        // the borrow ends before this call returns.
+        let connect = unsafe { options.connect.as_ref() };
+        let choice = match build_driver(&options, connect) {
             Ok(choice) => choice,
-            Err(status) => {
-                set_last_error(DbError::new(
-                    ErrorKind::Unsupported,
-                    "reldex-ffi: this build cannot open a session against the requested driver; \
-                     only the mock driver is linked",
-                ));
-                return status;
-            }
+            Err(status) => return status,
         };
 
         let start = |hub: &Arc<ReldexHub>| {

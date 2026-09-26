@@ -13,9 +13,10 @@ import Reldex.Adapter
 // this file's).
 //
 // Presentation only, per ARCHITECTURE.md invariant 4: no business rules
-// here. Every backend-shaped placeholder (session state, results,
-// DBMS_OUTPUT) names the milestone that replaces it; connections (M3.2) and
-// the production indicator (M3.4) are filled in already. See
+// here. Every backend-shaped placeholder (results, DBMS_OUTPUT) names the
+// milestone that replaces it; connections (M3.2), the worksheet connect flow
+// and its status (M3.3) and the production indicator (M3.4) are filled in
+// already. See
 // `ui/README.md` "App shell" for the layout diagram and how this differs
 // from `Harness.qml`, the still-reachable S15 measurement window
 // (`ui/app/main.cpp` picks between the two).
@@ -112,6 +113,9 @@ ApplicationWindow {
             visible: root.sidebarVisible
             bridge: bridge
             connectionManager: bridge.connections
+            // M3.3: each connection row's Connect button connects this
+            // worksheet (one shared session until M4.9).
+            session: bridge.session
         }
 
         SplitView {
@@ -156,5 +160,14 @@ ApplicationWindow {
         height: 28
         // M3.4: see the same-named binding on `WorksheetArea` above.
         productionActive: bridge.session ? bridge.session.activeProfileIsProduction : false
+        // M3.3: the worksheet's connection state, Cancel and Disconnect.
+        session: bridge.session
+    }
+
+    // M3.3: asked for when the worksheet's connect needs a password; opens
+    // and closes itself as `SessionController.connectState` moves.
+    ConnectPasswordDialog {
+        id: connectPasswordDialog
+        session: bridge.session
     }
 }

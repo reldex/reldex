@@ -21,6 +21,8 @@ use reldex_ffi::{
     reldex_session_set_server_output,
 };
 
+pub(crate) mod workspace;
+
 /// How long a test waits for an event before calling it a hang.
 ///
 /// Deliberately generous and deliberately **not** an assertion about speed:
@@ -370,17 +372,23 @@ impl Drop for Harness {
 
 /// Reads an event's error and releases it.
 pub(crate) fn take_error(event: &ReldexEvent) -> Option<ErrorSnapshot> {
-    if event.error.is_null() {
+    take_error_pointer(event.error)
+}
+
+/// Reads an error this library handed out (on an event, a reply or
+/// `reldex_last_error_take`) and releases it.
+pub(crate) fn take_error_pointer(error: *mut ReldexError) -> Option<ErrorSnapshot> {
+    if error.is_null() {
         return None;
     }
     let mut view = ReldexErrorView::default();
-    // SAFETY: the event's error is live until `reldex_error_free` below.
-    let status = unsafe { reldex_error_view(event.error, std::ptr::from_mut(&mut view)) };
+    // SAFETY: the error is live until `reldex_error_free` below.
+    let status = unsafe { reldex_error_view(error, std::ptr::from_mut(&mut view)) };
     assert_eq!(status, ReldexStatus::Ok);
     // SAFETY: the view's strings borrow from the still-live error.
     let snapshot = unsafe { ErrorSnapshot::read(&view) };
-    // SAFETY: the error came from an event and has not been freed.
-    unsafe { reldex_error_free(event.error) };
+    // SAFETY: the error came from this library and has not been freed.
+    unsafe { reldex_error_free(error) };
     Some(snapshot)
 }
 
@@ -440,6 +448,37 @@ impl Drop for OwnedBatch {
             // SAFETY: taken from an event and released exactly once, here.
             unsafe { reldex_batch_release(self.0) };
         }
+    }
+}
+
+/// Formats one cell of `batch` as the adapter would display it, with the
+/// default options.
+pub(crate) fn format_cell(batch: *const ReldexBatch, column: usize, row: usize) -> String {
+    let arena = reldex_ffi::reldex_text_arena_create();
+    assert!(!arena.is_null());
+    let options = reldex_ffi::ReldexFormatOptions::default();
+    let mut view = reldex_ffi::ReldexArenaView::default();
+    // SAFETY: the batch is live (the caller's contract), and the arena and
+    // `options` are live locals; the view's pointers borrow from the arena,
+    // which is released only after the text is copied out.
+    unsafe {
+        let status = reldex_ffi::reldex_batch_format_column(
+            batch,
+            column,
+            row,
+            1,
+            &raw const options,
+            arena,
+        );
+        assert_eq!(status, ReldexStatus::Ok);
+        let status = reldex_ffi::reldex_text_arena_view(arena, &raw mut view);
+        assert_eq!(status, ReldexStatus::Ok);
+        assert_eq!(view.count, 1);
+        let offsets = std::slice::from_raw_parts(view.offsets, 2);
+        let bytes = std::slice::from_raw_parts(view.data, view.data_len);
+        let text = String::from_utf8_lossy(&bytes[offsets[0]..offsets[1]]).into_owned();
+        reldex_ffi::reldex_text_arena_release(arena);
+        text
     }
 }
 

@@ -113,7 +113,7 @@ ApplicationWindow
      `- SplitView (vertical)
          |- WorksheetArea.qml  tab bar + [editor placeholder | result placeholder] (SplitView)
          `- OutputPanes.qml    Messages / DBMS_OUTPUT placeholder tabs
- `- StatusBar.qml              session-state placeholder, production-indicator slot, theme picker
+ `- StatusBar.qml              worksheet connection state + Cancel/Disconnect (M3.3), production indicator, theme picker
 ```
 
 Every split is a real `SplitView` handle (draggable, remembered for the
@@ -708,6 +708,13 @@ Not fixed here — `crates/ffi` was otherwise out of scope for this task:
   `handleHubEvent()` is exercised directly via `messageKeyForError()` unit
   tests instead of end to end, since nothing in this build can make the mock
   driver fail a connect.
+  **Partly closed by M3.3 (ABI 3.3):** the hub now opens Oracle sessions
+  (`RELDEX_DRIVER_KIND_ORACLE`, from `reldex_workspace_prepare_connect`'s
+  summary), and the worksheet connect flow uses that path and the mock's
+  `connect_failure` for its own tests (see "Connect flow (M3.3)").
+  `testConnect()` itself still opens a default (mock) session from
+  `build_connect_params`. Moving it onto `prepare_connect` and the real
+  driver is a follow-up.
 
 ### Hand-off
 
@@ -731,6 +738,214 @@ Not fixed here — `crates/ffi` was otherwise out of scope for this task:
   two rules it encodes (put-then-flip; `NotFound`/`Unavailable`-count-as-done,
   with the `Unavailable` gap called out above).
 
+## Connect flow (M3.3)
+
+This is the worksheet's first real database session (`SPEC.md` §B3, §10, §17; ADR-0007; ADR-0003
+A40–A43).
+
+- Each row of the sidebar's connection list has a **Connect** button.
+- The status bar shows where the connection is, with **Cancel** while connecting and
+  **Disconnect** once connected.
+- Until M4.9, every worksheet tab shares the single `SessionController` that `Bridge` owns.
+
+### States (`SessionController.connectState`)
+
+```text
+NotConnected/ConnectFailed/TimedOut/Cancelled/Lost --connectProfile()--> Preparing
+Preparing --parameters ready--> Connecting (open submitted, timer armed)
+Preparing --password needed--> AwaitingPassword --submitPassword()--> Preparing
+Connecting --OPENED--> Connected | ConnectFailed | TimedOut (limit reached)
+Connected --disconnectSession()--> Disconnecting --TERMINAL--> NotConnected
+Connected --TERMINAL (lost)--> Lost
+Preparing/AwaitingPassword/Connecting --cancelConnect()--> Cancelled, at once
+```
+
+`connectState` sits beside the statement-level `state` and does not replace it. The work is split
+three ways.
+
+**`ConnectionManager` owns the workspace half.**
+
+- `prepareConnect(profileId, typed, sink)` submits `reldex_workspace_prepare_connect` and hands the
+  `CONNECT_PREPARED` reply to the controller that asked.
+- `saveConnectPassword()` saves a typed password.
+- It remembers which stored passwords were refused.
+
+**`SessionController` owns the session half.**
+
+- It opens with `RELDEX_DRIVER_KIND_ORACLE` and `options.connect`, and releases the summary, which
+  wipes the password, as soon as `reldex_hub_open_session` returns.
+- It arms the timeout and handles `OPENED` and `TERMINAL`.
+
+**QML only presents.**
+
+- The parts are `Sidebar.qml`'s `connectButton_<n>`, `ConnectPasswordDialog.qml`, `StatusBar.qml`
+  (`sessionStateText`, `cancelConnectButton`, `disconnectButton`) and `DisconnectConfirmDialog.qml`.
+- Each part reads an adapter property and calls one invokable. The properties are `canConnect`,
+  `canCancelConnect`, `canDisconnect`, `transactionPossiblyActive`, `passwordPromptReason`,
+  `offerSavePassword` and `errorKey`.
+- No rule is decided in QML.
+- The status bar's `sessionStateText` replaces M3.1's `sessionStatePlaceholder`.
+
+### The rules it keeps
+
+**Asking for a password, by name.** The prompt always says why it appears:
+
+| Reason | Why the prompt appears |
+| --- | --- |
+| `PromptEachTime` | The profile asks at every connect. |
+| `NotStored` | Nothing is saved for this profile. |
+| `StoreUnavailable` | This system has no credential store, so every connect prompts. |
+| `StoreFailed` | The store could not be read. The store's value-free message is shown. |
+| `StoredPasswordRefused` | The database refused the saved password earlier in this run. |
+
+A profile with a stored password connects with no prompt. External authentication needs none.
+
+`tst_connectflow` covers the first two reasons and `StoredPasswordRefused`. The adapter's tests
+always use the memory store, so `StoreUnavailable` and `StoreFailed` are not driven through the UI.
+They are proven one layer down:
+
+- `StoreUnavailable`: `crates/ffi/tests/connect_prepare.rs`'s
+  `with_no_credential_store_every_connect_prompts`, run on the CI platforms that have no store.
+- `StoreFailed`: `reldex_secrets`' `resolve_password` truth table.
+
+**How a typed password crosses into the core.**
+
+- It crosses in one place: `submitPassword()` turns it into a zeroizing `ReldexSecret`
+  (`reldex_secret_from_utf8`) and wipes its own UTF-8 copy.
+- No QML property holds it. The dialog clears its field on submit, on cancel and whenever it opens.
+- It is never logged.
+- **Known limit:** the `QString` inside Qt's `TextField` cannot be wiped. It is dropped when the
+  field is cleared, but its memory is not overwritten.
+
+**Saving a password.**
+
+- Saving happens only after a successful connect, and only when the user ticked the checkbox. The
+  checkbox is unchecked each time the prompt opens.
+- `saveConnectPassword()` follows M3.2's write order: `credential_put` first, then the profile's
+  `password_storage` flips to `CREDENTIAL_STORE`.
+- A `PromptEachTime` profile saved this way becomes a stored-password profile, which is what the
+  checkbox says.
+- With no store, the checkbox is not offered.
+
+**A refused saved password is never retried.**
+
+- When a connect that used the stored password fails with `AUTHENTICATION`, the profile is marked
+  for the rest of the run.
+- Its next connect asks first (`StoredPasswordRefused`) and offers to update the saved password.
+- Nothing retries on its own, because each failed attempt counts against the account's failed-login
+  limit (ADR-0007).
+- A successful save clears the mark.
+
+**Connect limit and timeout.**
+
+- The limit is the profile's resolved `CONNECT_TIMEOUT` (application → profile, default 15 s),
+  read from the summary. The status bar shows it while connecting.
+- A `QTimer` (`PreciseTimer`) armed at the limit abandons the session and reports a `TIMEOUT`.
+- The driver's own limit fails with a `CONNECTION` error whose text says "connect limit". When
+  that error arrives at or after the limit, it also reads as timed out, with the driver's text as
+  the detail.
+- A profile set to "no limit" arms no timer.
+- This split is adapter policy, not ABI (ADR-0003 A42).
+
+**Cancel.**
+
+- `cancelConnect()` returns at once in every pre-connected state:
+  - while preparing, the reply is dropped unread;
+  - while asking, the prompt closes;
+  - while connecting, `reldex_session_abandon` runs.
+- An abandoned session's remaining events (`OPENED` with `CANCELLED`, then `TERMINAL` with
+  `abandoned`) are consumed and never adopted, and the session id is unregistered at its
+  `TERMINAL`.
+- A failed open is retired the same way, so the user can connect again at once.
+
+**After connecting.**
+
+- The session is the worksheet's stable session. `connectProfile()` is refused while one is
+  preparing, connecting, connected or disconnecting, so nothing replaces it silently.
+- `activeProfileIsProduction` (M3.4) comes from the connecting profile's `treatAsProduction`. It is
+  set when the session opens and cleared when it closes or is lost.
+- Auto-commit stays off, and nothing in this flow commits.
+
+**Disconnect.**
+
+- When `transactionPossiblyActive` is set, Disconnect opens `DisconnectConfirmDialog`: Keep
+  connected, Roll back and disconnect, or Commit and disconnect.
+- The thin driver sets that flag after any statement except DDL, a `SELECT` included (ADR-0003
+  A43).
+- A close the core refuses returns to `Connected` with the error shown.
+
+**Loss.**
+
+- A `TERMINAL` while connected moves to `Lost`. The status text says whether an open transaction
+  may have been lost with it.
+- The adapter then calls `reldex_session_close` on the retired id, only to free orphaned column
+  descriptions (ADR-0003 A39). The call answers `NOT_FOUND`, which the adapter discards.
+- Reconnecting is the user's click.
+
+**Errors.**
+
+- The status text shows the kind (via `errorKey`) and the vendor's message with its code, e.g.
+  `ORA-01017`.
+- Hovering shows the kind, the vendor message, Reldex's message and the cause chain.
+
+**No I/O on the UI thread.**
+
+- Parameters and the store are handled on the workspace service thread, and the connect runs on the
+  session's worker.
+- The UI thread only submits. Two things back this up:
+  - `tst_connectflow`'s calls return while the mock holds a connect indefinitely;
+  - the live test measures the UI thread's own calls (below).
+
+### Tests
+
+`ui/tests/tst_connectflow.cpp` runs offscreen against the mock driver and a memory credential
+store:
+
+- a `PromptEachTime` profile prompts, then connects;
+- a connected worksheet is never silently replaced;
+- the production indicator follows the session;
+- a stored password needs no prompt;
+- a refused stored password prompts next time, is never retried, and can be updated;
+- a typed password is saved only after success, and only when asked;
+- external authentication needs no password;
+- cancel returns at once and adopts nothing late;
+- cancel while asking leaves nothing behind;
+- the settings limit times out;
+- a failed connect keeps its error kind;
+- a lost session lands in the UI and allows a new connect;
+- disconnect with a possibly open transaction waits for a decision.
+
+`ui/tests/tst_coreinfo.cpp` has two more:
+
+- `connectFlowThroughTheShellWithTheMockDriver` loads `Main.qml` and clicks through the real QML:
+  the prompt, whose field is cleared at once; the production indicator, which appears only once
+  the session is open; Disconnect; and Cancel while connecting.
+- `connectFlowAgainstTheRealDatabase` is the live end-to-end test. It is skipped unless
+  `RELDEX_TEST_ORACLE_DSN`/`_USER`/`_PASSWORD` are set. It checks that a wrong password shows
+  1017 in the status text. Then, five times, it connects through the prompt, runs
+  `select 1 from dual`, and disconnects (confirm → Roll back). Run it through the test-database
+  runner, which loads `tools/oracle-test-db/.env` without printing it:
+
+```bash
+source tools/dev-env/env.sh
+bash ui/build.sh --test
+RELDEX_WORKSPACE_IN_MEMORY=1 QT_QPA_PLATFORM=offscreen \
+  RELDEX_IT_EXEC=build/ui-RelWithDebInfo/tst_coreinfo \
+  bash tools/oracle-test-db/run-it.sh connectFlowAgainstTheRealDatabase
+```
+
+Measured 2026-09-27 on an AMD Ryzen 7 5700G, 64 GB, Windows 11. The build was `ui/build.sh`'s
+default RelWithDebInfo, against the local 19c container. Each run is n = 5 and each figure is a
+p50:
+
+| Measure | Run 1 | Run 2 | Run 3 (via `run-it.ps1`) | Run 4 (before pushing) |
+| --- | --- | --- | --- | --- |
+| Connect (open → `OPENED`) | 46 ms | 48 ms | 49 ms | 47 ms |
+| `select 1 from dual` (execute → result complete) | 2 ms | 2 ms | 3 ms | 3 ms |
+| Longest UI-thread call (click Connect, or press Connect in the prompt) | 226 µs | 264 µs | 314 µs | 430 µs |
+
+The test asserts that the UI-thread call is shorter than the connect.
+
 ## Production indicator (M3.4)
 
 `SPEC.md` §17: "Production should have a persistent visual indicator";
@@ -744,16 +959,16 @@ connection manager:
   `runOnOpen`/`autoFetch` on the same class. It is `Profile::
   treat_as_production()` (ADR-0006 P3) carried across the adapter boundary
   once whatever binds a worksheet's session to a profile has resolved it --
-  never the `ReldexEnvironmentKind` enum, and never computed in QML. **Nothing
-  sets it yet**: M3.3 (the connect flow) is the class that will call
-  `setActiveProfileIsProduction()` once a worksheet's session is actually
-  bound to a profile, most likely from whatever already has the profile row
-  in hand to build `connection_params` in the first place (P4) -- see
-  "Hand-off" above for why this replaced the originally-planned "look
-  `treatAsProduction` up in `ProfileModel` by id from QML" approach. Until
-  M3.3 lands, the property simply always reads `false`, so every location
-  below is exercised in tests by calling the setter directly (`ui/tests/
-  tst_coreinfo.cpp`'s `productionIndicator*` tests), not by a real connect.
+  never the `ReldexEnvironmentKind` enum, and never computed in QML. **Set by
+  M3.3's connect flow**: `SessionController` takes the connecting profile's
+  `treatAsProduction` from `ProfileModel`'s row when the connect starts,
+  sets the property when the session opens, and clears it when the session
+  closes or is lost (`tst_connectflow.cpp`'s
+  `theProductionIndicatorFollowsTheConnectedSession`). See "Hand-off" above
+  for why this replaced the originally-planned "look `treatAsProduction` up
+  in `ProfileModel` by id from QML" approach. The `productionIndicator*`
+  tests below still call the setter directly, so they test the indicator on
+  its own.
 - **`ui/app/ProductionIndicator.qml`** — a small reusable `Row`: a Unicode
   warning-triangle glyph (`⚠`, not a raster asset, matching this shell's
   existing icon convention) plus a text label, both coloured with
@@ -832,13 +1047,11 @@ as the app-shell tests above):
 
 ### Hand-off
 
-- **M3.3** (connect flow): call
-  `bridge.session.setActiveProfileIsProduction(...)` with the connecting
-  profile's `treatAsProduction` (from the `ProfileModel` row, or the FFI
-  profile view it already has in hand to build `connection_params`) once the
-  session actually opens against a profile, and set it back to `false` on
-  close/disconnect. No other file needs to change for the indicator to start
-  reflecting real connections.
+- **M3.3** (connect flow) -- **done**: `SessionController` sets
+  `activeProfileIsProduction` from the connecting profile's
+  `treatAsProduction` (the `ProfileModel` row) when the session opens, and
+  clears it on disconnect or loss. No QML changed for it. See "Connect flow
+  (M3.3)".
 - **M4.9** ("N sessions, per-tab state"): once each tab has its own
   `SessionController`, `productionActive` moves from one shared
   `WorksheetArea`-level property to a per-tab value read off each tab's own
@@ -908,12 +1121,23 @@ independent, stacked reasons:
    `reldex_driver_mock::metadata::MetadataFixture`. So even a bind-carrying
    `execute()` would have nothing to answer it: S14's scenario only knows
    `ReldexMockStatement`'s own statements.
-3. `ReldexDriverKind` (`reldex.h`) has **no non-mock value at all** yet —
-   "the only driver a build with the `mock-driver` feature can open" — so
-   this is not a missing wiring step in `SessionController::open()` (which
-   already only ever requested `RELDEX_DRIVER_KIND_MOCK`, unchanged by this
-   task); there is no Oracle session to open from this FFI yet, mock feature
-   or not.
+3. ~~`ReldexDriverKind` (`reldex.h`) has **no non-mock value at all**
+   yet.~~ **Closed by M3.3 (ABI 3.3):** `RELDEX_DRIVER_KIND_ORACLE` opens a
+   real session from the summary `reldex_workspace_prepare_connect` hands
+   out (see "Connect flow (M3.3)"). This class does not use it yet:
+   `ObjectBrowserModel`'s own `SessionController::open()` still requests
+   `RELDEX_DRIVER_KIND_MOCK`.
+
+**What still stands between this class and real rows** (after M3.3):
+
+- **Gap 1 — binds.** `reldex_session_execute` still takes no bind values, and every metadata
+  statement needs them. This is a `crates/ffi` change (an ABI addition).
+- **Gap 2 — the mock.** Its `S14` scenario still cannot answer a metadata statement. This only
+  matters for the offscreen tests, once gap 1 closes.
+- **Opening the real session.** The browser's session must open through `prepare_connect` and
+  `ORACLE` for the profile the tree is rooted at, the same way the worksheet does, instead of
+  `open()`. It needs its own password handling or a shared prompt. This is the M6.1 real-DB half,
+  and it is blocked on gap 1.
 
 `ObjectBrowserModel` still calls the real pipeline for real: `expand()` opens
 its own session, calls `reldex_metadata_prepare`, reads the SQL text and
@@ -1048,9 +1272,10 @@ objects, against the Oracle test container, using the S15 method.
 
 **Not measured against the container, and not because it was down.** Even
 with `reldex-oracle19c` healthy, this build cannot run a single metadata
-query against it: `ReldexDriverKind` has no Oracle value (gap 3 above), so
-there is no session to open in the first place — this is a `crates/ffi` gap,
-not a container or measurement-methodology problem. See `phase-1.md` row
+query against it. When this was written, `ReldexDriverKind` had no Oracle value
+(gap 3 above; M3.3 has since added one), and binds still cannot reach a
+statement (gap 1, still open) — a `crates/ffi` gap, not a container or
+measurement-methodology problem. See `phase-1.md` row
 M6.1's "as implemented" note for the container's actual state on the day
 this was written.
 
@@ -1094,9 +1319,12 @@ lead pending the real-driver half above.
 
 ### Hand-off
 
-- **M2.15** (or whichever task adds bind support to `reldex_session_execute`
-  and an Oracle `ReldexDriverKind`) is what turns this class's already-real
-  pipeline into one that returns actual rows; no shape change needed here.
+- **Real rows.** Two changes turn this class's already-real pipeline into
+  one that returns actual rows. The Oracle `ReldexDriverKind` landed in M3.3.
+  Bind support in `reldex_session_execute` has not landed and has no task
+  row of its own yet (M4.4's bind dialog needs it too). Once binds exist, the browser's session switches from `open()` (the
+  mock) to the worksheet's `prepare_connect` → `ORACLE` path. No shape change
+  is needed here.
 - **M6.3** (i18n): every user-facing string in `ObjectBrowserModel.cpp`/
   `ObjectBrowserPanel.qml` already goes through `tr()`/`qsTr()`, including the
   9 group labels (`QT_TR_NOOP`) — ready for a `.ts` catalogue with no further

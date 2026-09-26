@@ -210,8 +210,15 @@ using ReldexWorkspaceWakeFnNoexcept = void (*)(void *user_data) noexcept;
  * a loss mid-statement, a session id that is retired once its `TERMINAL` is
  * drained — without changing its shape; ADR-0003's M2.15 amendment lists
  * each change.
+ *
+ * `3` because M3.3 opens the first real database session, additively:
+ * `RELDEX_DRIVER_KIND_ORACLE`, a trailing `ReldexOpenOptions::connect`,
+ * `reldex_workspace_prepare_connect` with its reply kind
+ * (`CONNECT_PREPARED`) and password source (`SUPPLIED`), and a
+ * `ReldexConnectSummary` that now carries the parameters it summarises.
+ * ADR-0003's M3.3 amendment (A40–A43) lists each change.
  */
-#define RELDEX_ABI_VERSION_MINOR 2
+#define RELDEX_ABI_VERSION_MINOR 3
 
 /**
  * How many significant digits a [`ReldexNumber`] carries.
@@ -946,10 +953,17 @@ enum ReldexDriverKind
    */
   RELDEX_DRIVER_KIND_UNKNOWN = 0,
   /**
-   * The in-process mock driver: no database, deterministic, and the only
-   * driver a build with the `mock-driver` feature can open.
+   * The in-process mock driver: no database, deterministic. Only a build
+   * with the `mock-driver` feature can open it.
    */
   RELDEX_DRIVER_KIND_MOCK = 1,
+  /**
+   * Oracle Database through the thin driver (ABI 3.3). Needs
+   * `ReldexOpenOptions::connect`: a summary that
+   * `reldex_workspace_prepare_connect` (or `_build_connect_params`)
+   * handed out, which carries the parameters to open with.
+   */
+  RELDEX_DRIVER_KIND_ORACLE = 2,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -1742,6 +1756,11 @@ enum ReldexPasswordSourceKind
    * The profile authenticates without a password.
    */
   RELDEX_PASSWORD_SOURCE_KIND_NOT_NEEDED = 3,
+  /**
+   * The caller supplied the password (typed in), so the store was not
+   * read -- [`crate::reldex_workspace_prepare_connect`] only (ABI 3.3).
+   */
+  RELDEX_PASSWORD_SOURCE_KIND_SUPPLIED = 4,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -1941,6 +1960,15 @@ enum ReldexWorkspaceReplyKind
    * compares against the numeric value, not just the name.
    */
   RELDEX_WORKSPACE_REPLY_KIND_SETTING_SET = 21,
+  /**
+   * Reply to [`crate::reldex_workspace_prepare_connect`] (ABI 3.3): `id` is
+   * the profile; either `connect` is ready to open with and
+   * `password_source_kind` says where its password came from, or
+   * `password_source_kind` is `PromptRequired` with `prompt_reason` (and,
+   * for `StoreFailed`, the store's value-free error in `error`). Any other
+   * non-null `error` is the request's failure.
+   */
+  RELDEX_WORKSPACE_REPLY_KIND_CONNECT_PREPARED = 22,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -2275,14 +2303,15 @@ typedef struct ReldexBatch ReldexBatch;
 
 /**
  * The [`ConnectionParams`] `reldex_workspace::connection_params` built for a
- * profile, summarised into plain data -- owned by the caller from the
- * moment the reply that carries it is drained, released with
- * [`reldex_connect_summary_release`].
+ * profile: summarised into plain data for display
+ * ([`reldex_connect_summary_view`]), and -- since ABI 3.3 (M3.3, ADR-0003
+ * A40) -- carrying the parameters themselves, **password included**, so it
+ * can be handed to `reldex_hub_open_session` as
+ * `ReldexOpenOptions::connect`. The view never exposes the password.
  *
- * Not `ConnectionParams` itself: nothing downstream of M2.11 consumes it yet
- * (session opening against a real driver is M1.8's), so this crate reports
- * what the mapping produced rather than inventing a second FFI shape for a
- * type with no consumer. See the PR description's "weak points" note.
+ * Owned by the caller from the moment the reply that carries it is drained;
+ * release it with [`reldex_connect_summary_release`], which wipes the
+ * password, as soon as the open that needs it has returned.
  */
 typedef struct ReldexConnectSummary ReldexConnectSummary;
 
@@ -3070,14 +3099,22 @@ typedef struct ReldexOpenOptions {
    */
   uint32_t struct_size;
   /**
-   * A [`crate::ReldexDriverKind`]. This build accepts only
-   * `RELDEX_DRIVER_KIND_MOCK`.
+   * A [`crate::ReldexDriverKind`]: `RELDEX_DRIVER_KIND_MOCK` (a build with
+   * the `mock-driver` feature) or `RELDEX_DRIVER_KIND_ORACLE` (ABI 3.3).
    */
   int32_t driver;
   /**
    * The scripted world, when `driver` is the mock.
    */
   struct ReldexMockScenarioConfig mock;
+  /**
+   * What to connect to, when `driver` is `RELDEX_DRIVER_KIND_ORACLE` (ABI
+   * 3.3): a summary `reldex_workspace_prepare_connect` handed out, which
+   * carries the parameters, password included. **Borrowed** for the call
+   * only — the session keeps its own copy — so release it straight after
+   * the call returns. Ignored for the mock.
+   */
+  const struct ReldexConnectSummary *connect;
 } ReldexOpenOptions;
 
 /**
@@ -4454,11 +4491,17 @@ ReldexStatus reldex_mock_release_block(struct ReldexHub *hub, ReldexSessionId se
  * submitted on it until the connect has succeeded (see
  * [`reldex_session_execute`] for exactly when that is).
  *
+ * An Oracle session (`RELDEX_DRIVER_KIND_ORACLE`, ABI 3.3) connects on its
+ * worker with the parameters in `options->connect`, bounded by the
+ * connection's connect limit; `reldex_session_abandon` gives up on it at
+ * once, and a connection that arrives after that is closed, never adopted.
+ *
  * # Safety
  *
  * `hub` must be a live hub; `options` must be null (for the defaults) or
- * point at a [`ReldexOpenOptions`] with `struct_size` set; `out_session` must
- * be null or point at a writable `uint64_t`.
+ * point at a [`ReldexOpenOptions`] with `struct_size` set, whose `connect` is
+ * null or a live [`crate::ReldexConnectSummary`]; `out_session` must be null
+ * or point at a writable `uint64_t`.
  */
 ReldexStatus reldex_hub_open_session(struct ReldexHub *hub,
                                      const struct ReldexOpenOptions *options,
@@ -5459,6 +5502,29 @@ ReldexStatus reldex_workspace_credential_delete(struct ReldexWorkspace *workspac
 ReldexStatus reldex_workspace_resolve_password(struct ReldexWorkspace *workspace,
                                                uint64_t request,
                                                const uint8_t *profile);
+
+/**
+ * Prepares a connect to `profile` on the service thread (ABI 3.3, M3.3):
+ * resolves its connect settings and, unless `password` is given, asks the
+ * credential store (`reldex_secrets::resolve_password`). The reply
+ * (`RELDEX_WORKSPACE_REPLY_KIND_CONNECT_PREPARED`) either carries a
+ * [`ReldexConnectSummary`] ready for `reldex_hub_open_session`, or says the
+ * user must be asked, and why. A stored password is never handed out: it
+ * travels only inside that summary.
+ *
+ * `password`, when non-null, is what the user typed (build it with
+ * [`reldex_secret_from_utf8`]); the store is then not read. It is **not**
+ * consumed. Nothing here retries a stored password: call this again only
+ * when the user asks to connect again (ADR-0007).
+ *
+ * # Safety
+ *
+ * As [`reldex_workspace_build_connect_params`].
+ */
+ReldexStatus reldex_workspace_prepare_connect(struct ReldexWorkspace *workspace,
+                                              uint64_t request,
+                                              const uint8_t *profile,
+                                              const struct ReldexSecret *password);
 
 /**
  * Records one statement's outcome, then trims the profile's history back to

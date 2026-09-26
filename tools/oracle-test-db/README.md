@@ -112,7 +112,7 @@ PowerShell runner clears the password variables again in its `finally` block.
 | Variable | From | Used by |
 |---|---|---|
 | `RELDEX_TEST_ORACLE_DSN` / `_USER` / `_PASSWORD` | `RELDEX_TEST_PWD` | every spike |
-| `RELDEX_TEST_ORACLE_SYSTEM_USER` / `_SYSTEM_PASSWORD` | `ORACLE_PWD`, as `SYSTEM` | S4's privileged-cancel candidate only |
+| `RELDEX_TEST_ORACLE_SYSTEM_USER` / `_SYSTEM_PASSWORD` | `ORACLE_PWD`, as `SYSTEM` | S4's privileged-cancel candidate; M3.3's `v$session` observer (abandon test) |
 | `RELDEX_TEST_ORACLE_SYSDBA_USER` / `_SYSDBA_PASSWORD` | `ORACLE_PWD`, as `SYS` | S13 (`AS SYSDBA` over the listener) only |
 | `RELDEX_TEST_ORACLE_TCPS_DSN` / `_TCPS_CA_DIR` / `_TCPS_WRONG_CA_DIR` | the exported CA PEMs, when present | S8, the U-14 canary |
 
@@ -126,9 +126,23 @@ Result Store tests are the first:
 
 ```bash
 RELDEX_IT_PACKAGE=reldex-core-poc bash tools/oracle-test-db/run-it.sh m5_2_result_store_live -- --nocapture
+RELDEX_IT_PACKAGE=reldex-ffi bash tools/oracle-test-db/run-it.sh m3_3_connect_live -- --ignored --test-threads=1 --nocapture
 ```
 
-`run-it.ps1` reads the same variable.
+`RELDEX_IT_EXEC` runs a program instead of `cargo test`. The program gets the same environment,
+and the arguments exactly as given, from the repository root. M3.3's live UI end-to-end test is
+the first to use it: it is a Qt test binary, not a cargo test. Qt's DLLs must be on `PATH`, which
+`tools/dev-env/env.sh` sets up on Windows:
+
+```bash
+source tools/dev-env/env.sh
+bash ui/build.sh --test
+RELDEX_WORKSPACE_IN_MEMORY=1 QT_QPA_PLATFORM=offscreen \
+  RELDEX_IT_EXEC=build/ui-RelWithDebInfo/tst_coreinfo \
+  bash tools/oracle-test-db/run-it.sh connectFlowAgainstTheRealDatabase
+```
+
+`run-it.ps1` reads both variables.
 
 ### Upstream canaries
 

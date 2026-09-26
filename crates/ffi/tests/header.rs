@@ -224,6 +224,43 @@ fn every_repr_c_type_reaches_the_header() {
     );
 }
 
+/// ABI 3.3 (M3.3) added values to existing enums and a trailing field to an
+/// existing struct. The enum guard above proves each enum is *defined*; this
+/// pins that the new values and the field reached the header with the numbers
+/// the Rust side uses, so a C caller never compiles against a stale header.
+#[test]
+fn the_abi_3_3_additions_reach_the_header() {
+    let header = header();
+    for (name, value) in [
+        (
+            "RELDEX_DRIVER_KIND_ORACLE",
+            reldex_ffi::ReldexDriverKind::Oracle as i32,
+        ),
+        (
+            "RELDEX_WORKSPACE_REPLY_KIND_CONNECT_PREPARED",
+            reldex_ffi::ReldexWorkspaceReplyKind::ConnectPrepared as i32,
+        ),
+        (
+            "RELDEX_PASSWORD_SOURCE_KIND_SUPPLIED",
+            reldex_ffi::ReldexPasswordSourceKind::Supplied as i32,
+        ),
+    ] {
+        let needle = format!("{name} = {value},");
+        assert!(
+            header.contains(&needle),
+            "the header does not define `{needle}`"
+        );
+    }
+    assert!(
+        header.contains("const struct ReldexConnectSummary *connect;"),
+        "ReldexOpenOptions::connect is missing from the header"
+    );
+    assert!(
+        header.contains("ReldexStatus reldex_workspace_prepare_connect("),
+        "reldex_workspace_prepare_connect is missing from the header"
+    );
+}
+
 #[test]
 fn the_abi_version_macro_matches_the_rust_constants() {
     // The adapter checks `reldex_abi_version() == RELDEX_ABI_VERSION` before

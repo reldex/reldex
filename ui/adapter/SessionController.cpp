@@ -1,10 +1,12 @@
 #include "SessionController.h"
 
 #include "Bridge.h"
+#include "ConnectionManager.h"
 #include "Metrics.h"
 
 #include <QByteArray>
 #include <QThread>
+#include <QTimer>
 #include <QtGlobal>
 
 #include <algorithm>
@@ -30,6 +32,19 @@ SessionController::SessionController(Bridge *bridge, QObject *parent)
     , m_model(new ResultTableModel(this))
 {
     m_model->setFetchSource(this);
+
+    // M3.3: the adapter's own copy of the connect limit. The driver bounds the
+    // attempt too (and reports it as a connection failure); this timer is
+    // what lets the UI say "timed out" and end the attempt itself.
+    m_connectTimer = new QTimer(this);
+    m_connectTimer->setSingleShot(true);
+    m_connectTimer->setTimerType(Qt::PreciseTimer);
+    connect(m_connectTimer, &QTimer::timeout, this, &SessionController::onConnectTimeout);
+    // `canConnect` also depends on whether a session is held at all.
+    connect(this, &SessionController::connectStateChanged, this,
+            &SessionController::canConnectChanged);
+    connect(this, &SessionController::sessionIdChanged, this,
+            &SessionController::canConnectChanged);
 
     // Defaults M1.8 can set without rebuilding. Every one of them is also a
     // writable property, so a test sets them directly.
@@ -59,6 +74,14 @@ SessionController::~SessionController()
     // and that never commits (`SPEC.md` §10).
     if (m_bridge != nullptr && m_sessionId != 0) {
         m_bridge->unregisterSession(m_sessionId);
+    }
+    if (m_bridge != nullptr) {
+        for (const quint64 retiring : std::as_const(m_retiringSessions)) {
+            m_bridge->unregisterSession(retiring);
+        }
+    }
+    if (m_bridge != nullptr && m_bridge->connections() != nullptr) {
+        m_bridge->connections()->forgetConnectPrepare(this);
     }
 }
 
@@ -94,6 +117,7 @@ void SessionController::clearError()
     m_errorLine = 0;
     m_errorColumn = 0;
     m_errorCharOffset = -1;
+    m_errorCause.clear();
     Q_EMIT errorChanged();
 }
 
@@ -120,6 +144,8 @@ void SessionController::adoptError(const ReldexError *error)
     m_errorLine = view.has_line_column ? static_cast<int>(view.line) : 0;
     m_errorColumn = view.has_line_column ? static_cast<int>(view.column) : 0;
     m_errorCharOffset = view.has_char_offset ? static_cast<int>(view.char_offset) : -1;
+    m_errorCause = QString::fromUtf8(reinterpret_cast<const char *>(view.cause.ptr),
+                                     static_cast<qsizetype>(view.cause.len));
     Q_EMIT errorChanged();
 }
 
@@ -402,6 +428,20 @@ void SessionController::handleEvent(const ReldexEvent &raw, reldex::BatchHandle 
     // for -- is ignored (D7). The library already guarantees that only a
     // reply carries a request id; switching on the kind first keeps this
     // class from depending on that for anything but its assert.
+    if (raw.session != m_sessionId && m_retiringSessions.contains(raw.session)) {
+        // M3.3: a connect the user cancelled, the limit ended, or that
+        // failed. Its late OPENED (a `Cancelled` error, or a session the
+        // abandon already released) and its TERMINAL are consumed here and
+        // never adopted; the handles release whatever they carry.
+        if (raw.kind == RELDEX_EVENT_KIND_TERMINAL) {
+            m_retiringSessions.remove(raw.session);
+            if (m_bridge != nullptr) {
+                m_bridge->unregisterSession(raw.session);
+            }
+        }
+        return;
+    }
+
     switch (raw.kind) {
     case RELDEX_EVENT_KIND_EXECUTING:
         return;
@@ -465,6 +505,9 @@ void SessionController::handleEvent(const ReldexEvent &raw, reldex::BatchHandle 
     switch (raw.kind) {
     case RELDEX_EVENT_KIND_OPENED:
         m_cancelKind = raw.cancel_kind;
+        if (m_connectState == Connecting && raw.request == m_connectOpenRequest) {
+            finishConnect(!error);
+        }
         if (error) {
             setState(Failed);
             Q_EMIT failed();
@@ -563,6 +606,11 @@ void SessionController::handleEvent(const ReldexEvent &raw, reldex::BatchHandle 
     case RELDEX_EVENT_KIND_SESSION_CLOSED:
         m_closeOutcome = raw.close_outcome;
         setState(raw.session_still_open ? Ready : Closed);
+        if (m_connectState == Disconnecting && raw.session_still_open) {
+            // Refused (a transaction may be open and no disposition was
+            // named): still connected, and the error says why.
+            setConnectState(Connected);
+        }
         Q_EMIT sessionClosed(raw.close_outcome, raw.session_still_open);
         return;
 
@@ -577,6 +625,7 @@ void SessionController::handleTerminal(const ReldexEvent &raw, const reldex::Err
     // mid-statement, with nobody having asked to close it. Replies to requests
     // accepted before then may still follow, so `m_outstanding` is left alone.
     m_terminated = true;
+    Q_EMIT canConnectChanged();
     m_transactionPossiblyLost = raw.transaction_possibly_lost;
     if (error) {
         adoptError(error.get());
@@ -597,6 +646,30 @@ void SessionController::handleTerminal(const ReldexEvent &raw, const reldex::Err
     if (m_transactionPossiblyActive) {
         m_transactionPossiblyActive = false;
         Q_EMIT transactionStateChanged(false);
+    }
+
+    // M3.3: the worksheet's connection ended. A failed open's TERMINAL finds
+    // the connect already settled by its OPENED, so only an open session
+    // moves the connect state here.
+    if (m_connectState == Connected || m_connectState == Disconnecting) {
+        setActiveProfileIsProduction(false);
+        if (raw.session_state == RELDEX_SESSION_STATE_LOST) {
+            // A lost session's column descriptions outlive its TERMINAL until
+            // the caller names the retired id again (ADR-0003 A39). Nothing
+            // here still reads them -- the model holds deep copies -- so
+            // name it now: NOT_FOUND is the expected answer, and the orphans
+            // go with it.
+            if (m_bridge != nullptr && m_bridge->isValid()) {
+                const quint64 unanswered = m_nextRequestId++;
+                reldex_session_close(m_bridge->hub(), m_sessionId, unanswered,
+                                     RELDEX_CLOSE_DISPOSITION_NONE);
+                const reldex::ErrorHandle expected(reldex_last_error_take());
+                Q_UNUSED(expected);
+            }
+            setConnectState(Lost);
+        } else {
+            setConnectState(NotConnected);
+        }
     }
     Q_EMIT terminated(raw.transaction_possibly_lost, raw.abandoned);
 }
@@ -691,4 +764,429 @@ void SessionController::setMockBlockDurationMs(qint64 milliseconds)
     }
     m_mockBlockDurationMs = milliseconds;
     Q_EMIT mockConfigChanged();
+}
+
+// ============================================================================
+// M3.3: the connect flow. See the class comment for the state machine and
+// ui/README.md "Connect flow (M3.3)" for the rules it follows.
+// ============================================================================
+
+QString SessionController::errorKey() const
+{
+    if (!m_hasError) {
+        return {};
+    }
+    ReldexErrorView view = reldex::makeErrorView();
+    view.kind = m_errorKind;
+    return ConnectionManager::messageKeyForError(view, false);
+}
+
+bool SessionController::canConnect() const noexcept
+{
+    switch (m_connectState) {
+    case Preparing:
+    case AwaitingPassword:
+    case Connecting:
+    case Connected:
+    case Disconnecting:
+        return false;
+    default:
+        return m_bridge != nullptr && m_bridge->isValid() && (m_sessionId == 0 || m_terminated);
+    }
+}
+
+ConnectionManager *SessionController::connections() const
+{
+    return m_bridge != nullptr ? m_bridge->connections() : nullptr;
+}
+
+void SessionController::setConnectState(ConnectState state)
+{
+    if (m_connectState == state) {
+        return;
+    }
+    m_connectState = state;
+    Q_EMIT connectStateChanged();
+}
+
+void SessionController::setPasswordPrompt(PasswordPromptReason reason, const QString &detail,
+                                          bool offerSave)
+{
+    if (m_passwordPromptReason == reason && m_passwordPromptDetail == detail
+        && m_offerSavePassword == offerSave) {
+        return;
+    }
+    m_passwordPromptReason = reason;
+    m_passwordPromptDetail = detail;
+    m_offerSavePassword = offerSave;
+    Q_EMIT passwordPromptChanged();
+}
+
+void SessionController::adoptManagerError(const ConnectionManager *manager)
+{
+    setAdapterError(manager != nullptr ? manager->errorKind() : RELDEX_ERROR_KIND_UNKNOWN,
+                    manager != nullptr && manager->hasError()
+                            ? manager->errorMessage()
+                            : QStringLiteral("the workspace could not take the request"));
+}
+
+void SessionController::setAdapterError(int kind, const QString &message)
+{
+    m_hasError = true;
+    m_errorKind = kind;
+    m_errorMessage = message;
+    m_errorNativeMessage.clear();
+    m_errorNativeCode = 0;
+    m_errorLine = 0;
+    m_errorColumn = 0;
+    m_errorCharOffset = -1;
+    m_errorCause.clear();
+    Q_EMIT errorChanged();
+}
+
+void SessionController::recycleEndedSession()
+{
+    if (m_sessionId == 0 || !m_terminated) {
+        return;
+    }
+    if (m_bridge != nullptr) {
+        m_bridge->unregisterSession(m_sessionId);
+    }
+    m_sessionId = 0;
+    Q_EMIT sessionIdChanged();
+    // Replies still owed for the ended session now reach the Bridge with no
+    // owner and are released there; nothing of theirs is adopted.
+    m_outstanding.clear();
+    m_resultId = 0;
+    m_hasResult = false;
+    m_exhausted = false;
+    m_fetchesInFlight = 0;
+    m_pendingFetchRequests = 0;
+    m_rowsAffected = -1;
+    if (m_rowsFetched != 0) {
+        m_rowsFetched = 0;
+        Q_EMIT rowsFetchedChanged();
+    }
+    m_model->reset();
+    m_terminated = false;
+    m_transactionPossiblyLost = false;
+    m_cancelKind = RELDEX_CANCEL_KIND_UNKNOWN;
+    m_closeOutcome = RELDEX_CLOSE_OUTCOME_UNKNOWN;
+    setState(Idle);
+}
+
+bool SessionController::connectProfile(const QString &profileIdHex)
+{
+    if (!checkThread() || m_bridge == nullptr || !m_bridge->isValid()) {
+        return false;
+    }
+    ConnectionManager *const manager = connections();
+    if (manager == nullptr || !manager->isReady()) {
+        return false;
+    }
+    switch (m_connectState) {
+    case Preparing:
+    case AwaitingPassword:
+    case Connecting:
+    case Connected:
+    case Disconnecting:
+        // A worksheet owns one stable session, never silently replaced
+        // (`AGENTS.md`): the user disconnects first.
+        return false;
+    default:
+        break;
+    }
+    if (m_sessionId != 0 && !m_terminated) {
+        return false; // a session opened some other way is still open
+    }
+    const QByteArray id = QByteArray::fromHex(profileIdHex.toLatin1());
+    const ProfileModel::Row *row = id.size() == 16 ? manager->profiles()->findRow(id) : nullptr;
+    if (row == nullptr) {
+        return false;
+    }
+
+    recycleEndedSession();
+    clearError();
+    m_passwordToSave.reset();
+    m_usedStoredPassword = false;
+    m_connectTimeoutSeconds = 0;
+    m_connectProfileId = id;
+    m_connectProfileName = row->name;
+    m_connectProfileIsProduction = row->treatAsProduction;
+    setPasswordPrompt(NoPrompt, {}, false);
+
+    if (row->authKind == RELDEX_AUTH_KIND_PASSWORD && manager->storedPasswordWasRefused(id)) {
+        // ADR-0007: a stored password the database refused is never tried
+        // again automatically -- each attempt counts towards the account's
+        // failed-login limit. Ask, and offer to replace it.
+        setPasswordPrompt(StoredPasswordRefused, {}, manager->canStoreCredential());
+        setConnectState(AwaitingPassword);
+        return true;
+    }
+    if (!manager->prepareConnect(id, nullptr, this)) {
+        adoptManagerError(manager);
+        setConnectState(ConnectFailed);
+        return false;
+    }
+    setConnectState(Preparing);
+    return true;
+}
+
+bool SessionController::submitPassword(const QString &password, bool savePassword)
+{
+    if (!checkThread() || m_connectState != AwaitingPassword) {
+        return false;
+    }
+    ConnectionManager *const manager = connections();
+    if (manager == nullptr) {
+        return false;
+    }
+    // The one crossing: into a zeroizing ReldexSecret, and this function's
+    // own UTF-8 copy wiped straight after. The QString is the caller's (a
+    // QML text field's), which this class never stores.
+    QByteArray utf8 = password.toUtf8();
+    reldex::SecretHandle secret(reldex_secret_from_utf8(
+            ReldexStr { reinterpret_cast<const std::uint8_t *>(utf8.constData()),
+                        static_cast<std::size_t>(utf8.size()) }));
+    utf8.fill('\0');
+    if (!secret) {
+        takeThreadLocalError();
+        setConnectState(ConnectFailed);
+        return false;
+    }
+    clearError();
+    if (!manager->prepareConnect(m_connectProfileId, secret.get(), this)) {
+        adoptManagerError(manager);
+        setConnectState(ConnectFailed);
+        return false;
+    }
+    // Kept only when the user asked to save it, and only until the connect
+    // it was typed for settles; `prepareConnect` did not consume it.
+    if (savePassword && m_offerSavePassword) {
+        m_passwordToSave = std::move(secret);
+    }
+    setPasswordPrompt(NoPrompt, {}, false);
+    setConnectState(Preparing);
+    return true;
+}
+
+void SessionController::handleConnectPrepared(const ReldexWorkspaceReply &reply)
+{
+    if (m_connectState != Preparing) {
+        return; // cancelled meanwhile; the reply is released unread
+    }
+    ConnectionManager *const manager = connections();
+
+    if (reply.password_source_kind == RELDEX_PASSWORD_SOURCE_KIND_PROMPT_REQUIRED) {
+        PasswordPromptReason reason = NotStored;
+        QString detail;
+        switch (reply.prompt_reason) {
+        case RELDEX_PROMPT_REASON_KIND_PROMPT_EACH_TIME:
+            reason = PromptEachTime;
+            break;
+        case RELDEX_PROMPT_REASON_KIND_STORE_UNAVAILABLE:
+            reason = StoreUnavailable;
+            break;
+        case RELDEX_PROMPT_REASON_KIND_STORE_FAILED: {
+            reason = StoreFailed;
+            // The credential error rides on the reply: say why by name (for
+            // `Malformed`, that the saved entry is not one Reldex wrote).
+            ReldexErrorView view = reldex::makeErrorView();
+            if (reply.error != nullptr && reldex_error_view(reply.error, &view) == RELDEX_STATUS_OK) {
+                detail = QString::fromUtf8(reinterpret_cast<const char *>(view.message.ptr),
+                                           static_cast<qsizetype>(view.message.len));
+            }
+            break;
+        }
+        case RELDEX_PROMPT_REASON_KIND_NOT_STORED:
+        default:
+            reason = NotStored;
+            break;
+        }
+        m_passwordToSave.reset();
+        const bool canSave = manager != nullptr && manager->canStoreCredential()
+                && reason != StoreUnavailable;
+        setPasswordPrompt(reason, detail, canSave);
+        setConnectState(AwaitingPassword);
+        return;
+    }
+
+    if (reply.error != nullptr || reply.connect == nullptr) {
+        m_passwordToSave.reset();
+        adoptError(reply.error);
+        setConnectState(ConnectFailed);
+        return;
+    }
+
+    m_usedStoredPassword = reply.password_source_kind == RELDEX_PASSWORD_SOURCE_KIND_FROM_STORE;
+    // The limit comes from the settings registry (`CONNECT_TIMEOUT`,
+    // application then profile), already resolved into the parameters.
+    int limitSeconds = 0;
+    ReldexConnectSummaryView view = reldex::makeConnectSummaryView();
+    if (reldex_connect_summary_view(reply.connect, &view) && view.has_connect_timeout
+        && !view.connect_without_limit) {
+        limitSeconds = static_cast<int>(view.connect_timeout_seconds);
+    }
+    openPrepared(reply.connect, limitSeconds);
+}
+
+void SessionController::openPrepared(const ReldexConnectSummary *summary, int limitSeconds)
+{
+    ReldexOpenOptions options = reldex::makeOpenOptions();
+    if (m_connectDriver == RELDEX_DRIVER_KIND_MOCK) {
+        options.driver = RELDEX_DRIVER_KIND_MOCK;
+        options.mock.scenario = RELDEX_MOCK_SCENARIO_S14;
+        options.mock.rows = static_cast<quint64>(std::max<qint64>(0, m_mockRows));
+        options.mock.seed = static_cast<quint64>(std::max<qint64>(0, m_mockSeed));
+        options.mock.connect_failure = m_mockConnectFailure;
+        options.mock.block_connect = m_mockBlockConnect;
+    } else {
+        options.driver = RELDEX_DRIVER_KIND_ORACLE;
+        // Borrowed for the call: the session keeps its own copy, and the
+        // summary (password included) is released when this drain step ends.
+        options.connect = summary;
+    }
+
+    const quint64 request = nextRequest(RELDEX_EVENT_KIND_OPENED);
+    ReldexSessionId session = 0;
+    m_connectClock.start();
+    // Never blocks: the connect itself runs on the session's own worker.
+    const ReldexStatus status =
+            reldex_hub_open_session(m_bridge->hub(), &options, request, &session);
+    if (status != RELDEX_STATUS_OK) {
+        m_outstanding.remove(request);
+        m_passwordToSave.reset();
+        takeThreadLocalError();
+        setConnectState(ConnectFailed);
+        return;
+    }
+    m_sessionId = session;
+    m_bridge->registerSession(m_sessionId, this);
+    Q_EMIT sessionIdChanged();
+    m_connectOpenRequest = request;
+    m_connectTimeoutSeconds = limitSeconds;
+    if (limitSeconds > 0) {
+        m_connectTimer->start(limitSeconds * 1000);
+    }
+    setState(Opening);
+    setConnectState(Connecting);
+}
+
+void SessionController::finishConnect(bool ok)
+{
+    m_connectTimer->stop();
+    m_connectOpenRequest = 0;
+    const qint64 elapsedMs = m_connectClock.elapsed();
+    ConnectionManager *const manager = connections();
+    if (ok) {
+        m_lastConnectMs = elapsedMs;
+        setActiveProfileIsProduction(m_connectProfileIsProduction);
+        if (m_passwordToSave && manager != nullptr) {
+            // ADR-0007: saved only now, after the connect succeeded, and only
+            // because the user asked. The manager follows M3.2's write order.
+            manager->saveConnectPassword(m_connectProfileId, m_passwordToSave.get());
+        }
+        m_passwordToSave.reset();
+        setConnectState(Connected);
+        return;
+    }
+    m_passwordToSave.reset();
+    // The error was adopted before this ran (handleEvent does that first).
+    if (m_errorKind == RELDEX_ERROR_KIND_AUTHENTICATION && m_usedStoredPassword
+        && manager != nullptr) {
+        manager->markStoredPasswordRefused(m_connectProfileId);
+    }
+    // A failed open's TERMINAL is still to come; the worksheet need not wait
+    // for it before connecting again.
+    retireCurrentSession();
+    // The driver bounds the connect by the same limit and reports its expiry
+    // as a connection failure, never sooner than the limit: an answer at or
+    // past it is the limit speaking.
+    const bool pastLimit =
+            m_connectTimeoutSeconds > 0 && elapsedMs >= qint64 { m_connectTimeoutSeconds } * 1000;
+    setConnectState(pastLimit ? TimedOut : ConnectFailed);
+}
+
+void SessionController::onConnectTimeout()
+{
+    if (m_connectState != Connecting) {
+        return;
+    }
+    abandonConnectingSession();
+    setAdapterError(RELDEX_ERROR_KIND_TIMEOUT,
+                    QStringLiteral("the database did not answer within the connect timeout "
+                                   "(%1 s), so the attempt was abandoned")
+                            .arg(m_connectTimeoutSeconds));
+    setConnectState(TimedOut);
+}
+
+void SessionController::abandonConnectingSession()
+{
+    m_connectTimer->stop();
+    if (m_sessionId != 0 && m_bridge != nullptr && m_bridge->isValid()) {
+        int outcome = RELDEX_ABANDON_OUTCOME_UNKNOWN;
+        bool lost = false;
+        // Returns at once (M2.15): a connect still in flight is left to finish
+        // or fail on its own thread, and a connection that arrives late is
+        // closed, never adopted.
+        if (reldex_session_abandon(m_bridge->hub(), m_sessionId, &outcome, &lost)
+            != RELDEX_STATUS_OK) {
+            const reldex::ErrorHandle ignored(reldex_last_error_take());
+            Q_UNUSED(ignored);
+        }
+    }
+    m_outstanding.remove(m_connectOpenRequest);
+    m_connectOpenRequest = 0;
+    m_passwordToSave.reset();
+    retireCurrentSession();
+    setState(Idle);
+}
+
+void SessionController::retireCurrentSession()
+{
+    if (m_sessionId == 0) {
+        return;
+    }
+    m_retiringSessions.insert(m_sessionId);
+    m_sessionId = 0;
+    Q_EMIT sessionIdChanged();
+}
+
+bool SessionController::cancelConnect()
+{
+    if (!checkThread()) {
+        return false;
+    }
+    switch (m_connectState) {
+    case Preparing:
+        if (ConnectionManager *const manager = connections()) {
+            manager->forgetConnectPrepare(this);
+        }
+        break;
+    case AwaitingPassword:
+        break;
+    case Connecting:
+        abandonConnectingSession();
+        break;
+    default:
+        return false;
+    }
+    m_passwordToSave.reset();
+    setPasswordPrompt(NoPrompt, {}, false);
+    clearError();
+    setConnectState(Cancelled);
+    return true;
+}
+
+bool SessionController::disconnectSession(int disposition)
+{
+    if (m_connectState != Connected) {
+        return false;
+    }
+    clearError();
+    if (!closeSession(disposition)) {
+        return false;
+    }
+    setConnectState(Disconnecting);
+    return true;
 }

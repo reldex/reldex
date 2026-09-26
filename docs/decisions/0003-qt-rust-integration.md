@@ -3,7 +3,7 @@
 **Status:** Proposed — spike S15 complete 2026-09-20; owner ruling requested
 **Date:** 2026-09-20
 **Amended:** 2026-09-20 (pre-acceptance, from building `crates/ffi` in M1.3 — see "Amendment (pre-acceptance): what building the boundary changed", items A1–A9; extended the same day with A10–A18 from the independent review of that work. A19–A25 followed the same day from the first consumers' findings (ABI 3). The status is unchanged and S15 is still the gate.) **Amended again, 2026-09-20:** spike S15 was run and reported (`docs/exec-plans/active/phase-1-s15-ffi-spike.md`) — see "S15 result (2026-09-20)" under Evidence. Status moved from "acceptance conditional on spike S15" to "spike S15 complete; owner ruling requested". The lead does not accept ADR-0003 unilaterally on this evidence; three specific rulings are requested from the owner (see below). Status is still not Accepted. **Amended 2026-09-26:** M2.11 (A26–A31) and M2.15 (A32–A37, the
-switch onto `db-core`'s event queue; ABI 3.2). The status is unchanged.
+switch onto `db-core`'s event queue; ABI 3.2). **Amended 2026-09-27:** M3.3 (A40–A43, the first real database session; ABI 3.3). The status is unchanged.
 **Supersedes/resolves:** `ARCHITECTURE.md` §13 item 2 (FFI mechanism), item 3's remaining FFI half (completion marshalling, thread affinity, reentrancy), and item 10 in part (crate layout for the FFI/UI tier).
 
 ## Context
@@ -897,6 +897,9 @@ with these parameters (not just inspect them), that is the point to decide wheth
 grows into the real crossing shape or a second, session-opening-specific one is added beside it —
 recorded here as a known, deliberate gap rather than a decision made by omission.
 
+**Resolved by M3.3 (A40):** the summary grew into the crossing shape. It carries the parameters
+themselves, and `ReldexOpenOptions::connect` hands them to the session.
+
 ## Amendment: M2.15 — the hub drains `db-core`'s event queue (2026-09-26)
 
 M2.15 removes the per-session pump (A5) and puts the hub on `db-core`'s `EventQueue` and
@@ -1101,3 +1104,141 @@ the count returns to baseline for each of the three calls.
 **ABI 4.0 (M5.2 Stage B) will shorten this:** a lost session's descriptions will be valid only until
 its `TERMINAL` is drained, the same point at which its id stops being found. That is a change to
 A20's documented lifetime, so it waits for the major version that ADR-0004 already reserves.
+
+## Amendment: M3.3 — the first real database session (2026-09-27)
+
+M3.3 opens the first session against a real database through this boundary: the worksheet connect
+flow over the async path, bounded by the profile's connect limit, with a Connecting… state the
+user can cancel. The ABI moves **3.2 → 3.3**, additively (A26's rule). Nothing here touches the
+K1/K2/K3 rulings still requested from the owner (S15), and the status is unchanged: this ADR is
+still not Accepted.
+
+### A40 — what ABI 3.3 adds
+
+Every addition is a new enum value, a trailing field, or a new symbol:
+
+- `RELDEX_DRIVER_KIND_ORACLE` (2).
+- **A trailing `ReldexOpenOptions::connect`** (`const ReldexConnectSummary *`). It is required for
+  `ORACLE` and ignored for the mock. It is **borrowed** for the call only: the session keeps its own
+  copy of the parameters, so the caller releases the summary as soon as `reldex_hub_open_session`
+  returns. A caller built against 3.2 declares the smaller `struct_size`; the field then reads as
+  null and the mock opens exactly as before (`a_3_2_sized_open_options_still_opens_the_mock`).
+- **`reldex_workspace_prepare_connect(workspace, request, profile, password)`** runs on the
+  workspace's service thread. It loads the profile, resolves its connect settings
+  (application → profile layers) and, unless the caller supplies `password`, asks the credential
+  store (`reldex_secrets::resolve_password`, ADR-0007 S3). Its reply is
+  `RELDEX_WORKSPACE_REPLY_KIND_CONNECT_PREPARED` (22), which takes one of two forms:
+  - A `ReldexConnectSummary` ready to open with, plus the source of the password: `FROM_STORE`,
+    `NOT_NEEDED`, or the new `SUPPLIED` (4) for a password the user typed.
+  - `PROMPT_REQUIRED` with its `prompt_reason` (`PROMPT_EACH_TIME`, `NOT_STORED`,
+    `STORE_UNAVAILABLE`, `STORE_FAILED`, the last also carrying the store's value-free error).
+
+  A stored password is never handed to the caller. It stays on the service thread except inside the
+  summary's parameters, and the reply carries no `ReldexSecret`
+  (`a_stored_password_travels_only_inside_the_summary`). A supplied password is **not consumed**,
+  so the adapter can still save it after a successful connect. Nothing retries a stored password
+  that was refused (ADR-0007): the call runs again only when the user connects again.
+- **`ReldexConnectSummary` now carries the `ConnectionParams` it summarises, password included**,
+  and wipes them on `reldex_connect_summary_release`. **This resolves A31:** the summary grows into
+  the crossing shape instead of gaining a second, session-opening struct beside it. It was already
+  an opaque handle, so carrying the real parameters needs no FFI mirror of `ConnectionParams`, and
+  that type can keep changing without an ABI change. `reldex_connect_summary_view` stays
+  display-only and never exposes the password.
+- **A new `oracle-it` cargo feature** gates the live tests (`crates/ffi/tests/m3_3_connect_live.rs`)
+  and compiles nothing into the library.
+
+A 3.3 adapter refuses a 3.2 library at startup (A38: `Bridge::checkAbiVersion` compares against
+the header's minor), because it would read `connect` from bytes a 3.2 library never defined.
+
+### A41 — one dispatch point, and the same registry for both drivers
+
+`crate::mock::build_driver` is still the only code in this crate that chooses the driver a session
+opens against:
+
+| `driver` | `connect` | Result |
+| --- | --- | --- |
+| `MOCK` | — | builds the scripted world |
+| `ORACLE` | a summary | builds `OracleThinDriver` with a copy of the summary's parameters |
+| `ORACLE` | null | `RELDEX_STATUS_INVALID_ARGUMENT` with a `Configuration` error |
+| anything else | — | `RELDEX_STATUS_INVALID_ARGUMENT` with an `Unsupported` error |
+
+The Oracle session opens through the same `SessionRegistry` and event queue as the mock (A32), so
+the following apply unchanged:
+
+- ordering (E1–E6);
+- the request bound (A34);
+- abandon (A33);
+- retirement at `TERMINAL`;
+- a lost session's column descriptions (A39).
+
+The driver's types stay inside the driver crate. Its errors arrive already normalised, with the
+native code kept: a wrong password is `AUTHENTICATION` with `native_code` 1017 and the vendor's
+`ORA-01017` message.
+
+The thin driver was already linked for `OracleDriverBinding` (M2.11), so it is not a feature, and
+a product build is simply `--no-default-features`.
+
+### A42 — the connect limit, a timeout, and cancelling a connect
+
+- **The limit** is the profile's resolved `CONNECT_TIMEOUT` setting (built-in default 15 s). It
+  travels in the parameters, and the thin driver enforces it on its worker. The summary reports it
+  (`connect_timeout_seconds`, or `connect_without_limit`) so the adapter can show it.
+  - When the limit expires, the driver reports `ErrorKind::Connection` with the text "connect
+    limit". The ABI has no separate connect-timeout kind.
+  - Against an unroutable address (192.0.2.1) with a 2 s limit, the failure arrived at
+    2.00–2.015 s. It never arrived before the limit.
+- **Timeout is adapter policy, not ABI.** The adapter arms its own timer at the resolved limit.
+  - If the timer fires, the adapter abandons the session and reports a `TIMEOUT`.
+  - If a driver failure arrives at or after the limit, the adapter shows it as timed out and keeps
+    the driver's text as the detail.
+  - Both rest on one observed assumption: the driver never reports expiry early. It is recorded in
+    `phase-1.md`'s M3.3 note.
+- **Cancel is `reldex_session_abandon`** (A33). It does not wait for the connect.
+  - Against the live database it returned `CONNECTING` in 18–105 µs.
+  - The connect then runs to its end on the worker. A connection that arrives afterwards is closed
+    by the registry and never adopted: `OPENED` carries `CANCELLED`, then `TERMINAL` carries
+    `abandoned`.
+  - A second session watched `v$session` for 3 s after the abandon
+    (`abandoning_a_real_connect_returns_at_once_and_adopts_nothing`).
+    - The late connection does reach the server: the watch saw at most one of the test user's
+      sessions at a time.
+    - It was always gone again before the watch ended, and nothing was left.
+    - A control check shows the same watch does see a session that is kept open.
+  - Abandon therefore bounds how long a connection that is not wanted lives. It cannot stop the
+    connect from reaching the server (U-15).
+
+### A43 — real-driver behaviours an adapter must handle
+
+These are not new ABI. They are what the thin driver does today, observed live, which the mock
+never showed:
+
+- **`transaction_possibly_active` is conservative.** After any statement except DDL (a `SELECT`
+  included), the driver cannot rule out an open transaction.
+  - A close that names no decision is therefore refused: a `TRANSACTION` error, and the session
+    stays open.
+  - The adapter asks the user to keep the connection, roll back, or commit. It never picks one
+    itself (SPEC §10).
+  - Auto-commit is off. The live test proves it: an uncommitted insert is invisible to a second
+    session.
+- **On-demand cancel is not available.**
+  - `OPENED` reports `cancel_kind` = `PRE_ARMED_DEADLINE`, and `reldex_session_request_cancel`
+    answers `NOT_INTERRUPTIBLE`. The UI must not offer a cancel that pretends to work.
+  - A statement deadline does end a call, but at the price of the session. In the live test, a
+    1.5 s deadline on a 10 s `dbms_session.sleep` ended the call at ~3.0 s with `NETWORK_LOST`, and
+    a `TERMINAL` followed on its own (ADR-0002 T4; owner decision 2026-09-20 to stay on this
+    driver).
+- **A loss reaches the UI as the session's `TERMINAL`.**
+  - The adapter then calls `reldex_session_close` on the retired id, only to free the orphaned
+    column descriptions (A39). The call answers `NOT_FOUND`, and the adapter discards that answer.
+  - Reconnecting is the user's decision. The adapter never replaces the worksheet's session on its
+    own.
+
+Measured through this boundary (release, the local 19c test container, n = 10):
+
+| Measure | p50 | max |
+| --- | --- | --- |
+| `prepare_connect` round trip | 224 µs | 278 µs |
+| open → `OPENED` | 51.7 ms | 171.6 ms |
+| first reply (`select 1 from dual`) | 1.72 ms | 2.47 ms |
+
+`phase-1.md`'s M3.3 note has the debug-build numbers and the UI end-to-end numbers.

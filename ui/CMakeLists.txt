@@ -166,6 +166,8 @@ set(RELDEX_APP_QML_FILES
     StatusBar.qml
     ConnectionManagerDialog.qml
     ProductionIndicator.qml
+    ConnectPasswordDialog.qml
+    DisconnectConfirmDialog.qml
 )
 
 enable_testing()

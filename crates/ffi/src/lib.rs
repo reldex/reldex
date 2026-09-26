@@ -80,7 +80,7 @@
 //! is lost, not only when it is closed. See the module docs in `src/hub.rs`
 //! and `src/session.rs`.
 //!
-//! Not yet exported, and out of scope for M1.3: binds and LOB reads. Commit /
+//! Not yet exported: binds and LOB reads. Commit /
 //! rollback / savepoint / ping, server output control, statement splitting,
 //! metadata, the `Terminal` session event, and settings/profiles/
 //! credentials/history/worksheets/layout landed in M2.11 (see below) — each
@@ -103,9 +103,9 @@
 //! [`reldex_workspace_next_reply`] after its own, independent waker fires —
 //! it does not share the hub's event queue or waker. `crates/ffi/src/
 //! workspace.rs` is also this crate's second composition root (alongside
-//! `metadata.rs`/`splitter.rs`): it is the one place that names
-//! `reldex-driver-oracle-thin` concretely, to map a profile's settings into
-//! real connection parameters. A resolved or fetched password never crosses
+//! `metadata.rs`/`splitter.rs`, and `mock.rs` for opening a session): it
+//! names `reldex-driver-oracle-thin` concretely, to map a profile's settings
+//! into real connection parameters. A resolved or fetched password never crosses
 //! as a plain string the adapter could copy and keep — see
 //! [`ReldexSecret`]/[`reldex_secret_expose`]'s doc comment for the one,
 //! deliberate exception to this crate's outbound-NUL-termination promise.
@@ -123,18 +123,20 @@
 //!
 //! # Features
 //!
-//! `mock-driver` (**on by default**) links `reldex-driver-mock`, the only
-//! driver this crate can currently open a session against. It is how M1.3 and
-//! spike S15 drive the boundary with no database.
+//! `mock-driver` (**on by default**) links `reldex-driver-mock`, which is how
+//! M1.3, spike S15 and every test here drive the boundary with no database.
+//! The Oracle thin driver needs no feature: this crate already links it for
+//! its metadata and profile bindings, and since ABI 3.3 (M3.3)
+//! [`reldex_hub_open_session`] opens `RELDEX_DRIVER_KIND_ORACLE` sessions
+//! with the parameters [`reldex_workspace_prepare_connect`] prepared.
+//! `oracle-it` only compiles this crate's live tests (`tests/m3_3_connect_live.rs`).
 //!
 //! **A cargo feature never changes the ABI.** The exported symbols and the
 //! generated header are identical either way, so one `reldex.h` describes every
-//! build. Without the feature, [`reldex_hub_open_session`] reports
-//! `RELDEX_STATUS_INVALID_ARGUMENT` — there is no driver to open — and
-//! [`reldex_mock_release_block`] does nothing. That is the shape a shipping
-//! build should have until a real driver feature replaces it (M1.8): the mock's
-//! *behaviour* is compiled out, and the adapter is not built against a
-//! different ABI than the one it was tested on.
+//! build. Without `mock-driver`, opening `RELDEX_DRIVER_KIND_MOCK` reports
+//! `RELDEX_STATUS_INVALID_ARGUMENT` and [`reldex_mock_release_block`] does
+//! nothing: the mock's *behaviour* is compiled out, and the adapter is not
+//! built against a different ABI than the one it was tested on.
 
 // The workspace denies `unsafe_code` (root `Cargo.toml`) and ADR-0003 D2 makes
 // this crate its single exception. Cargo rejects overriding `workspace.lints`
@@ -239,10 +241,11 @@ pub use workspace::{
     reldex_workspace_get_profile, reldex_workspace_list_history, reldex_workspace_list_profiles,
     reldex_workspace_load_layout, reldex_workspace_load_worksheets,
     reldex_workspace_new_worksheet_id, reldex_workspace_next_reply, reldex_workspace_open,
-    reldex_workspace_pending_replies, reldex_workspace_record_history,
-    reldex_workspace_resolve_password, reldex_workspace_resolve_setting,
-    reldex_workspace_save_layout, reldex_workspace_save_worksheet, reldex_workspace_set_setting,
-    reldex_workspace_set_waker, reldex_workspace_update_profile,
+    reldex_workspace_pending_replies, reldex_workspace_prepare_connect,
+    reldex_workspace_record_history, reldex_workspace_resolve_password,
+    reldex_workspace_resolve_setting, reldex_workspace_save_layout,
+    reldex_workspace_save_worksheet, reldex_workspace_set_setting, reldex_workspace_set_waker,
+    reldex_workspace_update_profile,
 };
 
 /// Major part of the ABI version reported by [`reldex_abi_version`].
@@ -287,7 +290,14 @@ pub const RELDEX_ABI_VERSION_MAJOR: u32 = 3;
 /// a loss mid-statement, a session id that is retired once its `TERMINAL` is
 /// drained — without changing its shape; ADR-0003's M2.15 amendment lists
 /// each change.
-pub const RELDEX_ABI_VERSION_MINOR: u32 = 2;
+///
+/// `3` because M3.3 opens the first real database session, additively:
+/// `RELDEX_DRIVER_KIND_ORACLE`, a trailing `ReldexOpenOptions::connect`,
+/// `reldex_workspace_prepare_connect` with its reply kind
+/// (`CONNECT_PREPARED`) and password source (`SUPPLIED`), and a
+/// `ReldexConnectSummary` that now carries the parameters it summarises.
+/// ADR-0003's M3.3 amendment (A40–A43) lists each change.
+pub const RELDEX_ABI_VERSION_MINOR: u32 = 3;
 
 /// The ABI version this library implements: `(major << 16) | minor`.
 ///

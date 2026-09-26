@@ -538,6 +538,11 @@ Popup {
         id: deleteConfirm
         objectName: "deleteConfirmDialog"
         anchors.centerIn: parent
+        // An explicit width (M3.3): without one, Basic's Dialog derives its
+        // implicitWidth from the button box and the content, which reported
+        // a binding loop every time a saved profile reloaded `draft` into the
+        // text below -- first seen once the shell tests saved a profile.
+        width: 420
         modal: true
         title: qsTr("Delete connection?")
         standardButtons: Dialog.Yes | Dialog.No

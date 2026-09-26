@@ -14,14 +14,14 @@ boundary) open; it does not repeat that reasoning.
 
 | Family | Entry points | Notes |
 | --- | --- | --- |
-| Hub / sessions | `reldex_hub_create`/`_destroy`/`_set_waker`, `reldex_hub_open_session`, `reldex_session_execute`/`_fetch`/`_close`/`_close_result`/`_abandon`, `reldex_hub_next_event`/`_pending_events`, `reldex_hub_session_count`/`_list_sessions` | One hub per process is typical but not required; a session is scoped to the hub that opened it, and its id is not found once its `TERMINAL` has been drained. |
+| Hub / sessions | `reldex_hub_create`/`_destroy`/`_set_waker`, `reldex_hub_open_session`, `reldex_session_execute`/`_fetch`/`_close`/`_close_result`/`_abandon`, `reldex_hub_next_event`/`_pending_events`, `reldex_hub_session_count`/`_list_sessions` | One hub per process is typical but not required; a session is scoped to the hub that opened it, and its id is not found once its `TERMINAL` has been drained. `ReldexOpenOptions::driver` is `MOCK` or, since ABI 3.3, `ORACLE` with `connect` set (see "Opening a real session" below). |
 | Transaction control | `reldex_session_commit`/`_rollback`/`_savepoint`/`_rollback_to_savepoint`/`_ping` | Reply is `RELDEX_EVENT_KIND_COMPLETED`; read `completed_operation` (`ReldexCompletedOperation`) to know which. |
 | Server output | `reldex_session_set_server_output`, `reldex_server_output_lines_count`/`_get`/`_release` | Off by default; a reconnect never carries the setting over. Delivered ahead of the reply that follows it (see "Events" below). |
 | Statement splitting | `reldex_split_statements` -> `ReldexStatementSpan` | `snprintf`-style capacity contract; honours the caller's `struct_size`. |
-| Metadata | `reldex_metadata_prepare` + `ReldexMetadataQuery` (`_sql`/`_bind_count`/`_column_count`/`_column`/`_reclassify_error`/`_release`) | Vendor-concrete: this is one of the two places (with `workspace.rs`) allowed to name `reldex-driver-oracle-thin` directly. |
+| Metadata | `reldex_metadata_prepare` + `ReldexMetadataQuery` (`_sql`/`_bind_count`/`_column_count`/`_column`/`_reclassify_error`/`_release`) | Vendor-concrete: one of the few places (with `workspace.rs`, `splitter.rs` and, for opening a session, `mock.rs`) allowed to name `reldex-driver-oracle-thin` directly. |
 | Batches / cells | `reldex_batch_*`, `reldex_batch_format_column`, `reldex_text_arena_*` | Zero-copy on the dominant column types; see `batch.rs`/`format.rs` module docs for the column-kind contract. |
 | Errors | `ReldexError`, `reldex_error_view`, `reldex_last_error_take`/`_clear` | Per-thread last-error slot; an error attached to an *event* is owned by whoever drains the event instead. |
-| Workspace: settings/profiles | `ReldexWorkspace`, `reldex_workspace_open`/`_close`/`_set_waker`/`_pending_replies`/`_next_reply`, `_resolve_setting`/`_set_setting`/`_clear_setting`, `_create_profile`/`_update_profile`/`_delete_profile`/`_get_profile`/`_list_profiles`, `_build_connect_params`, `ReldexProfileError` | One service thread per `ReldexWorkspace`, independent of the hub's event queue and waker. A refused profile's `CONFIGURATION` error carries a `ReldexProfileError` as `native_code` (ABI 3.2). |
+| Workspace: settings/profiles | `ReldexWorkspace`, `reldex_workspace_open`/`_close`/`_set_waker`/`_pending_replies`/`_next_reply`, `_resolve_setting`/`_set_setting`/`_clear_setting`, `_create_profile`/`_update_profile`/`_delete_profile`/`_get_profile`/`_list_profiles`, `_build_connect_params`, `_prepare_connect` (ABI 3.3), `ReldexProfileError` | One service thread per `ReldexWorkspace`, independent of the hub's event queue and waker. A refused profile's `CONFIGURATION` error carries a `ReldexProfileError` as `native_code` (ABI 3.2). |
 | Workspace: credentials | `reldex_workspace_credential_get`/`_put`/`_delete`, `_resolve_password`, `ReldexSecret` (`reldex_secret_expose`/`_from_utf8`/`_release`), `ReldexCredentialError`, `ReldexCredentialStoreKind` | A password never crosses as a `ReldexStr` the caller could keep; see "Ownership and lifetime" below. |
 | Workspace: history/worksheets/layout | `reldex_workspace_record_history`/`_list_history`/`_clear_history`, `_save_worksheet`/`_load_worksheets`/`_delete_worksheet`, `_save_layout`/`_load_layout`, `_new_worksheet_id` | Non-transactional state only (`AGENTS.md`): no session, connection or transaction is ever implied. |
 | Diagnostics | `reldex_abi_version`, `reldex_live_counts` | `reldex_live_counts` is a test/diagnostic instrument, not part of the working API — see `counters.rs`'s module doc. |
@@ -131,6 +131,39 @@ A29, A32–A36). What a caller can rely on:
   `SERVER_OUTPUT` 5 for three lines, `TERMINAL` 1 on a clean close and about 10 when it carries a
   loss's error.
 
+## Opening a real session (ABI 3.3, M3.3)
+
+ADR-0003 A40–A43 has the reasoning. Three steps:
+
+1. **Prepare the connect.** `reldex_workspace_prepare_connect(workspace, request, profile, password)`
+   runs on the workspace's service thread.
+   - Pass `password = null` to let it ask the credential store.
+   - Pass a `ReldexSecret` from `reldex_secret_from_utf8` to use what the user typed. It is not
+     consumed.
+2. **Read the `CONNECT_PREPARED` reply.** It either carries a `ReldexConnectSummary` ready to open
+   with, or `PROMPT_REQUIRED` with a `prompt_reason`.
+   - `password_source_kind` says where the password came from: `FROM_STORE`, `NOT_NEEDED` or
+     `SUPPLIED`.
+   - The summary now carries the connection parameters, password included. A stored password
+     reaches the caller only inside it. `reldex_connect_summary_view` still shows display fields
+     only.
+3. **Open the session.** Call `reldex_hub_open_session` with `driver = RELDEX_DRIVER_KIND_ORACLE`
+   and `connect` pointing at the summary.
+   - The summary is borrowed for the call only. Release it (`reldex_connect_summary_release`, which
+     wipes the password) as soon as the call returns.
+   - The worker connects within the profile's connect limit.
+   - `reldex_session_abandon` gives up at once. A connection that arrives later is closed, never
+     adopted.
+
+What the real driver does that the mock does not (A43):
+
+- `transaction_possibly_active` becomes true after any statement except DDL, so a close with no
+  decision is refused.
+- `reldex_session_request_cancel` answers `NOT_INTERRUPTIBLE`.
+- A statement deadline that fires loses the session (`NETWORK_LOST`, then `TERMINAL`).
+
+A 3.2-sized `ReldexOpenOptions` reads `connect` as null and opens the mock exactly as before.
+
 ## Known limitation: the fetch-size hint and the result-store settings
 
 `Statement::with_fetch_rows` (`db-driver-api`) is never set by anything in this crate today —
@@ -160,3 +193,12 @@ fetch-size hint above.
 4. `crates/ffi/tests/header.rs` enforces that `include/reldex.h` matches what `cbindgen` generates
    from source, and that every exported function and every `#[repr(C)]`/`#[repr(i32)]` type actually
    reaches it (the latter guards against the class of gap ADR-0003 A27 records).
+5. **Live tests against the Oracle test database** (M3.3) are separate from all of the above.
+   - `crates/ffi/tests/m3_3_connect_live.rs` compiles only with the `oracle-it` feature, and each
+     test is `#[ignore]`.
+   - Run them through `tools/oracle-test-db/`, which reads the credentials from its `.env` and
+     never prints them:
+     `RELDEX_IT_PACKAGE=reldex-ffi bash tools/oracle-test-db/run-it.sh m3_3_connect_live -- --ignored --test-threads=1 --nocapture`
+   - They cover select 1, auto-commit off, ORA-01017, an unreachable host within the limit, abandon
+     mid-connect (watched from `v$session`), a statement deadline, and connect and first-reply
+     timings (`RELDEX_M33_RUNS`, default 10).
