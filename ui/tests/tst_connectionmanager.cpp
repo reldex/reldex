@@ -112,6 +112,8 @@ private Q_SLOTS:
     void aControlCharacterPasswordIsRefusedByTheCredentialStoreAndReportedAsAWarning();
     void testConnectSucceedsAgainstTheMockDriver();
     void testConnectFailsTypedWhenAPasswordIsRequiredAndNoneWasGiven();
+    void testConnectResolvesAndUsesAStoredPasswordWithoutRetypingIt();
+    void authFailureAgainstStoredPasswordDecisionCoversAllFourCases();
     void messageKeyForErrorCoversEveryFfiErrorKind();
     void messageKeyForErrorCoversEveryCredentialErrorCode();
     void defaultStorePathMirrorsAdr0006PlatformRules();
@@ -152,21 +154,32 @@ void TstConnectionManager::opensInMemoryAndBecomesReady()
     QVERIFY(bridge.isValid());
     ConnectionManager *cm = bridge.connections();
     QVERIFY(cm != nullptr);
-    QVERIFY(cm->isValid());
+    // Must-fix 1: never open automatically. `Bridge`'s constructor only
+    // allocates this object; nothing has called open() yet, so there is no
+    // workspace handle and no I/O has happened anywhere.
+    QVERIFY(!cm->isValid());
 
+    QSignalSpy valid(cm, &ConnectionManager::validChanged);
     QSignalSpy opened(cm, &ConnectionManager::openFinished);
+    QVERIFY(cm->open());
     QVERIFY(spinUntil([cm] { return cm->isReady(); }));
+    QVERIFY(cm->isValid());
+    QVERIFY(valid.count() >= 1);
     QCOMPARE(opened.count(), 1);
     QCOMPARE(opened.constFirst().at(0).toBool(), true);
     QCOMPARE(cm->credentialStoreKind(), static_cast<int>(RELDEX_CREDENTIAL_STORE_KIND_MEMORY));
     QVERIFY(cm->canStoreCredential());
     QCOMPARE(cm->profiles()->rowCount(), 0);
+
+    // Idempotent: a second call while already open is a harmless no-op.
+    QVERIFY(cm->open());
 }
 
 void TstConnectionManager::createListsUpdatesAndDeletesRoundTripThroughTheModel()
 {
     Bridge bridge;
     ConnectionManager *cm = bridge.connections();
+    QVERIFY(cm->open());
     QVERIFY(spinUntil([cm] { return cm->isReady(); }));
 
     QSignalSpy saved(cm, &ConnectionManager::profileSaved);
@@ -205,6 +218,7 @@ void TstConnectionManager::aPastedPasswordEqualsDescriptorIsRefusedWithoutEchoin
 {
     Bridge bridge;
     ConnectionManager *cm = bridge.connections();
+    QVERIFY(cm->open());
     QVERIFY(spinUntil([cm] { return cm->isReady(); }));
 
     const QString secret = QStringLiteral("Sup3rSecr3tPassword");
@@ -229,6 +243,7 @@ void TstConnectionManager::environmentAndProductionFlagRulesAreEnforced()
 {
     Bridge bridge;
     ConnectionManager *cm = bridge.connections();
+    QVERIFY(cm->open());
     QVERIFY(spinUntil([cm] { return cm->isReady(); }));
 
     // Production without the flag: refused (ADR-0006 P3).
@@ -283,6 +298,7 @@ void TstConnectionManager::aControlCharacterPasswordIsRefusedByTheCredentialStor
 {
     Bridge bridge;
     ConnectionManager *cm = bridge.connections();
+    QVERIFY(cm->open());
     QVERIFY(spinUntil([cm] { return cm->isReady(); }));
     QVERIFY(cm->canStoreCredential()); // the in-memory test store (ADR-0007 S3)
 
@@ -311,6 +327,7 @@ void TstConnectionManager::testConnectSucceedsAgainstTheMockDriver()
 {
     Bridge bridge;
     ConnectionManager *cm = bridge.connections();
+    QVERIFY(cm->open());
     QVERIFY(spinUntil([cm] { return cm->isReady(); }));
 
     QSignalSpy saved(cm, &ConnectionManager::profileSaved);
@@ -328,12 +345,16 @@ void TstConnectionManager::testConnectSucceedsAgainstTheMockDriver()
     QCOMPARE(succeeded.constFirst().at(0).toString(), idHex);
     QVERIFY(!succeeded.constFirst().at(1).toString().isEmpty()); // a connect summary
     QVERIFY(spinUntil([cm] { return !cm->testConnectBusy(); }));
+    // must-fix 4: an explicitly typed password never counts as "used the
+    // store", even though it succeeded.
+    QVERIFY(!cm->testConnectUsedStoredPassword());
 }
 
 void TstConnectionManager::testConnectFailsTypedWhenAPasswordIsRequiredAndNoneWasGiven()
 {
     Bridge bridge;
     ConnectionManager *cm = bridge.connections();
+    QVERIFY(cm->open());
     QVERIFY(spinUntil([cm] { return cm->isReady(); }));
 
     QSignalSpy saved(cm, &ConnectionManager::profileSaved);
@@ -350,6 +371,69 @@ void TstConnectionManager::testConnectFailsTypedWhenAPasswordIsRequiredAndNoneWa
     QCOMPARE(failed.constFirst().at(1).toString(), QStringLiteral("error.configuration"));
     QCOMPARE(failed.constFirst().at(3).toBool(), false); // not an auth-with-stored-password failure
     QVERIFY(!cm->testConnectBusy());
+}
+
+void TstConnectionManager::testConnectResolvesAndUsesAStoredPasswordWithoutRetypingIt()
+{
+    // must-fix 4: testConnect() with no typed password asks resolve_password
+    // rather than failing outright or guessing from the profile's own
+    // passwordStorage flag -- a profile actually using the credential store
+    // is test-connectable without re-typing its password.
+    Bridge bridge;
+    ConnectionManager *cm = bridge.connections();
+    QVERIFY(cm->open());
+    QVERIFY(spinUntil([cm] { return cm->isReady(); }));
+    QVERIFY(cm->canStoreCredential()); // the in-memory test store (ADR-0007 S3)
+
+    QVariantMap fields = baseProfileFields();
+    fields["passwordStorage"] = RELDEX_PASSWORD_STORAGE_KIND_CREDENTIAL_STORE;
+    fields["password"] = QStringLiteral("Sup3rSecr3tPassword"); // no control character: accepted
+
+    QSignalSpy warning(cm, &ConnectionManager::credentialWarning);
+    QSignalSpy saved(cm, &ConnectionManager::profileSaved);
+    QVERIFY(cm->createProfile(fields));
+    QVERIFY(spinUntil([&saved] { return saved.count() >= 1; }));
+    QVERIFY(warning.isEmpty()); // the put succeeded; nothing to warn about
+    const QString idHex = saved.constFirst().at(0).toString();
+    QCOMPARE(cm->profiles()->get(cm->profiles()->indexOfId(idHex)).value("passwordStorage").toInt(),
+             static_cast<int>(RELDEX_PASSWORD_STORAGE_KIND_CREDENTIAL_STORE));
+
+    QSignalSpy succeeded(cm, &ConnectionManager::testConnectSucceeded);
+    QSignalSpy failed(cm, &ConnectionManager::testConnectFailed);
+    QVERIFY(cm->testConnect(idHex, QString())); // no password typed
+    QVERIFY(spinUntil([&succeeded, &failed] { return succeeded.count() + failed.count() >= 1; }));
+    QCOMPARE(failed.count(), 0);
+    QCOMPARE(succeeded.count(), 1);
+    // The whole point: resolve_password found it in the store and testConnect
+    // used it, without the caller ever having to type it again.
+    QVERIFY(cm->testConnectUsedStoredPassword());
+    // Let the session-close/finishTestConnect cycle actually finish (as
+    // testConnectSucceedsAgainstTheMockDriver's own trailing spin does)
+    // before the test function returns and `bridge` goes out of scope --
+    // otherwise `m_testConnectSessionId` is still non-zero when
+    // `~ConnectionManager()` runs as a QObject child during `Bridge`'s own
+    // `~QObject()`, and it calls back into `m_bridge->unregisterHubSink()`
+    // after `Bridge`'s `m_hubSinks` member has already been destructed
+    // (found by a real crash in this exact test during the M3.2 fix round).
+    QVERIFY(spinUntil([cm] { return !cm->testConnectBusy(); }));
+}
+
+void TstConnectionManager::authFailureAgainstStoredPasswordDecisionCoversAllFourCases()
+{
+    // must-fix 4's decision, tested as the pure function it is refactored
+    // into (`ConnectionManager::isAuthFailureAgainstStoredPassword()`'s own
+    // doc comment explains why a real "fake hub event" through the private
+    // method it is used from is not buildable in this build: crates/ffi
+    // exposes no way to fabricate a ReldexError*). Only "authentication
+    // failure" AND "used a stored password" together may offer to update the
+    // stored password; either alone must not.
+    QVERIFY(ConnectionManager::isAuthFailureAgainstStoredPassword(RELDEX_ERROR_KIND_AUTHENTICATION,
+                                                                   true));
+    QVERIFY(!ConnectionManager::isAuthFailureAgainstStoredPassword(RELDEX_ERROR_KIND_AUTHENTICATION,
+                                                                    false));
+    QVERIFY(!ConnectionManager::isAuthFailureAgainstStoredPassword(RELDEX_ERROR_KIND_CONNECTION, true));
+    QVERIFY(
+            !ConnectionManager::isAuthFailureAgainstStoredPassword(RELDEX_ERROR_KIND_CONNECTION, false));
 }
 
 void TstConnectionManager::messageKeyForErrorCoversEveryFfiErrorKind()
@@ -440,10 +524,11 @@ void TstConnectionManager::defaultStorePathMirrorsAdr0006PlatformRules()
 void TstConnectionManager::aRealOnDiskWorkspaceRoundTripsThroughTheResolvedDefaultPath()
 {
     // This one test opens a REAL, file-backed store (not
-    // `RELDEX_WORKSPACE_IN_MEMORY`) -- proving `ensureStoreDirectoryReady()`
-    // actually creates the directory/file `reldex_workspace_open()` itself
-    // does not (see ConnectionManager.h's FFI-gap note) -- while still never
-    // touching a real OS credential store.
+    // `RELDEX_WORKSPACE_IN_MEMORY`) -- proving `reldex_workspace_open()`
+    // itself creates the directory/file (`Store::open_creating`, the
+    // must-fix 2 fix) -- while still never touching a real OS credential
+    // store. `kPlatformDataDirEnvVar` stands in for the platform's data-dir
+    // env var, redirected at a `QTemporaryDir`, never the developer's own.
     m_inMemory.reset();
     QTemporaryDir tempDir;
     QVERIFY(tempDir.isValid());
@@ -458,6 +543,7 @@ void TstConnectionManager::aRealOnDiskWorkspaceRoundTripsThroughTheResolvedDefau
     {
         Bridge bridge;
         ConnectionManager *cm = bridge.connections();
+        QVERIFY(cm->open());
         QVERIFY(spinUntil([cm] { return cm->isReady(); }));
         QVERIFY(QFileInfo::exists(expectedPath));
 
@@ -478,6 +564,7 @@ void TstConnectionManager::aRealOnDiskWorkspaceRoundTripsThroughTheResolvedDefau
     // Reopening the same file finds the profile still there.
     Bridge bridge2;
     ConnectionManager *cm2 = bridge2.connections();
+    QVERIFY(cm2->open());
     QVERIFY(spinUntil([cm2] { return cm2->isReady(); }));
     QVERIFY(spinUntil([cm2] { return cm2->profiles()->rowCount() == 1; }));
 }

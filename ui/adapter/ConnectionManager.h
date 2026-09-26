@@ -18,6 +18,22 @@
 // (M3.3 owns "Connecting..."/cancel/bounded timeout) -- test-connect below is
 // a throwaway probe with its own transient session, never the worksheet's.
 //
+// Opening: `open()` is explicit, never automatic. The workspace's service
+// thread is NOT started from this class's constructor -- `Bridge` still
+// constructs a `ConnectionManager` eagerly (cheap: it allocates a model and
+// nothing else), but nothing calls `open()` until either the app's own
+// startup path does (`Main.qml`'s `Bridge { Component.onCompleted:
+// connections.open() }`) or a test does. This is a fix for a real bug (M3.2
+// fix round, 2026-09-26): opening eagerly from the constructor meant *every*
+// test that merely constructs a `Bridge` -- `tst_bridge`, `tst_resultmodel`,
+// `tst_teardown` (12,000 constructions in its K5 loop), and `tst_coreinfo`/
+// its DPI variants (which load the real `Main.qml`) -- silently opened the
+// developer's real on-disk default workspace store, because none of them had
+// any reason to guard against a connection-manager side effect they never
+// asked for. `open()` is idempotent (a second call while already open or
+// opening is a no-op) and `Q_INVOKABLE` so both QML and a test can call it
+// directly.
+//
 // FFI gaps this class works around, documented in the M3.2 hand-off (see
 // ui/README.md "Connection manager (M3.2)"):
 //  * `reldex_hub_open_session` accepts only `RELDEX_DRIVER_KIND_MOCK` in this
@@ -27,13 +43,6 @@
 //    typed failures (an invalid profile, a missing password) are still real,
 //    caught entirely by `reldex_workspace_build_connect_params` before any
 //    session is opened.
-//  * `reldex_workspace_open` takes a caller-supplied path and calls
-//    `Store::open` directly; it does not create the parent directory or apply
-//    ADR-0006 P5's Unix permissions the way `Store::open_default` (Rust-only,
-//    not exposed over the ABI) does. `resolveDefaultStorePath()` /
-//    `ensureStoreDirectoryReady()` below reimplement exactly that rule on the
-//    C++ side so a real (non-in-memory) workspace still gets a `0700`
-//    directory and a `0600` file on Unix.
 //  * `ProfileError` (unlike `CredentialError`) crosses the ABI folded into
 //    `RELDEX_ERROR_KIND_CONFIGURATION` with no numeric sub-code -- including
 //    the credential-pattern refusal. Its `Display` text is safe by
@@ -41,7 +50,14 @@
 //    the pattern class and never the text", `crates/workspace/src/
 //    profile.rs`), so this class shows that message verbatim under one
 //    message key (`error.configuration`) rather than inventing a fragile
-//    English-text parse to recover a finer one.
+//    English-text parse to recover a finer one. Deferred to M2.15.
+//
+// Fixed since the first version of this class (M3.2 fix round, 2026-09-26):
+// `reldex_workspace_open` now creates a non-in-memory store's directory and
+// file itself, with ADR-0006 P5's permissions, on its own service thread
+// (`Store::open_creating`, `crates/ffi/src/workspace.rs`) -- this class no
+// longer reimplements that on the C++ side (there is no
+// `ensureStoreDirectoryReady()` any more), and never did it on a UI thread.
 
 #include "ProfileModel.h"
 #include "ReldexHandles.h"
@@ -63,10 +79,14 @@ class ConnectionManager : public QObject
     QML_ELEMENT
     QML_UNCREATABLE("ConnectionManager is created by Bridge and reached as bridge.connections")
 
-    /// False if the workspace's service thread could not be started at all
-    /// (an OS thread-creation failure or an invalid argument). Distinct from
-    /// `ready`: a valid workspace is still opening until its first reply.
-    Q_PROPERTY(bool valid READ isValid CONSTANT)
+    /// True once `open()` has actually opened a workspace handle (whether or
+    /// not it has finished; `ready` is that). False before `open()` is ever
+    /// called, and false again if it failed (an OS thread-creation failure or
+    /// an invalid argument) -- `open()` may be retried in that case, which is
+    /// why this is `NOTIFY`, not `CONSTANT`: unlike `Bridge::valid` (decided
+    /// once, synchronously, in its constructor), this can change after
+    /// construction now that opening is no longer automatic.
+    Q_PROPERTY(bool valid READ isValid NOTIFY validChanged)
     /// True once `RELDEX_WORKSPACE_REPLY_KIND_OPENED` has been drained
     /// without an error. Every command below is refused (returns `false`,
     /// `hasError`/`errorMessageKey` set to `error.workspace.notReady`) before
@@ -106,6 +126,14 @@ public:
     explicit ConnectionManager(Bridge *bridge, QObject *parent = nullptr);
     ~ConnectionManager() override;
 
+    /// Opens the workspace's service thread. Idempotent: a call while
+    /// already open, or already opening, is a no-op that returns `true`.
+    /// Never called automatically (see the class documentation) -- the app's
+    /// startup path or a test calls this explicitly. Returns whether the
+    /// open request was issued, not whether it has finished; the outcome
+    /// arrives through `readyChanged()`/`validChanged()`/`openFinished()`.
+    Q_INVOKABLE bool open();
+
     [[nodiscard]] bool isValid() const noexcept { return m_workspace != nullptr; }
     [[nodiscard]] bool isReady() const noexcept { return m_ready; }
     [[nodiscard]] ProfileModel *profiles() const noexcept { return m_profiles; }
@@ -121,6 +149,15 @@ public:
     [[nodiscard]] int errorKind() const noexcept { return m_errorKind; }
 
     [[nodiscard]] bool testConnectBusy() const noexcept { return m_testConnectBusy; }
+    /// Whether the test-connect in progress (or the last one) used a password
+    /// `resolve_password` resolved `FromStore`, rather than one typed in.
+    /// Public (C++-only, not exposed to QML -- `testConnectFailed`'s own
+    /// fourth argument is what a dialog reads) so a test can check the wiring
+    /// end to end without befriending the class.
+    [[nodiscard]] bool testConnectUsedStoredPassword() const noexcept
+    {
+        return m_testConnectUsedStoredPassword;
+    }
 
     // --- commands. Every one validates/maps in this class, never in QML. --
 
@@ -163,28 +200,47 @@ public:
     /// nothing a caller could not already do with `qEnvironmentVariable()`.
     [[nodiscard]] static QString defaultGetEnv(const char *name);
 
-    /// ADR-0006 P5's rule, reimplemented here because `reldex_workspace_open`
-    /// does not expose `Store::open_default()` (see the class documentation).
-    /// Pure and independently testable: `getenv` defaults to
-    /// `qEnvironmentVariable`, and a test overrides it to point at a
-    /// `QTemporaryDir` without touching the process environment.
-    /// Returns empty when the platform has no derivable data directory
-    /// (mirrors `reldex_workspace::store::default_data_dir()` returning
+    /// ADR-0006 P5's *path* rule (mirrors
+    /// `reldex_workspace::store::default_data_dir()`) -- only the path, not
+    /// the directory/file creation any more (that moved to
+    /// `reldex_workspace_open`'s own service thread, `Store::open_creating`;
+    /// see the class documentation). `open()` still needs to know which path
+    /// to pass across the ABI when no explicit override is given. Pure and
+    /// independently testable: `getenv` defaults to `qEnvironmentVariable`,
+    /// and a test overrides it to point at a `QTemporaryDir` without touching
+    /// the process environment. Returns empty when the platform has no
+    /// derivable data directory (mirrors `default_data_dir()` returning
     /// `None`).
     [[nodiscard]] static QString
     resolveDefaultStorePath(const std::function<QString(const char *)> &getenv = defaultGetEnv);
 
     /// "Each FFI error kind maps to a message key" -- public and pure so
-    /// `tst_connectionmanager` can check the whole table directly, including
-    /// the `authFailureWithStoredPassword` decision `testConnectFailed`
-    /// makes, which this build's mock driver cannot itself trigger (see the
-    /// class documentation). `credentialContext`: true for a
-    /// `reldex_workspace_credential_*` reply (native code is a
+    /// `tst_connectionmanager` can check the whole table directly. `credentialContext`:
+    /// true for a `reldex_workspace_credential_*` reply (native code is a
     /// `ReldexCredentialError`), false for everything else.
     [[nodiscard]] static QString messageKeyForError(const ReldexErrorView &view,
                                                      bool credentialContext);
 
+    /// The decision `handleHubEvent()` makes for `testConnectFailed`'s
+    /// `authFailureWithStoredPassword`: true only for an authentication
+    /// failure *and* a test-connect that used a password `resolve_password`
+    /// resolved `FromStore`. Public, pure and taking already-decoded inputs
+    /// (rather than a `ReldexEvent`/`ReldexError`) for the same reason
+    /// `messageKeyForError()` is: this build's mock driver cannot itself
+    /// produce a real authentication failure to drive the real path with
+    /// (`crates/ffi` exposes no way to fabricate a `ReldexError*` either, so
+    /// a "fake hub event" through the real private method is not buildable
+    /// without a core change this task's scope excludes) -- the decision
+    /// itself is still fully exercised this way, independent of whether the
+    /// failure it decides about can be produced in this build.
+    [[nodiscard]] static bool isAuthFailureAgainstStoredPassword(int errorKind,
+                                                                  bool usedStoredPassword) noexcept
+    {
+        return errorKind == RELDEX_ERROR_KIND_AUTHENTICATION && usedStoredPassword;
+    }
+
 Q_SIGNALS:
+    void validChanged();
     void readyChanged();
     void errorChanged();
     void testConnectStateChanged();
@@ -200,9 +256,17 @@ Q_SIGNALS:
     void testConnectSucceeded(const QString &idHex, const QString &summary);
     /// `authFailureWithStoredPassword`: ADR-0007's rule -- a stored password
     /// is never retried automatically; the UI offers to update it instead.
-    /// (Unreachable in this build's own tests: see the class documentation --
-    /// the mock driver cannot fail an open or a ping. Covered directly by a
-    /// unit test of `messageKeyForError()`/this signal's decision instead.)
+    /// True only when `testConnect()` actually used a password
+    /// `resolve_password` resolved `FromStore` (never when the user typed a
+    /// password explicitly, and never just because the profile's own
+    /// `passwordStorage` says `CredentialStore` -- that flag can be stale, so
+    /// `resolve_password` is asked rather than trusted locally) *and* the
+    /// resulting session open/ping failed with `RELDEX_ERROR_KIND_
+    /// AUTHENTICATION`. This build's mock driver cannot itself fail an open
+    /// or a ping (see the class documentation), so end-to-end coverage of the
+    /// "database refuses it" half is not possible here; see
+    /// `isAuthFailureAgainstStoredPassword()`'s own doc comment for how the
+    /// *decision* is tested instead.
     void testConnectFailed(const QString &idHex, const QString &messageKey, const QString &message,
                             bool authFailureWithStoredPassword);
 
@@ -287,9 +351,6 @@ private:
     [[nodiscard]] bool ensureReady();
     [[nodiscard]] quint64 nextRequest();
 
-    void openWorkspace();
-    [[nodiscard]] bool ensureStoreDirectoryReady(const QString &path) const;
-
     void postDrain();
     void drain();
     void handleReply(const ReldexWorkspaceReply &reply);
@@ -298,7 +359,22 @@ private:
     void continueDeleteProfile(quint64 request, PendingOp &op, const ReldexWorkspaceReply &reply);
     void finishSave(const PendingOp &op, const QByteArray &id, bool created);
 
+    /// Issues `reldex_workspace_build_connect_params` for the profile
+    /// `testConnect()` is probing, with `password` (which may be null --
+    /// "no password available", not an error) as-is; stashes the request id
+    /// so `handleConnectParamsBuilt()` recognizes its reply. On a rejected
+    /// request (the FFI call itself failing, not a later async error), fails
+    /// test-connect immediately and returns `false`.
+    bool issueBuildConnectParams(const QString &idHex, const ReldexSecret *password);
     void handleConnectParamsBuilt(const ReldexWorkspaceReply &reply);
+    /// `testConnect()`'s continuation when no password was typed: reads
+    /// where `resolve_password` says one should come from
+    /// (`m_testConnectUsedStoredPassword`, ADR-0007 S3) and, on `FromStore`,
+    /// forwards `reply.secret` straight into `issueBuildConnectParams()`
+    /// (used synchronously within this same drain iteration; never adopted
+    /// or retained -- `drain()`'s own `SecretHandle` releases it right after
+    /// `handleReply()` returns, same as every other reply-owned object here).
+    void handlePasswordResolved(const ReldexWorkspaceReply &reply);
     void handleHubEvent(const ReldexEvent &raw, reldex::BatchHandle batch, reldex::ErrorHandle error);
     void finishTestConnect();
 
@@ -328,6 +404,15 @@ private:
     // own doc comment for why this is not a `PendingOp`). ---------------
     bool m_testConnectBusy = false;
     QByteArray m_testConnectProfileId;
+    /// Set when no password was typed, while `resolve_password`'s reply is
+    /// awaited; 0 once `issueBuildConnectParams()` has run (whether reached
+    /// from here or directly from `testConnect()` for a typed password).
+    quint64 m_testConnectResolveRequest = 0;
+    /// True only when this test-connect's password came from
+    /// `resolve_password` resolving `FromStore` -- the one case
+    /// `handleHubEvent()` may set `authFailureWithStoredPassword` for. False
+    /// for a typed password, `PromptRequired`, or `NotNeeded` alike.
+    bool m_testConnectUsedStoredPassword = false;
     quint64 m_testConnectBuildRequest = 0;
     quint64 m_testConnectSessionId = 0;
     quint64 m_testConnectPingRequest = 0;

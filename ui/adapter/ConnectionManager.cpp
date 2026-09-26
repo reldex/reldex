@@ -4,18 +4,12 @@
 
 #include <QByteArray>
 #include <QDir>
-#include <QFile>
-#include <QFileInfo>
 #include <QMetaObject>
 #include <QProcessEnvironment>
 #include <QtGlobal>
 
 #include <algorithm>
 #include <type_traits>
-
-#ifdef Q_OS_UNIX
-#include <sys/stat.h>
-#endif
 
 namespace {
 
@@ -79,7 +73,8 @@ ConnectionManager::ConnectionManager(Bridge *bridge, QObject *parent)
     : QObject(parent), m_bridge(bridge)
 {
     m_profiles = new ProfileModel(this);
-    openWorkspace();
+    // Deliberately does not call open() here -- see the class documentation
+    // and open()'s own doc comment for why opening is never automatic.
 }
 
 ConnectionManager::~ConnectionManager()
@@ -99,8 +94,11 @@ ConnectionManager::~ConnectionManager()
 }
 
 // ============================================================================
-// Opening the store (ADR-0006 P5's rule, reimplemented -- see the class
-// documentation's FFI-gap note).
+// Opening the store. `resolveDefaultStorePath()` derives ADR-0006 P5's
+// *path* only; the directory/file creation and Unix permissions themselves
+// happen inside `reldex_workspace_open()`'s own service thread now
+// (`Store::open_creating`, crates/ffi/src/workspace.rs) -- never here, on
+// whichever thread calls `open()`.
 // ============================================================================
 
 QString ConnectionManager::defaultGetEnv(const char *name)
@@ -147,38 +145,12 @@ QString ConnectionManager::resolveDefaultStorePath(const std::function<QString(c
     return base + QStringLiteral("/com.reldex.reldex/reldex.sqlite3");
 }
 
-bool ConnectionManager::ensureStoreDirectoryReady(const QString &path) const
+bool ConnectionManager::open()
 {
-    const QFileInfo info(path);
-    QDir directory = info.dir();
-    if (!directory.exists() && !directory.mkpath(QStringLiteral("."))) {
-        qWarning("ConnectionManager: could not create the workspace directory %s",
-                 qPrintable(directory.absolutePath()));
-        return false;
+    if (m_workspace || m_openRequest != 0) {
+        return true; // already open, or an open is already in flight
     }
-#ifdef Q_OS_UNIX
-    // ADR-0006 P5: owner-only on Unix, applied before Rust's `Store::open`
-    // (which does not create or chmod anything -- it opens exactly the path
-    // it is given) ever touches the file.
-    ::chmod(directory.absolutePath().toLocal8Bit().constData(), 0700);
-#endif
-    if (!info.exists()) {
-        QFile file(path);
-        if (!file.open(QIODevice::WriteOnly)) {
-            qWarning("ConnectionManager: could not create the workspace store file %s",
-                     qPrintable(path));
-            return false;
-        }
-        file.close();
-#ifdef Q_OS_UNIX
-        file.setPermissions(QFile::ReadOwner | QFile::WriteOwner);
-#endif
-    }
-    return true;
-}
 
-void ConnectionManager::openWorkspace()
-{
     const QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
     const bool forceInMemory = env.value(QStringLiteral("RELDEX_WORKSPACE_IN_MEMORY")) == "1";
     const bool forceMemoryCredentials =
@@ -186,18 +158,17 @@ void ConnectionManager::openWorkspace()
     QString path = env.value(QStringLiteral("RELDEX_WORKSPACE_PATH"));
     bool inMemory = forceInMemory;
 
-    if (!inMemory) {
-        if (path.isEmpty()) {
-            path = resolveDefaultStorePath();
-        }
+    if (!inMemory && path.isEmpty()) {
+        path = resolveDefaultStorePath();
         if (path.isEmpty()) {
             qWarning("ConnectionManager: no default workspace store path on this platform; "
                      "opening in-memory instead");
             inMemory = true;
-        } else if (!ensureStoreDirectoryReady(path)) {
-            inMemory = true;
         }
     }
+    // No directory/file creation here any more: reldex_workspace_open()'s own
+    // service thread does that now (Store::open_creating). Nothing in this
+    // function does filesystem I/O, on this or any thread.
 
     const QByteArray pathUtf8 = path.toUtf8();
     const quint64 request = nextRequest();
@@ -214,9 +185,10 @@ void ConnectionManager::openWorkspace()
                   static_cast<int>(status));
         m_openRequest = 0;
         Q_EMIT openFinished(false);
-        return;
+        return false;
     }
     m_workspace.reset(workspace);
+    Q_EMIT validChanged();
 
     const ReldexStatus wakerStatus =
             reldex_workspace_set_waker(m_workspace.get(), &reldexConnectionManagerWake, this);
@@ -225,15 +197,17 @@ void ConnectionManager::openWorkspace()
                   "itself invalid rather than never delivering a reply",
                   static_cast<int>(wakerStatus));
         m_workspace.reset(); // no waker was registered
+        Q_EMIT validChanged();
         m_openRequest = 0;
         Q_EMIT openFinished(false);
-        return;
+        return false;
     }
 
     // A reply (at least OPENED) may already be queued by the time the waker
     // is registered -- drain once now rather than waiting for a wake that may
     // never come if it arrived in the gap between open() and set_waker().
     drain();
+    return true;
 }
 
 // ============================================================================
@@ -968,6 +942,11 @@ void ConnectionManager::handleReply(const ReldexWorkspaceReply &reply)
         return;
     }
 
+    if (reply.kind == RELDEX_WORKSPACE_REPLY_KIND_PASSWORD_RESOLVED) {
+        handlePasswordResolved(reply);
+        return;
+    }
+
     const auto pendingIt = m_pending.find(reply.request);
     if (pendingIt == m_pending.end()) {
         return; // e.g. the initial list_profiles request, already handled above
@@ -1003,21 +982,76 @@ bool ConnectionManager::testConnect(const QString &idHex, const QString &passwor
     m_testConnectProfileId = idBytes(idHex);
     m_testConnectSessionId = 0;
     m_testConnectSummary.clear();
+    m_testConnectUsedStoredPassword = false;
     Q_EMIT testConnectStateChanged();
 
-    reldex::SecretHandle secret;
     if (!password.isEmpty()) {
+        // An explicit, just-typed password always wins and always bypasses
+        // the credential store -- this is a *different* attempt from
+        // whatever the store might hold, never "the stored password", so it
+        // can never be the thing `handleHubEvent()` offers to update.
         const QByteArray passwordUtf8 = password.toUtf8();
-        secret.reset(reldex_secret_from_utf8(strOf(passwordUtf8)));
+        reldex::SecretHandle secret(reldex_secret_from_utf8(strOf(passwordUtf8)));
+        const bool issued = issueBuildConnectParams(idHex, secret.get());
+        // Not consumed by the call above (reldex.h): released here,
+        // immediately, rather than kept until the async reply.
+        secret.reset();
+        return issued;
     }
+
+    // No password typed: ask `resolve_password` where one would come from
+    // rather than trusting the profile's own `passwordStorage` flag locally
+    // (that flag can be stale -- e.g. a `credential_put` that failed after
+    // create leaves it at prompt-each-time even though a stale entry might
+    // still exist). `resolve_password` is ADR-0007 S3's single source of
+    // truth; only when it resolves `FromStore` does a later authentication
+    // failure get to offer "update the stored password?" in
+    // `handleHubEvent()`.
+    const quint64 request = nextRequest();
+    const QByteArray id16 = idToBytes16(m_testConnectProfileId);
+    const ReldexStatus status = reldex_workspace_resolve_password(
+            m_workspace.get(), request, reinterpret_cast<const std::uint8_t *>(id16.constData()));
+    if (status != RELDEX_STATUS_OK) {
+        adoptError(reldex_last_error_take(), false);
+        Q_EMIT testConnectFailed(idHex, m_errorMessageKey, m_errorMessage, false);
+        m_testConnectBusy = false;
+        Q_EMIT testConnectStateChanged();
+        return false;
+    }
+    m_testConnectResolveRequest = request;
+    return true;
+}
+
+void ConnectionManager::handlePasswordResolved(const ReldexWorkspaceReply &reply)
+{
+    if (reply.request != m_testConnectResolveRequest || !m_testConnectBusy) {
+        return;
+    }
+    m_testConnectResolveRequest = 0;
+    const QString idHex = idHexOf(idToBytes16(m_testConnectProfileId));
+    if (reply.error != nullptr) {
+        adoptError(reply.error, false);
+        Q_EMIT testConnectFailed(idHex, m_errorMessageKey, m_errorMessage, false);
+        m_testConnectBusy = false;
+        Q_EMIT testConnectStateChanged();
+        return;
+    }
+    m_testConnectUsedStoredPassword =
+            reply.password_source_kind == RELDEX_PASSWORD_SOURCE_KIND_FROM_STORE;
+    // `reply.secret` (null unless FromStore) is passed on synchronously, in
+    // this same drain iteration; `drain()`'s own SecretHandle releases it
+    // right after handleReply() returns -- never adopted or retained here,
+    // the same rule every other reply-owned object in this class follows.
+    issueBuildConnectParams(idHex, reply.secret);
+}
+
+bool ConnectionManager::issueBuildConnectParams(const QString &idHex, const ReldexSecret *password)
+{
     const quint64 request = nextRequest();
     const QByteArray id16 = idToBytes16(m_testConnectProfileId);
     const ReldexStatus status = reldex_workspace_build_connect_params(
             m_workspace.get(), request, reinterpret_cast<const std::uint8_t *>(id16.constData()),
-            secret.get());
-    // Not consumed by the call above (reldex.h): released here, immediately,
-    // rather than kept until the async reply.
-    secret.reset();
+            password);
     if (status != RELDEX_STATUS_OK) {
         adoptError(reldex_last_error_take(), false);
         Q_EMIT testConnectFailed(idHex, m_errorMessageKey, m_errorMessage, false);
@@ -1106,12 +1140,19 @@ void ConnectionManager::handleHubEvent(const ReldexEvent &raw, reldex::BatchHand
         if (error) {
             // ADR-0007: a stored password refused at the database is an
             // authentication failure; the caller offers to update it rather
-            // than retrying automatically. Unreachable through this build's
-            // mock driver (see the class documentation) -- covered directly
-            // by a unit test of this decision instead.
+            // than retrying automatically. `isAuthFailureAgainstStoredPassword()`
+            // is gated on `m_testConnectUsedStoredPassword` (set only when
+            // `resolve_password` itself resolved `FromStore`, in
+            // `handlePasswordResolved()`) -- an authentication failure on its
+            // own does not mean a *stored* password was refused; it could
+            // just as well be a typed-in password or one the profile never
+            // had at all. See that function's own doc comment for why this
+            // build's mock driver cannot exercise this end to end and how it
+            // is tested instead.
             ReldexErrorView view = reldex::makeErrorView();
             const bool decoded = reldex_error_view(error.get(), &view);
-            const bool authFailure = decoded && view.kind == RELDEX_ERROR_KIND_AUTHENTICATION;
+            const bool authFailure = decoded
+                    && isAuthFailureAgainstStoredPassword(view.kind, m_testConnectUsedStoredPassword);
             adoptError(error.get(), false);
             Q_EMIT testConnectFailed(idHex, m_errorMessageKey, m_errorMessage, authFailure);
             m_testConnectCloseRequest = nextRequest();

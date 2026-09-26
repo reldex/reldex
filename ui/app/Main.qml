@@ -57,6 +57,14 @@ ApplicationWindow {
     Bridge {
         id: bridge
         objectName: "bridge"
+
+        // M3.2 fix round (2026-09-26): `ConnectionManager` never opens its
+        // workspace automatically (see `ConnectionManager::open()`'s own doc
+        // comment for why) -- this is the app's own startup path calling it
+        // explicitly, exactly the alternative that class documents. `open()`
+        // is idempotent, so this is safe even if something else calls it
+        // first.
+        Component.onCompleted: connections.open()
     }
 
     // VSCode's own bindings for the same two affordances (sidebar / bottom
